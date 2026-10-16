@@ -17,7 +17,11 @@ import { semantic } from '../theme/tokens'
  *
  * - always dark (brand element, §6.6.4-3) — ignores theme mode
  * - SSE via native EventSource; `event: eof` from the bridge relies on the
- *   browser's automatic reconnect ("eof 重连")
+ *   terminal's own reconnect ("eof 重连"): retries rebuild the channel with
+ *   `&after_seq=<lastSeq>` so the bridge resumes past everything already
+ *   shown (no tail replay, no gap), and existing lines survive reconnects
+ * - seq dedup: entries with `seq <= lastSeq` are dropped even if a bridge
+ *   overlap delivers them again
  * - virtual scrolling: 2000-line window, self-implemented visible-range
  *   rendering (~30 rows), fixed row height
  * - 80ms batched flush merges bursty arrivals into one render (§6.5 monitor)
@@ -125,27 +129,96 @@ async function flush(): Promise<void> {
 }
 
 // --- SSE channel ---
-const channel = createSseChannel(props.url, {
-  events: {
-    log: (data) => {
-      if (typeof data === 'object' && data !== null) {
-        const l = data as LogLine
-        if (typeof l.message === 'string') {
+// Reconnect policy: the native EventSource always retries with the SAME url,
+// which would replay the tail screen on every reconnect (and skip anything
+// between the old tail and the new one). So retries are taken over here: on
+// a stream error the channel is torn down (cancelling the browser's stale
+// retry) and rebuilt with `&after_seq=<lastSeq>` — the bridge seeds its
+// engine cursor from it and streams only entries past what this terminal
+// has already shown. Reconnects never clear existing lines.
+const RECONNECT_MS = 2000
+
+let lastSeq = 0
+let channel: ReturnType<typeof createSseChannel> | null = null
+/** true while a freshly built channel is doing its FIRST connect attempt */
+let expectConnect = false
+/** true while we close() a channel ourselves (switch/visibility/unmount) */
+let closingOurselves = false
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+let disposed = false
+
+function sseUrl(): string {
+  if (lastSeq <= 0) return props.url
+  const sep = props.url.includes('?') ? '&' : '?'
+  return `${props.url}${sep}after_seq=${lastSeq}`
+}
+
+function closeChannel(): void {
+  if (!channel) return
+  closingOurselves = true
+  channel.close()
+  channel = null
+  closingOurselves = false
+}
+
+function cancelReconnect(): void {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer)
+    reconnectTimer = null
+  }
+}
+
+function scheduleReconnect(): void {
+  if (reconnectTimer || !channel) return
+  closeChannel() // cancel the browser's native retry (stale url)
+  status.value = 'connecting'
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null
+    if (!disposed) connect()
+  }, RECONNECT_MS)
+}
+
+function connect(): void {
+  expectConnect = true
+  channel = createSseChannel(sseUrl(), {
+    events: {
+      log: (data) => {
+        if (typeof data === 'object' && data !== null) {
+          const l = data as LogLine
+          if (typeof l.message !== 'string') return
+          if (typeof l.seq === 'number') {
+            if (l.seq <= lastSeq) return // replay of an already-seen entry
+            lastSeq = l.seq
+          }
           enqueue({ seq: l.seq, level: l.level ?? 'INFO', kind: l.kind, message: l.message })
         }
+      },
+      eof: () => {
+        // Bridge gave up (engine unreachable 5x / 300s cap, §4.5); the
+        // reconnect that follows is the documented "eof 重连" (§6.6.6).
+        eofSeen.value = true
+      },
+    },
+    onStatus: (s) => {
+      status.value = s
+      if (s === 'open') {
+        eofSeen.value = false
+        expectConnect = false // heal a stuck flag: the channel did connect
       }
+      if (s === 'connecting') {
+        if (expectConnect) {
+          expectConnect = false // first attempt of a freshly built channel
+          return
+        }
+        scheduleReconnect() // error path: retry ourselves, with after_seq
+        return
+      }
+      // 'closed': only a close we did not initiate can mean session death
+      if (!closingOurselves && !disposed) void probeAuth()
     },
-    eof: () => {
-      // Bridge gave up (engine unreachable 5x, §4.5); EventSource will retry.
-      eofSeen.value = true
-    },
-  },
-  onStatus: (s) => {
-    status.value = s
-    if (s === 'open') eofSeen.value = false
-    if (s === 'closed') void probeAuth()
-  },
-})
+  })
+  channel.open()
+}
 
 /** 401 probe — a hard-closed stream may mean the session died. */
 async function probeAuth(): Promise<void> {
@@ -212,28 +285,34 @@ function clear(): void {
   lines.value = []
   pausedBuffer.value = []
   received.value = 0
+  // lastSeq is NOT reset: clearing is display-level — cleared entries must
+  // not come back on the next reconnect.
 }
 
 // --- lifecycle + visibility (§6.0: SSE pauses while hidden, kicks on visible) ---
 // NOTE: `url` is fixed for the component's lifetime — key the component by
-// pipeline id so switching remounts it with a fresh channel.
+// pipeline id so switching remounts it with a fresh channel (the per-reconnect
+// after_seq URL is derived internally from lastSeq).
 function onVisibility(): void {
   if (document.hidden) {
-    channel.close()
-  } else if (status.value === 'closed') {
-    channel.open()
+    cancelReconnect()
+    closeChannel()
+  } else if (!channel && !reconnectTimer) {
+    connect() // closed (or stranded mid-switch) — kick one reconnect
   }
 }
 
 onMounted(() => {
-  channel.open()
+  connect()
   document.addEventListener('visibilitychange', onVisibility)
 })
 
 onBeforeUnmount(() => {
+  disposed = true
   if (flushTimer) clearTimeout(flushTimer)
+  cancelReconnect()
   document.removeEventListener('visibilitychange', onVisibility)
-  channel.close()
+  closeChannel()
 })
 </script>
 

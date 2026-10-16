@@ -114,12 +114,13 @@
 - **验收**：`cd web && pnpm build` 后 `grep -c monaco dist/index.html` → **0**（首屏不 preload）；`dist/assets/` 中 monaco 相关 chunk 合计 **< 1.5MB**；`pnpm typecheck && pnpm build` 绿；编辑页手测可打开（smoke 不覆盖，L2 由 CI web job 保证构建）。
 - **文件域**：web/src/components/SqlMonaco.vue、pages/pipelines/edit.vue、vite.config.ts。
 
-### T10 web SSE 日志续读（~1 人日）☐
+### T10 web SSE 日志续读（~1 人日）✅
 
 - **现状**：SSE 断线重连尾屏重放 + 显示层丢行（无 seq 去重；桥游标是每连接局部变量）；未部署管道的监控页无限重连死循环。
 - **方案**：后端 SSE 桥支持 `after_seq` 查询参数（引擎日志条目自带全局 seq）；前端 LogTerminal 维护 lastSeq，`seq <= lastSeq` 丢弃，重连不清空已有行；监控页 `v-if="deployed"` 才挂 LogTerminal。
 - **验收**：新增集成测试——断开重连后不重放已见行；未部署管道日志区不发起 SSE；`cargo test -p tailrace-console` + `pnpm typecheck` 绿。
 - **文件域**：console api/pipelines.rs（SSE 桥）、web LogTerminal.vue、monitor.vue。
+- **结果**（2026-10-17）：SSE 桥接受 `after_seq` 查询参数种子化引擎游标（>0 首拉即增量、跳过尾屏重放；背压结构 bounded 64/断连感知/300s 未动）；LogTerminal 接管重连（2s 节奏）：重建 channel 携带 `&after_seq=<lastSeq>`、`seq<=lastSeq` 丢弃、重连不清空已显示行；monitor.vue `v-if="deployed"` 才挂 LogTerminal（未部署管道不再发起 SSE → 无无限重连死循环）。验收数字：新增集成测试 2 个——重连不重放（首屏收 seq 1..3 断开，引擎补 seq 4，`after_seq=3` 重连仅流 seq=4，且 mock 引擎侧证实首拉即 `after_seq=3` 而非 tail）与未部署单帧 `eof:not_deployed` 即收流；`cargo test -p tailrace-console` **25 passed / 0 failed**；clippy `--all-targets --locked -D warnings` 绿；`pnpm typecheck` + `pnpm build` 绿。
 
 ### T11 CI/测试深化 + docker 链路首跑（~2 人日）☐
 

@@ -177,6 +177,9 @@ pub struct MockEngineState {
     /// logs: (seq, level, kind, message)
     pub logs: Arc<Mutex<Vec<LogRow>>>,
     pub reject_plans: Arc<Mutex<bool>>,
+    /// Canonical query string ("k=v&…" sorted) of every /v1/pipelines/{id}/logs
+    /// hit — lets tests assert how the console bridge drives the cursor API.
+    pub log_queries: Arc<Mutex<Vec<String>>>,
 }
 
 /// Spawn a mock engine on an ephemeral loopback port; returns its state
@@ -256,6 +259,12 @@ fn mock_router(st: MockEngineState) -> Router {
                     let after: u64 = q.get("after_seq").and_then(|v| v.parse().ok()).unwrap_or(0);
                     let limit = q.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(200);
                     let is_tail = q.get("tail").map(|v| v == "1").unwrap_or(false);
+                    {
+                        let mut qs: Vec<String> =
+                            q.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                        qs.sort();
+                        st.log_queries.lock().unwrap().push(qs.join("&"));
+                    }
                     let all = st.logs.lock().unwrap().clone();
                     let (entries, last_seq) = if is_tail && after == 0 {
                         let n = limit.min(all.len());

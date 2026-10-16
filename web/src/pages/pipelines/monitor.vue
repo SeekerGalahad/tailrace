@@ -541,9 +541,12 @@ const logsUrl = computed(() => pipelinesApi.logsUrl(pipelineId, 200))
           </NCard>
         </div>
 
-        <!-- SSE logs -->
+        <!-- SSE logs: mounted only when deployed — an undeployed pipeline has
+             no engine to stream from (the bridge would emit eof:not_deployed
+             and every reconnect would loop) -->
         <NCard size="small" title="运行日志（SSE）" :content-style="{ padding: '8px' }">
-          <LogTerminal :url="logsUrl" :height="360" :max-lines="2000" :key="pipelineId" />
+          <LogTerminal v-if="deployed" :url="logsUrl" :height="360" :max-lines="2000" :key="pipelineId" />
+          <EmptyState v-else description="管道未部署——先发布并部署" cta="前往发布向导" @cta="goPublish" />
         </NCard>
 
         <!-- meta collapse -->

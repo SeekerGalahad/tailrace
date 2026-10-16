@@ -441,3 +441,162 @@ async fn sse_logs_bridge_streams_engine_events() {
     // the data frames carry the engine entry shape
     assert!(buffer.contains("\"kind\"") || buffer.contains("FLUSH_OK") || log_events == 3);
 }
+
+// ---------------- SSE log continuation (T10, §4.5) ----------------
+
+/// Open the SSE bridge and collect the `seq`s of the first `want` complete
+/// `event: log` frames (the response is dropped on return — the caller
+/// simulating a client disconnect). Frames are parsed on the `\n\n` boundary
+/// so a `data:` line split across chunks cannot be misread.
+async fn read_sse_log_seqs(app: &TestApp, pid: i64, query: &str, want: usize) -> Vec<u64> {
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/pipelines/{pid}/logs{query}"))
+                .header("cookie", &app.cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(ct.starts_with("text/event-stream"), "content-type: {ct}");
+
+    let mut stream = resp.into_body().into_data_stream();
+    let mut buffer = String::new();
+    let mut seqs: Vec<u64> = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while seqs.len() < want && std::time::Instant::now() < deadline {
+        let chunk = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio_stream::StreamExt::next(&mut stream),
+        )
+        .await;
+        match chunk {
+            Ok(Some(Ok(bytes))) => {
+                buffer.push_str(&String::from_utf8_lossy(&bytes));
+                while let Some(idx) = buffer.find("\n\n") {
+                    let frame: String = buffer.drain(..=idx + 1).collect();
+                    if !frame.starts_with("event: log") {
+                        continue;
+                    }
+                    for line in frame.lines() {
+                        if let Some(data) = line.strip_prefix("data: ") {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                                if let Some(seq) = v.get("seq").and_then(serde_json::Value::as_u64)
+                                {
+                                    seqs.push(seq);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    seqs
+}
+
+/// Disconnect + reconnect with `after_seq`: the bridge seeds its engine
+/// cursor from the query param (no tail pull), so already-seen entries are
+/// never replayed — only entries past the client cursor stream.
+#[tokio::test]
+async fn sse_logs_bridge_after_seq_no_replay_on_reconnect() {
+    let app = app().await;
+    let (st, port) = spawn_mock_engine().await;
+    let (_node_id, _key, _token) = online_node(&app, port, "edge-sse2").await;
+    let (kafka, doris, _kt, _dt) = seed_datasources(&app).await;
+    let pid = published_pipeline(&app, kafka, doris).await;
+    let (s, b) = req(
+        &app,
+        "POST",
+        &format!("/api/pipelines/{pid}/deploy"),
+        Some(json!({"nodeId": null})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+
+    // First screen (no after_seq): tail pull delivers seq 1..3, then the
+    // connection drops (read_sse_log_seqs returns = client went away).
+    let first = read_sse_log_seqs(&app, pid, "?lines=100", 3).await;
+    assert_eq!(first, vec![1, 2, 3], "initial tail screen must be seq 1..3");
+
+    // The engine produces one more entry while the client is offline.
+    st.logs
+        .lock()
+        .unwrap()
+        .push((4, "INFO", "FLUSH_OK", "flush 500 rows in 90ms"));
+
+    // Reconnect with the client cursor: only seq 4 may stream — a tail pull
+    // (the pre-T10 behavior) would deliver seq 1 first and fail this assert.
+    let second = read_sse_log_seqs(&app, pid, "?lines=100&after_seq=3", 1).await;
+    assert_eq!(
+        second,
+        vec![4],
+        "reconnect with after_seq=3 must stream only the new entry, not replay the tail"
+    );
+
+    // Proof the bridge forwarded the cursor to the engine's incremental API
+    // (not a tail request) on its very first pull.
+    let queries = st.log_queries.lock().unwrap().clone();
+    assert!(
+        queries.iter().any(|q| q.contains("after_seq=3")),
+        "bridge must hit the engine with after_seq=3; saw {queries:?}"
+    );
+}
+
+/// An undeployed pipeline gets a single `event: eof` (reason not_deployed)
+/// and the session ends — the bridge never loops on an engine that does not
+/// exist (the frontend does not even mount LogTerminal then; §6.5.4).
+#[tokio::test]
+async fn sse_logs_bridge_undeployed_single_eof() {
+    let app = app().await;
+    let (_st, port) = spawn_mock_engine().await;
+    let (_node_id, _key, _token) = online_node(&app, port, "edge-sse3").await;
+    let (kafka, doris, _kt, _dt) = seed_datasources(&app).await;
+    let pid = published_pipeline(&app, kafka, doris).await; // published, never deployed
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/pipelines/{pid}/logs?lines=100"))
+                .header("cookie", &app.cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut stream = resp.into_body().into_data_stream();
+    let mut buffer = String::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // read until the stream ends (eof frame + server close)
+    while std::time::Instant::now() < deadline {
+        let chunk = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio_stream::StreamExt::next(&mut stream),
+        )
+        .await;
+        match chunk {
+            Ok(Some(Ok(bytes))) => buffer.push_str(&String::from_utf8_lossy(&bytes)),
+            _ => break,
+        }
+    }
+    assert!(
+        buffer.contains("event: eof") && buffer.contains("not_deployed"),
+        "undeployed bridge must emit one eof:not_deployed frame, got: {buffer}"
+    );
+    assert!(
+        !buffer.contains("event: log"),
+        "undeployed bridge must never stream log events, got: {buffer}"
+    );
+}

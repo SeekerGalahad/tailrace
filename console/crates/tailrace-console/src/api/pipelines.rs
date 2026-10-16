@@ -1175,14 +1175,20 @@ async fn proxy_get(state: &AppState, id: i64, resource: &str) -> Response {
 
 // ---------------- SSE log bridge (§4.5 / A5) ----------------
 
-/// `GET /api/pipelines/{id}/logs?lines=200` — SSE bridge over the engine's
-/// cursor API: initial `tail=1&limit` (clamped 50..500), then 1.5s
-/// `after_seq` polling; keepalive every 15s; session ends at 300s or after 5
-/// consecutive engine failures (eof event, §4.5).
+/// `GET /api/pipelines/{id}/logs?lines=200&after_seq=N` — SSE bridge over
+/// the engine's cursor API: initial `tail=1&limit` (clamped 50..500), then
+/// 1.5s `after_seq` polling; keepalive every 15s; session ends at 300s or
+/// after 5 consecutive engine failures (eof event, §4.5). A client-supplied
+/// `after_seq>0` seeds the cursor (log continuation on reconnect — no tail
+/// replay; the engine only returns entries past that global seq).
 #[utoipa::path(
     get,
     path = "/api/pipelines/{id}/logs",
-    params(("id" = i64, Path), ("lines" = Option<usize>, Query, description = "first-screen tail, clamped 50..500")),
+    params(
+        ("id" = i64, Path),
+        ("lines" = Option<usize>, Query, description = "first-screen tail, clamped 50..500"),
+        ("after_seq" = Option<u64>, Query, description = "resume cursor: skip the tail pull, stream only entries past this global seq"),
+    ),
     responses((status = 200, description = "text/event-stream: events log / eof, : keepalive"))
 )]
 pub async fn logs(
@@ -1195,6 +1201,12 @@ pub async fn logs(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(200)
         .clamp(50, 500);
+    // Reconnect cursor (§4.5 log continuation): 0/absent = fresh first
+    // screen (tail pull); >0 = resume past that seq (incremental only).
+    let after_seq = params
+        .get("after_seq")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
     let full = match load_pipeline(&state, id) {
         Ok(f) => f,
         Err(r) => return r,
@@ -1221,7 +1233,9 @@ pub async fn logs(
             return;
         };
         let endpoint = console_proxy::NodeEndpoint::with_token(api_url, node_token);
-        let mut cursor: u64 = 0;
+        // Client cursor seed: after_seq>0 skips the tail pull entirely (the
+        // `cursor == 0` branch below) so a reconnect never replays the tail.
+        let mut cursor: u64 = after_seq;
         loop {
             let page = if cursor == 0 {
                 endpoint
