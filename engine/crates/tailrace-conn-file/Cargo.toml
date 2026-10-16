@@ -11,3 +11,10 @@ anyhow = "1"
 datafusion = { workspace = true }
 tailrace-catalog = { workspace = true }
 tailrace-connector = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "sink"
+harness = false

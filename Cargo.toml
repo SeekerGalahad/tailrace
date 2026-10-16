@@ -81,6 +81,10 @@ tokio-stream = "0.1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# dev-only (roadmap T1 benchmark suite): criterion micro-benches live in
+# per-crate benches/ and reference this as a workspace dev-dependency —
+# never a runtime dependency.
+criterion = "0.8"
 # internal crates (path + version, mirrors original engine practice)
 tailrace-connector = { path = "engine/crates/tailrace-connector", version = "0.1.0" }
 tailrace-conn-kafka = { path = "engine/crates/tailrace-conn-kafka", version = "0.1.0" }
