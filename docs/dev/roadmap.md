@@ -46,7 +46,7 @@
 > 原则：**基准先行**——T1 是 T3/T5/T6/T7 的门槛；没有前后对比数据的优化不收。
 > 总量评估：~23 业余人日（各卡标注）；agent 执行按波次编排（§五）。
 
-### T1 基准套件（~3 人日）〔门槛任务〕☐
+### T1 基准套件（~3 人日）〔门槛任务〕✅
 
 - **现状**：零基准——无 benches/、无 criterion、无 BENCHMARKS.md；v0.1.0 的默认攒批参数（8k 行/100ms/10k 行 flush）与容量自报（8 管/24 语）均无测量支撑。
 - **方案**：
@@ -56,6 +56,7 @@
   4. CI：微基准仅编译验证（`cargo bench --no-run` 进 rust job），不上传数据。
 - **验收**：`cargo bench -p tailrace-decode --no-run` 通过；`bash scripts/bench/macro.sh --rows 100000 --report /tmp/r2-baseline.md` 出吞吐行；`test -s docs/BENCHMARKS.md` 且含首批数字。
 - **文件域**：engine 各 crate `benches/`、root `Cargo.toml`（criterion workspace dep）、`scripts/bench/`、`docs/BENCHMARKS.md`。
+> 结果：fa9f74d decode 302K / transform 19.1M / sink encode 8.43M rows/s；宏基准 100000 行 4.600s=21739 rows/s(debug 档)，docs/BENCHMARKS.md 已立方法学+基线
 
 ### T2 可观测：tracing + OTLP（~3 人日）☐
 
