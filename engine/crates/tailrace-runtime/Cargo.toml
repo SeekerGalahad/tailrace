@@ -1,0 +1,35 @@
+[package]
+name = "tailrace-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Micro-batch pipeline executor: per-statement threads, ledger-backed at-least-once commits, serve-mode pipeline registry"
+
+[features]
+# Connector wiring: the default registry registers whatever is compiled in.
+# The binary mirrors these features via build_registry().
+default = ["connector-kafka", "connector-file", "connector-doris"]
+connector-kafka = ["dep:tailrace-conn-kafka"]
+connector-file = ["dep:tailrace-conn-file"]
+connector-doris = ["dep:tailrace-conn-doris"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+anyhow = "1"
+base64 = { workspace = true }
+tokio = { workspace = true }
+tailrace-ir = { workspace = true }
+tailrace-connector = { workspace = true }
+tailrace-conn-kafka = { workspace = true, optional = true }
+tailrace-conn-file = { workspace = true, optional = true }
+tailrace-conn-doris = { workspace = true, optional = true }
+tailrace-decode = { workspace = true }
+tailrace-state = { workspace = true }
+tailrace-catalog = { workspace = true }
+tailrace-transform = { workspace = true }
+datafusion = { workspace = true }
+
+[dev-dependencies]
+rdkafka = { workspace = true }

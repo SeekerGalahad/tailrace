@@ -1,0 +1,13 @@
+[package]
+name = "tailrace-connector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Source/Sink connector traits plus the explicit ConnectorRegistry"
+
+[dependencies]
+anyhow = "1"
+datafusion = { workspace = true }
+tailrace-ir = { workspace = true }
+tailrace-catalog = { workspace = true }

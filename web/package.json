@@ -1,0 +1,26 @@
+{
+  "name": "tailrace-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "vue-tsc --noEmit"
+  },
+  "dependencies": {
+    "@vicons/ionicons5": "^0.13.0",
+    "monaco-editor": "^0.57.0",
+    "naive-ui": "^2.45.0",
+    "pinia": "^4.0.3",
+    "uplot": "^1.6.32",
+    "vue": "^3.5.13",
+    "vue-router": "^5.0.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.10",
+    "typescript": "~5.9.3",
+    "vite": "^8.3.4",
+    "vue-tsc": "^3.3.13"
+  }
+}

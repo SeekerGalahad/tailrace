@@ -1,0 +1,21 @@
+/* Global base — token-driven only (design doc §6.6). */
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--tr-bg-page);
+  color: var(--tr-text-1);
+  font-family: var(--tr-font-ui);
+  font-size: var(--tr-fs-body-sm);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Machine identity everywhere: tabular numbers for metrics/offsets (§6.6.2). */
+.mono,
+code {
+  font-family: var(--tr-font-mono);
+}

@@ -1,0 +1,13 @@
+[package]
+name = "tailrace-conn-file"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "File connector: tailing source (jsonl/csv text + parquet batch) and jsonl/parquet writers"
+
+[dependencies]
+anyhow = "1"
+datafusion = { workspace = true }
+tailrace-catalog = { workspace = true }
+tailrace-connector = { workspace = true }

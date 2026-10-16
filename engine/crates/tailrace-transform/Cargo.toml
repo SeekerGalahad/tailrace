@@ -1,0 +1,12 @@
+[package]
+name = "tailrace-transform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "DataFusion execution integration: register the decoded batch as `src` and run select_sql"
+
+[dependencies]
+tokio = { workspace = true }
+anyhow = "1"
+datafusion = { workspace = true }

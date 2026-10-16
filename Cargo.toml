@@ -1,0 +1,102 @@
+# tailrace workspace root — single source of truth for shared dependency versions.
+# Engine-side versions are carried over verbatim from the original engine
+# workspace manifest (pre-extraction location, see the design doc §7.1);
+# console-side versions follow design doc §3.1/§五/A3/A4. Crate owners edit
+# their own manifest, not this file.
+[workspace]
+resolver = "2"
+members = [
+    # engine
+    "engine/bin/tailrace-node",
+    "engine/crates/tailrace-connector",
+    "engine/crates/tailrace-conn-kafka",
+    "engine/crates/tailrace-conn-file",
+    "engine/crates/tailrace-conn-doris",
+    "engine/crates/tailrace-conn-mqtt",
+    "engine/crates/tailrace-conn-jdbc",
+    "engine/crates/tailrace-conn-s3",
+    "engine/crates/tailrace-ir",
+    "engine/crates/tailrace-decode",
+    "engine/crates/tailrace-transform",
+    "engine/crates/tailrace-parser",
+    "engine/crates/tailrace-state",
+    "engine/crates/tailrace-catalog",
+    "engine/crates/tailrace-runtime",
+    "engine/crates/tailrace-api",
+    # console
+    "console/crates/tailrace-console",
+    "console/crates/console-store",
+    "console/crates/console-auth",
+    "console/crates/console-proxy",
+    # contract tests (engine H3: the /v1 protocol + executor determinism
+    # suite — joins cargo test --workspace via membership)
+    "tests/contract",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# ---------------------------------------------------------------------------
+# Shared dependency version table (single fact source).
+# Engine side: copied from the original engine workspace, do not bump ad hoc.
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+# engine side (verbatim version table)
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time", "sync"] }
+rdkafka = { version = "0.39", features = ["cmake-build", "tokio", "curl-static"] }
+openssl = { version = "0.10", features = ["vendored"] }
+datafusion = "48.0.1"
+datafusion-proto = "48.0.1"
+bytes = "1"
+simd-json = "0.15.1"
+serde_json = "1"
+toml = "0.8"
+base64 = "0.22"
+axum = { version = "0.8", features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["http2", "blocking", "json"] }
+# console side (design doc §3.1 / §5.1 / A3 / A4)
+rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite_migration = "2.6"
+argon2 = { version = "0.6", features = ["rand_core"] }
+utoipa = "6"
+utoipa-axum = "0.3"
+# design doc A4 writes "swagger-ui 10"; the actual crate is utoipa-swagger-ui
+# (v10.0.1 — the framework integrations are implicit optional-dep features).
+utoipa-swagger-ui = { version = "10", features = ["axum"] }
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+rand = "0.9"
+aes-gcm = "0.10"
+tower = { version = "0.5", features = ["util"] }
+tokio-stream = "0.1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# internal crates (path + version, mirrors original engine practice)
+tailrace-connector = { path = "engine/crates/tailrace-connector", version = "0.1.0" }
+tailrace-conn-kafka = { path = "engine/crates/tailrace-conn-kafka", version = "0.1.0" }
+tailrace-conn-file = { path = "engine/crates/tailrace-conn-file", version = "0.1.0" }
+tailrace-conn-doris = { path = "engine/crates/tailrace-conn-doris", version = "0.1.0" }
+tailrace-conn-mqtt = { path = "engine/crates/tailrace-conn-mqtt", version = "0.1.0" }
+tailrace-conn-jdbc = { path = "engine/crates/tailrace-conn-jdbc", version = "0.1.0" }
+tailrace-conn-s3 = { path = "engine/crates/tailrace-conn-s3", version = "0.1.0" }
+tailrace-ir = { path = "engine/crates/tailrace-ir", version = "0.1.0" }
+tailrace-decode = { path = "engine/crates/tailrace-decode", version = "0.1.0" }
+tailrace-transform = { path = "engine/crates/tailrace-transform", version = "0.1.0" }
+tailrace-parser = { path = "engine/crates/tailrace-parser", version = "0.1.0" }
+tailrace-state = { path = "engine/crates/tailrace-state", version = "0.1.0" }
+tailrace-catalog = { path = "engine/crates/tailrace-catalog", version = "0.1.0" }
+tailrace-runtime = { path = "engine/crates/tailrace-runtime", version = "0.1.0" }
+tailrace-api = { path = "engine/crates/tailrace-api", version = "0.1.0" }
+console-store = { path = "console/crates/console-store", version = "0.1.0" }
+console-auth = { path = "console/crates/console-auth", version = "0.1.0" }
+console-proxy = { path = "console/crates/console-proxy", version = "0.1.0" }

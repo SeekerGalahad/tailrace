@@ -1,0 +1,4 @@
+# Minimum supported Rust is 1.85 (workspace rust-version, design doc §8.1).
+# Track stable so contributors always build on a >= 1.85 toolchain.
+[toolchain]
+channel = "stable"

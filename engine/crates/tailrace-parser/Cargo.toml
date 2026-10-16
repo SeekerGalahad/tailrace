@@ -1,0 +1,13 @@
+[package]
+name = "tailrace-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "SQL frontend: ${ds:} reference extraction, FlinkDialect parsing, statement lowering and validation"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+datafusion = { workspace = true }
+tailrace-catalog = { workspace = true }

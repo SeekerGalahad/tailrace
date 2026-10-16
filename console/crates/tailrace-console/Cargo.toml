@@ -1,0 +1,38 @@
+[package]
+name = "tailrace-console"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "tailrace_console"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tailrace-console"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true, features = ["multipart"] }
+tokio = { workspace = true, features = ["signal", "net", "fs"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rust-embed = { workspace = true }
+utoipa = { workspace = true }
+utoipa-swagger-ui = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+tokio-stream = { workspace = true }
+console-store = { workspace = true }
+console-auth = { workspace = true }
+console-proxy = { workspace = true }
+tailrace-parser = { workspace = true }
+tailrace-catalog = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }

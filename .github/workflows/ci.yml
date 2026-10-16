@@ -1,0 +1,98 @@
+# CI per design doc §8.3 (three jobs: rust / web / smoke), hardened per
+# upgrade plan §3.1 (research-oss ③): rust-cache, pinned cargo-deny-action,
+# MSRV job, --no-default-features guard, macOS core-test job, workflow hygiene.
+name: ci
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "rustfmt, clippy" }
+      - uses: Swatinem/rust-cache@v2
+      # rust-embed requires web/dist at compile time; jobs that compile the
+      # console without a real web build provide a placeholder instead.
+      - run: mkdir -p web/dist && echo '<!doctype html><title>placeholder</title>' > web/dist/index.html
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked       # 含 tests/contract 契约测试
+      - uses: EmbarkStudios/cargo-deny-action@v2.1.1   # pinned tag (eng M2)
+        with:
+          command: check
+          command-arguments: advisories bans licenses sources
+
+  msrv:                                            # workspace rust-version = 1.85 (eng M3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - run: mkdir -p web/dist && echo '<!doctype html><title>placeholder</title>' > web/dist/index.html
+      - run: cargo check --workspace --locked
+
+  no-default-features:                            # feature contract: off must still compile (engine M10 guard)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: mkdir -p web/dist && echo '<!doctype html><title>placeholder</title>' > web/dist/index.html
+      - run: cargo check --workspace --locked --no-default-features
+
+  macos:                                           # released platform runs at least the core tests (§3.1)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p tailrace-api -p console-store
+
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 10 }
+      - uses: actions/setup-node@v4
+        with:
+          {
+            cache: pnpm,
+            node-version: 22,
+            cache-dependency-path: web/pnpm-lock.yaml,
+          }
+      - run: cd web && pnpm install --frozen-lockfile
+      - run: cd web && pnpm typecheck && pnpm build
+
+  smoke:                                           # 端到端冒烟：起 console+node，跑通 healthz/注册/心跳
+    needs: [rust, web]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable       # build.sh needs cargo; runners ship no Rust
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4                # build.sh builds the embedded web bundle
+        with: { version: 10 }
+      - uses: actions/setup-node@v4
+        with:
+          {
+            cache: pnpm,
+            node-version: 22,
+            cache-dependency-path: web/pnpm-lock.yaml,
+          }
+      - run: ./scripts/build.sh
+      - run: ./scripts/smoke.sh                   # P1 交付件（启动→探活→示例管道→断言）

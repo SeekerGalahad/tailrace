@@ -1,0 +1,14 @@
+[package]
+name = "tailrace-decode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Decoder trait plus ogg/json/csv/parquet decoders writing directly into Arrow columns"
+
+[dependencies]
+anyhow = "1"
+bytes = { workspace = true }
+datafusion = { workspace = true }
+simd-json = { workspace = true }
+serde_json = { workspace = true }

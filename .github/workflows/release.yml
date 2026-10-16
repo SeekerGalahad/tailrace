@@ -1,0 +1,96 @@
+# Release per design doc §8.3: tag v* -> preflight -> 4-target matrix -> aggregate -> GitHub Release.
+# dist is never committed; the web bundle is built here (rust-embed contract, §8.2).
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:                                      # eng H3: a tag on a red commit ships nothing
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "rustfmt, clippy" }
+      - uses: Swatinem/rust-cache@v2
+      # Same rust-embed placeholder as ci.yml (console compiles before web).
+      - run: mkdir -p web/dist && echo '<!doctype html><title>placeholder</title>' > web/dist/index.html
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  build:
+    needs: preflight
+    strategy:
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest, cross: "true" }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-latest, cross: "true" }
+          - { target: x86_64-apple-darwin, os: macos-latest, cross: "false" }
+          - { target: aarch64-apple-darwin, os: macos-latest, cross: "false" }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 10 }
+      - uses: actions/setup-node@v4
+        with:
+          {
+            cache: pnpm,
+            node-version: 22,
+            cache-dependency-path: web/pnpm-lock.yaml,
+          }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "${{ matrix.target }}" }
+      - uses: Swatinem/rust-cache@v2
+      - name: Build web bundle (rust-embed precondition)
+        run: cd web && pnpm install --frozen-lockfile && pnpm build
+      - name: Install cross
+        if: matrix.cross == 'true'
+        uses: taiki-e/install-action@v2
+        with: { tool: cross }
+      - name: Package tarballs
+        run: |
+          echo "cross=${{ matrix.cross }}"
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            CARGO_BIN=cross TARGETS="${{ matrix.target }}" ./scripts/package.sh
+          else
+            TARGETS="${{ matrix.target }}" ./scripts/package.sh
+          fi
+      - name: Upload tarballs for aggregation
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: target/package/*.tar.gz
+          if-no-files-found: error
+
+  aggregate:                                      # eng H2: one checksums.txt over all 8 tarballs
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+      - name: Checksums (all matrix tarballs)
+        run: cd dist && shasum -a 256 *.tar.gz > checksums.txt && cat checksums.txt
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/checksums.txt

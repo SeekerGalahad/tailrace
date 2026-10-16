@@ -1,0 +1,13 @@
+[package]
+name = "tailrace-state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "OffsetStore trait (commit only after write success — the at-least-once anchor) plus the local JSON ledger"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+tailrace-ir = { workspace = true }

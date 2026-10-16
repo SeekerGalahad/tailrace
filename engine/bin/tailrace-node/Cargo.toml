@@ -1,0 +1,45 @@
+[package]
+name = "tailrace-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "tailrace single-binary node entry: CLI (run / serve / compile) with feature-wired connectors"
+
+[features]
+# Connector wiring: default registers kafka/file/doris; mqtt/jdbc/s3 stay
+# placeholder crates and register nothing until implemented.
+default = ["connector-kafka", "connector-file", "connector-doris"]
+connector-kafka = ["dep:tailrace-conn-kafka"]
+connector-file  = ["dep:tailrace-conn-file"]
+connector-doris = ["dep:tailrace-conn-doris"]
+connector-mqtt  = ["dep:tailrace-conn-mqtt"]
+connector-jdbc  = ["dep:tailrace-conn-jdbc"]
+connector-s3    = ["dep:tailrace-conn-s3"]
+
+[dependencies]
+anyhow = "1"
+tailrace-connector = { workspace = true }
+tailrace-conn-kafka = { workspace = true, optional = true }
+tailrace-conn-file = { workspace = true, optional = true }
+tailrace-conn-doris = { workspace = true, optional = true }
+tailrace-conn-mqtt = { workspace = true, optional = true }
+tailrace-conn-jdbc = { workspace = true, optional = true }
+tailrace-conn-s3 = { workspace = true, optional = true }
+tailrace-runtime = { workspace = true }
+tailrace-catalog = { workspace = true }
+tailrace-api = { workspace = true }
+tailrace-parser = { workspace = true }
+# graceful shutdown: the signal thread (SIGINT/SIGTERM → final heartbeat
+# beat) builds its own current-thread runtime
+tokio = { workspace = true, features = ["signal"] }
+# Vendored OpenSSL: curl-sys (via rdkafka curl-static) links OpenSSL, and
+# cross-compilation containers have no target-arch OpenSSL. Vendoring makes
+# every release target self-contained. Unused as a library on purpose.
+openssl = { workspace = true }
+
+[dev-dependencies]
+# chaos live-gate probes only (documented-precondition checks; both crates
+# are already in the workspace dependency graph)
+rdkafka = { workspace = true }
+reqwest = { workspace = true }

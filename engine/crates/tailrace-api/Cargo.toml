@@ -1,0 +1,20 @@
+[package]
+name = "tailrace-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "axum REST: /healthz, /v1/compile, /v1/pipelines (+plan/stats/logs/offsets/actions) and the node heartbeat against the console"
+
+[dependencies]
+anyhow = "1"
+axum = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+# auth.rs: generated node API token entropy (already a workspace dep)
+rand = { workspace = true }
+tailrace-parser = { workspace = true }
+tailrace-catalog = { workspace = true }
+tailrace-runtime = { workspace = true }

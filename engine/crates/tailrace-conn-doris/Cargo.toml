@@ -1,0 +1,21 @@
+[package]
+name = "tailrace-conn-doris"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Doris sink: BE-direct stream load with idempotent labels, bounded retries, group commit and sequence columns"
+
+[features]
+# StarRocks speaks the same Stream Load protocol: enabling this only registers
+# the extra "starrocks" sink kind (same factory). A dedicated default
+# user-agent can ride on this feature later — the protocol is shared.
+starrocks = []
+
+[dependencies]
+anyhow = "1"
+serde_json = { workspace = true }
+datafusion = { workspace = true }
+reqwest = { workspace = true }
+tailrace-catalog = { workspace = true }
+tailrace-connector = { workspace = true }

@@ -1,0 +1,17 @@
+{
+  "ir_version": "1.0",
+  "pipeline_id": 42,
+  "statements": [
+    {
+      "source_ref": "12.default.orders_ogg",
+      "sink_ref": "3.shop.orders",
+      "group": "tr.p42.s0",
+      "pushdown": [
+        "I",
+        "U"
+      ],
+      "proto_plan_b64": "GnIKLCIqCgJSABIkIiIKEgoQCgdvcF90eXBlEgUKA3NyYwoFGgMSAUQaBU5vdEVxEhMKEQoIb3JkZXJfbm8SBQoDc3JjEi0SKwoiIiAKDgoMCgNzZXESBQoDc3JjCgQaAjgKGghNdWx0aXBseRIFc2VxMTA=",
+      "debug_sql_echo": "SELECT order_no, seq * 10 AS seq10 FROM src WHERE op_type <> 'D'"
+    }
+  ]
+}

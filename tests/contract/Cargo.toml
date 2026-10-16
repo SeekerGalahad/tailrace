@@ -1,0 +1,17 @@
+[package]
+name = "tests-contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "In-process /v1 protocol contract tests + deterministic executor main-loop tests (file→file, zero external deps)"
+
+[dependencies]
+anyhow = "1"
+base64 = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tailrace-api = { workspace = true }
+tailrace-catalog = { workspace = true }
+tailrace-connector = { workspace = true }
+tailrace-runtime = { workspace = true }

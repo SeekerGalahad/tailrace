@@ -1,0 +1,21 @@
+# Rust
+/target/
+
+# Web
+web/node_modules/
+web/dist/
+web/*.local
+
+# Runtime data
+*.db
+*.db-shm
+*.db-wal
+data/
+
+# Env & OS
+.env
+.env.*
+.DS_Store
+
+# IDE
+.idea/
