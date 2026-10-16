@@ -7,7 +7,7 @@ ingestion engine with a built-in web console (Rust workspace in `engine/` +
 ## Getting started
 
 Start with the [Development](README.md#development) section of the README for
-the toolchain prerequisites (Rust ≥ 1.85, Node.js 22, pnpm) and the everyday
+the toolchain prerequisites (Rust ≥ 1.95, Node.js 22, pnpm) and the everyday
 commands:
 
 ```bash

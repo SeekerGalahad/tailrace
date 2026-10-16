@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- MSRV raised from 1.85 to 1.95: `rusqlite_migration` 2.6 (the locked
+  version) declares `rust-version = 1.95`, so the previous claim was
+  unenforceable. The `msrv` CI job now actually compiles the workspace on
+  1.95.
+
 ## [0.1.0] - 2026-10-13
 
 Initial baseline: the SQL pipeline engine, management console, and embedded
@@ -23,7 +30,7 @@ web UI.
   console SPA (`web/`, Vue 3) embedded into the single-binary console via
   rust-embed.
 - Engineering baseline: `cargo fmt` / `clippy -D warnings` / `cargo test`
-  gates with dependency caching, MSRV (1.85) and `--no-default-features`
+  gates with dependency caching, MSRV (1.85 at tag time) and `--no-default-features`
   checks, `cargo deny` supply-chain gates (advisories/bans/licenses/sources),
   end-to-end smoke script (`scripts/smoke.sh`, 25 assertions), 4-target
   release matrix (linux amd64/arm64, macOS amd64/arm64) with aggregate

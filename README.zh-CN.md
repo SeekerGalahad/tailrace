@@ -8,7 +8,7 @@ v0.1.0 基线（2026-10-13）。已可用：`engine/` 数据面（SQL 变换、o
 
 ## 快速开始
 
-前置条件：Rust ≥ 1.85（rustup；仓库 pin 了 stable 工具链）、Node.js 22、pnpm。
+前置条件：Rust ≥ 1.95（rustup；仓库 pin 了 stable 工具链）、Node.js 22、pnpm。
 
 ```bash
 # 1. 构建前端并内嵌，再构建双二进制

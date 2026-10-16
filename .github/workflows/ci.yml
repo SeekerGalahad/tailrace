@@ -31,12 +31,12 @@ jobs:
           command: check
           command-arguments: advisories bans licenses sources
 
-  msrv:                                            # workspace rust-version = 1.85 (eng M3)
+  msrv:                                            # workspace rust-version = 1.95
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@1.95
       - uses: Swatinem/rust-cache@v2
       - run: mkdir -p web/dist && echo '<!doctype html><title>placeholder</title>' > web/dist/index.html
       - run: cargo check --workspace --locked

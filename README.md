@@ -13,7 +13,7 @@ placeholders.
 
 ## Quickstart
 
-Prerequisites: Rust ≥ 1.85 (rustup; the repo pins a stable toolchain), Node.js 22, pnpm.
+Prerequisites: Rust ≥ 1.95 (rustup; the repo pins a stable toolchain), Node.js 22, pnpm.
 
 ```bash
 # 1. build the web bundle, embed it, and build both binaries
