@@ -16,9 +16,26 @@ connector-doris = ["dep:tailrace-conn-doris"]
 connector-mqtt  = ["dep:tailrace-conn-mqtt"]
 connector-jdbc  = ["dep:tailrace-conn-jdbc"]
 connector-s3    = ["dep:tailrace-conn-s3"]
+# T2 observability: OTLP span export (opentelemetry + tracing-opentelemetry).
+# Default OFF (roadmap §四 T2 / §八.2): plain tracing stays the always-on floor;
+# enabling this compiles the OTLP layer, activated at runtime by
+# OTEL_EXPORTER_OTLP_ENDPOINT.
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
 
 [dependencies]
 anyhow = "1"
+# T2: subscriber init in main (env-filter, default info) + the optional OTLP layer
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
 tailrace-connector = { workspace = true }
 tailrace-conn-kafka = { workspace = true, optional = true }
 tailrace-conn-file = { workspace = true, optional = true }
@@ -43,3 +60,5 @@ openssl = { workspace = true }
 # are already in the workspace dependency graph)
 rdkafka = { workspace = true }
 reqwest = { workspace = true }
+# chaos live-gate skip notice goes through tracing (T2)
+tracing = { workspace = true }

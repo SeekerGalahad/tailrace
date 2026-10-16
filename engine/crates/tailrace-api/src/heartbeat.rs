@@ -626,7 +626,7 @@ fn run_loop(
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[heartbeat] client build failed: {e}");
+            tracing::error!(error = %e, "heartbeat client build failed");
             mark_finished(&finished);
             return;
         }
@@ -636,7 +636,7 @@ fn run_loop(
         match load_or_create_identity(&cfg.state_dir, cfg.flag_node_key.as_deref(), &cfg.name) {
             Ok(id) => id,
             Err(e) => {
-                eprintln!("[heartbeat] identity load failed: {e:#}");
+                tracing::error!(error = %format!("{e:#}"), "heartbeat identity load failed");
                 mark_finished(&finished);
                 return;
             }
@@ -645,14 +645,16 @@ fn run_loop(
     // deploy-chain bootstrap token once it exists
     let mut node_token = load_persisted_node_token(&cfg.state_dir);
     if node_token.is_some() {
-        eprintln!(
-            "[heartbeat] per-node token loaded from {}",
-            cfg.state_dir.join(crate::auth::NODE_TOKEN_FILE).display()
+        tracing::info!(
+            path = %cfg.state_dir.join(crate::auth::NODE_TOKEN_FILE).display(),
+            "per-node token loaded"
         );
     }
-    eprintln!(
-        "[heartbeat] identity ready node_key={} name={} → {}",
-        identity.node_key, identity.name, base
+    tracing::info!(
+        node_key = %identity.node_key,
+        name = %identity.name,
+        control_plane = base,
+        "identity ready"
     );
     events.emit(
         "INFO",
@@ -685,9 +687,10 @@ fn run_loop(
                 registered = true;
                 events.confirm(batch.len());
                 if let Some(adopted) = apply_echo(&identity, &body) {
-                    eprintln!(
-                        "[heartbeat] identity echo adoption: {} → {}",
-                        identity.node_key, adopted.node_key
+                    tracing::info!(
+                        from = %identity.node_key,
+                        to = %adopted.node_key,
+                        "identity echo adoption"
                     );
                     let _ = persist_identity(&cfg.state_dir, &adopted);
                     identity = adopted;
@@ -709,8 +712,8 @@ fn run_loop(
                             if Some(&t) != node_token.as_ref() {
                                 match persist_node_token(&cfg.state_dir, &t) {
                                     Ok(()) => {
-                                        eprintln!(
-                                            "[heartbeat] adopted console-issued per-node token (persisted, m2m + /v1 rotated)"
+                                        tracing::info!(
+                                            "adopted console-issued per-node token (persisted, m2m + /v1 rotated)"
                                         );
                                         events.emit(
                                             "INFO",
@@ -722,13 +725,14 @@ fn run_loop(
                                         }
                                         node_token = Some(t);
                                     }
-                                    Err(e) => eprintln!(
-                                        "[heartbeat] per-node token persist failed (will retry adoption on next register): {e:#}"
+                                    Err(e) => tracing::warn!(
+                                        error = %format!("{e:#}"),
+                                        "per-node token persist failed (will retry adoption on next register)"
                                     ),
                                 }
                             }
                         }
-                        eprintln!("[heartbeat] self-registration ok {}", identity.node_key);
+                        tracing::info!(node_key = %identity.node_key, "self-registration ok");
                     }
                     Ok((s, b)) => {
                         // presenting an adopted token that the console no
@@ -736,27 +740,25 @@ fn run_loop(
                         // fall back to the bootstrap token next cycle
                         if s == 401 && node_token.take().is_some() {
                             drop_persisted_node_token(&cfg.state_dir);
-                            eprintln!(
-                                "[heartbeat] register 401 with the adopted per-node token — dropped it, falling back to the bootstrap token"
+                            tracing::warn!(
+                                "register 401 with the adopted per-node token — dropped it, falling back to the bootstrap token"
                             );
                         }
-                        eprintln!("[heartbeat] registration failed HTTP {s}: {}", truncate(&b))
+                        tracing::warn!(status = s, body = %truncate(&b), "registration failed");
                     }
-                    Err(e) => eprintln!("[heartbeat] registration unreachable: {e}"),
+                    Err(e) => tracing::warn!(error = %e, "registration unreachable"),
                 }
             }
             Ok((status, body)) => {
-                eprintln!(
-                    "[heartbeat] heartbeat abnormal HTTP {status}: {}",
-                    truncate(&body)
-                );
+                tracing::warn!(status, body = %truncate(&body), "heartbeat abnormal");
             }
             Err(e) => {
                 // network down / console restarting: retry silently (events
                 // stay pending confirmation and catch up on recovery)
-                eprintln!(
-                    "[heartbeat] console unreachable (retrying in {}s): {e}",
-                    cfg.heartbeat_secs
+                tracing::warn!(
+                    retry_secs = cfg.heartbeat_secs,
+                    error = %e,
+                    "console unreachable, retrying"
                 );
             }
         }
@@ -808,7 +810,7 @@ fn run_loop(
                     let _ = persist_identity(&cfg.state_dir, &adopted);
                 }
             }
-            eprintln!("[heartbeat] shut down");
+            tracing::info!("heartbeat shut down");
             break;
         }
     }

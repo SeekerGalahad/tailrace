@@ -14,6 +14,8 @@ starrocks = []
 
 [dependencies]
 anyhow = "1"
+# T2: engine-wide structured logging (tracing macros with pipeline/statement fields)
+tracing = { workspace = true }
 serde_json = { workspace = true }
 datafusion = { workspace = true }
 reqwest = { workspace = true }

@@ -11,6 +11,12 @@
 # sysctl -w vm.max_map_count=2000000; OrbStack/Docker Desktop handle this).
 # Image tag scheme verified against apache/doris master
 # docker/runtime/docker-compose-demo (FE_SERVERS/FE_ID/BE_ADDR contract).
+#
+# Optional observability profile (roadmap T2, NOT part of the smoke stack):
+#   docker compose --profile otel up -d
+# adds an OTLP collector for a tailrace-node built with --features otel
+# (spans over OTLP/HTTP). Point the node at it with
+# OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318.
 
 services:
   kafka:
@@ -66,3 +72,16 @@ services:
       timeout: 10s
       retries: 60
       start_period: 20s
+
+  # Optional OTLP sink for tailrace-node --features otel (profile "otel";
+  # never started by smoke.sh or a plain `docker compose up -d`). Config is
+  # inlined as a YAML provider string to keep this file self-contained: OTLP
+  # over HTTP on 4318, debug exporter to the collector's own stdout.
+  otel-collector:
+    image: otel/opentelemetry-collector:0.163.1
+    container_name: tailrace-otel-collector
+    profiles: ["otel"]
+    ports:
+      - "127.0.0.1:4318:4318"   # OTLP http/protobuf (engine exporter target)
+    command:
+      - "--config=yaml:{receivers: {otlp: {protocols: {http: {endpoint: 0.0.0.0:4318}}}}, exporters: {debug: {verbosity: basic}}, service: {pipelines: {traces: {receivers: [otlp], exporters: [debug]}}}}"

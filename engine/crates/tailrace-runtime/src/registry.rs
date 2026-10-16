@@ -384,6 +384,13 @@ impl PipelineRegistry {
             .spawn(move || {
                 let mut attempt: u32 = 0;
                 let mut no_progress: u32 = 0;
+                tracing::info!(
+                    pipeline_id,
+                    statements = n_st,
+                    dispatch_id,
+                    bad_row_policy = %rl_bad_row_policy.as_str(),
+                    "pipeline started (serve)"
+                );
                 thread_hub.push(pipeline_id, "INFO", "PIPELINE_STARTED",
                     &format!("plan started: statements={} dispatch_id={} badRowPolicy={}", n_st, dispatch_id, rl_bad_row_policy.as_str()), None);
                 loop {
@@ -468,6 +475,10 @@ impl PipelineRegistry {
                         }
                         continue;
                     }
+                    tracing::info!(
+                        pipeline_id,
+                        "pipeline stopped (final flush + cursor commit done in the statement threads)"
+                    );
                     return; // normal stop (final flush + cursor commit already done in the statement threads)
                 }
             })?;

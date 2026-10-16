@@ -171,7 +171,7 @@ fn main_flow() -> anyhow::Result<()> {
 #[test]
 fn chaos_kill9_restart_idempotent() -> anyhow::Result<()> {
     if !env_ready() {
-        eprintln!(
+        tracing::warn!(
             "[live-gate] no seeded tailrace.chaos.src topic / no FE serving tailrace_spike \
              with the dev credentials on 9092/8030 (another project's stack?) — skipping"
         );

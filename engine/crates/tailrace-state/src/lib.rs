@@ -170,10 +170,11 @@ impl FileOffsetStore {
                 let corrupt = self
                     .dir
                     .join(format!("offsets-{pipeline_id}.json.corrupt-{ts}"));
-                eprintln!(
-                    "[STATE] offsets corrupt (pipeline={}): {e} — quarantined as {}, falling back to .bak",
+                tracing::warn!(
                     pipeline_id,
-                    corrupt.display()
+                    quarantine = %corrupt.display(),
+                    error = %e,
+                    "offsets corrupt — quarantined, falling back to .bak"
                 );
                 let _ = std::fs::rename(&path, &corrupt);
                 let bak = self.bak_of(pipeline_id);
@@ -191,18 +192,15 @@ impl FileOffsetStore {
                                     })
                             });
                         if let Some(map) = parsed {
-                            eprintln!(
-                                "[STATE] pipeline={} .bak fallback ok (restored {} statement cursors, replay window = previous version)",
+                            tracing::warn!(
                                 pipeline_id,
-                                map.len()
+                                restored = map.len(),
+                                ".bak fallback ok (replay window = previous version)"
                             );
                             return Ok(map);
                         }
                     }
-                    eprintln!(
-                        "[STATE] pipeline={} .bak unreadable too — staying fail-closed",
-                        pipeline_id
-                    );
+                    tracing::error!(pipeline_id, ".bak unreadable too — staying fail-closed");
                 }
                 anyhow::bail!(
                     "offsets corrupt with no usable backup (pipeline={}): {e}",

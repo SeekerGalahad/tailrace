@@ -8,6 +8,8 @@ description = "OffsetStore trait (commit only after write success — the at-lea
 
 [dependencies]
 anyhow = "1"
+# T2: engine-wide structured logging (tracing macros with pipeline/statement fields)
+tracing = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
 tailrace-ir = { workspace = true }

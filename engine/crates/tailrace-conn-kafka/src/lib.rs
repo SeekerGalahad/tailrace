@@ -162,9 +162,12 @@ impl Source for KafkaSource {
             // misaligned consumption across topics after plan changes shift
             // statement indices)
             if *topic != self.topic || *group != self.group {
-                eprintln!(
-                    "[SOURCE] cursor reposition failed: cursor(topic={},group={}) != source(topic={},group={}) — treating as no-cursor",
-                    topic, group, self.topic, self.group
+                tracing::warn!(
+                    topic = %self.topic,
+                    group = %self.group,
+                    cursor_topic = %topic,
+                    cursor_group = %group,
+                    "cursor reposition failed — treating as no-cursor"
                 );
             } else if !offsets.is_empty() {
                 // The resume path **assigns, never subscribes** — mixing
@@ -226,20 +229,22 @@ impl Source for KafkaSource {
                                     .fetch_watermarks(&self.topic, part.id(), Duration::from_secs(5))
                                     .map(|(_, hw)| hw)
                                     .unwrap_or_else(|e| {
-                                        eprintln!(
-                                            "[SOURCE] partition discovery: topic={} partition {} high watermark fetch failed ({e}) → falling back to the beginning",
-                                            self.topic, part.id()
+                                        tracing::warn!(
+                                            topic = %self.topic,
+                                            partition = part.id(),
+                                            error = %e,
+                                            "partition discovery: high watermark fetch failed → falling back to the beginning"
                                         );
                                         0
                                     })
                             } else {
                                 0
                             };
-                            eprintln!(
-                                "[SOURCE] partition discovery: topic={} new partition {} → {}",
-                                self.topic,
-                                part.id(),
-                                self.start_offset
+                            tracing::info!(
+                                topic = %self.topic,
+                                partition = part.id(),
+                                start = %self.start_offset,
+                                "partition discovery: new partition"
                             );
                             self.offsets.entry(part.id()).or_insert(next);
                             discovered = true;
@@ -295,9 +300,12 @@ impl Source for KafkaSource {
                             Offset::Offset(*start),
                             Duration::from_secs(5),
                         ) {
-                            eprintln!(
-                                "[SOURCE] half-batch rollback seek failed topic={} p={} → {}: {se}",
-                                self.topic, p, start
+                            tracing::error!(
+                                topic = %self.topic,
+                                partition = *p,
+                                batch_start_offset = *start,
+                                error = %se,
+                                "half-batch rollback seek failed"
                             );
                         }
                     }
@@ -333,12 +341,20 @@ impl Source for KafkaSource {
                     true
                 }
                 Err(e) => {
-                    eprintln!("[SOURCE] pause failed (degrading to sleep heartbeat, eviction risk remains): {e}");
+                    tracing::warn!(
+                        topic = %self.topic,
+                        error = %e,
+                        "pause failed (degrading to sleep heartbeat, eviction risk remains)"
+                    );
                     false
                 }
             },
             Err(e) => {
-                eprintln!("[SOURCE] pause could not fetch assignment: {e}");
+                tracing::warn!(
+                    topic = %self.topic,
+                    error = %e,
+                    "pause could not fetch assignment"
+                );
                 false
             }
         }
@@ -351,7 +367,7 @@ impl Source for KafkaSource {
         };
         if let Ok(tpl) = c.assignment() {
             if let Err(e) = c.resume(&tpl) {
-                eprintln!("[SOURCE] resume failed: {e}");
+                tracing::warn!(topic = %self.topic, error = %e, "resume failed");
             }
         }
     }
@@ -533,7 +549,7 @@ mod tests {
             return Ok(()); // CI-safe
         }
         if !kafka_topic_seeded("localhost:9092", "tailrace.discover.test") {
-            eprintln!(
+            tracing::warn!(
                 "[live-gate] kafka on 9092 has no seeded tailrace.discover.test topic \
                  (another project's stack?) — skipping the live test"
             );

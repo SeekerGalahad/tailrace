@@ -134,6 +134,22 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Flush observability span (T2 OTLP instrumentation, four groups): 批次大小
+/// `rows` / 批次延迟 `flush_ms` (+ span duration) / sink 在途 `in_flight_rows`
+/// / 成功率 (spans that reach the `rows` record vs. ones dropped on a failed
+/// flush). Zero-cost without a subscriber; exported through
+/// tracing-opentelemetry under the binary's `otel` feature.
+fn sink_flush_span(pipeline_id: u64, st: &StatementRuntime) -> tracing::Span {
+    tracing::info_span!(
+        "sink_flush",
+        pipeline_id,
+        statement_idx = st.statement_index,
+        in_flight_rows = st.pending_rows,
+        rows = tracing::field::Empty,
+        flush_ms = tracing::field::Empty
+    )
+}
+
 /// Bad-row post-processing shared by both statement loops (upgrade plan §二
 /// engine H2): policy handling (fail → bail before the cursor can cross the
 /// batch; dlq → quarantine raw bytes + poll-time cursor + timestamp to the
@@ -363,6 +379,12 @@ impl PipelineRunner {
     /// (join aggregates the stats).
     pub fn run(&mut self) -> anyhow::Result<Vec<StatementStats>> {
         use std::thread;
+        tracing::info!(
+            pipeline_id = self.pipeline_id,
+            statements = self.statements.len(),
+            duration_secs = self.options.duration.as_secs(),
+            "pipeline run started (standalone)"
+        );
         let deadline = Instant::now() + self.options.duration;
         let mut handles = Vec::new();
         for st in self.statements.drain(..) {
@@ -452,9 +474,14 @@ fn run_statement_serve(
                 // transient errors instead of killing the pipeline
                 backoff_secs += 1;
                 let delay = std::cmp::min(1u64 << backoff_secs.min(6), 300); // 1s→2s→...→capped at 300s
-                eprintln!(
-                    "[RUNTIME] pipeline#{} stmt#{} poll failed (backing off {}s, attempt #{}): {e}",
-                    pipeline_id, st.statement_index, delay, backoff_secs
+                tracing::warn!(
+                    pipeline_id,
+                    statement_idx = st.statement_index,
+                    kind = "POLL_BACKOFF",
+                    attempt = backoff_secs,
+                    delay_secs = delay,
+                    error = %e,
+                    "poll failed, backing off"
                 );
                 if backoff_secs == 1 {
                     // observability: emit one event only when entering backoff
@@ -486,7 +513,12 @@ fn run_statement_serve(
             // check flush_interval on idle polls too — the trailing batch
             // after a stream stops must not linger in memory indefinitely
             if st.pending_rows > 0 && st.last_flush.elapsed() >= options.flush_interval {
+                let span = sink_flush_span(pipeline_id, &st);
+                let _flush_span = span.enter();
+                let flush_t0 = Instant::now();
                 let ack = st.sink.flush()?;
+                span.record("rows", ack.rows);
+                span.record("flush_ms", flush_t0.elapsed().as_millis() as u64);
                 stats.flushed_rows += ack.rows;
                 stats.flushes += 1;
                 st.obs_flush(ack.rows);
@@ -585,8 +617,12 @@ fn run_statement_serve(
             || st.last_flush.elapsed() >= options.flush_interval
             || (options.flush_bytes > 0 && st.sink.buffered_bytes() >= options.flush_bytes)
         {
+            let span = sink_flush_span(pipeline_id, &st);
+            let _flush_span = span.enter();
             let flush_t0 = Instant::now();
             let ack = st.sink.flush()?;
+            span.record("rows", ack.rows);
+            span.record("flush_ms", flush_t0.elapsed().as_millis() as u64);
             stats.flushed_rows += ack.rows;
             stats.flushes += 1;
             st.obs_flush(ack.rows);
@@ -619,7 +655,12 @@ fn run_statement_serve(
     // stop finalization: flush the remainder + commit the cursor
     // (at-least-once anchor — same semantics as standalone)
     if st.pending_rows > 0 {
+        let span = sink_flush_span(pipeline_id, &st);
+        let _flush_span = span.enter();
+        let flush_t0 = Instant::now();
         let ack = st.sink.flush()?;
+        span.record("rows", ack.rows);
+        span.record("flush_ms", flush_t0.elapsed().as_millis() as u64);
         stats.flushed_rows += ack.rows;
         stats.flushes += 1;
         st.obs_flush(ack.rows);
@@ -673,7 +714,12 @@ fn run_statement(
             // check flush_interval on idle polls too — the trailing batch
             // after a stream stops must not linger in memory indefinitely
             if st.pending_rows > 0 && st.last_flush.elapsed() >= options.flush_interval {
+                let span = sink_flush_span(pipeline_id, &st);
+                let _flush_span = span.enter();
+                let flush_t0 = Instant::now();
                 let ack = st.sink.flush()?;
+                span.record("rows", ack.rows);
+                span.record("flush_ms", flush_t0.elapsed().as_millis() as u64);
                 stats.flushed_rows += ack.rows;
                 stats.flushes += 1;
                 st.obs_flush(ack.rows);
@@ -770,8 +816,12 @@ fn run_statement(
             || st.last_flush.elapsed() >= options.flush_interval
             || (options.flush_bytes > 0 && st.sink.buffered_bytes() >= options.flush_bytes)
         {
+            let span = sink_flush_span(pipeline_id, &st);
+            let _flush_span = span.enter();
             let flush_t0 = Instant::now();
             let ack = st.sink.flush()?;
+            span.record("rows", ack.rows);
+            span.record("flush_ms", flush_t0.elapsed().as_millis() as u64);
             stats.flushed_rows += ack.rows;
             stats.flushes += 1;
             st.obs_flush(ack.rows);
@@ -803,7 +853,12 @@ fn run_statement(
     }
     // finalization: flush the remainder + commit the cursor
     if st.pending_rows > 0 {
+        let span = sink_flush_span(pipeline_id, &st);
+        let _flush_span = span.enter();
+        let flush_t0 = Instant::now();
         let ack = st.sink.flush()?;
+        span.record("rows", ack.rows);
+        span.record("flush_ms", flush_t0.elapsed().as_millis() as u64);
         stats.flushed_rows += ack.rows;
         stats.flushes += 1;
         st.obs_flush(ack.rows);
@@ -908,7 +963,7 @@ mod tests {
             return Ok(()); // CI-safe
         }
         if !kafka_topic_exists("localhost:9092", "tailrace.discover.test") {
-            eprintln!(
+            tracing::warn!(
                 "[live-gate] kafka on 9092 has no seeded tailrace.discover.test topic \
                  (another project's stack?) — skipping the live acceptance"
             );

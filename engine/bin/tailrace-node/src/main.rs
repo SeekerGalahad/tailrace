@@ -60,6 +60,7 @@ fn main() {
                         stream_load_hosts_from_env(),
                     ),
                 );
+                init_tracing(Some(registry.log_hub()));
                 state.upsert_pipeline(tailrace_api::PipelineSnapshot {
                     id: 0,
                     statements: vec![format!("run {}", spec)],
@@ -70,10 +71,13 @@ fn main() {
                 match tailrace_api::start_server(addr, state, registry, api_token) {
                     Ok(_) => println!("API service started: http://{addr} (/healthz open; /v1 requires the node token)"),
                     Err(e) => {
-                        eprintln!("API service start failed: {e:#}");
+                        tracing::error!(error = %format!("{e:#}"), "API service start failed");
+                        shutdown_otel();
                         std::process::exit(1);
                     }
                 }
+            } else {
+                init_tracing(None);
             }
 
             let opts = tailrace_runtime::RunOptions {
@@ -89,10 +93,12 @@ fn main() {
                     println!("pipeline#{id} finished");
                 }
                 Err(e) => {
-                    eprintln!("pipeline execution failed: {e:#}");
+                    tracing::error!(error = %format!("{e:#}"), "pipeline execution failed");
+                    shutdown_otel();
                     std::process::exit(1);
                 }
             }
+            shutdown_otel();
 
             // with --serve the process stays alive after the pipeline (the
             // API service thread keeps running)
@@ -131,6 +137,9 @@ fn main() {
                     stream_load_hosts,
                 ),
             );
+            // the log hub must exist before the subscriber: the tracing
+            // layer sinks pipeline-tagged WARN/ERROR events into it
+            init_tracing(Some(registry.log_hub()));
             // engine H1: /v1 sits behind the shared node token; when the
             // console issues a fresh per-node token at register time the
             // heartbeat rotates this handle live
@@ -201,6 +210,7 @@ fn main() {
                         // widens the replay window to a whole batching period.
                         registry.shutdown_all();
                         println!("serve shut down gracefully, exiting");
+                        shutdown_otel();
                         std::process::exit(0);
                     }
                     // Without --control-plane the shutdown is graceful too (a
@@ -224,17 +234,20 @@ fn main() {
                         });
                         reg_sig.shutdown_all();
                         println!("serve graceful shutdown (signal-triggered, final flush + cursor commit done), exiting");
+                        shutdown_otel();
                         std::process::exit(0);
                     });
                     let _ = h.join();
                 }
                 Err(e) => {
-                    eprintln!("API service start failed: {e:#}");
+                    tracing::error!(error = %format!("{e:#}"), "API service start failed");
+                    shutdown_otel();
                     std::process::exit(1);
                 }
             }
         }
         Some("compile") => {
+            init_tracing(None);
             let sql_path = match args.get(2) {
                 Some(p) => p.clone(),
                 None => {
@@ -258,19 +271,22 @@ fn main() {
                         println!("  select: {}", st.select_sql.replace('\n', " "));
                     }
                     for d in &diags {
-                        eprintln!("diagnostic[{:?}]: {}", d.statement, d.message);
+                        tracing::warn!(statement = ?d.statement, "{}", d.message);
                     }
                     if !diags.is_empty() {
+                        shutdown_otel();
                         std::process::exit(3);
                     }
                 }
                 Err(e) => {
-                    eprintln!("compile failed: {e:#}");
+                    tracing::error!(error = %format!("{e:#}"), "compile failed");
+                    shutdown_otel();
                     std::process::exit(1);
                 }
             }
         }
         _ => {
+            init_tracing(None);
             println!(
                 "tailrace-node {} (subcommands: run <pipeline.toml> [--serve ADDR] | serve [--addr ADDR] | compile <pipeline.sql>)",
                 env!("CARGO_PKG_VERSION")
@@ -278,6 +294,94 @@ fn main() {
         }
     }
 }
+
+/// T2 observability bootstrap: fmt (stderr) + EnvFilter (RUST_LOG, default
+/// info) + the PipelineLogHub layer — engine WARN/ERROR events tagged with a
+/// pipeline_id land in the per-pipeline ring the console SSE chain reads —
+/// plus the optional OTLP span-export layer (feature `otel`, runtime-activated
+/// by OTEL_EXPORTER_OTLP_ENDPOINT). `hub` is None on the standalone run /
+/// compile paths (no registry, no per-pipeline sink).
+fn init_tracing(hub: Option<std::sync::Arc<tailrace_runtime::pipeline_log::PipelineLogHub>>) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    // the OTLP layer must sit directly on the registry (it layers over one
+    // concrete subscriber type); plain tracing remains the always-on floor
+    // when the feature is off or no endpoint is configured
+    #[cfg(feature = "otel")]
+    let stack = tracing_subscriber::registry().with(init_otel_layer());
+    #[cfg(not(feature = "otel"))]
+    let stack = tracing_subscriber::registry();
+    stack
+        .with(filter)
+        // stderr: the eprintln channel tracing replaces wrote to stderr, and
+        // the node's stdout carries result output (statement#… lines) — logs
+        // must not pollute it (the fmt default is stdout)
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(hub.map(tailrace_runtime::pipeline_log::PipelineLogLayer::new))
+        .init();
+}
+
+/// OTLP exporter provider handle (shutdown flushes the batch exporter).
+#[cfg(feature = "otel")]
+static OTEL_PROVIDER: std::sync::OnceLock<opentelemetry_sdk::trace::SdkTracerProvider> =
+    std::sync::OnceLock::new();
+
+/// Build the OTLP layer: None when the feature is off-by-env (no
+/// OTEL_EXPORTER_OTLP_ENDPOINT) or the exporter fails to build — plain
+/// tracing continues either way. The exporter is configured entirely by the
+/// standard OTLP env vars (endpoint/protocol/headers); the blocking reqwest
+/// client matches the engine's synchronous threads.
+#[cfg(feature = "otel")]
+fn init_otel_layer() -> Option<
+    tracing_opentelemetry::OpenTelemetryLayer<
+        tracing_subscriber::Registry,
+        opentelemetry_sdk::trace::SdkTracer,
+    >,
+> {
+    use opentelemetry::trace::TracerProvider as _;
+
+    if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_err() {
+        return None; // compiled in, staying dark (feature default-off anyway)
+    }
+    let exporter = match opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .build()
+    {
+        Ok(e) => e,
+        Err(e) => {
+            // subscriber not up yet — a plain stderr notice is the only channel
+            eprintln!("[otel] OTLP exporter init failed (continuing without OTLP): {e:?}");
+            return None;
+        }
+    };
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(
+            opentelemetry_sdk::Resource::builder()
+                .with_service_name(format!("tailrace-node@{}", env!("CARGO_PKG_VERSION")))
+                .build(),
+        )
+        .build();
+    let tracer = provider.tracer("tailrace-node");
+    let _ = OTEL_PROVIDER.set(provider);
+    Some(tracing_opentelemetry::layer().with_tracer(tracer))
+}
+
+/// Best-effort OTLP flush before process exit (spans still in the batch
+/// exporter are dropped otherwise). No-op without the feature.
+#[cfg(feature = "otel")]
+fn shutdown_otel() {
+    if let Some(p) = OTEL_PROVIDER.get() {
+        let _ = p.shutdown();
+    }
+}
+
+#[cfg(not(feature = "otel"))]
+fn shutdown_otel() {}
 
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
     args.iter()
@@ -299,8 +403,8 @@ fn resolve_api_token(
         bootstrap_flag,
     );
     match origin {
-        tailrace_api::auth::TokenOrigin::Generated => {} // already printed with the value
-        _ => eprintln!("[AUTH] /v1 node token source: {origin:?} (value not logged)"),
+        tailrace_api::auth::TokenOrigin::Generated => {} // already logged with the value
+        _ => tracing::info!(origin = ?origin, "/v1 node token source (value not logged)"),
     }
     token
 }

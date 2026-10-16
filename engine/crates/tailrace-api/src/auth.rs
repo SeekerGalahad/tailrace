@@ -179,10 +179,9 @@ pub fn resolve_node_api_token(
     }
     let generated = generate_local_token();
     let _ = write_token_file(&state_dir.join(API_TOKEN_FILE), &generated);
-    eprintln!(
-        "[AUTH] no node token configured — generated one (also persisted at {}): {}",
-        state_dir.join(API_TOKEN_FILE).display(),
-        generated
+    tracing::warn!(
+        path = %state_dir.join(API_TOKEN_FILE).display(),
+        "no node token configured — generated one (also persisted, shown once): {generated}"
     );
     (NodeApiToken::new(&generated), TokenOrigin::Generated)
 }

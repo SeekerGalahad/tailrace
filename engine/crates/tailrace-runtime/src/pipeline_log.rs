@@ -83,7 +83,7 @@ impl PipelineLogHub {
 
     /// Constructor with file mirroring: WARN/ERROR events append to disk (an
     /// open failure degrades to pure memory — a log-path problem must not
-    /// refuse startup; one eprintln notice).
+    /// refuse startup; one tracing warn).
     pub fn with_mirror(path: &std::path::Path) -> Self {
         let hub = Self::new();
         if let Some(parent) = path.parent() {
@@ -97,9 +97,10 @@ impl PipelineLogHub {
             Ok(f) => {
                 *hub.mirror.lock().unwrap() = Some(f);
             }
-            Err(e) => eprintln!(
-                "[LOG-HUB] event mirror file open failed (degrading to memory only): {}: {e}",
-                path.display()
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "event mirror file open failed (degrading to memory only)"
             ),
         }
         hub
@@ -207,6 +208,99 @@ impl PipelineLogHub {
                 (entries, buf.last_seq)
             }
             None => (Vec::new(), 0),
+        }
+    }
+}
+
+/// Tracing layer sink (T2): engine-side WARN/ERROR events carrying a
+/// `pipeline_id` field land in the hub's per-pipeline ring — the console SSE
+/// chain reads the hub exactly as before. The `emit()` trio stays the primary
+/// structured hot-path event source (its semantics are untouched); this layer
+/// additionally captures tracing warnings/errors that used to go to plain
+/// stderr only (e.g. runtime poll backoff), so the per-pipeline log shows the
+/// full failure picture. INFO events are deliberately NOT sunk (fmt layer
+/// only) — structured INFO (FLUSH_OK …) is owned by `emit`.
+pub struct PipelineLogLayer {
+    hub: std::sync::Arc<PipelineLogHub>,
+}
+
+impl PipelineLogLayer {
+    pub fn new(hub: std::sync::Arc<PipelineLogHub>) -> Self {
+        Self { hub }
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for PipelineLogLayer
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let level = match *event.metadata().level() {
+            tracing::Level::ERROR => "ERROR",
+            tracing::Level::WARN => "WARN",
+            _ => return,
+        };
+        let mut grab = FieldGrab::default();
+        event.record(&mut grab);
+        if let Some(pipeline_id) = grab.pipeline_id {
+            self.hub.push(
+                pipeline_id,
+                level,
+                grab.kind.as_deref().unwrap_or("ENGINE_LOG"),
+                &grab.message,
+                grab.statement_idx.map(|v| v as u32),
+            );
+        }
+    }
+}
+
+/// Field visitor: pulls `pipeline_id` / `statement_idx` / `kind` / `message`
+/// out of one tracing event.
+#[derive(Default)]
+struct FieldGrab {
+    pipeline_id: Option<u64>,
+    statement_idx: Option<u64>,
+    kind: Option<String>,
+    message: String,
+}
+
+impl FieldGrab {
+    fn note_uint(&mut self, name: &str, value: u64) {
+        match name {
+            "pipeline_id" => self.pipeline_id = Some(value),
+            "statement_idx" => self.statement_idx = Some(value),
+            _ => {}
+        }
+    }
+}
+
+impl tracing::field::Visit for FieldGrab {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.note_uint(field.name(), value);
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        if value >= 0 {
+            self.note_uint(field.name(), value as u64);
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "kind" {
+            self.kind = Some(value.to_string());
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        match field.name() {
+            // format_args Debug renders the formatted text (no quotes)
+            "message" => self.message = format!("{value:?}"),
+            "kind" => self.kind = Some(format!("{value:?}")),
+            _ => {}
         }
     }
 }
@@ -421,5 +515,36 @@ mod tests {
         let t = c.totals();
         assert_eq!(t.consumed, 4000);
         assert_eq!(t.flushed, 8000);
+    }
+
+    /// T2 tracing sink: WARN/ERROR events tagged with pipeline_id land in the
+    /// ring (kind + statement_idx carried); INFO events and untagged events
+    /// do not (emit() owns structured INFO; untagged events have no pipeline
+    /// to attach to).
+    #[test]
+    fn tracing_layer_sinks_pipeline_tagged_warnings() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let hub = Arc::new(PipelineLogHub::new());
+        let sub = tracing_subscriber::registry().with(PipelineLogLayer::new(Arc::clone(&hub)));
+        let _guard = tracing::subscriber::set_default(sub);
+        tracing::warn!(
+            pipeline_id = 42u64,
+            statement_idx = 1u64,
+            kind = "POLL_BACKOFF",
+            "poll failed, entering backoff"
+        );
+        tracing::warn!("no pipeline tag — fmt layer only");
+        tracing::info!(pipeline_id = 42u64, "info stays on the fmt layer");
+        tracing::error!(pipeline_id = 43u64, "sink write failed");
+        let (entries, _) = hub.last(42, 10);
+        assert_eq!(entries.len(), 1, "only the tagged WARN sank: {entries:?}");
+        assert_eq!(entries[0].level, "WARN");
+        assert_eq!(entries[0].kind, "POLL_BACKOFF");
+        assert_eq!(entries[0].statement_idx, Some(1));
+        assert!(entries[0].message.contains("poll failed"));
+        let (errs, _) = hub.last(43, 10);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].level, "ERROR");
+        assert_eq!(errs[0].kind, "ENGINE_LOG", "no kind field → fallback kind");
     }
 }

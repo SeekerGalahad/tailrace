@@ -339,9 +339,12 @@ impl Sink for DorisSink {
                     let exhausted = attempt as usize > self.retry_backoff_ms.len();
                     if e.retryable && !exhausted {
                         let backoff = self.retry_backoff_ms[(attempt - 1) as usize];
-                        eprintln!(
-                            "[SINK] stream load attempt {attempt} failed (retrying in {backoff}ms, label={label}): {}",
-                            e.message
+                        tracing::warn!(
+                            attempt,
+                            backoff_ms = backoff,
+                            label = %label,
+                            error = %e.message,
+                            "stream load attempt failed, retrying"
                         );
                         std::thread::sleep(Duration::from_millis(backoff));
                         continue;
@@ -611,7 +614,7 @@ mod tests {
             .map(|body| body.trim_start().starts_with('{'))
             .unwrap_or(false);
         if !fe_ok {
-            eprintln!(
+            tracing::warn!(
                 "[live-gate] the FE on 8030 does not serve tailrace_spike.ogg_event with the \
                  tailrace dev credentials (another project's stack?) — skipping the live test"
             );

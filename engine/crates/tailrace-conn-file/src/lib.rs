@@ -112,11 +112,11 @@ impl FileSource {
             );
         }
         if self.miss_streak == 1 || self.miss_streak.is_multiple_of(20) {
-            eprintln!(
-                "[SOURCE] source file temporarily missing (poll #{}, tolerance {}): {}",
-                self.miss_streak,
-                FILE_MISSING_TOLERANCE,
-                self.path.display()
+            tracing::warn!(
+                path = %self.path.display(),
+                poll = self.miss_streak,
+                tolerance = FILE_MISSING_TOLERANCE,
+                "source file temporarily missing"
             );
         }
         Ok(())
@@ -141,9 +141,9 @@ impl Source for FileSource {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // missing is not fatal — in tail scenarios the file may be
                 // created later (retry + count during poll)
-                eprintln!(
-                    "[SOURCE] source file not created yet (will retry during poll): {}",
-                    self.path.display()
+                tracing::info!(
+                    path = %self.path.display(),
+                    "source file not created yet (will retry during poll)"
                 );
                 self.reader = None;
             }
@@ -183,9 +183,12 @@ impl Source for FileSource {
             }
             if self.byte_pos > len {
                 self.truncated_events += 1;
-                eprintln!(
-                    "[SOURCE] parquet file truncated/rotated (len={len} < cursor={}) — rewinding to zero (event #{})",
-                    self.byte_pos, self.truncated_events
+                tracing::warn!(
+                    path = %self.path.display(),
+                    len,
+                    cursor = self.byte_pos,
+                    event = self.truncated_events,
+                    "parquet file truncated/rotated — rewinding to zero"
                 );
                 self.byte_pos = 0; // the file was replaced (shorter) — treat as new
             }
@@ -219,9 +222,12 @@ impl Source for FileSource {
         if let Ok(m) = std::fs::metadata(&self.path) {
             if m.len() < self.byte_pos {
                 self.truncated_events += 1;
-                eprintln!(
-                    "[SOURCE] text source truncated/rotated (len={} < cursor={}) — rewinding to zero (event #{})",
-                    m.len(), self.byte_pos, self.truncated_events
+                tracing::warn!(
+                    path = %self.path.display(),
+                    len = m.len(),
+                    cursor = self.byte_pos,
+                    event = self.truncated_events,
+                    "text source truncated/rotated — rewinding to zero"
                 );
                 self.byte_pos = 0;
                 self.partial.clear();
@@ -465,11 +471,11 @@ fn recover_partial_tail(path: &std::path::Path) -> anyhow::Result<()> {
         Some(i) => (len - window) + i as u64 + 1,
         None => 0, // no newline within 64KB = the whole span is a half line (abnormal) — clear to 0
     };
-    eprintln!(
-        "[SINK] jsonl half-line recovery: {} tail {} bytes without newline — truncating to {}",
-        path.display(),
-        len - keep,
-        keep
+    tracing::warn!(
+        path = %path.display(),
+        tail_bytes = len - keep,
+        keep_bytes = keep,
+        "jsonl half-line recovery: tail without newline — truncating to the last full line"
     );
     f.set_len(keep)?;
     f.sync_data()?;

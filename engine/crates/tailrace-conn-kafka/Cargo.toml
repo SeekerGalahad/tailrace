@@ -8,6 +8,8 @@ description = "Kafka connector: BaseConsumer source (assign-only resume, partiti
 
 [dependencies]
 anyhow = "1"
+# T2: engine-wide structured logging (tracing macros with pipeline/statement fields)
+tracing = { workspace = true }
 rdkafka = { workspace = true }
 datafusion = { workspace = true }
 tailrace-ir = { workspace = true }

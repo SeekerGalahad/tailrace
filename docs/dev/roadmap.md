@@ -58,12 +58,13 @@
 - **文件域**：engine 各 crate `benches/`、root `Cargo.toml`（criterion workspace dep）、`scripts/bench/`、`docs/BENCHMARKS.md`。
 > 结果：fa9f74d decode 302K / transform 19.1M / sink encode 8.43M rows/s；宏基准 100000 行 4.600s=21739 rows/s(debug 档)，docs/BENCHMARKS.md 已立方法学+基线
 
-### T2 可观测：tracing + OTLP（~3 人日）☐
+### T2 可观测：tracing + OTLP（~3 人日）✅
 
 - **现状**：`eprintln!` 是唯一日志通道（engine 侧 37 处：conn-kafka / conn-file / state / runtime / conn-doris / api 各处），无级别过滤、无结构化字段、无管道关联；root Cargo.toml 已声明 tracing / tracing-subscriber(env-filter)（零新基础依赖）。
 - **方案**：37 处 eprintln → `tracing::warn!/info!` 带 `pipeline_id`/`statement_idx` 字段；两个二进制 main 初始化 subscriber（env-filter，默认 info）；`PipelineLogHub`/emit 三件套保留并作为 tracing 的一个 layer sink（**console 侧 SSE 消费链路不动**——R1 审计红线）；OTLP exporter 以 feature 门控（`opentelemetry` + `tracing-opentelemetry`，`features = ["otel"]` 默认关），埋点四组：批次大小/批次延迟/sink 在途/sink 成功率；`docker-compose.yml` 增 otel-collector 可选 profile。
 - **验收**：`grep -rn 'eprintln' engine/crates --include='*.rs' | wc -l` → **0**；`RUST_LOG=tailrace_runtime=info` 启动可见带 pipeline_id 的结构化行；`cargo test --workspace` 全绿（SSE 桥行为不变由既有测试保证）；`--no-default-features` check 仍绿。
 - **文件域**：engine 全部含 eprintln 的文件、两个 main、root Cargo.toml、docker-compose.yml。
+> 结果（2026-10-17）：engine/crates 37 处 eprintln 全部转 tracing（connector 层带 topic/partition/path 字段，runtime 带 pipeline_id/statement_idx/kind）；新增 `PipelineLogLayer`（tracing Layer → PipelineLogHub sink，仅 WARN/ERROR 且带 pipeline_id 的事件入环，INFO 仍归 emit——SSE 链路与 emit 三件套零改动，新增单测 `tracing_layer_sinks_pipeline_tagged_warnings`）；node main 初始化 registry+EnvFilter(默认 info)+fmt(**with_writer(stderr)**，fmt 默认是 stdout)+hub layer；OTEL feature 默认关（opentelemetry 0.33.1 + tracing-opentelemetry 0.34 + otlp http-proto/blocking-reqwest + internal-logs），运行时由 OTEL_EXPORTER_OTLP_ENDPOINT 激活，四组埋点=`sink_flush` info_span（rows/flush_ms/in_flight_rows/pipeline_id/statement_idx，六个 flush 点，RUST_LOG=warn 会关掉 INFO 级 span 导出）；docker-compose `--profile otel` 加 otel-collector:0.163.1（默认栈不含）。验证数字：grep eprintln=0；受影响 7 crate 测试 39 passed/0 failed/1 ignored；clippy -D warnings 默认与 --features otel 均 0 告警；`cargo check --workspace --no-default-features --locked` 绿；deny 四门 ok（重复版本 warn 16→18，prost 系带入）；OTLP E2E：本地 HTTP 探针收到 `POST /v1/traces`（application/x-protobuf 555B）；`RUST_LOG=tailrace_runtime=info` stderr 可见 `pipeline run started (standalone) pipeline_id=7001 statements=1 duration_secs=3` 结构化行；compose config 校验默认服务不含 otel-collector、`--profile otel` 才含。注：otel collector 容器实跑留 T11（本机 OrbStack 未启动，docker-compose 配置已过 config 校验）。
 
 ### T3 热路径零拷贝（~4 人日）☐〔依赖 T1 基线〕
 

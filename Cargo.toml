@@ -81,6 +81,14 @@ tokio-stream = "0.1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# T2 observability: OTLP exporter stack. Feature-gated (`otel` on tailrace-node,
+# default off). Version anchoring per roadmap §八.2 (opentelemetry 0.33 /
+# tracing-opentelemetry 0.34); http-proto + blocking reqwest client only — the
+# engine is fully synchronous, spans are emitted from non-tokio threads.
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "internal-logs"] }
+tracing-opentelemetry = { version = "0.34", default-features = false }
 # dev-only (roadmap T1 benchmark suite): criterion micro-benches live in
 # per-crate benches/ and reference this as a workspace dev-dependency —
 # never a runtime dependency.
