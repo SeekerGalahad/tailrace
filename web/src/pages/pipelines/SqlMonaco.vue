@@ -1,6 +1,44 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import * as monaco from 'monaco-editor'
+// T9 entry cut: `monaco-editor` (editor.main) bundles ~80 language
+// definitions + css/html/json/ts LSP features + monaco-lsp-client and their
+// workers (ts.worker alone is 6.9MB). Deep specifiers resolve through the
+// package exports map ("./*.js" → "./esm/vs/*.js"); the set below is
+// editor.api (core API + widget) + SQL tokenizer + the editor-side contribs
+// the SQL editor actually uses (completion/find/contextmenu/... — without
+// them editor.api alone registers no suggest/find controller and table
+// completion would render nothing). The single editor worker stays.
+import * as monaco from 'monaco-editor/editor/editor.api.js'
+import 'monaco-editor/languages/definitions/sql/register.js'
+// editor-side contributions (subset of editor.main's list, languages/LSP cut)
+import 'monaco-editor/editor/browser/coreCommands.js'
+import 'monaco-editor/features/find/register.js'
+import 'monaco-editor/editor/contrib/suggest/browser/suggestController.js'
+import 'monaco-editor/editor/contrib/snippet/browser/snippetController2.js'
+import 'monaco-editor/editor/contrib/contextmenu/browser/contextmenu.js'
+import 'monaco-editor/editor/contrib/hover/browser/hoverContribution.js'
+import 'monaco-editor/editor/contrib/bracketMatching/browser/bracketMatching.js'
+import 'monaco-editor/editor/contrib/folding/browser/folding.js'
+import 'monaco-editor/editor/contrib/wordHighlighter/browser/wordHighlighter.js'
+import 'monaco-editor/editor/contrib/comment/browser/comment.js'
+import 'monaco-editor/editor/contrib/linesOperations/browser/linesOperations.js'
+import 'monaco-editor/editor/contrib/wordOperations/browser/wordOperations.js'
+import 'monaco-editor/editor/contrib/wordPartOperations/browser/wordPartOperations.js'
+import 'monaco-editor/editor/contrib/smartSelect/browser/smartSelect.js'
+import 'monaco-editor/editor/contrib/multicursor/browser/multicursor.js'
+import 'monaco-editor/editor/contrib/lineSelection/browser/lineSelection.js'
+import 'monaco-editor/editor/contrib/indentation/browser/indentation.js'
+import 'monaco-editor/editor/contrib/cursorUndo/browser/cursorUndo.js'
+import 'monaco-editor/editor/contrib/caretOperations/browser/caretOperations.js'
+import 'monaco-editor/editor/contrib/caretOperations/browser/transpose.js'
+import 'monaco-editor/editor/contrib/clipboard/browser/clipboard.js'
+import 'monaco-editor/editor/contrib/unicodeHighlighter/browser/unicodeHighlighter.js'
+import 'monaco-editor/editor/contrib/unusualLineTerminators/browser/unusualLineTerminators.js'
+import 'monaco-editor/editor/contrib/links/browser/links.js'
+import 'monaco-editor/editor/contrib/dnd/browser/dnd.js'
+import 'monaco-editor/editor/standalone/browser/quickAccess/standaloneCommandsQuickAccess.js'
+import 'monaco-editor/editor/standalone/browser/quickAccess/standaloneHelpQuickAccess.js'
+import 'monaco-editor/base/browser/ui/codicons/codicon/codicon.css'
 import EditorWorker from './editor-worker?worker'
 import { useThemeStore } from '../../stores/theme'
 import { fontMono, neutral, semantic } from '../../theme/tokens'
@@ -153,9 +191,56 @@ function defineThemes(): void {
 
 let editor: monaco.editor.IStandaloneCodeEditor | null = null
 let applying = false
+let layoutRo: ResizeObserver | null = null
 
-onMounted(() => {
+// T9: this component is an async chunk — its CSS (monaco base styles
+// included) can apply AFTER the JS has run. An editor created against the
+// unstyled DOM ends up half-built and pinned at a garbage width
+// (automaticLayout observes the editor node itself, whose inline width never
+// changes, so it never recovers). Gate creation on monaco's stylesheet being
+// live; ResizeObserver (not rAF polling) so a background-tab mount can't wedge.
+function whenLaidOut(el: HTMLElement): Promise<void> {
+  return new Promise((resolve) => {
+    const done = () => resolve()
+    if (el.clientWidth >= 50) return done()
+    const ro = new ResizeObserver(() => {
+      if (el.clientWidth >= 50) {
+        ro.disconnect()
+        done()
+      }
+    })
+    ro.observe(el)
+    setTimeout(() => {
+      ro.disconnect()
+      done() // safety net: never block editor creation on layout quirks
+    }, 3000)
+  })
+}
+
+function whenMonacoCssReady(): Promise<void> {
+  return new Promise((resolve) => {
+    const ok = () =>
+      Array.from(document.styleSheets).some((s) => {
+        try {
+          return Array.from(s.cssRules).some((r) => r.cssText.includes('.monaco-editor'))
+        } catch {
+          return false // cross-origin sheet: unreadable
+        }
+      })
+    if (ok()) return resolve()
+    let n = 0
+    const iv = setInterval(() => {
+      if (ok() || ++n > 250) {
+        clearInterval(iv)
+        resolve()
+      }
+    }, 20)
+  })
+}
+
+onMounted(async () => {
   if (!hostEl.value) return
+  await Promise.all([whenLaidOut(hostEl.value), whenMonacoCssReady()])
   defineThemes()
   registerProvider()
   editor = monaco.editor.create(hostEl.value, {
@@ -184,6 +269,11 @@ onMounted(() => {
     emit('update:modelValue', editor!.getValue())
   })
   applyMarkers()
+  // T9: belt-and-braces — force a re-measure whenever the host resizes, so a
+  // late-applying stylesheet (or any container change) can't pin the editor
+  // at a stale width.
+  layoutRo = new ResizeObserver(() => editor?.layout())
+  layoutRo.observe(hostEl.value)
 })
 
 // external value → editor (guard the echo)
@@ -228,6 +318,8 @@ watch(
 )
 
 onBeforeUnmount(() => {
+  layoutRo?.disconnect()
+  layoutRo = null
   editor?.dispose()
   editor = null
   activeEditor = null

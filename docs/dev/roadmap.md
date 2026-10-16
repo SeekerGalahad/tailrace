@@ -108,12 +108,14 @@
 - **文件域**：console-store（nodes.rs 写路径、lib.rs pragmas）、牵连的事务化写闭包。
 - **结果**（2026-10-17）：pragmas 增 `synchronous=NORMAL`；新增 `Store::with_tx`（`Connection::transaction()`，失败即回滚）；事务化 7 条多语句/批量写路径（apply_heartbeat / insert_node_events / insert_pipeline_metrics / delete_node_cascade / purge_expired / set_pipeline_published / update_datasource）。验收数字：`cargo test -p console-store` 22 passed（含新增并发压测与 publish 原子回滚两测）+ `-p tailrace-console` 25 passed，0 failed；clippy `-D warnings` 绿。压测（4 并发 × 500 事件批，文件库实测）：最差批 4.50s（修复前 autocommit+FULL）→ **31.7ms**（≈142×）。
 
-### T9 web 首屏：monaco 拆分裁剪（~2 人日）☐
+### T9 web 首屏：monaco 拆分裁剪（~2 人日）✅
 
 - **现状**：首屏静态加载 monaco 全量 chunk（4.43MB / gzip ≈1.1MB），登录页被拖垮；根因是编辑页静态 `import * as monaco` + advancedChunks 分组把共享预加载助手一并收编。
-- **方案**：SqlMonaco 改 `defineAsyncComponent` + 编辑页 loading 骨架；入口裁剪到 `monaco-editor/esm/vs/editor/editor.api` + `basic-languages/sql`（SQL 无 LSP worker，单 editor worker 保留）；分组收紧（minShareCount）针对「共享助手被吞并」机制。
-- **验收**：`cd web && pnpm build` 后 `grep -c monaco dist/index.html` → **0**（首屏不 preload）；`dist/assets/` 中 monaco 相关 chunk 合计 **< 1.5MB**；`pnpm typecheck && pnpm build` 绿；编辑页手测可打开（smoke 不覆盖，L2 由 CI web job 保证构建）。
-- **文件域**：web/src/components/SqlMonaco.vue、pages/pipelines/edit.vue、vite.config.ts。
+- **方案**：SqlMonaco 改 `defineAsyncComponent` + 编辑页 loading 骨架；入口裁剪到 `monaco-editor/esm/vs/editor/editor.api` + SQL 词法定义（SQL 无 LSP worker，单 editor worker 保留）；分组收紧（minShareCount）针对「共享助手被吞并」机制。
+- **验收**：`cd web && pnpm build` 后 `grep -c monaco dist/index.html` → **0**（首屏零加载）；`dist/assets/` 中 monaco 相关 chunk 合计 **gzip ≤ 1.5MB**；`pnpm typecheck && pnpm build` 绿；编辑页手测可打开（smoke 不覆盖，L2 由 CI web job 保证构建）。
+  > **验收修订（2026-10-17，用户裁决）**：原「合计 < 1.5MB（raw）」不可达——实测 monaco-editor 0.57 裁剪到极限（editor.api + sql 词法、零 contrib）即 2,706,886 B（2.58MiB），且零 contrib 时 suggest/find 控制器不注册、SQL 表补全（§6.5.2 核心特性）失效；含补全的可用最小面 ≈3.91MiB raw / 883kB gzip。验收按 gzip 口径执行（raw→gzip 修订理由：异步 chunk 的网络相关量是 gzip 字节；首屏性能目标不受影响）。首屏零加载目标不变且已达成。
+- **文件域**：web/src/pages/pipelines/SqlMonaco.vue、pages/pipelines/edit.vue、vite.config.ts。
+- **结果**（2026-10-17）：SqlMonaco 入口裁到 editor.api + sql 词法 + 25 个编辑侧 contrib（editor.main 的语言/LSP 面全砍）；edit.vue defineAsyncComponent + NSkeleton 骨架 + 错误兜底；advancedChunks minShareCount=2（共享预加载助手不再被吞，独立 75.7kB chunk）；修复异步化引入的两个真实缺陷（CSS 晚到→编辑器 5px 塌缩，加 whenLaidOut+whenMonacoCssReady 双门与宿主 RO 强制 relayout；codicon.css 无 exports 映射→vite alias）。验收数字：`grep -c monaco dist/index.html` = **0**；`pnpm typecheck && pnpm build` 绿；monaco 相关 chunk 合计 gzip **883.22 kB ≤ 1.5MB**（raw 3,467,180+8,840 JS / 162,369 CSS / 153,228 ttf / 303,843 editor-worker）。对照 v0.1.0：首屏 monaco 4,433,097 B 静载 → **0**；dist 内 css/html/json/ts 四 LSP worker 9,183,152 B → **0**；monaco JS −22%。浏览器实测（stub API + v0.1.0 对照构建）：编辑页打开、编辑器 924px 正确创建、完整 DOM（ime-textarea/scrollable/minimap）、v-model 管线通、零运行时错误；rAF 级视觉/补全交互因测试面板被 OS 遮挡无法执行（详见提交说明）。
 
 ### T10 web SSE 日志续读（~1 人日）✅
 
@@ -181,4 +183,5 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 
 1. `utoipa-swagger-ui 10.0.1` 锁定的 `zip 8.6.0` 被上游 yank（deny.toml 已 `yanked="warn"` 带跟踪注释）——其发新版后回收 warn 并重新收紧；
 2. OTLP 的 `opentelemetry` 0.33 / `tracing-opentelemetry` 0.34 版本锚定后是否升格默认开启（当前 feature 门控默认关）；
-3. R3 升格评审五项的门槛数据（本 R2 的 BENCHMARKS.md 即门槛输入）。
+3. R3 升格评审五项的门槛数据（本 R2 的 BENCHMARKS.md 即门槛输入）；
+4. CodeMirror6 替换 monaco 评估（编辑器体积档位，R3 裁决；T9 实测 monaco gzip 883kB vs CM6 预期 ~200-300kB 级，2026-10-17 立项）。

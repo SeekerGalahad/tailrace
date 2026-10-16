@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, h, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, defineComponent, h, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import {
   useDialog,
@@ -34,7 +34,24 @@ import { datasourcesApi, type Datasource, type TableObject } from '../../api/dat
 import { ApiError } from '../../api/http'
 import StateTag from '../../components/StateTag.vue'
 import EmptyState from '../../components/EmptyState.vue'
-import SqlMonaco from './SqlMonaco.vue'
+
+// T9 first-screen split: monaco rides its own async chunk (~1MB) — the edit
+// shell renders immediately and the editor swaps in when the chunk lands.
+const SqlEditorSkeleton = defineComponent({
+  name: 'SqlEditorSkeleton',
+  render: () => h('div', { class: 'sql-editor-skeleton' }, [h(NSkeleton, { text: true, repeat: 18 })]),
+})
+const SqlEditorError = defineComponent({
+  name: 'SqlEditorError',
+  render: () =>
+    h(NAlert, { type: 'error', bordered: false }, { default: () => 'SQL 编辑器加载失败，请刷新页面重试' }),
+})
+const SqlMonaco = defineAsyncComponent({
+  loader: () => import('./SqlMonaco.vue'),
+  loadingComponent: SqlEditorSkeleton,
+  errorComponent: SqlEditorError,
+  delay: 0,
+})
 
 /**
  * SQL editor (design doc §6.5.2): SQL-as-pipeline authoring — basic form +
@@ -847,6 +864,15 @@ function discardDraft(): void {
 
 .editor-note {
   margin-top: 8px;
+}
+
+/* mirrors .sql-monaco's frame while the async editor chunk loads */
+.sql-editor-skeleton {
+  height: 560px;
+  border: 1px solid var(--tr-border);
+  border-radius: var(--tr-radius-code);
+  padding: 10px 16px;
+  overflow: hidden;
 }
 
 .diag-list {
