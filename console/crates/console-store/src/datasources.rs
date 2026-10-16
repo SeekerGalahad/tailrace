@@ -50,7 +50,9 @@ impl Store {
 
     /// Update with generation CAS (§4.2). `credential` = Some only when the
     /// caller supplied a fresh password (blank password keeps the old one);
-    /// generation is bumped on success.
+    /// generation is bumped on success. Atomic (T8): the row UPDATE and the
+    /// credential UPSERT commit together, so a failed credential write
+    /// cannot leave a bumped generation with the old secret.
     pub fn update_datasource(
         &self,
         id: i64,
@@ -60,7 +62,7 @@ impl Store {
         expected_generation: i64,
         credential: Option<(&str, &str)>,
     ) -> Result<DatasourceUpdate> {
-        self.with_conn(|conn| {
+        self.with_tx(|conn| {
             let dup: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM datasource WHERE name = ?1 AND id <> ?2",
                 rusqlite::params![name, id],

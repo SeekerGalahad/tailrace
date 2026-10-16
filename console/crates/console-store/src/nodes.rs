@@ -110,7 +110,7 @@ impl Store {
         engine_version: Option<&str>,
         capacity_json: Option<&str>,
     ) -> Result<bool> {
-        self.with_conn(|conn| {
+        self.with_tx(|conn| {
             let updated = conn.execute(
                 "UPDATE node SET status = 'ONLINE', last_heartbeat = datetime('now'), \
                  api_url = COALESCE(?1, api_url), engine_version = COALESCE(?2, engine_version), \
@@ -132,12 +132,14 @@ impl Store {
     }
 
     /// Persist acknowledged engine events (§4.3). Rows are pre-validated by
-    /// the caller; a unix `ts` is null or garbage -> "now".
+    /// the caller; a unix `ts` is null or garbage -> "now". One transaction
+    /// per batch (T8): atomic and a single commit's fsync instead of one per
+    /// row.
     pub fn insert_node_events(&self, events: &[NewNodeEvent]) -> Result<usize> {
         if events.is_empty() {
             return Ok(0);
         }
-        self.with_conn(|conn| {
+        self.with_tx(|conn| {
             let mut stmt = conn.prepare(
                 "INSERT INTO node_event (node_key, pipeline_id, level, kind, message, event_ts) \
                  VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(datetime(?6, 'unixepoch'), datetime('now')))",
@@ -176,7 +178,7 @@ impl Store {
         if rows.is_empty() {
             return Ok(0);
         }
-        self.with_conn(|conn| {
+        self.with_tx(|conn| {
             let mut stmt = conn.prepare(
                 "INSERT INTO pipeline_metrics (pipeline_id, node_id, status, consumed, flushed, flushes, ts) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
@@ -252,8 +254,10 @@ impl Store {
     /// node_key and node_metrics by node_id — neither has an FK; deploy_log
     /// cascades via FK). Pipelines must have been re-assigned or stopped
     /// beforehand (the handler guards with `pipelines_assigned_to`).
+    /// Runs in one transaction (T8): no orphaned observation rows if a
+    /// later statement fails.
     pub fn delete_node_cascade(&self, id: i64, node_key: &str) -> Result<bool> {
-        self.with_conn(|conn| {
+        self.with_tx(|conn| {
             let n = conn.execute("DELETE FROM node WHERE id = ?1", [id])?;
             if n == 0 {
                 return Ok(false);
@@ -535,5 +539,58 @@ mod tests {
         assert!(store.revoke_bootstrap_token("sn-b").unwrap());
         let node = store.node_by_key("sn-b").unwrap().unwrap();
         assert!(node.bootstrap_token.is_none());
+    }
+
+    /// T8 heartbeat write-path stress (file-backed DB so the real fsync/WAL
+    /// path is exercised): concurrent 500-event batches must each finish in
+    /// seconds, and every row must land (conservation behind the single
+    /// `Mutex<Connection>`).
+    #[test]
+    fn concurrent_heartbeat_500_event_batches_finish_in_seconds() {
+        let dir = std::env::temp_dir().join(format!("tailrace-t8-stress-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("console.db");
+        let _ = std::fs::remove_file(&db);
+        let store = Store::open(&db).unwrap();
+        store
+            .upsert_self_registered("sn-stress0000000001", Some("http://h:1"), None, "tok")
+            .unwrap();
+
+        const THREADS: usize = 4;
+        const BATCH: usize = 500;
+        let mut handles = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let store = store.clone();
+            handles.push(std::thread::spawn(move || {
+                let events: Vec<NewNodeEvent> = (0..BATCH)
+                    .map(|i| NewNodeEvent {
+                        node_key: "sn-stress0000000001".into(),
+                        pipeline_id: Some(i as i64),
+                        level: "INFO".into(),
+                        kind: "BENCH".into(),
+                        message: "x".repeat(120),
+                        ts_unix: None,
+                    })
+                    .collect();
+                let t0 = std::time::Instant::now();
+                let n = store.insert_node_events(&events).unwrap();
+                assert_eq!(n, BATCH);
+                t0.elapsed()
+            }));
+        }
+        let mut worst = std::time::Duration::ZERO;
+        for h in handles {
+            worst = worst.max(h.join().unwrap());
+        }
+        let total = store.events_24h_total().unwrap();
+        assert_eq!(total, (THREADS * BATCH) as i64, "every event must land");
+        eprintln!(
+            "t8 stress: {THREADS} concurrent {BATCH}-event batches, worst batch wall time {worst:?}"
+        );
+        assert!(
+            worst < std::time::Duration::from_secs(5),
+            "worst 500-event batch took {worst:?} (>= 5s)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

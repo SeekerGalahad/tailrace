@@ -70,6 +70,11 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // SQLite's documented recommendation for WAL: NORMAL keeps the
+        // database consistent across crashes (WAL is only deferred-sync at
+        // commit) while heartbeats stop paying one fsync per autocommit
+        // statement. T8.
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         migrations()
             .to_latest(&mut conn)
             .context("apply migrations")?;
@@ -84,24 +89,41 @@ impl Store {
         f(&conn)
     }
 
+    /// Run `f` inside one explicit `Connection::transaction()` (T8):
+    /// multi-statement and batch writes become atomic (no half-written
+    /// state on failure) and pay one commit instead of one fsync per
+    /// statement. The `Mutex` guarantees at most one transaction at a time.
+    fn with_tx<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        match f(&tx) {
+            Ok(v) => tx.commit().map_err(Into::into).map(|()| v),
+            Err(e) => {
+                let _ = tx.rollback();
+                Err(e)
+            }
+        }
+    }
+
     fn purge_expired(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "DELETE FROM pipeline_metrics WHERE ts < datetime('now', '-7 days')",
-            [],
-        )
-        .context("purge pipeline_metrics")?;
-        conn.execute(
-            "DELETE FROM node_metrics WHERE ts < datetime('now', '-7 days')",
-            [],
-        )
-        .context("purge node_metrics")?;
-        conn.execute(
-            "DELETE FROM session WHERE expires_at <= datetime('now')",
-            [],
-        )
-        .context("purge sessions")?;
-        Ok(())
+        self.with_tx(|conn| {
+            conn.execute(
+                "DELETE FROM pipeline_metrics WHERE ts < datetime('now', '-7 days')",
+                [],
+            )
+            .context("purge pipeline_metrics")?;
+            conn.execute(
+                "DELETE FROM node_metrics WHERE ts < datetime('now', '-7 days')",
+                [],
+            )
+            .context("purge node_metrics")?;
+            conn.execute(
+                "DELETE FROM session WHERE expires_at <= datetime('now')",
+                [],
+            )
+            .context("purge sessions")?;
+            Ok(())
+        })
     }
 }
 
@@ -170,6 +192,9 @@ mod tests {
                 .with_conn(|c| {
                     let mode: String = c.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
                     assert_eq!(mode, "wal");
+                    // T8: WAL's documented companion pragma (1 = NORMAL).
+                    let sync: i64 = c.query_row("PRAGMA synchronous", [], |r| r.get(0))?;
+                    assert_eq!(sync, 1, "synchronous must be NORMAL under WAL");
                     Ok(())
                 })
                 .unwrap();

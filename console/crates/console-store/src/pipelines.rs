@@ -177,6 +177,9 @@ impl Store {
 
     /// Publish (§4.5): bump version, store the materialized spec snapshot on
     /// the pipeline row and in `pipeline_version`, move to PUBLISHED.
+    /// Atomic (T8): the UPDATE and the version-snapshot INSERT commit
+    /// together, so a failed publish cannot leave a bumped `version` with no
+    /// matching `pipeline_version` row.
     pub fn set_pipeline_published(
         &self,
         id: i64,
@@ -184,7 +187,7 @@ impl Store {
         sql_content: &str,
         published_by: &str,
     ) -> Result<i64> {
-        self.with_conn(|conn| {
+        self.with_tx(|conn| {
             let version: i64 = conn.query_row(
                 "UPDATE pipeline SET version = version + 1, spec_json = ?2, status = 'PUBLISHED', \
                  updated_at = datetime('now') WHERE id = ?1 RETURNING version",
@@ -406,6 +409,48 @@ mod tests {
             .unwrap();
         assert!(store.delete_pipeline(pid).unwrap());
         assert!(store.pipeline_version(vid).unwrap().is_none());
+    }
+
+    /// T8 atomicity: `set_pipeline_published` must roll back the version
+    /// bump when the `pipeline_version` INSERT fails (here: a pre-seeded
+    /// UNIQUE(pipeline_id, version) conflict) — no half-published state.
+    #[test]
+    fn publish_rolls_back_atomically_on_version_conflict() {
+        let store = Store::open_in_memory().unwrap();
+        let pid = match store
+            .create_pipeline("p-atomic", "SELECT 1", None, 10000, None, None)
+            .unwrap()
+        {
+            PipelineWrite::Created(id) => id,
+            PipelineWrite::NameConflict => panic!(),
+        };
+        assert_eq!(
+            store
+                .set_pipeline_published(pid, "spec-1", "SELECT 1", "admin")
+                .unwrap(),
+            1
+        );
+        // Occupy (pid, version=2) so the next publish's snapshot INSERT fails
+        // after the UPDATE already bumped version to 2.
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO pipeline_version (pipeline_id, version, spec_json, sql_content, published_by) \
+                     VALUES (?1, 2, 'occupied', 'SELECT 1', 'squatter')",
+                    [pid],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store
+            .set_pipeline_published(pid, "spec-2", "SELECT 2", "admin")
+            .is_err());
+        // The UPDATE must have rolled back with the INSERT: version and
+        // spec_json stay at the last successful publish.
+        let p = store.pipeline(pid).unwrap().unwrap();
+        assert_eq!(p.version, 1, "version bump must roll back");
+        assert_eq!(p.spec_json.as_deref(), Some("spec-1"));
+        assert_eq!(p.status, "PUBLISHED");
     }
 
     #[test]

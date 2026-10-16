@@ -99,12 +99,13 @@
 - **验收**：`max_rows_per_batch` 生效单测（首批 1 行 + 后续 8000 行 → 计划执行批数下降，DataFusion explain metrics 断言）；宏基准 RSS/吞吐对比入 BENCHMARKS.md；全量测试绿。
 - **文件域**：tailrace-runtime（session 组装）、tailrace-transform、tailrace-ir。
 
-### T8 console 心跳写优化（~1 人日）☐
+### T8 console 心跳写优化（~1 人日）✅
 
 - **现状**：心跳批量写逐行 autocommit，未设 `synchronous=NORMAL`（数千事件 → 数千 fsync 在唯一 Mutex<Connection> 内串行，阻塞所有 API）；多语句写无显式事务（崩溃即半写）。
 - **方案**：pragma 增设 `synchronous=NORMAL`（SQLite 官方对 WAL 的推荐）；心跳批量 INSERT 与既有写路径包 `Connection::transaction()`。
 - **验收**：`cargo test -p console-store -p tailrace-console` 全绿；新增并发心跳压测单测（N=500 事件批 < 数秒）。
 - **文件域**：console-store（nodes.rs 写路径、lib.rs pragmas）、牵连的事务化写闭包。
+- **结果**（2026-10-17）：pragmas 增 `synchronous=NORMAL`；新增 `Store::with_tx`（`Connection::transaction()`，失败即回滚）；事务化 7 条多语句/批量写路径（apply_heartbeat / insert_node_events / insert_pipeline_metrics / delete_node_cascade / purge_expired / set_pipeline_published / update_datasource）。验收数字：`cargo test -p console-store` 22 passed（含新增并发压测与 publish 原子回滚两测）+ `-p tailrace-console` 25 passed，0 failed；clippy `-D warnings` 绿。压测（4 并发 × 500 事件批，文件库实测）：最差批 4.50s（修复前 autocommit+FULL）→ **31.7ms**（≈142×）。
 
 ### T9 web 首屏：monaco 拆分裁剪（~2 人日）☐
 
