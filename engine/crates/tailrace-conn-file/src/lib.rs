@@ -111,7 +111,7 @@ impl FileSource {
                 self.path.display()
             );
         }
-        if self.miss_streak == 1 || self.miss_streak % 20 == 0 {
+        if self.miss_streak == 1 || self.miss_streak.is_multiple_of(20) {
             eprintln!(
                 "[SOURCE] source file temporarily missing (poll #{}, tolerance {}): {}",
                 self.miss_streak,
