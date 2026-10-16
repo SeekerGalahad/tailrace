@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use datafusion::arrow::csv;
+use datafusion::arrow::json::LineDelimitedWriter;
 use datafusion::arrow::record_batch::RecordBatch;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
@@ -411,7 +411,8 @@ impl rdkafka::producer::ProducerContext for SinkProducerContext {
 
 /// Kafka sink (BaseProducer batching + flush = at-least-once; acks=all +
 /// idempotence: success means leader + all replicas persisted, and in-process
-/// retries deduplicate).
+/// retries deduplicate). Carrier = JSON-lines: one message per row, one
+/// `\n`-terminated JSON object per message (see [`encode_json_lines`]).
 pub struct KafkaSink {
     producer: BaseProducer<SinkProducerContext>,
     topic: String,
@@ -458,26 +459,31 @@ impl KafkaSink {
     }
 }
 
+/// JSON-lines carrier: Arrow rows → one JSON object per `\n`-terminated line
+/// (the same `arrow::json::LineDelimitedWriter` the file sink ships). JSON
+/// string escaping encodes in-field newlines, quotes and emoji inside the
+/// line, so one row is always exactly one line — no line split can ever cut
+/// a record (the CSV carrier's poison-record failure mode), and numeric
+/// columns stay numeric (CSV stringified every column).
+fn encode_json_lines(batches: &[RecordBatch]) -> anyhow::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    {
+        let mut w = LineDelimitedWriter::new(&mut buf);
+        for b in batches {
+            w.write(b)?;
+        }
+        w.finish()?;
+    }
+    Ok(buf)
+}
+
 impl Sink for KafkaSink {
     fn write(&mut self, batches: Vec<RecordBatch>) -> anyhow::Result<()> {
-        let mut buf = Vec::new();
-        {
-            let mut w = csv::WriterBuilder::new().with_header(false).build(&mut buf);
-            for b in &batches {
-                w.write(b)?;
-            }
-        }
+        let buf = encode_json_lines(&batches)?;
+        // one \n-terminated JSON object per row — splitting on line
+        // boundaries is record-safe by construction
         let text = String::from_utf8(buf)?;
         for line in text.lines().filter(|l| !l.is_empty()) {
-            // RFC4180: a quoted field containing newlines gets split by
-            // lines() into two broken messages. A complete record has an even
-            // quote count (pairs + doubled quotes inside); odd = the record
-            // was cut — fail explicitly so it replays.
-            if line.matches('"').count() % 2 == 1 {
-                anyhow::bail!(
-                    "kafka sink: CSV carrier has an in-field newline (record cut) — clean newlines in the source data or switch to a JSON carrier"
-                );
-            }
             if let Err((e, _)) = self
                 .producer
                 .send(BaseRecord::<(), str>::to(&self.topic).payload(line))
@@ -570,8 +576,13 @@ mod tests {
         Ok(())
     }
 
+    /// Poison rows (in-field newlines / quotes / emoji) ride the JSON-lines
+    /// carrier without bailing — the CSV carrier used to fail the write
+    /// explicitly, which escalated to a registry restart loop and a FAILED
+    /// terminal state (a poison record permanently killed the pipeline).
+    /// Plus the unchanged fail-closed flush property.
     #[test]
-    fn kafka_sink_csv_guard_and_fail_closed() -> anyhow::Result<()> {
+    fn kafka_sink_jsonl_poison_rows_no_bail_and_flush_fails_closed() -> anyhow::Result<()> {
         let mk = |v: &str| -> anyhow::Result<RecordBatch> {
             Ok(RecordBatch::try_new(
                 Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)])),
@@ -581,18 +592,115 @@ mod tests {
         // constructible even with an unreachable broker (the producer connects
         // lazily; send only queues locally)
         let mut sink = KafkaSink::new("localhost:1", "t-guard")?;
-        // ① a normal single-line CSV: queued and counted
+        // ① a plain row: queued and counted
         sink.write(vec![mk("plain")?])?;
         assert_eq!(sink.pending, 1);
-        // ② an in-field newline (RFC4180 quoted, spanning lines) → lines()
-        // cuts the record → explicit failure, no broken message produced
-        let err = sink.write(vec![mk("a\nb")?]).unwrap_err().to_string();
-        assert!(err.contains("in-field newline"), "{err}");
-        assert_eq!(sink.pending, 1, "the failed line is not queued");
+        // ② poison rows — in-field newline, doubled quotes, emoji: one JSON
+        // object per row, no record cut, no bail, all queued
+        sink.write(vec![
+            mk("a\nb")?,
+            mk("he said \"hi\" 🎉")?,
+            mk("comma, inside\nand a newline 🚀")?,
+        ])?;
+        assert_eq!(
+            sink.pending, 4,
+            "poison rows queue (the CSV carrier bailed here)"
+        );
         // ③ unreachable broker: flush must explicitly fail (fail-closed —
         // cursor not committed, at-least-once)
         sink.flush_timeout = Duration::from_millis(300);
         assert!(sink.flush().is_err());
+        Ok(())
+    }
+
+    /// T4 carrier acceptance: rows with in-field newlines, quotes and emoji,
+    /// serialized by the kafka sink's JSON-lines carrier, read back
+    /// **losslessly** by `arrow::json::Reader` — field values equal, row
+    /// count equal, numeric columns stay numeric (the CSV carrier degraded
+    /// every column to a string).
+    #[test]
+    fn kafka_sink_jsonl_carrier_roundtrips_poison_fields() -> anyhow::Result<()> {
+        use datafusion::arrow::array::{Array, Float64Array, Int64Array, StringArray};
+        use datafusion::arrow::json::ReaderBuilder;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("qty", DataType::Int64, true),
+            Field::new("ratio", DataType::Float64, true),
+        ]));
+        let poisons = [
+            "line1\nline2",                    // in-field newline
+            "he said \"hi\", twice 🎉",        // doubled quotes + comma + emoji
+            "🚀🀄 multiline\nemoji \"field\"", // emoji + newline + quotes
+            "tab\tcr\rcontrols",               // control characters
+        ];
+        let rows: Vec<RecordBatch> = poisons
+            .iter()
+            .map(|p| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(StringArray::from(vec![Some(*p)])),
+                        Arc::new(Int64Array::from(vec![Some(7)])),
+                        Arc::new(Float64Array::from(vec![Some(0.5)])),
+                    ],
+                )
+            })
+            .collect::<Result<_, _>>()?;
+        // the exact bytes the sink ships per write()
+        let bytes = encode_json_lines(&rows)?;
+        // carrier invariant: exactly one \n-terminated line per row (what makes
+        // the per-line produce/consume split record-safe)
+        assert_eq!(
+            std::str::from_utf8(&bytes)?.lines().count(),
+            poisons.len(),
+            "one JSON line per row"
+        );
+        // lossless read-back via arrow::json::Reader
+        let mut reader = ReaderBuilder::new(schema.clone()).build(bytes.as_slice())?;
+        let mut names: Vec<Option<String>> = Vec::new();
+        let mut qtys: Vec<i64> = Vec::new();
+        let mut ratios: Vec<f64> = Vec::new();
+        for rb in &mut reader {
+            let rb = rb?;
+            let n = rb
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let q = rb
+                .column_by_name("qty")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let r = rb
+                .column_by_name("ratio")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            for i in 0..rb.num_rows() {
+                names.push(if n.is_null(i) {
+                    None
+                } else {
+                    Some(n.value(i).to_string())
+                });
+                qtys.push(q.value(i));
+                ratios.push(r.value(i));
+            }
+        }
+        let expect: Vec<Option<String>> = poisons.iter().map(|p| Some(p.to_string())).collect();
+        assert_eq!(
+            names, expect,
+            "poison fields (newline/quote/emoji) roundtrip losslessly"
+        );
+        assert!(qtys.iter().all(|q| *q == 7), "int64 columns stay int64");
+        assert!(
+            ratios.iter().all(|r| *r == 0.5),
+            "float64 columns stay float64"
+        );
         Ok(())
     }
 }

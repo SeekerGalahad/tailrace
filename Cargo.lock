@@ -4051,6 +4051,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "criterion",
+ "csv",
  "datafusion",
  "serde_json",
  "simd-json",

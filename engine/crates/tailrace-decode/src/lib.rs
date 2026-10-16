@@ -370,10 +370,16 @@ impl Decoder for OggDecoder {
     }
 }
 
-// ==================== CSV (split by target column types; v1 has no quote escaping) ====================
+// ==================== CSV (RFC4180 via the csv crate, typed by target column) ====================
 
-/// CSV decoder: comma-split written by column order (schema column order =
-/// file column order, matching the console csv inference).
+/// CSV decoder: one RFC4180 record per message, fields written by column
+/// order (schema column order = file column order, matching the console csv
+/// inference). Quoted fields carry commas, doubled quotes and in-field
+/// newlines (`"a,b"`, `"he said ""hi"""`); the record grammar is delegated
+/// to the `csv` crate — the old `split(',')` splitter had no quote handling
+/// at all. Per-column coercion semantics are unchanged: bad numerics
+/// degrade to null, the row is not dropped; positional fields are trimmed
+/// (the splitter's whitespace tolerance).
 pub struct CsvDecoder;
 
 impl Decoder for CsvDecoder {
@@ -385,10 +391,26 @@ impl Decoder for CsvDecoder {
         if line.is_empty() {
             return Decoded::Skip;
         }
-        let parts: Vec<&str> = line.split(',').map(|p| p.trim()).collect();
+        // has_headers(false): the only record IS the data; flexible(true):
+        // ragged records keep the positional mapping — missing trailing
+        // fields decode as empty → null, extra ones ignored (same as the old
+        // splitter's parts.get(i)). Note the csv reader is lenient on an
+        // unterminated trailing quote (`a,"b` → fields a,b) — it decodes
+        // rather than fails; anything harder (invalid UTF-8, mid-record
+        // garbage) surfaces as Err → Bad, where the bad-row policy decides.
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .flexible(true)
+            .from_reader(line.as_bytes());
+        let mut rec = csv::StringRecord::new();
+        match rdr.read_record(&mut rec) {
+            Ok(true) => {}
+            Ok(false) => return Decoded::Skip, // defensive: empty input
+            Err(_) => return Decoded::Bad,
+        }
         let typed = batch_fields_typed(batch);
-        for (i, (name, dt)) in typed.iter().enumerate() {
-            let v = parts.get(i).copied().unwrap_or("");
+        for (i, (_name, dt)) in typed.iter().enumerate() {
+            let v = rec.get(i).map(str::trim).unwrap_or("");
             let b = batch.column_mut(i);
             match dt {
                 DataType::Int64 => match v.parse::<i64>() {
@@ -406,7 +428,6 @@ impl Decoder for CsvDecoder {
                     }
                 }
                 _ => {
-                    let _ = name;
                     append_str(b, if v.is_empty() { None } else { Some(v) });
                 }
             }
@@ -689,6 +710,104 @@ mod tests {
             .downcast_ref::<datafusion::arrow::array::BooleanArray>()
             .unwrap();
         assert!(ok.value(0));
+    }
+
+    /// T4 RFC4180 compliance: the csv branch used to be a bare `split(',')`
+    /// — quoted commas, doubled quotes and in-field newlines were all cut
+    /// into garbage fields. Every case here decodes the quoted payload
+    /// intact.
+    #[test]
+    fn csv_decode_rfc4180_quoted_fields() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("qty", DataType::Int64, true),
+        ]));
+        let cases: Vec<(&[u8], &str, i64)> = vec![
+            // quoted comma: the splitter produced ["a", "b\""] garbage
+            (b"\"a,b\",10", "a,b", 10),
+            // doubled quotes escape (RFC4180 §2.7): "he said ""hi"""
+            (b"\"he said \"\"hi\"\"\",7", "he said \"hi\"", 7),
+            // in-field newline inside quotes (a whole RFC4180 record)
+            (b"\"line1\nline2\",3", "line1\nline2", 3),
+            // quotes + comma + emoji together
+            (
+                "\"emoji 🎉, \"\"quoted\"\"\",1".as_bytes(),
+                "emoji 🎉, \"quoted\"",
+                1,
+            ),
+            // unquoted field keeps an unpaired apostrophe/quote
+            (b"5'9\",2", "5'9\"", 2),
+            // quoted empty field ≠ unquoted empty: both utf8-null here
+            (b"\"\",5", "", 5),
+        ];
+        let mut batch = ColBatch::new(schema, 8);
+        for (raw, _want_name, _want_qty) in &cases {
+            assert_eq!(
+                CsvDecoder.decode(raw, &mut batch, &Pushdown::default()),
+                Decoded::Append
+            );
+        }
+        let rb = batch.finish().unwrap();
+        assert_eq!(rb.num_rows(), cases.len());
+        let names = rb
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        let qtys = rb
+            .column(1)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .unwrap();
+        for (i, (_raw, want_name, want_qty)) in cases.iter().enumerate() {
+            if want_name.is_empty() {
+                assert!(names.is_null(i), "row {i}: quoted empty → null");
+            } else {
+                assert_eq!(names.value(i), *want_name, "row {i} field value");
+            }
+            assert_eq!(qtys.value(i), *want_qty, "row {i} qty");
+        }
+    }
+
+    /// RFC4180 edges around emptiness and broken records: blank input skips,
+    /// invalid UTF-8 goes Bad (bad-row policy decides upstream), and ragged
+    /// records keep the positional mapping (missing trailing field → null).
+    #[test]
+    fn csv_decode_blank_skip_utf8_bad_and_ragged() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("qty", DataType::Int64, true),
+        ]));
+        let mut batch = ColBatch::new(schema, 8);
+        assert_eq!(
+            CsvDecoder.decode(b"", &mut batch, &Pushdown::default()),
+            Decoded::Skip
+        );
+        assert_eq!(
+            CsvDecoder.decode(b"\n", &mut batch, &Pushdown::default()),
+            Decoded::Skip
+        );
+        assert_eq!(
+            CsvDecoder.decode(b"   ", &mut batch, &Pushdown::default()),
+            Decoded::Skip
+        );
+        assert_eq!(
+            CsvDecoder.decode(b"\xff\xfe", &mut batch, &Pushdown::default()),
+            Decoded::Bad
+        );
+        // ragged: one field only → qty column null, row kept
+        assert_eq!(
+            CsvDecoder.decode(b"solo", &mut batch, &Pushdown::default()),
+            Decoded::Append
+        );
+        let rb = batch.finish().unwrap();
+        assert_eq!(rb.num_rows(), 1);
+        assert!(rb
+            .column(1)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .unwrap()
+            .is_null(0));
     }
 
     #[test]
