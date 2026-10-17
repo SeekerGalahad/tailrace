@@ -2,8 +2,9 @@
 # a single-node Kafka (KRaft, no zookeeper) + a single-node Doris (FE+BE).
 #
 # NOT started by scripts/smoke.sh unless --full is passed. Engine consumes
-# Kafka on 127.0.0.1:9092 (bootstrap) and Doris Stream Load on 127.0.0.1:8040
-# (BE webserver_port); MySQL protocol for DDL/queries on 127.0.0.1:9030 (FE).
+# Kafka on 127.0.0.1:9092 (bootstrap) and Doris Stream Load on 127.0.0.1:38040
+# (BE webserver_port, host side); MySQL protocol for DDL/queries on
+# 127.0.0.1:39030 (FE, host side; container-side stays 9030/8040).
 #
 # Kafka runs the official apache/kafka image (bitnami/kafka was removed from
 # Docker Hub — the 2025 Bitnami archive — T11 first-run finding F1). Env vars
@@ -24,11 +25,17 @@
 # (spans over OTLP/HTTP). Point the node at it with
 # OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318.
 
-# Host port overrides (defaults keep the documented contract): shared dev
-# machines may already run another Doris on 8030/8040/9030 — export e.g.
-# TAILRACE_FE_HTTP_PORT=38030 TAILRACE_FE_MYSQL_PORT=39030
-# TAILRACE_BE_HTTP_PORT=38040 docker compose up -d
-# (scripts/smoke.sh --full reads the same variables.)
+# Host port overrides. The DEFAULTS are shifted off the standard Doris ports
+# (8030/8040/9030) onto 38030/39030/38040: this is a shared dev machine that
+# keeps another standing Doris on the standard ports (the mdop `doris-2.1`
+# container, per the repo-group environment contract), and a bare
+# `docker compose up -d` (the L3 gate's first leg, docs/dev/roadmap.md §三)
+# must not collide with it. W3 gate 2026-10-17: `Bind for 0.0.0.0:8030
+# failed: port is already allocated`. scripts/smoke.sh --full reads the same
+# variables, so datasource wiring follows automatically. Further conflicts
+# are still resolvable by exporting e.g. TAILRACE_FE_HTTP_PORT=48030
+# TAILRACE_FE_MYSQL_PORT=49030 TAILRACE_BE_HTTP_PORT=48040 (the chaos
+# testcontainers tests stay in 20000-34999, clear of all of these).
 
 services:
   kafka:
@@ -71,8 +78,8 @@ services:
       doris_net:
         ipv4_address: 172.28.0.2
     ports:
-      - "127.0.0.1:${TAILRACE_FE_HTTP_PORT:-8030}:8030"   # FE http
-      - "127.0.0.1:${TAILRACE_FE_MYSQL_PORT:-9030}:9030"   # FE mysql protocol
+      - "127.0.0.1:${TAILRACE_FE_HTTP_PORT:-38030}:8030"   # FE http
+      - "127.0.0.1:${TAILRACE_FE_MYSQL_PORT:-39030}:9030"  # FE mysql protocol
     environment:
       # FE_SERVERS wants a literal IP (the image entrypoint regex rejects
       # hostnames) — static IPs on the dedicated doris_net, per the upstream
@@ -100,7 +107,7 @@ services:
       doris-fe:
         condition: service_healthy
     ports:
-      - "127.0.0.1:${TAILRACE_BE_HTTP_PORT:-8040}:8040"   # BE webserver (Stream Load target)
+      - "127.0.0.1:${TAILRACE_BE_HTTP_PORT:-38040}:8040"   # BE webserver (Stream Load target)
     environment:
       FE_SERVERS: "fe1:172.28.0.2:9010"
       BE_ADDR: "172.28.0.3:9050"

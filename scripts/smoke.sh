@@ -155,8 +155,8 @@ append_rows 1 3
 KDS=""; DDS=""; DDS_ENV_NAME=""; DDS_ENV_VALUE="Basic cm9vdDo="   # root:
 if [ "$FULL" = "1" ]; then
   KPORT="${TAILRACE_KAFKA_PORT:-9092}"
-  FEPORT="${TAILRACE_FE_MYSQL_PORT:-9030}"
-  BEPORT="${TAILRACE_BE_HTTP_PORT:-8040}"
+  FEPORT="${TAILRACE_FE_MYSQL_PORT:-39030}"
+  BEPORT="${TAILRACE_BE_HTTP_PORT:-38040}"
   req POST /api/datasources "{\"name\":\"smoke-kafka\",\"type\":\"kafka\",\"connJson\":{\"bootstrap\":\"127.0.0.1:$KPORT\"}}" "$TOKEN"
   KDS="$(jq -r '.id // empty' <<<"$BODY" 2>/dev/null)"
   # doris datasource contract (console api/datasources.rs): jdbcUrl AND
@@ -267,11 +267,12 @@ req GET "/api/pipelines/$P_ID" "" "$TOKEN"
 # Docker + docker-compose.yml services; NOT part of the dependency-free gate.
 run_full() {
   local COMPOSE="docker compose -f $ROOT/docker-compose.yml"
-  # host-port overrides (must match docker-compose.yml defaults; shared dev
-  # machines may run another Doris on the standard ports)
+  # host-port overrides (must match docker-compose.yml defaults; defaults
+  # sit on 39030/38040 — the standard Doris ports 9030/8040 are taken by
+  # this shared dev machine's standing mdop `doris-2.1` container)
   local KPORT="${TAILRACE_KAFKA_PORT:-9092}"
-  local FEPORT="${TAILRACE_FE_MYSQL_PORT:-9030}"
-  local BEPORT="${TAILRACE_BE_HTTP_PORT:-8040}"
+  local FEPORT="${TAILRACE_FE_MYSQL_PORT:-39030}"
+  local BEPORT="${TAILRACE_BE_HTTP_PORT:-38040}"
   echo "  (--full) starting docker compose kafka+doris (first pull may take minutes; kafka=127.0.0.1:$KPORT doris-be=127.0.0.1:$BEPORT)"
   if $COMPOSE up -d --wait; then
     step pass "S8.1 docker compose kafka+doris healthy"
