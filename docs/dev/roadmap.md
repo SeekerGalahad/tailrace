@@ -74,6 +74,7 @@
 - **验收**：criterion decode/transform 微基准前后对比表入 BENCHMARKS.md（具体倍数以实测为准，不预填）；既有 decode/transform 测试 + 契约测试全绿；宏基准吞吐行前后对比。
 - **文件域**：tailrace-decode、conn-kafka（source 侧）、conn-file、conn-doris、tailrace-connector（如 trait 签名牵连）。
 > 结果：Decoder trait 收 Vec<u8> 所有权（JSON/OGG 借用封装进内层 walk 保 Bad 还回；Parquet `Bytes::from(Vec)` 零拷贝）；ColBatch `parts()` split-borrow 消除每行 N 个 String 列名分配（schema.fields 即构造时缓存）；FileSource 读栈字节化（完整行 move 进 chunk）+ FileSink flush 直写（免 tmp 写+整读回+一档 fsync）；DorisSink 载体 BytesMut→Bytes（重试 body refcount clone）；kafka 侧验证后无需 diff（`.to_vec()` 是 rdkafka C 堆唯一边界拷贝，全链 2→1 由 decode 签名兑现）。验收数字（同机同日，BENCHMARKS §4.1）：decode json **328.9K→534.9K（+33% 保守，二次样本 438.5K）**、ogg **+45%**、csv +11%（噪声界内）；sink flush **234.4K→458.2K（+95%）**；transform 零改动三项 +1~4%（criterion 判噪声/no-change，无回归）；宏基准 **21739→24649 rows/s（+13.4%，debug 档）**。测试：受影响 6 crate+契约 38 passed/0 failed；clippy --all-targets -D warnings 绿。已知取舍（实测登记）：JSON/OGG Bad 行还回的 buffer 可能已被 simd-json 转义展开改写（毒行含转义时 DLQ 样本为解析视图），happy-path 每消息拷贝消除的固有代价，`Decoded::Bad` doc 注明。
+> 结果：a5b48fd T3 热路径零拷贝：Decoder trait 收 Vec<u8> 所有权（walk 内层封装借用，Bad 路径还回 buffer）、ColBatch parts() split-borrow 消除每行 N 个 String 列名分配、Parquet Bytes 零拷贝、FileSource 读栈字节化、FileSink flush 免 tmp 写+整读回+一档 fsync、DorisSink 载体 BytesMut→Bytes 免重试拷贝；kafka→decode 全链每消息拷贝 2→1。同机同日前后对比：decode json 328.9K→534.9K rows/s(+33% 保守)、ogg +45%、sink flush 234.4K→458.2K(+95%)、宏基准 21739→24649/25246 rows/s(+13.4~16.1%)；transform 零改动无回归；受影响 6 crate+契约 38 passed/0 failed。
 
 ### T4 毒数据载体：JSON-lines（~1 人日）✅
 
