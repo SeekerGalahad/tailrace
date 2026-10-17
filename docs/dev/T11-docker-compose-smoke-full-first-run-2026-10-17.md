@@ -138,6 +138,38 @@ fresh group 加入/再平衡要数秒，chaos 两阶段窗口 4s/6s 太短（con
 `doris_json_carrier_poison_roundtrip` 在 MockDoris 上钉住毒值逐字节往返。
 S9.9 的 Doris 端字节级验证（INSTR(note, CHAR(10))=6）确认真实换行落库。
 
+### F11 · GitHub runner 默认 4GB swap → BE 容器静默 exit(0)（W3-ci 首跑，2026-10-17）
+
+本地 44/44 全绿后，CI 的 chaos 与 smoke 两个 job 在两轮 run 中确定性失败：
+smoke 的 S8.1 `docker compose up -d --wait` 报 `container tailrace-doris-be
+exited (0)`（BE 容器启动后 ~18s），chaos 的 BE `/api/health` 探针 240s 全程
+connection refused。两层排查：
+
+1. **退出码被镜像 entrypoint 洗白**：`entry_point.sh → init_be.sh` 以
+   `start_be.sh --console &` 起前台子进程后执行 `wait $child_pid;
+   exec "$@"`——`exec` 无参恒返 0；外层 `entry_point.sh` 再 `wait`（无参亦
+   恒返 0）。所以 **start_be.sh 的任何 `exit 1` 检查失败，容器都记
+   exit(0)**，且报错文本只留在 `docker logs`（detached compose 不外显）。
+   本地以 `--ulimit nofile=1024:1024` 强制 nofile 检查失败复现：容器
+   **16.1s 后 ExitCode=0**，`docker logs` 里才是真错误——与 CI 签名
+   （~18s / exit 0）吻合。18s ≈ entrypoint 自身 `check_be_status + sleep 15`
+   的节奏，并非 BE 存活时长。
+2. **真根因**：start_be.sh 三道 `exit 1` 门中，max_map_count（job 已
+   sysctl）与 nofile（compose/`docker run` 已 655350）均排除，剩
+   **swap 检查**——`swapon -s | wc -l > 1` 即拒启，而 `/proc/swaps` 不做
+   namespace 隔离，容器内可见宿主 swap。GitHub Ubuntu runner 默认带
+   **4096MB swapfile**（[runner-images#965]：swapfile 移至 /mnt；
+   [get-bridge/swap-space] README: "runners default (4096)"）。OrbStack
+   宿主无 swap，故本地全绿、CI 全红。
+
+**修复**：ci.yml 的 chaos 与 smoke job 在 sysctl 步旁加 `sudo swapoff -a`
+（runner 一次性环境，无副作用）；同时补失败可观测性——smoke.sh S8.1
+失败先 `$COMPOSE logs --tail 50` 再 teardown，chaos.rs 的 BE 健康超时错误
+附带 `docker logs --tail 30`（此类失败从此一步定位）。
+
+[runner-images#965]: https://github.com/actions/runner-images/issues/965
+[get-bridge/swap-space]: https://github.com/get-bridge/swap-space
+
 ## 三、S9 毒数据浸泡（≥10 分钟持续消费 + 行数守恒）
 
 场景：`smoke_poison_ogg` topic 持续生产含

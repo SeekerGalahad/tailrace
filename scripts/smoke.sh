@@ -277,6 +277,13 @@ run_full() {
   if $COMPOSE up -d --wait; then
     step pass "S8.1 docker compose kafka+doris healthy"
   else
+    # detached `up` swallows container stdout — and the apache/doris
+    # entrypoint launders every start_be.sh failure (swap / max_map_count
+    # / nofile checks) into a clean container exit(0), so without this
+    # dump the failure is undiagnosable (W3-ci 2026-10-17: BE
+    # "exited (0)" with zero output — real cause: the runner host's
+    # default swap, T11 finding F11)
+    $COMPOSE logs --tail 50 doris-be doris-fe kafka || true
     step fail "S8.1 docker compose up" "$COMPOSE up --wait failed"
     $COMPOSE down -v   # L3 discipline: teardown regardless of outcome
     return

@@ -95,6 +95,10 @@ jobs:
       # Doris BE requires vm.max_map_count >= 2000000 on the docker host
       # (runners default to 65530; OrbStack/Docker Desktop set it already)
       - run: sudo sysctl -w vm.max_map_count=2000000
+      # ...and no active swap: start_be.sh exit(1)s when the host has swap,
+      # and the image entrypoint launders that into a silent container
+      # exit(0) (runners ship a default 4096MB swapfile on /mnt — T11 F11)
+      - run: sudo swapoff -a
       - run: cargo test --locked -p tailrace-node --test chaos -- --nocapture
       - run: cargo test --locked -p tailrace-conn-kafka kafka_source_live -- --nocapture
 
@@ -116,8 +120,10 @@ jobs:
             cache-dependency-path: web/pnpm-lock.yaml,
           }
       - run: ./scripts/build.sh
-      # Doris BE mmap requirement on runners (same as the chaos job)
-      - run: sudo sysctl -w vm.max_map_count=2000000
+      # Doris BE mmap requirement on runners (same as the chaos job), plus
+      # swapoff — start_be.sh refuses to start on a host with swap, which
+      # the entrypoint turns into an undiagnosable exit(0) (T11 F11)
+      - run: sudo sysctl -w vm.max_map_count=2000000 && sudo swapoff -a
       # --full: compose Kafka+Doris e2e + poison soak (T11). The soak is
       # shortened to fit the 45-min job budget (build+pull+boot ≈ 20 min);
       # the ≥10-minute acceptance runs locally on OrbStack (default 600s).

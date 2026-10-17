@@ -318,8 +318,37 @@ fn boot_ephemeral() -> anyhow::Result<Deps> {
     ])?;
     let be_http = format!("127.0.0.1:{be_http_port}");
     if let Err(e) = wait_http_ok(&format!("http://{be_http}/api/health"), 240) {
+        // the doris entrypoint turns any start_be.sh failure (swap /
+        // max_map_count / nofile checks) into a clean container exit(0)
+        // and its stdout lives only in `docker logs` — surface it or the
+        // timeout is undiagnosable (W3-ci 2026-10-17, T11 finding F11).
+        // inspect first: the BE runs --rm, so an exited container is
+        // already gone and `docker logs` alone would only say so.
+        let be_state = Command::new("docker")
+            .args([
+                "inspect",
+                "-f",
+                "{{.State.Status}} exit={{.State.ExitCode}}",
+                &be_name,
+            ])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|err| format!("(docker inspect failed: {err})"));
+        let be_logs = Command::new("docker")
+            .args(["logs", "--tail", "30", &be_name])
+            .output()
+            .map(|o| {
+                format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                )
+            })
+            .unwrap_or_else(|err| format!("(docker logs failed: {err})"));
         docker_teardown(&fe_name, &be_name, &network);
-        return Err(e);
+        return Err(e.context(format!(
+            "BE container state: {be_state}\nBE log tail:\n{be_logs}"
+        )));
     }
     // /api/health answers as soon as the BE webserver is up — but the FE
     // still needs a heartbeat round (a few seconds) before Alive=true, and
