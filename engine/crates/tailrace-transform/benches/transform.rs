@@ -5,16 +5,17 @@
 //!
 //! Caliber (mirrors docs/BENCHMARKS.md §方法学):
 //! - one iteration = ONE 8000-row RecordBatch (runtime default poll_rows)
-//!   through `transform_cached` — the per-micro-batch cost, SQL parse/plan
-//!   included (v0.1.0 re-plans every micro-batch; T7 changes that and this
-//!   bench is its before/after);
+//!   through `transform_cached` with default TransformOptions (batch_size
+//!   = 8000 = poll_rows, T7). v0.1.0 re-parsed+re-planned every micro-batch
+//!   and pinned batch_size to the first batch's rows — T7 materializes the
+//!   plan once per statement; this bench is its before/after;
 //! - `Throughput::Elements(ROWS)` → criterion reports rows/s;
 //! - three operator shapes: identity passthrough, filter+project (CPU-light
 //!   expression), group-by aggregate (hash build per batch).
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use std::sync::Arc;
-use tailrace_transform::transform_cached;
+use tailrace_transform::{transform_cached, TransformOptions};
 
 /// Rows per batch — equal to the runtime default `poll_rows` (8000).
 const ROWS: usize = 8000;
@@ -47,13 +48,15 @@ fn input_batch() -> datafusion::arrow::record_batch::RecordBatch {
 
 fn bench_transform(c: &mut Criterion) {
     let batch = input_batch();
+    let opts = TransformOptions::default(); // batch_size = 8000 = poll_rows (T7)
 
     let mut group = c.benchmark_group("transform");
     group.throughput(Throughput::Elements(ROWS as u64));
 
     group.bench_function("identity_select_star", |b| {
         b.iter(|| {
-            let out = transform_cached("SELECT * FROM src", batch.clone()).expect("transform");
+            let out =
+                transform_cached("SELECT * FROM src", batch.clone(), &opts).expect("transform");
             std::hint::black_box(out);
         });
     });
@@ -63,6 +66,7 @@ fn bench_transform(c: &mut Criterion) {
             let out = transform_cached(
                 "SELECT order_no, qty * 10 AS qty10, price FROM src WHERE qty > 4000",
                 batch.clone(),
+                &opts,
             )
             .expect("transform");
             std::hint::black_box(out);
@@ -74,6 +78,7 @@ fn bench_transform(c: &mut Criterion) {
             let out = transform_cached(
                 "SELECT op_type, COUNT(*) AS n, SUM(qty) AS total_qty FROM src GROUP BY op_type",
                 batch.clone(),
+                &opts,
             )
             .expect("transform");
             std::hint::black_box(out);

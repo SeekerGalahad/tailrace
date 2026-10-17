@@ -33,6 +33,51 @@ pub struct PipelineIr {
     pub statements: Vec<StatementIr>,
 }
 
+/// select_sql → execution LogicalPlan (T7 plan materialization): parsed and
+/// planned **once per statement** against the declared `src` schema. The
+/// TableScan keeps the placeholder source — the execution layer
+/// (`tailrace_transform::transform_plan`) swaps in the real batch per
+/// micro-batch; schema qualifiers and projection stay anchored by this plan
+/// (only the source `Arc` is replaced, sidestepping the CustomScan qualifier
+/// boundary that gates proto decoding below).
+pub fn build_exec_plan(
+    select_sql: &str,
+    src_columns: &[(String, String)],
+) -> anyhow::Result<LogicalPlan> {
+    // Plan on a dedicated thread: statement assembly may run inside an async
+    // runtime (the node serve deployment handler) — nesting a tokio runtime
+    // there panics ("Cannot start a runtime from within a runtime", caught by
+    // the v1 contract suite). One-time cost per statement deployment.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| -> anyhow::Result<LogicalPlan> {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                rt.block_on(async {
+                    let ctx = SessionContext::new();
+                    let schema = datafusion::arrow::datatypes::Schema::new(
+                        src_columns
+                            .iter()
+                            .map(|(n, t)| {
+                                datafusion::arrow::datatypes::Field::new(
+                                    n.clone(),
+                                    arrow_type(t),
+                                    true,
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                    placeholder::register_src(&ctx, std::sync::Arc::new(schema))?;
+                    let df = ctx.sql(select_sql).await?;
+                    Ok(df.logical_plan().clone())
+                })
+            })
+            .join()
+            .map_err(|_| anyhow::anyhow!("plan build thread panicked"))?
+    })
+}
+
 /// select_sql → proto bytes (planned against an empty `src` table with the
 /// declared schema — the plan anchors the schema, real batches are injected
 /// at execution time).
@@ -72,37 +117,21 @@ fn b64_to_plan_unchecked(b64: &str) -> anyhow::Result<LogicalPlan> {
 
 fn build_plan(select_sql: &str, src_columns: &[(String, String)]) -> anyhow::Result<LogicalPlan> {
     use datafusion::common::tree_node::TreeNode;
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(async {
-        let ctx = SessionContext::new();
-        let schema = datafusion::arrow::datatypes::Schema::new(
-            src_columns
-                .iter()
-                .map(|(n, t)| {
-                    datafusion::arrow::datatypes::Field::new(n.clone(), arrow_type(t), true)
-                })
-                .collect::<Vec<_>>(),
-        );
-        placeholder::register_src(&ctx, std::sync::Arc::new(schema))?;
-        let df = ctx.sql(select_sql).await?;
-        let plan = df.logical_plan().clone();
-        // TableScan("src") → EmptyRelation: the data source stays out of the IR
-        // (real batches are injected at execution time) — natively proto-serializable.
-        let plan = plan.transform_down(|p| match p {
-            LogicalPlan::TableScan(scan) if scan.table_name.table() == "src" => Ok(
-                datafusion::common::tree_node::Transformed::yes(LogicalPlan::EmptyRelation(
-                    datafusion::logical_expr::logical_plan::EmptyRelation {
-                        produce_one_row: false,
-                        schema: scan.projected_schema.clone(),
-                    },
-                )),
-            ),
-            other => Ok(datafusion::common::tree_node::Transformed::no(other)),
-        })?;
-        Ok(plan.data)
-    })
+    let plan = build_exec_plan(select_sql, src_columns)?;
+    // TableScan("src") → EmptyRelation: the data source stays out of the IR
+    // (real batches are injected at execution time) — natively proto-serializable.
+    let plan = plan.transform_down(|p| match p {
+        LogicalPlan::TableScan(scan) if scan.table_name.table() == "src" => {
+            Ok(datafusion::common::tree_node::Transformed::yes(
+                LogicalPlan::EmptyRelation(datafusion::logical_expr::logical_plan::EmptyRelation {
+                    produce_one_row: false,
+                    schema: scan.projected_schema.clone(),
+                }),
+            ))
+        }
+        other => Ok(datafusion::common::tree_node::Transformed::no(other)),
+    })?;
+    Ok(plan.data)
 }
 
 fn arrow_type(t: &str) -> datafusion::arrow::datatypes::DataType {

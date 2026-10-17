@@ -107,7 +107,11 @@ parse+plan——T7 物化 LogicalPlan 的改造对象）。
 | （待 T3 填） | sink/jsonl_flush_10k_rows | 205.7 K rows/s（磁盘敏感） | — | — | — |
 | （待 T5 填） | macro 多分区对比 | — | — | — | — |
 | （待 T6 填） | 批大小分布指标 | — | — | — | — |
-| （待 T7 填） | macro RSS/吞吐 | — | — | — | — |
+| T7 | transform/identity_select_star | 19.348 M rows/s | 30.647 M rows/s | **+58%** | 2026-10-17 |
+| T7 | transform/filter_project | 7.454 M rows/s | 8.958 M rows/s | **+20%** | 2026-10-17 |
+| T7 | transform/groupby_aggregate | 6.219 M rows/s | 8.072 M rows/s | **+30%** | 2026-10-17 |
+| T7 | macro 吞吐（file→file debug） | 25138 rows/s | 25094 rows/s | 持平（噪声内，见 §4.4） | 2026-10-17 |
+| T7 | macro node 峰值 RSS | 46888 KiB | 49124 KiB | +2.2 MiB（物化计划常驻，见 §4.4） | 2026-10-17 |
 
 ### §4.1 T3 热路径零拷贝（2026-10-17，同机同日复测）
 
@@ -149,6 +153,71 @@ console 轮询粒度主导尾延迟。）
 （实测 `{"ok":"\u0041","bad":` 类毒行；普通毒行字节不变）——DLQ 隔离样本在毒行含转义
 时为「解析视图」而非逐字节原样。这是消除每消息全量拷贝的固有取舍，已在
 `Decoded::Bad` 的 doc 注释中写明；DLQ 无字节重放机制，样本保持排查可读。
+
+### §4.4 T7 内存治理（2026-10-17，同机同日复测）
+
+改造内容：
+
+1. **batch_size 固定为 poll_rows**：session 组装改为
+   `TransformOptions { max_rows_per_batch = RunOptions.poll_rows }` 一次定型——原实现用
+   **第一个微批的行数**定格 SessionConfig batch_size（首批 1 行 → 该语句线程恒为 1）。
+2. **SQL 物化为 LogicalPlan 每语句一次**：`tailrace-ir` 新增 pub `build_exec_plan`
+   （组装期 parse+plan 一次，坏 SQL 在部署组装即失败——fail fast），执行层新入口
+   `tailrace-transform::transform_plan` 每微批仅替换 TableScan("src") 的 source `Arc`
+   （qualifier/投影由物化计划锚定，绕开 CustomScan qualifier 边界）；优化器仍每批执行
+   （物理计划需要活数据），SQL parse/analyze 不再进热路径。
+3. **DataFusion memory pool 进 session 组装**：`RuntimeEnvBuilder::with_memory_limit`
+   （GreedyMemoryPool，默认 256 MiB/语句，`TransformOptions.memory_pool_bytes` 可配）。
+
+实测机制修正（探针实证，DataFusion 48.0.1 内存表路径）：任务卡描述的「后续 8000 行微批
+被切成 8000 个单行 RecordBatch」对 scan/filter/project 形语句**不成立**——MemoryStream
+按存储批次原样产出且 target_partitions=1 无 repartition；**聚合输出**才是 batch_size 的
+切批点（hash agg 按批吐出）：batch_size=1 时 8000 组聚合 → **8000 个单行 RecordBatch**
+流过计划与 sink 写路径，batch_size=8000 → 1 批。
+
+验收单测（tailrace-transform 4 passed / tailrace-runtime 10 passed / tailrace-ir 2
+passed，契约 7/7）：
+
+- `explain_metrics_batch_count_drops`：首批 1 行 + 后续 8000 行 → 计划执行批数
+  **8000→1**。**如实注记**：DF48 的 `output_batches` 指标仅由 join/coalesce/unnest 算子
+  记录（datafusion-physical-plan 源码确认），聚合/投影计划不产出该指标，故执行批数取
+  计划输出 collect 计数，EXPLAIN ANALYZE 表断言其真实展示项（AggregateExec 执行、
+  output_rows=8000）——偏差在测试注释与本节注明，不按卡面字样造假。
+- `batch_size_fixed_from_options_not_first_batch`：同场景，固定 8000 → 输出 1 批 vs
+  旧定格（模拟 batch_size=1）→ 8000 批。
+- `t7_exec_plan_wiring`（runtime 接线）：声明 schema 的 `build_exec_plan` 计划 +
+  `transform_plan(poll_rows)`：8001 行微批 1 个执行批、4001 行过滤语义、投影列序
+  （order_no, seq10）与表达式值（seq*10）不变。
+- `memory_pool_wired_with_configured_cap`：pool 装配断言
+  （`memory_pool.memory_limit() == Finite(cap)`）。**如实登记**：DF 官方注明 pool
+  "not yet respected in all cases"；实测 64 KiB 池下 8000 组 hash agg 照常完成（不
+  强制拒绝），pool 是装配正确的护栏而非硬限制。
+- 过程修复：契约套件（v1_file_pipeline_lifecycle / v1_bad_rows_dlq）抓到
+  `build_exec_plan` 在节点 serve 部署 handler（异步上下文）内嵌套建 runtime → panic；
+  已改为专用线程建 runtime（一次性部署成本）。
+
+微基准（前=HEAD `98772be` stash 复测，后=T7 工作树；口径同 §2.2）：
+
+| bench | 前（98772be） | 后（T7） | 变化（criterion 判定） |
+|---|---|---|---|
+| transform/identity_select_star | 19.348 M rows/s | 30.647 M rows/s | **+58~59%**（time −37%，p<0.05） |
+| transform/filter_project | 7.454 M rows/s | 8.958 M rows/s | **+20%**（p<0.05） |
+| transform/groupby_aggregate | 6.219 M rows/s | 8.072 M rows/s | **+30%**（p<0.05） |
+
+增益来自每微批 SQL parse+plan 的消除（物化计划命中后每批仅 optimize+physical+execute）。
+
+宏基准（file→file debug 档 + node 峰值 RSS；RSS=外部采样器 200ms 轮询
+`tailrace-node.*tailrace-macro-bench` 进程 `ps -o rss=` 峰值，脚本本身未改）：
+
+| 口径 | 前（98772be） | 后（T7 工作树） | 变化 |
+|---|---|---|---|
+| 吞吐（100000 行追平） | 25138 rows/s | 25094 rows/s | 持平（−0.2%，机器噪声界内） |
+| node 峰值 RSS | 46888 KiB（45.8 MiB） | 49124 KiB（48.0 MiB） | +2.2 MiB（物化计划+会话缓存常驻） |
+
+如实解读：宏基准口径的 SQL 是 scan/project 形（无聚合）——batch_size 修复在该形态无
+增益空间（机制修正节），全链 debug 档由 decode 与 fsync 落盘主导（§2.2 观察），transform
+段微基准增益被链路稀释为持平；聚合形语句的批数收益由单测与微基准
+groupby（+30%）证实。RSS 小幅上浮是每语句物化 LogicalPlan + plan 缓存的常驻代价。
 
 ## 五、CI 口径
 

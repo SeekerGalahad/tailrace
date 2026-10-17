@@ -17,10 +17,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::logical_expr::LogicalPlan;
 
 use dlq::{BadRowPolicy, BadRowRecord};
 use pipeline_log::PipelineLogHub;
-use tailrace_catalog::{CatalogProvider, StatementSpec, TableObject};
+use tailrace_catalog::{CatalogProvider, TableObject};
 use tailrace_connector::ConnectorRegistry;
 use tailrace_decode::{
     ColBatch, CsvDecoder, Decoded, Decoder, JsonDecoder, OggDecoder, ParquetDecoder, Pushdown,
@@ -78,11 +79,14 @@ impl Default for RunOptions {
 type EmitFn = Box<dyn Fn(&str, &str, &str, Option<u32>) + Send>;
 
 struct StatementRuntime {
-    spec: StatementSpec,
     source: Box<dyn tailrace_connector::Source>,
     decoder: Box<dyn Decoder>,
     pushdown: Pushdown,
     sink: Box<dyn tailrace_connector::Sink>,
+    /// Materialized statement plan (T7: parse+plan once per statement at
+    /// assembly — `tailrace_ir::build_exec_plan`; per micro-batch only the
+    /// `src` data source is swapped)
+    exec_plan: Arc<LogicalPlan>,
     /// sink-side column list (transform output column-order check)
     sink_columns: Vec<String>,
     batch: ColBatch,
@@ -276,6 +280,13 @@ impl PipelineRunner {
                     .map(|(n, t)| Field::new(n.clone(), arrow_type(t), true))
                     .collect::<Vec<_>>(),
             ));
+            // T7 plan materialization: parse+plan ONCE per statement (fail
+            // fast on bad SQL at assembly), per micro-batch the decoded batch
+            // is injected as `src` — no re-parse/re-plan on the hot path.
+            let exec_plan = Arc::new(tailrace_ir::build_exec_plan(
+                &spec.select_sql,
+                &src_obj.columns,
+            )?);
             let batch = ColBatch::new(schema, options.poll_rows);
             let _ = state
                 .lock()
@@ -285,11 +296,11 @@ impl PipelineRunner {
             let dlq = (bad_row_policy == BadRowPolicy::Dlq)
                 .then(|| dlq::BadRowDlq::new(state_dir, pipeline_id, idx));
             statements.push(StatementRuntime {
-                spec,
                 source,
                 decoder,
                 pushdown,
                 sink,
+                exec_plan,
                 sink_columns: sink_cols,
                 batch,
                 pending_rows: 0,
@@ -441,6 +452,12 @@ fn run_statement_serve(
         .map(|(c, _, _)| c)
         .unwrap_or(Cursor::None);
     st.source.open(&resume)?;
+    // T7 session assembly: plan execution batch size fixed to poll_rows (NOT
+    // the first micro-batch's rows) + per-statement DataFusion memory pool.
+    let tx_opts = tailrace_transform::TransformOptions {
+        max_rows_per_batch: options.poll_rows,
+        ..Default::default()
+    };
     loop {
         if flags.is_stopped() {
             break;
@@ -581,11 +598,11 @@ fn run_statement_serve(
             continue;
         }
         let rb = st.batch.finish()?;
-        let out = tailrace_transform::transform_cached(&st.spec.select_sql, rb)?; // cached variant
-                                                                                  // Validate the output column 【order】 before the first row is written —
-                                                                                  // a HashSet equality used to let a same-columns-different-order
-                                                                                  // projection through (silently shuffled columns); only the ordered
-                                                                                  // comparison locks the order
+        let out = tailrace_transform::transform_plan(&st.exec_plan, rb, &tx_opts)?; // materialized-plan variant (T7)
+                                                                                    // Validate the output column 【order】 before the first row is written —
+                                                                                    // a HashSet equality used to let a same-columns-different-order
+                                                                                    // projection through (silently shuffled columns); only the ordered
+                                                                                    // comparison locks the order
         if let Some(first) = out.first() {
             let out_cols: Vec<String> = first
                 .schema()
@@ -701,6 +718,11 @@ fn run_statement(
         .map(|(c, _, _)| c)
         .unwrap_or(Cursor::None);
     st.source.open(&resume)?;
+    // T7 session assembly: same knobs as the serve loop
+    let tx_opts = tailrace_transform::TransformOptions {
+        max_rows_per_batch: options.poll_rows,
+        ..Default::default()
+    };
     while Instant::now() < deadline {
         let chunks = st.source.poll(options.poll_rows, options.poll_slice)?;
         if chunks.is_empty() {
@@ -778,9 +800,9 @@ fn run_statement(
             continue;
         }
         let rb = st.batch.finish()?;
-        let out = tailrace_transform::transform_cached(&st.spec.select_sql, rb)?; // cached variant
-                                                                                  // Validate the output column 【order】 before the first row is written
-                                                                                  // (see run_statement_serve)
+        let out = tailrace_transform::transform_plan(&st.exec_plan, rb, &tx_opts)?; // materialized-plan variant (T7)
+                                                                                    // Validate the output column 【order】 before the first row is written
+                                                                                    // (see run_statement_serve)
         if let Some(first) = out.first() {
             let out_cols: Vec<String> = first
                 .schema()
@@ -920,6 +942,89 @@ pub fn run_standalone(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T7 wiring acceptance: the runtime materializes each statement's plan
+    /// via `tailrace_ir::build_exec_plan` (declared schema) at assembly and
+    /// executes micro-batches via `tailrace_transform::transform_plan` with
+    /// batch size fixed to `poll_rows` — a first 1-row micro-batch must NOT
+    /// pin the session batch size (later micro-batches still execute as
+    /// single batches), and the projection/filter semantics are unchanged.
+    /// Each statement runs on its own thread (one statement = one thread-local
+    /// session, matching the statement-thread runtime).
+    #[test]
+    fn t7_exec_plan_wiring() -> anyhow::Result<()> {
+        use datafusion::arrow::array::{Int64Array, StringArray};
+        use datafusion::arrow::record_batch::RecordBatch;
+        let cols = vec![
+            ("op_type".to_string(), "utf8".to_string()),
+            ("order_no".to_string(), "utf8".to_string()),
+            ("seq".to_string(), "int64".to_string()),
+        ];
+        // the declared-schema plan the runtime assembles (nullability matches
+        // the ColBatch schema built in assemble)
+        let plan = std::sync::Arc::new(tailrace_ir::build_exec_plan(
+            "SELECT order_no, seq * 10 AS seq10 FROM src WHERE op_type <> 'D'",
+            &cols,
+        )?);
+        let cols_for_batches = cols.clone();
+        let mk_batch = move |rows: usize| -> anyhow::Result<RecordBatch> {
+            let schema = Arc::new(Schema::new(
+                cols_for_batches
+                    .iter()
+                    .map(|(n, t)| Field::new(n.clone(), arrow_type(t), true))
+                    .collect::<Vec<_>>(),
+            ));
+            let ops: Vec<String> = (0..rows)
+                .map(|i| if i % 2 == 0 { "I" } else { "D" }.to_string())
+                .collect();
+            let orders: Vec<String> = (0..rows).map(|i| format!("O-{i:06}")).collect();
+            Ok(RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(StringArray::from(ops)),
+                    Arc::new(StringArray::from(orders)),
+                    Arc::new(Int64Array::from((0..rows as i64).collect::<Vec<_>>())),
+                ],
+            )?)
+        };
+        let opts = tailrace_transform::TransformOptions {
+            max_rows_per_batch: RunOptions::default().poll_rows, // = the runtime wiring
+            ..Default::default()
+        };
+        std::thread::spawn(move || -> anyhow::Result<()> {
+            // first micro-batch: a single row (the old batch_size pinning trigger)
+            let first = tailrace_transform::transform_plan(&plan, mk_batch(1)?, &opts)?;
+            assert_eq!(first.len(), 1);
+            assert_eq!(first[0].num_rows(), 1, "I row passes the filter");
+            // later 8001-row micro-batch (4001 I rows survive): still ONE
+            // executed batch — the old pinning degraded aggregate-shaped
+            // statements to single-row batches (see transform crate tests)
+            let out = tailrace_transform::transform_plan(&plan, mk_batch(8001)?, &opts)?;
+            assert_eq!(out.len(), 1, "later micro-batch executes as one batch");
+            let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(rows, 4001, "D rows filtered, I rows flow");
+            // projection + column order (the sink column-order contract)
+            let names: Vec<String> = out[0]
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            assert_eq!(names, vec!["order_no".to_string(), "seq10".to_string()]);
+            // seq10 = seq * 10 spot check (first I row: seq=0 → 0; second: seq=2 → 20)
+            let seq10 = out[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .expect("seq10 int64");
+            assert_eq!(seq10.value(0), 0);
+            assert_eq!(seq10.value(1), 20);
+            Ok(())
+        })
+        .join()
+        .expect("wiring test thread")?;
+        Ok(())
+    }
 
     /// Metadata-based topic presence probe (the live-gate precondition —
     /// the seeded tailrace.discover.test topic must actually exist on the

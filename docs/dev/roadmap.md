@@ -98,12 +98,13 @@
 - **验收**：三阈值各自触发的单测（构造行数触发/字节触发/时间触发三场景）；批大小分布指标入 BENCHMARKS.md；契约测试全绿。
 - **文件域**：tailrace-runtime flush 逻辑、tailrace-connector sink trait、conn-doris / conn-kafka / conn-file。
 
-### T7 内存治理（~2 人日）☐〔依赖 T1；与 T5/T6 串行〕
+### T7 内存治理（~2 人日）✅〔依赖 T1；与 T5/T6 串行〕
 
 - **现状**：SessionConfig 的 batch_size 用**第一个微批的行数定格**（首批 1 行则该语句线程永远 batch_size=1，后续 8000 行微批被切成 8000 个单行 RecordBatch 流过整个计划）；SQL 每微批重新 parse+plan。
 - **方案**：batch_size 固定为 poll_rows 而非首批行数；SQL 物化为 LogicalPlan 每语句一次（`tailrace-ir` 的 `build_plan` 是现成计划产物，接线执行层）；DataFusion memory pool 配置进 plan options。
 - **验收**：`max_rows_per_batch` 生效单测（首批 1 行 + 后续 8000 行 → 计划执行批数下降，DataFusion explain metrics 断言）；宏基准 RSS/吞吐对比入 BENCHMARKS.md；全量测试绿。
 - **文件域**：tailrace-runtime（session 组装）、tailrace-transform、tailrace-ir。
+> 结果：batch_size 固定为 poll_rows（`TransformOptions`，session 组装一次定型）；SQL 物化为 LogicalPlan 每语句一次（tailrace-ir 新增 pub `build_exec_plan` 组装期 parse+plan——坏 SQL 部署即失败；执行层新入口 `transform_plan` 每微批仅换 `src` source Arc，qualifier 由计划锚定）；memory pool 进 session 组装（`RuntimeEnvBuilder::with_memory_limit`，默认 256MiB/语句；如实登记：DF48 pool 对部分算子不强制，64KiB 池下 8000 组 agg 照常完成，装配有单测断言）。**机制修正（探针实证）**：任务卡所述「8000 行切成单行批」在 DF48 内存表路径仅对**聚合输出**成立（scan/project 不切批），验收测试按实证锚定：首批 1 行+后续 8000 行 → 执行批数 **8000→1**（DF48 无 `output_batches` 指标于聚合/投影计划——已按 explain 表真实指标+collect 批数断言并在 BENCHMARKS §4.4 注明）。微基准（同机同日）：identity **19.3→30.6M（+58%）**、filter **+20%**、groupby **+30%**（p<0.05）；宏基准吞吐持平 25138→25094（scan/project 形 SQL+debug 档 decode/fsync 主导，增益被链路稀释）、node 峰值 RSS 46888→49124 KiB（物化计划常驻 +2.2MiB）。过程修复：契约测试抓到 serve 部署 handler 异步上下文内嵌套建 runtime panic → `build_exec_plan` 改专用线程。测试：transform 4 + runtime 10 + ir 2 passed（golden 字节稳定）、契约 7/7；clippy `-D warnings` 绿。
 
 ### T8 console 心跳写优化（~1 人日）✅
 
