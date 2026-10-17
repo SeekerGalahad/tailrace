@@ -74,12 +74,13 @@
 - **验收**：criterion decode/transform 微基准前后对比表入 BENCHMARKS.md（具体倍数以实测为准，不预填）；既有 decode/transform 测试 + 契约测试全绿；宏基准吞吐行前后对比。
 - **文件域**：tailrace-decode、conn-kafka（source 侧）、conn-file、conn-doris、tailrace-connector（如 trait 签名牵连）。
 
-### T4 毒数据载体：JSON-lines（~1 人日）☐
+### T4 毒数据载体：JSON-lines（~1 人日）✅
 
 - **现状**：kafka sink 用 CSV 载体——含换行字段触发序列化 bail → 语句线程 Err → 注册表重启循环 → 游标无推进 ×3 → **FAILED 终态**（毒记录永久杀死管道）；CSV 同时把数字列降级字符串；CSV 解码器无引号转义（RFC4180 不合规）。
 - **方案**：sink 载体换 JSON-lines（file sink 已用 `arrow::json::LineDelimitedWriter`，同款替换）；CSV 解码器换 `arrow` csv reader 或 `csv` crate（RFC4180 合规）。
 - **验收**：新增单测——含换行/引号/emoji 字段的行经 kafka sink 序列化可被 `arrow::json::Reader` 无损回读；e2e 毒数据场景（L3：kafka→kafka 或 file→kafka 持续 ≥10 分钟 RUNNING 且行数守恒）入 smoke `--full`；`cargo test -p tailrace-conn-kafka -p tailrace-decode` 绿。
 - **文件域**：conn-kafka（sink 侧）、tailrace-decode（csv 分支）。
+> 结果：8d0a8fc kafka sink载体CSV→JSON-lines（arrow::json::LineDelimitedWriter，与file sink同款，抽出encode_json_lines）消除毒记录bail-重启循环-FAILED终态；CsvDecoder由裸split(',')换csv crate RFC4180记录文法（带引号逗号/双写引号/字段内换行，逐列强制语义不变：坏数字降null不丢行）；毒数据单测4行换行/引号/emoji/控制字符经sink序列化后arrow::json::Reader无损回读（4/4字段相等，int64/float64类型保持，一行一记录不变量）；验收cargo test -p tailrace-conn-kafka -p tailrace-decode --locked＝12 passed/0 failed；依赖仅csv="1.4"（经arrow-csv已在lock，仅+1条边零新包）。
 
 ### T5 分区并行·方案 a（~2 人日）☐〔依赖 T1；与 T3/T6 串行〕
 
@@ -128,7 +129,7 @@
 - **文件域**：console api/pipelines.rs（SSE 桥）、web LogTerminal.vue、monitor.vue。
 - **结果**（2026-10-17）：SSE 桥接受 `after_seq` 查询参数种子化引擎游标（>0 首拉即增量、跳过尾屏重放；背压结构 bounded 64/断连感知/300s 未动）；LogTerminal 接管重连（2s 节奏）：重建 channel 携带 `&after_seq=<lastSeq>`、`seq<=lastSeq` 丢弃、重连不清空已显示行；monitor.vue `v-if="deployed"` 才挂 LogTerminal（未部署管道不再发起 SSE → 无无限重连死循环）。验收数字：新增集成测试 2 个——重连不重放（首屏收 seq 1..3 断开，引擎补 seq 4，`after_seq=3` 重连仅流 seq=4，且 mock 引擎侧证实首拉即 `after_seq=3` 而非 tail）与未部署单帧 `eof:not_deployed` 即收流；`cargo test -p tailrace-console` **25 passed / 0 failed**；clippy `--all-targets --locked -D warnings` 绿；`pnpm typecheck` + `pnpm build` 绿。
 
-### T11 CI/测试深化 + docker 链路首跑（~2 人日）☑
+### T11 CI/测试深化 + docker 链路首跑（~2 人日）✅
 
 - **现状**：契约测试已进 CI，但 chaos/活性测试仍 live-gated 跳过；`docker-compose.yml`（Kafka+Doris）与 `smoke.sh --full` 编排就绪**从未实跑**（v0.1.0 如实登记的遗留）。
 - **方案**：
@@ -138,6 +139,7 @@
 - **验收**：本地 OrbStack 全链绿（截图/日志摘要入 docs/dev/）；CI 新增 chaos job 绿；`docker compose down -v` 后现场无残留（`docker ps` 空）。
 - **文件域**：tests/chaos.rs、conn-kafka 测试、docker-compose.yml、smoke.sh、ci.yml。
 - **结果**（2026-10-17）：本地 OrbStack 首跑**两轮 38/44 → 修复后 44/44 全绿**（全程 11m20s 含 600s 毒数据浸泡；S9 守恒 1700==1700==1700==COUNT，S9.9 换行/引号/emoji/中文字节级往返；`down -v` 后容器/网络 0 残留；容器内存峰值 kafka 372MiB / fe 867MiB / be 1.08GiB——runner 预算依据）。首跑挖出并修掉一串真问题（详见 `docs/dev/T11-docker-compose-smoke-full-first-run-2026-10-17.md` F1–F10）：镜像源（bitnami 消失/Doris tag 改名）、宿主盘满两轮复发（BDB `DiskLimitException`，清 17G target/debug 后 BE 5s 注册 Alive）、console 部署计划 `stream_load_url` 丢斜杠→全量 flush 404（已加回归断言钉住完整 URL）、BE healthcheck 不感知 FE 注册 + smoke 建表步假绿（`mysql -e` 出错仍 exit 0）、**Doris CSV 载体在官方 be-2.1.7 无 RFC4180 模式**（实测矩阵：任一 enclose/escape 组合都毁掉双写引号/逗号行）→ conn-doris 载体换 **JSON lines**（`format:json`+`read_json_by_line`，serde_json 转义全覆盖；新增 `doris_json_carrier_poison_roundtrip` 单测钉毒值往返）。testcontainers 接入：chaos 与 conn-kafka 活性在 `TAILRACE_TESTCONTAINERS=1` 下自起 ephemeral Kafka+Doris（确定端口/泄漏清理重试/nofile ulimit/Alive 门/group 加入窗口，F7/F8 八轮调试收敛），本地实跑 chaos **1 passed 60.56s**（kill-9@5s → 重启 → COUNT==5 幂等对账）、conn-kafka 活性 **1 passed 8.60s**，默认 live-gate 语义保留；ci.yml 新增 chaos job（+runner vm.max_map_count=2e6）并把 smoke job 升级 `SMOKE_FULL_SOAK_SECS=180 --full`（≥10min 口径由本地默认 600s 承担）。CI 绿门禁留待 push 后 GitHub Actions 实跑（本波门禁统一执行）。
+> 结果：9a2a7a7 docker-compose(Kafka+Doris)+smoke --full 本地首跑从两轮 38/44 修到 44/44 全绿（11m20s 含 600s 毒数据浸泡，1700 行端到端守恒、毒值字节级往返）；修掉 console plan URL 丢斜杠(404)、DorisSink CSV→JSON-lines 载体、BE 注册感知健康检查等 F1–F10；chaos 与 conn-kafka 活性接 testcontainers（本地 chaos 1 passed 60.56s、活性 1 passed 8.60s）并新增 CI chaos job；数字已登记 roadmap/BENCHMARKS.md/T11 文档。
 
 ## 五、波次编排（agent 工作流执行协议）
 
