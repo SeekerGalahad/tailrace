@@ -91,6 +91,7 @@
 - **验收**：多分区 topic 宏基准吞吐对比（a vs 现状）入 BENCHMARKS.md；offsets 正确性断言——重启后不丢不重（totals 单调且重启后继续增长）；NO_PROGRESS_LIMIT 语义回归测试；契约测试全绿。
 - **文件域**：tailrace-runtime 主循环、conn-kafka poll 路径。
 > 结果：`decode_poll` 同 poll chunks 连续切片分组→scoped 线程并行 decode 到各自 ColBatch→`concat_batches` 按 chunk 序合并；低于 512×2 chunks 走原串行路径（涓流零开销）；游标语义（flush 点整体提交）与 NO_PROGRESS_LIMIT=3 完全不动；牵连 `Decoder: Send + Sync` 一处 trait 声明（4 个实现均无状态 unit struct，零实现改动）；conn-kafka poll 路径验证后无需 diff（rdkafka 单 consumer 拉取边界，属 R3 方案 b）。验收数字（交错 A/B，同窗口各 4 轮，BENCHMARKS §4.5）：多分区 kafka(P=6)→file **21396→24658 rows/s（+15.2%，debug 档）**，file→file 顺带 +16~19%；方法学修正：不交错先后测量同二进制漂移 16.4K→25.0K，不可比。动工前先写的 5 个语义回归测试（部分分区指纹/重启不丢不重 6800 行唯一键/totals 单调 5000→6800/NO_PROGRESS=3 FAILED 判决/进步复位不误杀）+ 并行等价性单测（4096 chunks 混合 Append/Skip/Bad，JSON-lines 编码字节级一致）全绿；契约套件抓到并行化初版 Fail 策略 bad_now 错接（=DLQ 载荷数）已修。clippy -D warnings 0；runtime/decode/contract 32 passed/0 failed。
+> 结果：50ee4b5 T5 方案a落地：同 poll chunks 连续切片分组→scoped 线程并行 decode 到各自 ColBatch→concat_batches 按 chunk 序合并（<1024 chunks 走原串行路径），游标 flush 点整体提交与 NO_PROGRESS_LIMIT=3 语义不动；交错 A/B 验收 kafka(6分区)→file 21396→24658 rows/s（+15.2%，debug 档），file→file 顺带 +16~19%；动工前先写的 5 个语义回归测试（指纹/重启不丢不重 6800 唯一键/totals 单调/NO_PROGRESS=3/进步复位）+ 并行等价性单测（4096 chunks 字节级一致）全绿，clippy 0 警告，32 测试 0 失败。
 
 ### T6 攒批三阈值（~2 人日）☐〔依赖 T1；与 T5 串行〕
 
