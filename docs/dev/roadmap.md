@@ -100,6 +100,7 @@
 - **验收**：三阈值各自触发的单测（构造行数触发/字节触发/时间触发三场景）；批大小分布指标入 BENCHMARKS.md；契约测试全绿。
 - **文件域**：tailrace-runtime flush 逻辑、tailrace-connector sink trait、conn-doris / conn-kafka / conn-file。
 > 结果（2026-10-17）：三阈值条件提取为 `RunOptions::flush_due` 单一谓词（两语句主循环共用；RunOptions/registry 注释钉住 `sink.buffer-flush.max-rows/max-bytes/interval` 参数映射，plan 面同名三维 flushRows/flushBytes/flushIntervalMs 经 clamp 接线不变）；`KafkaSink::buffered_bytes()` 从默认 0 改为**真实在途计量**（SinkProducerContext 投递回调记账：enqueue +payload/ delivery −payload，`in_flight_bytes` 原子计数）——至此 file（arrow 内存）/doris（carrier 字节）/kafka（在途 payload）三类 sink 字节边界全部真实（v0.1.0 时仅 kafka 缺）。验收数字：三阈值隔离单测（谓词级 13 断言 + 真 file→file 集成 3 场景：行数 500/200/100→恰 2 次 200 行 flush；字节 300/1024B/100→3 次 100 行；时间 100/1s→idle 路径 1 次；另两阈值各场景不可达保证归属）全绿，稳定性 6/6 轮；kafka buffered_bytes 离线精确账（==JSON-lines 字节总量、失败 flush 保留）+ testcontainers 真链路 flush 后==0（8.80s）；批大小分布入 BENCHMARKS.md §4.6（默认阈值 6 批全 16000+终局 4000；128KiB 字节档 13 批 p50=8000）+ 粒度事实如实登记（检查点在微批边界，行数边界以 poll_rows 为步进，Doris connector 逐 record 检查）；契约 7/7 绿；clippy -D warnings 0。
+> 结果：2eedf12 T6 完成：三阈值（行/字节/时间任一满足即 flush）提取为 RunOptions::flush_due 单一谓词并钉住 Doris Flink connector sink.buffer-flush.max-rows/max-bytes/interval 参数映射；KafkaSink::buffered_bytes() 从默认 0 改为真实在途计量（投递回调 enqueue+payload/delivery−payload 原子账），file/doris/kafka 三 sink 字节边界全部真实；三阈值三场景集成测试+谓词隔离单测全绿（稳定性 6/6 轮），批大小分布指标入 BENCHMARKS.md §4.6（默认阈值 6 批全 16000+终局 4000；128KiB 字节档 13 批 p50=8000），契约 7/7 绿、clippy -D warnings 0 告警。
 
 ### T7 内存治理（~2 人日）✅〔依赖 T1；与 T5/T6 串行〕
 
