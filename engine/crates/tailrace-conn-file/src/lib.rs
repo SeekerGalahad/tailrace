@@ -242,30 +242,34 @@ impl Source for FileSource {
             .ok_or_else(|| anyhow::anyhow!("source not opened"))?;
         let mut out = Vec::new();
         let started = Instant::now();
-        let mut line = String::new();
+        // Byte-oriented read stack (T3): read_until fills the Vec straight
+        // from the OS buffer, and a complete line with no pending half-line
+        // moves into the chunk as-is. The old String-based stack copied every
+        // line twice (extend into `full` + `from_utf8_lossy(..).to_vec()`).
+        let mut line: Vec<u8> = Vec::new();
         while out.len() < max_rows && started.elapsed() < deadline {
             line.clear();
-            let n = reader.read_line(&mut line)?;
+            let n = reader.read_until(b'\n', &mut line)?;
             if n == 0 {
                 break; // EOF (read everything this round; a half line stays buffered)
             }
-            if line.ends_with('\n') {
+            if line.last() == Some(&b'\n') {
                 // full line: joined with any earlier half line, cursor advances
                 // (a crash re-reads from the line start)
-                let mut full = std::mem::take(&mut self.partial);
-                full.extend_from_slice(line.as_bytes());
+                let full = if self.partial.is_empty() {
+                    std::mem::take(&mut line)
+                } else {
+                    let mut joined = std::mem::take(&mut self.partial);
+                    joined.extend_from_slice(&line);
+                    joined
+                };
                 self.byte_pos += full.len() as u64;
-                out.push(SourceChunk::plain(
-                    String::from_utf8_lossy(&full)
-                        .trim_end()
-                        .as_bytes()
-                        .to_vec(),
-                ));
+                out.push(SourceChunk::plain(trim_tail_owned(full)));
             } else {
                 // half line: buffered, not delivered, cursor not advanced —
                 // delivered only once the writer completes the newline; a
                 // crash also re-reads from the line start (no half-line data)
-                self.partial.extend_from_slice(line.as_bytes());
+                self.partial.extend_from_slice(&line);
             }
         }
         Ok(out)
@@ -276,6 +280,26 @@ impl Source for FileSource {
             path: self.path.display().to_string(),
             byte_pos: self.byte_pos,
         }
+    }
+}
+
+/// Trim a line's trailing whitespace in place and hand the buffer back (T3:
+/// every line used to be re-materialized through
+/// `String::from_utf8_lossy(&full).trim_end().as_bytes().to_vec()` — an
+/// unconditional full copy). Valid UTF-8 truncates in place; invalid UTF-8
+/// keeps the lossy-replacement path (byte-for-byte identical output either
+/// way: `trim_end`'s prefix length is the byte offset to keep).
+fn trim_tail_owned(mut full: Vec<u8>) -> Vec<u8> {
+    match std::str::from_utf8(&full) {
+        Ok(s) => {
+            let keep = s.trim_end().len();
+            full.truncate(keep);
+            full
+        }
+        Err(_) => String::from_utf8_lossy(&full)
+            .trim_end()
+            .as_bytes()
+            .to_vec(),
     }
 }
 
@@ -391,36 +415,23 @@ impl Sink for FileSink {
             if let Some(parent) = self.target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            // the whole batch lands in a tmp file (fsync) before appending to
-            // the final file — a crash leaves an ignorable tmp behind and the
-            // final file never shows a half JSON line
-            let tmp = self.target.with_extension(format!(
-                "append.{}.{}.tmp",
-                std::process::id(),
-                self.seq
-            ));
-            {
-                let mut t = std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&tmp)?;
-                t.write_all(&out)?;
-                t.sync_all()?;
-            }
             // before the first open, recover a historical half line (a
             // newline-less tail left by a past crash — truncate and warn)
             if self.seq == 0 {
                 recover_partial_tail(&self.target)?;
             }
+            // (T3) the encoded batch appends straight from memory. The old
+            // detour — write a tmp file + fsync, read the whole thing back,
+            // append, fsync again — provided no extra crash guarantee (an
+            // interrupted append can still leave a half line either way;
+            // recover_partial_tail is the actual repair) while paying a full
+            // extra write, read and fsync per flush.
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&self.target)?;
-            let buf = std::fs::read(&tmp)?;
-            f.write_all(&buf)?;
+            f.write_all(&out)?;
             f.sync_all()?;
-            let _ = std::fs::remove_file(&tmp);
             // seq advances (a constant append.0 used to give two flushes the
             // same idempotency key, breaking reconciliation)
             let key = format!("{}/append.{}", self.target.display(), self.seq);

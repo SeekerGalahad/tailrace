@@ -11,6 +11,7 @@
 
 use std::time::Duration;
 
+use bytes::{Bytes, BytesMut};
 use datafusion::arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
 use datafusion::arrow::record_batch::RecordBatch;
 
@@ -27,7 +28,7 @@ use tailrace_connector::{Sink, SinkAck};
 /// serde_json escaping makes the carrier total over arbitrary UTF-8 —
 /// no field value can break the framing.
 fn append_json_lines(
-    out: &mut Vec<u8>,
+    out: &mut BytesMut,
     batch: &RecordBatch,
     columns: &[String],
 ) -> anyhow::Result<()> {
@@ -210,7 +211,11 @@ pub struct DorisSink {
     label_prefix: String,
     label_seq: u64,
     pending_rows: u64,
-    buf: Vec<u8>,
+    /// In-flight carrier buffer (T3: `BytesMut` grows like a Vec on the write
+    /// side; at flush time it `freeze()`s into a refcounted `Bytes` the retry
+    /// loop hands to reqwest via cheap clones — the old `body.to_vec()`
+    /// memcpy'd the whole buffer on every attempt).
+    buf: BytesMut,
     /// Retry backoff sequence (after the Nth failure sleep backoff_ms[N-1]
     /// then retry; exhaustion kills)
     retry_backoff_ms: Vec<u64>,
@@ -250,7 +255,7 @@ impl DorisSink {
             label_prefix: format!("{}-r{}", label_prefix.into(), std::process::id()),
             label_seq: 0,
             pending_rows: 0,
-            buf: Vec::with_capacity(16 * 1024 * 1024),
+            buf: BytesMut::with_capacity(16 * 1024 * 1024),
             retry_backoff_ms: vec![2_000, 8_000, 30_000],
             request_timeout_ms: 120_000,
         }
@@ -289,10 +294,11 @@ impl DorisSink {
         Ok(self.client.get().expect("just initialized"))
     }
 
-    /// One send attempt with terminal-outcome judgment. The body is borrowed
-    /// read-only — on failure self.buf stays intact for the retry (a failure
-    /// never drops the buffer).
-    fn send_once(&self, label: &str, body: &[u8]) -> Result<FlushOutcome, FlushError> {
+    /// One send attempt with terminal-outcome judgment. The body is a
+    /// refcounted `Bytes` — the reqwest clone is free, and on failure the
+    /// shared buffer stays intact for the retry (a failure never drops the
+    /// buffered rows).
+    fn send_once(&self, label: &str, body: &Bytes) -> Result<FlushOutcome, FlushError> {
         let brief = |t: &str| -> String { t.chars().take(300).collect() };
         let resp = self
             .client()
@@ -314,7 +320,7 @@ impl DorisSink {
                 self.sequence_column.as_deref().unwrap_or(""),
             )
             .header("Expect", "100-continue")
-            .body(body.to_vec())
+            .body(body.clone())
             .send();
         let resp = match resp {
             Ok(r) => r,
@@ -416,18 +422,20 @@ impl Sink for DorisSink {
             });
         }
         let label = format!("{}_{}", self.label_prefix, self.label_seq);
+        // (T3) freeze the accumulated carrier into a refcounted body: every
+        // retry attempt clones the handle (refcount), not the bytes.
+        let body = std::mem::take(&mut self.buf).freeze();
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
-            match self.send_once(&label, &self.buf) {
+            match self.send_once(&label, &body) {
                 Ok(_) => {
                     self.label_seq += 1;
                     let rows = self.pending_rows;
                     self.pending_rows = 0;
                     // restore the buffer watermark (keep capacity to avoid
                     // regrowing per batch)
-                    self.buf.clear();
-                    self.buf.reserve(16 * 1024 * 1024);
+                    self.buf = BytesMut::with_capacity(16 * 1024 * 1024);
                     return Ok(SinkAck {
                         rows,
                         kind: "DORIS_STREAM_LOAD",
@@ -453,6 +461,12 @@ impl Sink for DorisSink {
                     } else {
                         "not retryable"
                     };
+                    // the attempt is terminal — hand the buffered bytes back
+                    // (try_into_mut is free when reqwest released its clone;
+                    // the fallback copy only happens if it somehow hasn't)
+                    self.buf = body
+                        .try_into_mut()
+                        .unwrap_or_else(|b| BytesMut::from(&b[..]));
                     anyhow::bail!(
                         "stream load failed label={label} (attempt {attempt}, {verdict}): {}",
                         e.message

@@ -48,6 +48,21 @@ impl ColBatch {
         self.builders[i].as_mut()
     }
 
+    /// Split borrow: (schema fields, column builders). The schema's field
+    /// list IS the construct-time name cache — this hands both halves out
+    /// simultaneously so the decode loop can iterate column names **by
+    /// reference** while appending into the builders (T3: the old path
+    /// cloned a `Vec<String>` of all column names per row to work around
+    /// the borrow conflict).
+    pub fn parts(
+        &mut self,
+    ) -> (
+        &[datafusion::arrow::datatypes::FieldRef],
+        &mut [Box<dyn ArrayBuilder>],
+    ) {
+        (self.schema.fields(), &mut self.builders)
+    }
+
     pub fn len(&self) -> usize {
         self.builders.first().map(|b| b.len()).unwrap_or(0)
     }
@@ -245,18 +260,36 @@ fn append_bool(b: &mut dyn ArrayBuilder, v: bool) {
 }
 
 /// Decode outcome: Append=column-filled / Skip=dropped by pushdown early
-/// filter / Bad=parse failure.
+/// filter / Bad=parse failure (carrying the raw bytes back).
 #[derive(PartialEq, Debug)]
 pub enum Decoded {
     Append,
     Skip,
-    Bad,
+    /// Parse failure. The raw bytes ride along (ownership round-trip: the
+    /// caller's bad-row policy — DLQ quarantine or fail-sample — needs them
+    /// after the decoder has consumed the buffer; handing them back here
+    /// avoids re-cloning what the owned-`Vec<u8>` signature just removed).
+    ///
+    /// Byte-fidelity caveat (T3, measured): the in-place simd-json parse may
+    /// already have rewritten escape sequences in strings it finished
+    /// scanning before hitting the failure — a poisoned row like
+    /// `{"ok":"\u0041","bad":` comes back with that escape rewritten. Plain
+    /// malformed rows come back byte-identical. The pre-T3 scratch-copy
+    /// design preserved the original bytes exactly at the cost of one full
+    /// copy per **every** message; removing that copy on the happy path
+    /// wins the trade (the DLQ sample stays quarantine-grade readable).
+    Bad(Vec<u8>),
 }
 
 /// Decoder: bytes → straight into the target schema columns. pushdown = the
 /// hook for compile-time constant-predicate early filtering.
+///
+/// The signature takes the buffer **by value** (T3 zero-copy): the JSON
+/// decoders parse simd-json in place inside it, the parquet decoder wraps it
+/// into `bytes::Bytes` — no per-message copy is made between the source's
+/// payload and the parser.
 pub trait Decoder: Send {
-    fn decode(&self, raw: &[u8], batch: &mut ColBatch, pushdown: &Pushdown) -> Decoded;
+    fn decode(&self, raw: Vec<u8>, batch: &mut ColBatch, pushdown: &Pushdown) -> Decoded;
 }
 
 /// Constant-predicate pushdown (v1: equality whitelist extracted from SQL
@@ -270,30 +303,44 @@ pub struct Pushdown {
 
 // ==================== JSON (root object, direct key access) ====================
 
+/// Where an inner decode walk stopped (mirrors `Decoded` minus the buffer —
+/// the outer `decode` frame keeps owning the buffer and hands it back on the
+/// Bad path, which is only sound because the parser's borrow of it ends when
+/// the walk returns).
+#[derive(PartialEq, Debug)]
+enum WalkFail {
+    Skip,
+    Bad,
+}
+
 /// JSON decoder: root object keys write into same-named columns (schema
 /// column names match JSON keys).
 pub struct JsonDecoder;
 
-impl Decoder for JsonDecoder {
-    fn decode(&self, raw: &[u8], batch: &mut ColBatch, _pushdown: &Pushdown) -> Decoded {
-        let mut scratch = raw.to_vec();
-        let dom = match simd_json::to_borrowed_value(scratch.as_mut_slice()) {
+impl JsonDecoder {
+    /// Borrow-scoped walk: simd-json parses the buffer in place and the DOM's
+    /// borrow of it stays inside this function (the owned-buffer `decode`
+    /// frame below can then hand the buffer back on failure).
+    fn walk(buf: &mut [u8], batch: &mut ColBatch) -> Result<(), WalkFail> {
+        let dom = match simd_json::to_borrowed_value(buf) {
             Ok(v) => v,
-            Err(_) => return Decoded::Bad,
+            Err(_) => return Err(WalkFail::Bad),
         };
         // Typed extraction chain: as_str → as_i64 → as_f64 → as_bool → null.
         // (Floats and bools used to fall through to NULL when as_str/as_i64
         // both failed — whole float64/bool columns silently lost their values.)
-        for (i, f) in batch_fields(batch).iter().enumerate() {
-            match dom.get(f.as_str()).and_then(|v| v.as_str()) {
-                Some(s) => append_str(batch.column_mut(i), Some(s)),
+        let (fields, builders) = batch.parts();
+        for (i, f) in fields.iter().enumerate() {
+            let name = f.name();
+            match dom.get(name.as_str()).and_then(|v| v.as_str()) {
+                Some(s) => append_str(builders[i].as_mut(), Some(s)),
                 None => {
-                    let b = batch.column_mut(i);
-                    if let Some(iv) = dom.get(f.as_str()).and_then(|v| v.as_i64()) {
+                    let b = builders[i].as_mut();
+                    if let Some(iv) = dom.get(name.as_str()).and_then(|v| v.as_i64()) {
                         append_i64(b, iv);
-                    } else if let Some(fv) = dom.get(f.as_str()).and_then(|v| v.as_f64()) {
+                    } else if let Some(fv) = dom.get(name.as_str()).and_then(|v| v.as_f64()) {
                         append_f64(b, fv);
-                    } else if let Some(bv) = dom.get(f.as_str()).and_then(|v| v.as_bool()) {
+                    } else if let Some(bv) = dom.get(name.as_str()).and_then(|v| v.as_bool()) {
                         append_bool(b, bv);
                     } else {
                         append_str(b, None);
@@ -301,7 +348,19 @@ impl Decoder for JsonDecoder {
                 }
             }
         }
-        Decoded::Append
+        Ok(())
+    }
+}
+
+impl Decoder for JsonDecoder {
+    fn decode(&self, mut raw: Vec<u8>, batch: &mut ColBatch, _pushdown: &Pushdown) -> Decoded {
+        // simd-json mutates the buffer in place — the owned signature lets it
+        // parse straight out of the source's payload (no scratch copy).
+        match Self::walk(raw.as_mut_slice(), batch) {
+            Ok(()) => Decoded::Append,
+            Err(WalkFail::Bad) => Decoded::Bad(raw),
+            Err(WalkFail::Skip) => Decoded::Skip, // unreachable for JSON; kept for the shared shape
+        }
     }
 }
 
@@ -311,48 +370,48 @@ impl Decoder for JsonDecoder {
 /// columns after — the column order matches the console schema inference.
 pub struct OggDecoder;
 
-impl Decoder for OggDecoder {
-    fn decode(&self, raw: &[u8], batch: &mut ColBatch, pushdown: &Pushdown) -> Decoded {
-        let mut scratch = raw.to_vec();
-        let dom = match simd_json::to_borrowed_value(scratch.as_mut_slice()) {
+impl OggDecoder {
+    /// Borrow-scoped walk (same rationale as [`JsonDecoder::walk`]).
+    fn walk(buf: &mut [u8], batch: &mut ColBatch, pushdown: &Pushdown) -> Result<(), WalkFail> {
+        let dom = match simd_json::to_borrowed_value(buf) {
             Ok(v) => v,
-            Err(_) => return Decoded::Bad,
+            Err(_) => return Err(WalkFail::Bad),
         };
         let after = match dom.get("after") {
             Some(v) => v,
-            None => return Decoded::Bad, // an OGG shape must have `after`
+            None => return Err(WalkFail::Bad), // an OGG shape must have `after`
         };
-        let fields = batch_fields(batch);
+        let (fields, builders) = batch.parts();
         // Pushdown early filter: op_type outside the whitelist → dropped with
         // zero column copies.
         if !pushdown.eq_whitelist.is_empty() {
             if let Some(allowed) = pushdown.eq_whitelist.get("op_type") {
                 let op = dom.get("op_type").and_then(|v| v.as_str()).unwrap_or("");
                 if !allowed.iter().any(|a| a == op) {
-                    return Decoded::Skip;
+                    return Err(WalkFail::Skip);
                 }
             }
         }
         for (i, f) in fields.iter().enumerate() {
-            match f.as_str() {
+            match f.name().as_str() {
                 "op_type" => append_str(
-                    batch.column_mut(i),
+                    builders[i].as_mut(),
                     dom.get("op_type").and_then(|v| v.as_str()),
                 ),
                 "ogg_table" => append_str(
-                    batch.column_mut(i),
+                    builders[i].as_mut(),
                     dom.get("table").and_then(|v| v.as_str()),
                 ),
                 "ogg_ts" => append_i64(
-                    batch.column_mut(i),
+                    builders[i].as_mut(),
                     dom.get("ts").and_then(|v| v.as_i64()).unwrap_or(0),
                 ),
                 name => match after.get(name).and_then(|v| v.as_str()) {
-                    Some(s) => append_str(batch.column_mut(i), Some(s)),
+                    Some(s) => append_str(builders[i].as_mut(), Some(s)),
                     None => {
                         // Same typed chain as JsonDecoder: after.* floats and
                         // bools must not fall through to NULL.
-                        let b = batch.column_mut(i);
+                        let b = builders[i].as_mut();
                         if let Some(iv) = after.get(name).and_then(|v| v.as_i64()) {
                             append_i64(b, iv);
                         } else if let Some(fv) = after.get(name).and_then(|v| v.as_f64()) {
@@ -366,7 +425,17 @@ impl Decoder for OggDecoder {
                 },
             }
         }
-        Decoded::Append
+        Ok(())
+    }
+}
+
+impl Decoder for OggDecoder {
+    fn decode(&self, mut raw: Vec<u8>, batch: &mut ColBatch, pushdown: &Pushdown) -> Decoded {
+        match Self::walk(raw.as_mut_slice(), batch, pushdown) {
+            Ok(()) => Decoded::Append,
+            Err(WalkFail::Skip) => Decoded::Skip,
+            Err(WalkFail::Bad) => Decoded::Bad(raw),
+        }
     }
 }
 
@@ -383,10 +452,10 @@ impl Decoder for OggDecoder {
 pub struct CsvDecoder;
 
 impl Decoder for CsvDecoder {
-    fn decode(&self, raw: &[u8], batch: &mut ColBatch, _pushdown: &Pushdown) -> Decoded {
-        let line = match std::str::from_utf8(raw) {
+    fn decode(&self, raw: Vec<u8>, batch: &mut ColBatch, _pushdown: &Pushdown) -> Decoded {
+        let line = match std::str::from_utf8(&raw) {
             Ok(s) => s.trim_end(),
-            Err(_) => return Decoded::Bad,
+            Err(_) => return Decoded::Bad(raw),
         };
         if line.is_empty() {
             return Decoded::Skip;
@@ -406,13 +475,13 @@ impl Decoder for CsvDecoder {
         match rdr.read_record(&mut rec) {
             Ok(true) => {}
             Ok(false) => return Decoded::Skip, // defensive: empty input
-            Err(_) => return Decoded::Bad,
+            Err(_) => return Decoded::Bad(raw),
         }
-        let typed = batch_fields_typed(batch);
-        for (i, (_name, dt)) in typed.iter().enumerate() {
+        let (fields, builders) = batch.parts();
+        for (i, f) in fields.iter().enumerate() {
             let v = rec.get(i).map(str::trim).unwrap_or("");
-            let b = batch.column_mut(i);
-            match dt {
+            let b = builders[i].as_mut();
+            match f.data_type() {
                 DataType::Int64 => match v.parse::<i64>() {
                     Ok(n) => append_i64(b, n),
                     Err(_) => append_i64_opt(b, None),
@@ -444,54 +513,31 @@ impl Decoder for CsvDecoder {
 pub struct ParquetDecoder;
 
 impl Decoder for ParquetDecoder {
-    fn decode(&self, raw: &[u8], batch: &mut ColBatch, _pushdown: &Pushdown) -> Decoded {
+    fn decode(&self, raw: Vec<u8>, batch: &mut ColBatch, _pushdown: &Pushdown) -> Decoded {
         use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-        let bytes = bytes::Bytes::from(raw.to_vec());
+        // `From<Vec<u8>>` wraps the allocation (refcount) — the old path
+        // copied the whole file here.
+        let bytes = bytes::Bytes::from(raw);
         let builder = match ParquetRecordBatchReaderBuilder::try_new(bytes) {
             Ok(b) => b,
-            Err(_) => return Decoded::Bad,
+            Err(_) => return Decoded::Bad(Vec::new()),
         };
         let reader = match builder.build() {
             Ok(r) => r,
-            Err(_) => return Decoded::Bad,
+            Err(_) => return Decoded::Bad(Vec::new()),
         };
         for rb in reader {
             match rb {
                 Ok(rb) => {
                     if batch.append_batch(&rb).is_err() {
-                        return Decoded::Bad;
+                        return Decoded::Bad(Vec::new());
                     }
                 }
-                Err(_) => return Decoded::Bad,
+                Err(_) => return Decoded::Bad(Vec::new()),
             }
         }
         Decoded::Append
     }
-}
-
-// ColBatch field-name snapshot (avoids borrow conflicts: clone the names
-// first, then write column by column).
-fn batch_fields(batch: &ColBatch) -> Vec<String> {
-    batch_fields_of(batch)
-}
-
-fn batch_fields_of(batch: &ColBatch) -> Vec<String> {
-    batch
-        .schema()
-        .fields()
-        .iter()
-        .map(|f| f.name().clone())
-        .collect()
-}
-
-/// Field name + type snapshot (CsvDecoder parses by column type).
-fn batch_fields_typed(batch: &ColBatch) -> Vec<(String, DataType)> {
-    batch
-        .schema()
-        .fields()
-        .iter()
-        .map(|f| (f.name().clone(), f.data_type().clone()))
-        .collect()
 }
 
 impl ColBatch {
@@ -532,7 +578,7 @@ mod tests {
             .insert("op_type".into(), vec!["I".into(), "U".into()]);
         let mut appended = 0;
         for m in msgs {
-            if ogg.decode(m, &mut batch, &pushdown) == Decoded::Append {
+            if ogg.decode(m.to_vec(), &mut batch, &pushdown) == Decoded::Append {
                 appended += 1;
             }
         }
@@ -561,12 +607,16 @@ mod tests {
         ]));
         let mut batch = ColBatch::new(schema, 4);
         assert_eq!(
-            JsonDecoder.decode(br#"{"a":"x","n":3}"#, &mut batch, &Pushdown::default()),
+            JsonDecoder.decode(
+                br#"{"a":"x","n":3}"#.to_vec(),
+                &mut batch,
+                &Pushdown::default()
+            ),
             Decoded::Append
         );
         assert_eq!(
-            JsonDecoder.decode(b"not-json", &mut batch, &Pushdown::default()),
-            Decoded::Bad
+            JsonDecoder.decode(b"not-json".to_vec(), &mut batch, &Pushdown::default()),
+            Decoded::Bad(b"not-json".to_vec())
         );
         let rb = batch.finish().unwrap();
         assert_eq!(rb.num_rows(), 1);
@@ -588,7 +638,7 @@ mod tests {
         let mut batch = ColBatch::new(schema, 4);
         assert_eq!(
             JsonDecoder.decode(
-                br#"{"ratio":0.5,"flag":true,"note":"ok","exact":2}"#,
+                br#"{"ratio":0.5,"flag":true,"note":"ok","exact":2}"#.to_vec(),
                 &mut batch,
                 &Pushdown::default()
             ),
@@ -596,7 +646,7 @@ mod tests {
         );
         assert_eq!(
             JsonDecoder.decode(
-                br#"{"ratio":1.5,"flag":false,"note":9,"exact":3.25}"#,
+                br#"{"ratio":1.5,"flag":false,"note":9,"exact":3.25}"#.to_vec(),
                 &mut batch,
                 &Pushdown::default()
             ),
@@ -656,7 +706,8 @@ mod tests {
         let mut batch = ColBatch::new(schema, 4);
         assert_eq!(
             OggDecoder.decode(
-                br#"{"table":"T","op_type":"I","ts":1,"after":{"ratio":0.75,"flag":true}}"#,
+                br#"{"table":"T","op_type":"I","ts":1,"after":{"ratio":0.75,"flag":true}}"#
+                    .to_vec(),
                 &mut batch,
                 &Pushdown::default()
             ),
@@ -687,12 +738,12 @@ mod tests {
         ]));
         let mut batch = ColBatch::new(schema, 8);
         assert_eq!(
-            CsvDecoder.decode(b"w1,10,0.5,true", &mut batch, &Pushdown::default()),
+            CsvDecoder.decode(b"w1,10,0.5,true".to_vec(), &mut batch, &Pushdown::default()),
             Decoded::Append
         );
         // Bad numeric columns degrade to null (the row is not dropped)
         assert_eq!(
-            CsvDecoder.decode(b"w2,xx,,false", &mut batch, &Pushdown::default()),
+            CsvDecoder.decode(b"w2,xx,,false".to_vec(), &mut batch, &Pushdown::default()),
             Decoded::Append
         );
         let rb = batch.finish().unwrap();
@@ -743,7 +794,7 @@ mod tests {
         let mut batch = ColBatch::new(schema, 8);
         for (raw, _want_name, _want_qty) in &cases {
             assert_eq!(
-                CsvDecoder.decode(raw, &mut batch, &Pushdown::default()),
+                CsvDecoder.decode(raw.to_vec(), &mut batch, &Pushdown::default()),
                 Decoded::Append
             );
         }
@@ -780,24 +831,24 @@ mod tests {
         ]));
         let mut batch = ColBatch::new(schema, 8);
         assert_eq!(
-            CsvDecoder.decode(b"", &mut batch, &Pushdown::default()),
+            CsvDecoder.decode(b"".to_vec(), &mut batch, &Pushdown::default()),
             Decoded::Skip
         );
         assert_eq!(
-            CsvDecoder.decode(b"\n", &mut batch, &Pushdown::default()),
+            CsvDecoder.decode(b"\n".to_vec(), &mut batch, &Pushdown::default()),
             Decoded::Skip
         );
         assert_eq!(
-            CsvDecoder.decode(b"   ", &mut batch, &Pushdown::default()),
+            CsvDecoder.decode(b"   ".to_vec(), &mut batch, &Pushdown::default()),
             Decoded::Skip
         );
         assert_eq!(
-            CsvDecoder.decode(b"\xff\xfe", &mut batch, &Pushdown::default()),
-            Decoded::Bad
+            CsvDecoder.decode(b"\xff\xfe".to_vec(), &mut batch, &Pushdown::default()),
+            Decoded::Bad(b"\xff\xfe".to_vec())
         );
         // ragged: one field only → qty column null, row kept
         assert_eq!(
-            CsvDecoder.decode(b"solo", &mut batch, &Pushdown::default()),
+            CsvDecoder.decode(b"solo".to_vec(), &mut batch, &Pushdown::default()),
             Decoded::Append
         );
         let rb = batch.finish().unwrap();
@@ -860,7 +911,7 @@ mod tests {
         ]));
         let mut batch = ColBatch::new(target, 8);
         assert_eq!(
-            ParquetDecoder.decode(&raw, &mut batch, &Pushdown::default()),
+            ParquetDecoder.decode(raw, &mut batch, &Pushdown::default()),
             Decoded::Append
         );
         let out = batch.finish().unwrap();
@@ -893,6 +944,40 @@ mod tests {
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
+    /// T3: the owned-buffer signature hands the buffer back on Bad (the
+    /// DLQ/fail-sample path depends on it). Plain malformed rows come back
+    /// byte-identical; the doc on `Decoded::Bad` covers the escape-rewrite
+    /// caveat measured on poisoned rows carrying escapes.
+    #[test]
+    fn bad_rows_hand_the_buffer_back() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, true)]));
+        for poisoned in [
+            b"not-json".to_vec(),
+            b"{\"a\":\"x".to_vec(),
+            b"{\"a\":1,\"b\":".to_vec(),
+            b"\xff\xfe".to_vec(),
+        ] {
+            let mut batch = ColBatch::new(schema.clone(), 4);
+            match JsonDecoder.decode(poisoned.clone(), &mut batch, &Pushdown::default()) {
+                Decoded::Bad(buf) => {
+                    assert_eq!(buf.len(), poisoned.len(), "buffer returned whole");
+                    assert_eq!(buf, poisoned, "plain malformed rows stay byte-identical");
+                }
+                other => panic!("expected Bad, got {other:?}"),
+            }
+            // OGG shape without `after` also hands the buffer back
+            let mut batch = ColBatch::new(schema.clone(), 4);
+            match OggDecoder.decode(
+                b"{\"table\":\"T\"}".to_vec(),
+                &mut batch,
+                &Pushdown::default(),
+            ) {
+                Decoded::Bad(buf) => assert_eq!(buf, b"{\"table\":\"T\"}".to_vec()),
+                other => panic!("expected Bad, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn coerce_keeps_column_lengths_equal() {
         // Regression lock: numbers into utf8 columns / numeric strings into

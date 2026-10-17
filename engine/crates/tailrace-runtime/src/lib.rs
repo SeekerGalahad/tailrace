@@ -544,7 +544,7 @@ fn run_statement_serve(
         let mut bad_raws: Vec<Vec<u8>> = Vec::new();
         let mut fail_sample: Option<String> = None;
         for chunk in chunks {
-            match st.decoder.decode(&chunk.raw, &mut st.batch, &st.pushdown) {
+            match st.decoder.decode(chunk.raw, &mut st.batch, &st.pushdown) {
                 Decoded::Append => stats.appended += 1,
                 Decoded::Skip => {
                     stats.skipped += 1;
@@ -552,21 +552,17 @@ fn run_statement_serve(
                         c.skipped.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                Decoded::Bad => {
+                Decoded::Bad(raw) => {
                     stats.bad_rows += 1;
                     bad_now += 1;
                     match st.bad_row_policy {
                         BadRowPolicy::Fail => {
                             if fail_sample.is_none() {
-                                fail_sample = Some(
-                                    String::from_utf8_lossy(&chunk.raw)
-                                        .chars()
-                                        .take(120)
-                                        .collect(),
-                                );
+                                fail_sample =
+                                    Some(String::from_utf8_lossy(&raw).chars().take(120).collect());
                             }
                         }
-                        BadRowPolicy::Dlq => bad_raws.push(chunk.raw.clone()),
+                        BadRowPolicy::Dlq => bad_raws.push(raw),
                         BadRowPolicy::Skip => {}
                     }
                 }
@@ -745,7 +741,7 @@ fn run_statement(
         let mut bad_raws: Vec<Vec<u8>> = Vec::new();
         let mut fail_sample: Option<String> = None;
         for chunk in chunks {
-            match st.decoder.decode(&chunk.raw, &mut st.batch, &st.pushdown) {
+            match st.decoder.decode(chunk.raw, &mut st.batch, &st.pushdown) {
                 Decoded::Append => stats.appended += 1,
                 Decoded::Skip => {
                     stats.skipped += 1;
@@ -753,21 +749,17 @@ fn run_statement(
                         c.skipped.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                Decoded::Bad => {
+                Decoded::Bad(raw) => {
                     stats.bad_rows += 1;
                     bad_now += 1;
                     match st.bad_row_policy {
                         BadRowPolicy::Fail => {
                             if fail_sample.is_none() {
-                                fail_sample = Some(
-                                    String::from_utf8_lossy(&chunk.raw)
-                                        .chars()
-                                        .take(120)
-                                        .collect(),
-                                );
+                                fail_sample =
+                                    Some(String::from_utf8_lossy(&raw).chars().take(120).collect());
                             }
                         }
-                        BadRowPolicy::Dlq => bad_raws.push(chunk.raw.clone()),
+                        BadRowPolicy::Dlq => bad_raws.push(raw),
                         BadRowPolicy::Skip => {}
                     }
                 }

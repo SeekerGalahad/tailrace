@@ -9,8 +9,13 @@
 //! - fixtures are deterministic (index-derived), generated once outside the
 //!   timed loop; JSON root / OGG envelope / CSV carry the same logical row
 //!   (5 columns: utf8 ×3, int64, float64/bool), row width ≈ 90-130 bytes.
+//!
+//! T3: the decoder takes the buffer by ownership — fixtures are cloned in
+//! the (untimed) iter_batched setup and moved into the decoders, matching
+//! the runtime path (the source hands the payload buffer over; the parse
+//! happens in place).
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use std::sync::Arc;
 use tailrace_decode::{ColBatch, CsvDecoder, Decoder, JsonDecoder, OggDecoder, Pushdown};
 
@@ -84,38 +89,50 @@ fn bench_decode(c: &mut Criterion) {
 
     group.bench_function("json_root_5col", |b| {
         let dec = JsonDecoder;
-        b.iter(|| {
-            let mut batch = ColBatch::new(json_schema(), ROWS);
-            for raw in &json_rows {
-                dec.decode(std::hint::black_box(raw), &mut batch, &Pushdown::default());
-            }
-            let rb = batch.finish().expect("finish");
-            std::hint::black_box(rb);
-        });
+        b.iter_batched(
+            || json_rows.clone(),
+            |rows| {
+                let mut batch = ColBatch::new(json_schema(), ROWS);
+                for raw in rows {
+                    dec.decode(raw, &mut batch, &Pushdown::default());
+                }
+                let rb = batch.finish().expect("finish");
+                std::hint::black_box(rb);
+            },
+            BatchSize::PerIteration,
+        );
     });
 
     group.bench_function("ogg_envelope_5col", |b| {
         let dec = OggDecoder;
-        b.iter(|| {
-            let mut batch = ColBatch::new(ogg_schema(), ROWS);
-            for raw in &ogg_rows {
-                dec.decode(std::hint::black_box(raw), &mut batch, &Pushdown::default());
-            }
-            let rb = batch.finish().expect("finish");
-            std::hint::black_box(rb);
-        });
+        b.iter_batched(
+            || ogg_rows.clone(),
+            |rows| {
+                let mut batch = ColBatch::new(ogg_schema(), ROWS);
+                for raw in rows {
+                    dec.decode(raw, &mut batch, &Pushdown::default());
+                }
+                let rb = batch.finish().expect("finish");
+                std::hint::black_box(rb);
+            },
+            BatchSize::PerIteration,
+        );
     });
 
     group.bench_function("csv_5col", |b| {
         let dec = CsvDecoder;
-        b.iter(|| {
-            let mut batch = ColBatch::new(json_schema(), ROWS);
-            for raw in &csv_rows {
-                dec.decode(std::hint::black_box(raw), &mut batch, &Pushdown::default());
-            }
-            let rb = batch.finish().expect("finish");
-            std::hint::black_box(rb);
-        });
+        b.iter_batched(
+            || csv_rows.clone(),
+            |rows| {
+                let mut batch = ColBatch::new(json_schema(), ROWS);
+                for raw in rows {
+                    dec.decode(raw, &mut batch, &Pushdown::default());
+                }
+                let rb = batch.finish().expect("finish");
+                std::hint::black_box(rb);
+            },
+            BatchSize::PerIteration,
+        );
     });
 
     group.finish();

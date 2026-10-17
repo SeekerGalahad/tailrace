@@ -109,6 +109,47 @@ parse+plan——T7 物化 LogicalPlan 的改造对象）。
 | （待 T6 填） | 批大小分布指标 | — | — | — | — |
 | （待 T7 填） | macro RSS/吞吐 | — | — | — | — |
 
+### §4.1 T3 热路径零拷贝（2026-10-17，同机同日复测）
+
+改造内容：Decoder trait 收 `Vec<u8>` 所有权（JSON/OGG simd-json 原地解析，kafka→decode
+全链每消息拷贝 2→1，剩余 1 次为 rdkafka C 堆→Rust 堆的必要边界拷贝）；ColBatch 借用
+split（`parts()`）消除每行 `Vec<String>` 列名克隆（N 列 = N 次分配/行）；ParquetDecoder
+`Bytes::from(Vec)` 零拷贝包装（原整文件再拷）；FileSource 读栈字节化（完整行 move 进
+chunk，原每行 extend+lossy+to_vec 双拷贝）；FileSink jsonl flush 直接 append（原
+tmp 写+fsync+**整读回**+append+fsync）；DorisSink 载体 `BytesMut→Bytes`（重试 reqwest
+body 为 refcount clone，原每次尝试 `body.to_vec()` 全量拷贝）。
+
+「前」口径：**当前 HEAD `d979e06` 复测**（T4 已将 CSV 载体换 RFC4180 csv crate，
+§2.1 的 652.4K 为 T4 前旧数，不可再作 CSV 前值）；「后」口径：T3 工作树改造后。
+
+| bench | 前（d979e06 复测） | 后（T3） | 变化 | 备注 |
+|---|---|---|---|---|
+| decode/json_root_5col | 328.9 K rows/s | 534.9 K（另一次 438.5 K） | **+33%（保守）~ +63%** | 两次 after 样本并列 |
+| decode/ogg_envelope_5col | 319.4 K rows/s | 463.2 K rows/s | **+45%** | |
+| decode/csv_5col | 45.0 K rows/s | 50.0 K rows/s | +11% | 列名 clone 消除；csv crate 解析主导 |
+| sink/jsonl_flush_10k_rows（磁盘敏感） | 234.4 K rows/s | 458.2 K rows/s | **+95%** | 免 tmp 写+整读回+一次 fsync |
+| sink/jsonl_encode_10k_rows | 8.02 M rows/s | 6.18 M rows/s | −23% | **未改动的对照项**——本表噪声界参考 |
+| transform/identity_select_star | 22.0 M rows/s | 23.8 M rows/s | +4%（噪声内） | 零改动对照，无回归 |
+| transform/filter_project | 7.47 M rows/s | 7.61 M rows/s | +4%（噪声内） | 零改动对照 |
+| transform/groupby_aggregate | 6.09 M rows/s | 6.21 M rows/s | +1%（criterion 判 no change） | 零改动对照 |
+
+机器噪声说明：本机（Intel MBP 2019）当日同代码重复测量漂移可达 ±20%+（未改动的
+encode bench 复测 −23% 即量级参照）；表中变化远超该界者（json/ogg/flush）为确定增益，
+csv +11% 与噪声界同量级、只作方向参考。**宏基准**（file→file 全链，debug 档）：
+
+| 日期 | git | 档位 | rows | elapsed | 吞吐（rows/s） | 对照基线 |
+|---|---|---|---|---|---|---|
+| 2026-10-17 | d979e06+T3 工作树 | debug | 100000 | 4.057 s | **24649** | 基线 21739（§三）→ **+13.4%** |
+| 2026-10-17 | d979e06+T3 工作树（二次采样） | debug | 100000 | 3.961 s | **25246** | → **+16.1%** |
+
+（两次采样区间 24.6–25.2K；全链增益受 debug 档未优化构建稀释，fsync 落盘与
+console 轮询粒度主导尾延迟。）
+
+语义注记（如实登记）：JSON/OGG Bad 行还回的 buffer 可能已被 simd-json 的转义展开改写
+（实测 `{"ok":"\u0041","bad":` 类毒行；普通毒行字节不变）——DLQ 隔离样本在毒行含转义
+时为「解析视图」而非逐字节原样。这是消除每消息全量拷贝的固有取舍，已在
+`Decoded::Bad` 的 doc 注释中写明；DLQ 无字节重放机制，样本保持排查可读。
+
 ## 五、CI 口径
 
 - 微基准在 CI 只做**编译验证**（`cargo bench -p <crate> --no-run`），不上传数据、

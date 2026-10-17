@@ -1,14 +1,14 @@
 //! T1 micro-benchmarks (roadmap §四 T1): sink serialization — the jsonl line
-//! encoding `FileSink::flush` performs (`arrow::json::LineDelimitedWriter`,
-//! lib.rs:376-384) before the tmp-file append.
+//! encoding `FileSink::flush` performs (`arrow::json::LineDelimitedWriter`)
+//! before the target append.
 //!
 //! Caliber (mirrors docs/BENCHMARKS.md §方法学):
 //! - one iteration = encode ROWS rows (runtime default `flush_rows` = 10000,
 //!   3 columns: int64/utf8/float64) into a fresh `Vec<u8>`;
 //! - two shapes: `jsonl_encode_*` = serialization only (stable, disk-free);
-//!   `jsonl_flush_*` = the full `FileSink::flush` (tmp write + fsync +
-//!   read-back + append + fsync — DISK-INCLUSIVE, quoted separately as a
-//!   disk-sensitive number);
+//!   `jsonl_flush_*` = the full `FileSink::flush` (append + fsync —
+//!   DISK-INCLUSIVE, quoted separately as a disk-sensitive number; before
+//!   T3 it also wrote a tmp file + fsync + read the whole batch back);
 //! - `Throughput::Elements(ROWS)` → criterion reports rows/s.
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
@@ -61,7 +61,7 @@ fn bench_sink(c: &mut Criterion) {
         });
     });
 
-    // full flush (tmp write + fsync ×2 + read-back + append) — disk-sensitive;
+    // full flush (append + fsync) — disk-sensitive;
     // setup (target removal + sink construction + in-memory buffering) is
     // excluded from timing; 8 rotating targets cap /tmp usage (~18MB)
     group.bench_function("jsonl_flush_10k_rows", |b| {
