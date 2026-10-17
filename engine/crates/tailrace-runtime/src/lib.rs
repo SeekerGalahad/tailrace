@@ -26,7 +26,7 @@ use tailrace_connector::ConnectorRegistry;
 use tailrace_decode::{
     ColBatch, CsvDecoder, Decoded, Decoder, JsonDecoder, OggDecoder, ParquetDecoder, Pushdown,
 };
-use tailrace_ir::Cursor;
+use tailrace_ir::{Cursor, SourceChunk};
 use tailrace_state::{FileOffsetStore, OffsetStore};
 
 /// Default connector registry: every connector feature compiled into this
@@ -89,6 +89,9 @@ struct StatementRuntime {
     exec_plan: Arc<LogicalPlan>,
     /// sink-side column list (transform output column-order check)
     sink_columns: Vec<String>,
+    /// declared source schema (T5: per-worker ColBatch construction on the
+    /// parallel decode path)
+    schema: datafusion::arrow::datatypes::SchemaRef,
     batch: ColBatch,
     pending_rows: u64,
     last_flush: Instant,
@@ -233,6 +236,208 @@ pub struct PipelineRunner {
     options: RunOptions,
 }
 
+// ==================== T5 plan-a: intra-poll parallel decode ====================
+
+/// Fan-out floor: below this many chunks per poll, a serial decode into the
+/// reused statement batch beats spawning scoped threads (trickle traffic
+/// keeps the zero-overhead path unchanged; a full 8000-chunk poll amortizes
+/// thread spawn cost ~100× over the decode work at measured decode rates).
+const PARALLEL_DECODE_MIN_CHUNKS: usize = 512;
+
+/// Worker count for one poll's decode: 1 (serial) below the fan-out floor,
+/// otherwise one worker per `PARALLEL_DECODE_MIN_CHUNKS` chunks capped at the
+/// machine's parallelism.
+fn decode_workers(n: usize) -> usize {
+    if n < PARALLEL_DECODE_MIN_CHUNKS * 2 {
+        return 1;
+    }
+    let avail = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .max(2);
+    (n / PARALLEL_DECODE_MIN_CHUNKS).clamp(2, avail)
+}
+
+/// One worker group's decode outcome.
+#[derive(Default)]
+struct GroupDecode {
+    appended: u64,
+    skipped: u64,
+    bad_rows: u64,
+    bad_raws: Vec<Vec<u8>>,
+    fail_sample: Option<String>,
+}
+
+/// One poll's decode outcome (T5 plan-a): the poll's chunks are mutually
+/// independent — fan them out to worker threads, each decoding into its own
+/// `ColBatch`, then merge in chunk order (`concat_batches`) so the row order
+/// is byte-identical to the serial path. Runs entirely between `source.poll`
+/// and the flush-point cursor commit — the cursor semantics (whole-map commit
+/// at flush) are untouched.
+struct PollDecode {
+    /// merged appended rows (`None` = nothing appended this poll — all
+    /// skipped)
+    merged: Option<datafusion::arrow::record_batch::RecordBatch>,
+    skipped: u64,
+    /// every bad row this poll, **all policies** (the fail-policy bail fires
+    /// on this count; `bad_raws` only carries payloads under Dlq)
+    bad_now: u64,
+    bad_raws: Vec<Vec<u8>>,
+    /// first bad-row sample under the Fail policy, in chunk order
+    fail_sample: Option<String>,
+}
+
+/// Decode one poll's chunks (T5 plan-a). Serial for small polls (the reused
+/// statement batch keeps its builder capacity — today's path unchanged);
+/// parallel for large ones. `stats` accumulates appended/skipped/bad exactly
+/// as the old inline loop did; the caller folds `skipped` into the counters
+/// and hands the bad-row collections to [`handle_bad_rows`].
+fn decode_poll(
+    decoder: &dyn Decoder,
+    pushdown: &Pushdown,
+    schema: &datafusion::arrow::datatypes::SchemaRef,
+    reuse: &mut ColBatch,
+    chunks: Vec<SourceChunk>,
+    policy: BadRowPolicy,
+    stats: &mut StatementStats,
+) -> anyhow::Result<PollDecode> {
+    let workers = decode_workers(chunks.len());
+    let mut pd = PollDecode {
+        merged: None,
+        skipped: 0,
+        bad_now: 0,
+        bad_raws: Vec::new(),
+        fail_sample: None,
+    };
+    if workers <= 1 {
+        // serial: today's path verbatim — decode into the reused batch
+        // (builders keep capacity across polls)
+        for chunk in chunks {
+            match decoder.decode(chunk.raw, reuse, pushdown) {
+                Decoded::Append => stats.appended += 1,
+                Decoded::Skip => {
+                    stats.skipped += 1;
+                    pd.skipped += 1;
+                }
+                Decoded::Bad(raw) => {
+                    stats.bad_rows += 1;
+                    pd.bad_now += 1;
+                    match policy {
+                        BadRowPolicy::Fail => {
+                            if pd.fail_sample.is_none() {
+                                pd.fail_sample =
+                                    Some(String::from_utf8_lossy(&raw).chars().take(120).collect());
+                            }
+                        }
+                        BadRowPolicy::Dlq => pd.bad_raws.push(raw),
+                        BadRowPolicy::Skip => {}
+                    }
+                }
+            }
+        }
+        if reuse.is_empty() {
+            return Ok(pd);
+        }
+        pd.merged = Some(reuse.finish()?);
+        return Ok(pd);
+    }
+    // parallel: contiguous chunk-order groups (split_off moves elements —
+    // no raw-buffer copies), one scoped thread per group, each decoding into
+    // its own ColBatch sized for its share
+    let per = chunks.len().div_ceil(workers);
+    let mut groups: Vec<Vec<SourceChunk>> = Vec::with_capacity(workers);
+    let mut rest = chunks;
+    while rest.len() > per {
+        groups.push(rest.split_off(rest.len() - per));
+    }
+    groups.push(rest);
+    groups.reverse(); // split_off takes tails — restore chunk order
+
+    let groups_out = std::thread::scope(
+        |scope| -> anyhow::Result<
+            Vec<(
+                GroupDecode,
+                Option<datafusion::arrow::record_batch::RecordBatch>,
+            )>,
+        > {
+            let mut handles = Vec::with_capacity(groups.len());
+            for chunks in groups {
+                handles.push(scope.spawn(move || {
+                    let mut r = GroupDecode::default();
+                    let mut batch = ColBatch::new(schema.clone(), chunks.len());
+                    for chunk in chunks {
+                        match decoder.decode(chunk.raw, &mut batch, pushdown) {
+                            Decoded::Append => r.appended += 1,
+                            Decoded::Skip => r.skipped += 1,
+                            Decoded::Bad(raw) => {
+                                r.bad_rows += 1;
+                                match policy {
+                                    BadRowPolicy::Fail => {
+                                        if r.fail_sample.is_none() {
+                                            r.fail_sample = Some(
+                                                String::from_utf8_lossy(&raw)
+                                                    .chars()
+                                                    .take(120)
+                                                    .collect(),
+                                            );
+                                        }
+                                    }
+                                    BadRowPolicy::Dlq => r.bad_raws.push(raw),
+                                    BadRowPolicy::Skip => {}
+                                }
+                            }
+                        }
+                    }
+                    let rb = if batch.is_empty() {
+                        None
+                    } else {
+                        Some(batch.finish()?)
+                    };
+                    anyhow::Ok((r, rb))
+                }));
+            }
+            let mut out = Vec::with_capacity(handles.len());
+            let mut panicked = false;
+            for h in handles {
+                match h.join() {
+                    Ok(Ok(v)) => out.push(v),
+                    Ok(Err(e)) => return Err(e), // ColBatch::finish (arrow) error
+                    Err(_) => panicked = true,   // scope joins the rest before unwinding
+                }
+            }
+            if panicked {
+                anyhow::bail!("decode worker thread panicked — cursor not crossed (batch replays)");
+            }
+            Ok(out)
+        },
+    )?;
+    // merge in group order = chunk order (row order identical to serial)
+    let mut non_empty: Vec<datafusion::arrow::record_batch::RecordBatch> =
+        Vec::with_capacity(groups_out.len());
+    for (r, rb) in groups_out {
+        stats.appended += r.appended;
+        stats.skipped += r.skipped;
+        stats.bad_rows += r.bad_rows;
+        pd.skipped += r.skipped;
+        pd.bad_now += r.bad_rows;
+        if !r.bad_raws.is_empty() {
+            pd.bad_raws.extend(r.bad_raws);
+        }
+        pd.fail_sample = pd.fail_sample.take().or(r.fail_sample);
+        if let Some(rb) = rb {
+            non_empty.push(rb);
+        }
+    }
+    pd.merged = match non_empty.len() {
+        0 => None,
+        1 => non_empty.into_iter().next(),
+        _ => Some(datafusion::arrow::compute::concat_batches(
+            schema, &non_empty,
+        )?),
+    };
+    Ok(pd)
+}
+
 /// Stats of one statement's execution round.
 #[derive(Debug, Default, Clone)]
 pub struct StatementStats {
@@ -287,7 +492,7 @@ impl PipelineRunner {
                 &spec.select_sql,
                 &src_obj.columns,
             )?);
-            let batch = ColBatch::new(schema, options.poll_rows);
+            let batch = ColBatch::new(schema.clone(), options.poll_rows);
             let _ = state
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -302,6 +507,7 @@ impl PipelineRunner {
                 sink,
                 exec_plan,
                 sink_columns: sink_cols,
+                schema,
                 batch,
                 pending_rows: 0,
                 last_flush: Instant::now(),
@@ -555,49 +761,36 @@ fn run_statement_serve(
         if let Some(c) = st.counters.as_ref() {
             c.consumed.fetch_add(chunks.len() as u64, Ordering::Relaxed);
         }
-        // Bad-row handling (engine H2): policy dispatch inside the chunk
-        // loop, shared post-processing after it
-        let mut bad_now: u64 = 0;
-        let mut bad_raws: Vec<Vec<u8>> = Vec::new();
-        let mut fail_sample: Option<String> = None;
-        for chunk in chunks {
-            match st.decoder.decode(chunk.raw, &mut st.batch, &st.pushdown) {
-                Decoded::Append => stats.appended += 1,
-                Decoded::Skip => {
-                    stats.skipped += 1;
-                    if let Some(c) = st.counters.as_ref() {
-                        c.skipped.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                Decoded::Bad(raw) => {
-                    stats.bad_rows += 1;
-                    bad_now += 1;
-                    match st.bad_row_policy {
-                        BadRowPolicy::Fail => {
-                            if fail_sample.is_none() {
-                                fail_sample =
-                                    Some(String::from_utf8_lossy(&raw).chars().take(120).collect());
-                            }
-                        }
-                        BadRowPolicy::Dlq => bad_raws.push(raw),
-                        BadRowPolicy::Skip => {}
-                    }
-                }
+        // T5 plan-a: intra-poll parallel decode (chunks are mutually
+        // independent) — serial below the fan-out floor, parallel above it,
+        // merged in chunk order. Bad-row policy handling stays exactly here:
+        // after the full poll decodes, before the cursor can cross.
+        let pd = decode_poll(
+            st.decoder.as_ref(),
+            &st.pushdown,
+            &st.schema,
+            &mut st.batch,
+            chunks,
+            st.bad_row_policy,
+            &mut stats,
+        )?;
+        if pd.skipped > 0 {
+            if let Some(c) = st.counters.as_ref() {
+                c.skipped.fetch_add(pd.skipped, Ordering::Relaxed);
             }
         }
         handle_bad_rows(
             &st,
             pipeline_id,
-            bad_now,
-            bad_raws,
-            fail_sample,
+            pd.bad_now,
+            pd.bad_raws,
+            pd.fail_sample,
             &mut bad_since_event,
             &mut bad_event_emitted,
         )?;
-        if st.batch.is_empty() {
+        let Some(rb) = pd.merged else {
             continue;
-        }
-        let rb = st.batch.finish()?;
+        };
         let out = tailrace_transform::transform_plan(&st.exec_plan, rb, &tx_opts)?; // materialized-plan variant (T7)
                                                                                     // Validate the output column 【order】 before the first row is written —
                                                                                     // a HashSet equality used to let a same-columns-different-order
@@ -757,49 +950,34 @@ fn run_statement(
         if let Some(c) = st.counters.as_ref() {
             c.consumed.fetch_add(chunks.len() as u64, Ordering::Relaxed);
         }
-        // Bad-row handling (engine H2): policy dispatch inside the chunk
-        // loop, shared post-processing after it
-        let mut bad_now: u64 = 0;
-        let mut bad_raws: Vec<Vec<u8>> = Vec::new();
-        let mut fail_sample: Option<String> = None;
-        for chunk in chunks {
-            match st.decoder.decode(chunk.raw, &mut st.batch, &st.pushdown) {
-                Decoded::Append => stats.appended += 1,
-                Decoded::Skip => {
-                    stats.skipped += 1;
-                    if let Some(c) = st.counters.as_ref() {
-                        c.skipped.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                Decoded::Bad(raw) => {
-                    stats.bad_rows += 1;
-                    bad_now += 1;
-                    match st.bad_row_policy {
-                        BadRowPolicy::Fail => {
-                            if fail_sample.is_none() {
-                                fail_sample =
-                                    Some(String::from_utf8_lossy(&raw).chars().take(120).collect());
-                            }
-                        }
-                        BadRowPolicy::Dlq => bad_raws.push(raw),
-                        BadRowPolicy::Skip => {}
-                    }
-                }
+        // T5 plan-a: intra-poll parallel decode (same helper as the serve
+        // loop — serial below the fan-out floor, merged in chunk order)
+        let pd = decode_poll(
+            st.decoder.as_ref(),
+            &st.pushdown,
+            &st.schema,
+            &mut st.batch,
+            chunks,
+            st.bad_row_policy,
+            &mut stats,
+        )?;
+        if pd.skipped > 0 {
+            if let Some(c) = st.counters.as_ref() {
+                c.skipped.fetch_add(pd.skipped, Ordering::Relaxed);
             }
         }
         handle_bad_rows(
             &st,
             pipeline_id,
-            bad_now,
-            bad_raws,
-            fail_sample,
+            pd.bad_now,
+            pd.bad_raws,
+            pd.fail_sample,
             &mut bad_since_event,
             &mut bad_event_emitted,
         )?;
-        if st.batch.is_empty() {
+        let Some(rb) = pd.merged else {
             continue;
-        }
-        let rb = st.batch.finish()?;
+        };
         let out = tailrace_transform::transform_plan(&st.exec_plan, rb, &tx_opts)?; // materialized-plan variant (T7)
                                                                                     // Validate the output column 【order】 before the first row is written
                                                                                     // (see run_statement_serve)
@@ -942,6 +1120,149 @@ pub fn run_standalone(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T5 equivalence acceptance: the parallel decode path (fan-out above
+    /// PARALLEL_DECODE_MIN_CHUNKS×2, one ColBatch per worker, concat_batches
+    /// merge) must produce a **byte-identical** RecordBatch to the serial
+    /// decode of the same chunks (arrow JSON-lines encoding is
+    /// order-sensitive, so byte equality pins row order too), with identical
+    /// stats (appended/skipped/bad) and identical bad-row payloads (plain
+    /// malformed rows come back byte-identical per the T3 note).
+    #[test]
+    fn t5_parallel_decode_equivalence() -> anyhow::Result<()> {
+        use datafusion::arrow::json::LineDelimitedWriter;
+        let cols = [
+            ("op_type".to_string(), "utf8".to_string()),
+            ("order_no".to_string(), "utf8".to_string()),
+            ("seq".to_string(), "int64".to_string()),
+        ];
+        let schema = Arc::new(Schema::new(
+            cols.iter()
+                .map(|(n, t)| Field::new(n.clone(), arrow_type(t), true))
+                .collect::<Vec<_>>(),
+        ));
+        let n = 4096; // → decode_workers ≥ 2 (floor is 512×2)
+        assert!(
+            decode_workers(n) >= 2,
+            "this poll size must take the parallel path"
+        );
+        // pushdown skip only exists on the OGG path (JsonDecoder ignores the
+        // whitelist) — use OGG-shaped rows so Skip/Append/Bad all occur
+        let mut pushdown = Pushdown::default();
+        pushdown
+            .eq_whitelist
+            .insert("op_type".into(), vec!["I".into()]);
+        let mut chunks = Vec::with_capacity(n);
+        for i in 0..n {
+            let raw: Vec<u8> = match i % 8 {
+                0 => format!(r#"{{"op_type":"D","table":"T","ts":{i},"after":{{}}}}"#).into_bytes(),
+                3 => b"{broken".to_vec(), // plain malformed — byte-identical Bad return
+                _ => format!(
+                    r#"{{"op_type":"I","table":"T","ts":{i},"after":{{"order_no":"O-{i:06}","seq":{i}}}}}"#
+                )
+                .into_bytes(),
+            };
+            chunks.push(SourceChunk::kafka(raw, (i % 3) as i32, i as i64));
+        }
+        // —— parallel path ——
+        let mut reuse = ColBatch::new(schema.clone(), 128);
+        let mut stats_par = StatementStats::default();
+        let pd = decode_poll(
+            &OggDecoder,
+            &pushdown,
+            &schema,
+            &mut reuse,
+            chunks.clone(),
+            BadRowPolicy::Dlq,
+            &mut stats_par,
+        )?;
+        // —— serial reference (the pre-T5 inline loop, verbatim) ——
+        let mut ref_batch = ColBatch::new(schema.clone(), n);
+        let mut ref_stats = StatementStats::default();
+        let mut ref_bad_raws: Vec<Vec<u8>> = Vec::new();
+        for c in chunks {
+            match OggDecoder.decode(c.raw, &mut ref_batch, &pushdown) {
+                Decoded::Append => ref_stats.appended += 1,
+                Decoded::Skip => ref_stats.skipped += 1,
+                Decoded::Bad(raw) => {
+                    ref_stats.bad_rows += 1;
+                    ref_bad_raws.push(raw);
+                }
+            }
+        }
+        assert_eq!(
+            (stats_par.appended, stats_par.skipped, stats_par.bad_rows),
+            (ref_stats.appended, ref_stats.skipped, ref_stats.bad_rows),
+            "per-outcome stats identical"
+        );
+        assert_eq!(pd.bad_raws.len(), ref_bad_raws.len());
+        for (a, b) in pd.bad_raws.iter().zip(ref_bad_raws.iter()) {
+            assert_eq!(a, b, "bad-row payloads identical and in chunk order");
+        }
+        let rb_ref = ref_batch.finish()?;
+        let rb_par = pd.merged.expect("appended rows present");
+        let enc = |rb: &datafusion::arrow::record_batch::RecordBatch| -> anyhow::Result<Vec<u8>> {
+            let mut buf = Vec::new();
+            {
+                let mut w = LineDelimitedWriter::new(&mut buf);
+                w.write(rb)?;
+                w.finish()?;
+            }
+            Ok(buf)
+        };
+        assert_eq!(
+            enc(&rb_par)?,
+            enc(&rb_ref)?,
+            "parallel decode is byte-identical to serial (row order preserved)"
+        );
+        // 汇的行数也逐一相等（顺带把 Skip/Bad 的份额算清楚）
+        let expected_appended = (0..n).filter(|i| i % 8 != 0 && i % 8 != 3).count();
+        assert_eq!(stats_par.appended as usize, expected_appended);
+        // Fail 策略在并行路径的形状：bad_now 统计**所有**坏行（含不进
+        // bad_raws 的），首样本在 chunk 序——串行路径由 contract 套件的
+        // bad_row_policy_branches 钉住，这里补并行路径
+        let mut reuse2 = ColBatch::new(schema.clone(), 128);
+        let mut stats_fail = StatementStats::default();
+        let chunks2: Vec<SourceChunk> = (0..n)
+            .map(|i| {
+                let raw: Vec<u8> = if i % 8 == 3 {
+                    b"{broken".to_vec()
+                } else {
+                    format!(
+                        r#"{{"op_type":"I","table":"T","ts":{i},"after":{{"order_no":"O-{i:06}","seq":{i}}}}}"#
+                    )
+                    .into_bytes()
+                };
+                SourceChunk::kafka(raw, (i % 3) as i32, i as i64)
+            })
+            .collect();
+        let pd_fail = decode_poll(
+            &OggDecoder,
+            &pushdown,
+            &schema,
+            &mut reuse2,
+            chunks2,
+            BadRowPolicy::Fail,
+            &mut stats_fail,
+        )?;
+        assert_eq!(
+            pd_fail.bad_now, ref_stats.bad_rows,
+            "bad_now counts all bad rows under Fail"
+        );
+        assert!(
+            pd_fail.bad_raws.is_empty(),
+            "Fail policy quarantines nothing"
+        );
+        assert!(
+            pd_fail
+                .fail_sample
+                .as_deref()
+                .is_some_and(|s| s.contains("{broken")),
+            "first bad-row sample in chunk order: {:?}",
+            pd_fail.fail_sample
+        );
+        Ok(())
+    }
 
     /// T7 wiring acceptance: the runtime materializes each statement's plan
     /// via `tailrace_ir::build_exec_plan` (declared schema) at assembly and

@@ -688,3 +688,91 @@ impl Drop for PipelineRegistry {
         self.shutdown_all();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use tailrace_state::{FileOffsetStore, OffsetStore};
+
+    fn kcursor(offsets: &[(i32, i64)]) -> Cursor {
+        Cursor::Kafka {
+            topic: "bench-parts".into(),
+            group: "tr.p9901.s0".into(),
+            offsets: offsets.iter().copied().collect::<BTreeMap<i32, i64>>(),
+        }
+    }
+
+    /// T5 pre-work fingerprint regression（动工前先写）：部分分区推进 IS 进步——
+    /// 只有部分分区的 offset 前移时指纹必须变化（NO_PROGRESS 毒数据判据不得
+    /// 误杀）；游标整体冻结时指纹逐位稳定（毒数据判据的确定性基础——跨重启
+    /// 同一冻结游标折叠出同一指纹）。并行 decode 改造（T5 方案 a）不得扰动
+    /// 这些语义。
+    #[test]
+    fn partial_partition_progress_moves_the_cursor_fingerprint() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("tailrace-t5-fp-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        {
+            let mut store = FileOffsetStore::new(&dir)?;
+            // 一次 flush 点整体提交：本轮 poll 只有分区 0/2 有数据（部分分区推进）
+            store.save(9901, 0, &kcursor(&[(0, 100), (2, 50)]), Some("run1"), None)?;
+        }
+        let fp1 = cursor_progress(&dir, 9901, 1);
+        assert_eq!(
+            fp1,
+            cursor_progress(&dir, 9901, 1),
+            "same ledger → identical fingerprint (deterministic fold)"
+        );
+        {
+            let mut store = FileOffsetStore::new(&dir)?;
+            // 下一 flush 点：p0/p2 各前移 1，p1 新加入——部分分区推进
+            store.save(
+                9901,
+                0,
+                &kcursor(&[(0, 101), (1, 30), (2, 75)]),
+                Some("run2"),
+                None,
+            )?;
+        }
+        assert_ne!(
+            fp1,
+            cursor_progress(&dir, 9901, 1),
+            "partial-partition progress must move the fingerprint (no false NO_PROGRESS)"
+        );
+        let fp2 = cursor_progress(&dir, 9901, 1);
+        // 再下一 flush 点：只有 p1 前移（p0/p2 冻结）——仍是进步
+        {
+            let mut store = FileOffsetStore::new(&dir)?;
+            store.save(
+                9901,
+                0,
+                &kcursor(&[(0, 101), (1, 31), (2, 75)]),
+                Some("run3"),
+                None,
+            )?;
+        }
+        let fp3 = cursor_progress(&dir, 9901, 1);
+        assert_ne!(
+            fp2, fp3,
+            "single-partition progress still moves the fingerprint"
+        );
+        // 游标整体冻结 → 逐位同一指纹（毒数据判据的确定性基础）
+        {
+            let mut store = FileOffsetStore::new(&dir)?;
+            store.save(
+                9901,
+                0,
+                &kcursor(&[(0, 101), (1, 31), (2, 75)]),
+                Some("run4"),
+                None,
+            )?;
+        }
+        assert_eq!(
+            fp3,
+            cursor_progress(&dir, 9901, 1),
+            "frozen cursor → identical fingerprint across restarts"
+        );
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+}

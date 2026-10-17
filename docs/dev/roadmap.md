@@ -84,12 +84,13 @@
 - **文件域**：conn-kafka（sink 侧）、tailrace-decode（csv 分支）。
 > 结果：8d0a8fc kafka sink载体CSV→JSON-lines（arrow::json::LineDelimitedWriter，与file sink同款，抽出encode_json_lines）消除毒记录bail-重启循环-FAILED终态；CsvDecoder由裸split(',')换csv crate RFC4180记录文法（带引号逗号/双写引号/字段内换行，逐列强制语义不变：坏数字降null不丢行）；毒数据单测4行换行/引号/emoji/控制字符经sink序列化后arrow::json::Reader无损回读（4/4字段相等，int64/float64类型保持，一行一记录不变量）；验收cargo test -p tailrace-conn-kafka -p tailrace-decode --locked＝12 passed/0 failed；依赖仅csv="1.4"（经arrow-csv已在lock，仅+1条边零新包）。
 
-### T5 分区并行·方案 a（~2 人日）☐〔依赖 T1；与 T3/T6 串行〕
+### T5 分区并行·方案 a（~2 人日）✅〔依赖 T1；与 T3/T6 串行〕
 
 - **现状**：每语句单线程 poll 全分区，decode+transform+sink 全部串行在同一 OS 线程——单语句吞吐上限 ≈1 核；一次慢 Doris flush（120s 超时 ×4 重试）期间全部分区停摆。
 - **方案 a（最廉价、无语义风险）**：同一 poll 的 chunks 相互独立，并行 decode 到各自 ColBatch，flush 前 `concat_batches` 合并；**游标语义完全不动**（仍按 flush 点整体提交）。方案 b（split 化+动态分区发现）属 R3，先不做。
 - **验收**：多分区 topic 宏基准吞吐对比（a vs 现状）入 BENCHMARKS.md；offsets 正确性断言——重启后不丢不重（totals 单调且重启后继续增长）；NO_PROGRESS_LIMIT 语义回归测试；契约测试全绿。
 - **文件域**：tailrace-runtime 主循环、conn-kafka poll 路径。
+> 结果：`decode_poll` 同 poll chunks 连续切片分组→scoped 线程并行 decode 到各自 ColBatch→`concat_batches` 按 chunk 序合并；低于 512×2 chunks 走原串行路径（涓流零开销）；游标语义（flush 点整体提交）与 NO_PROGRESS_LIMIT=3 完全不动；牵连 `Decoder: Send + Sync` 一处 trait 声明（4 个实现均无状态 unit struct，零实现改动）；conn-kafka poll 路径验证后无需 diff（rdkafka 单 consumer 拉取边界，属 R3 方案 b）。验收数字（交错 A/B，同窗口各 4 轮，BENCHMARKS §4.5）：多分区 kafka(P=6)→file **21396→24658 rows/s（+15.2%，debug 档）**，file→file 顺带 +16~19%；方法学修正：不交错先后测量同二进制漂移 16.4K→25.0K，不可比。动工前先写的 5 个语义回归测试（部分分区指纹/重启不丢不重 6800 行唯一键/totals 单调 5000→6800/NO_PROGRESS=3 FAILED 判决/进步复位不误杀）+ 并行等价性单测（4096 chunks 混合 Append/Skip/Bad，JSON-lines 编码字节级一致）全绿；契约套件抓到并行化初版 Fail 策略 bad_now 错接（=DLQ 载荷数）已修。clippy -D warnings 0；runtime/decode/contract 32 passed/0 failed。
 
 ### T6 攒批三阈值（~2 人日）☐〔依赖 T1；与 T5 串行〕
 

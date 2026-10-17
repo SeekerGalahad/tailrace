@@ -288,7 +288,13 @@ pub enum Decoded {
 /// decoders parse simd-json in place inside it, the parquet decoder wraps it
 /// into `bytes::Bytes` — no per-message copy is made between the source's
 /// payload and the parser.
-pub trait Decoder: Send {
+///
+/// `Sync` (T5 plan-a): the runtime fans one poll's chunks out to scoped
+/// worker threads, each decoding into its own `ColBatch` — the decoder is
+/// shared by reference across those threads. Every implementation is a
+/// stateless unit struct (`decode` takes `&self` and touches no interior
+/// mutability), so the bound is declarative only; no implementor changes.
+pub trait Decoder: Send + Sync {
     fn decode(&self, raw: Vec<u8>, batch: &mut ColBatch, pushdown: &Pushdown) -> Decoded;
 }
 

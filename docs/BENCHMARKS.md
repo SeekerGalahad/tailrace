@@ -112,6 +112,8 @@ parse+plan——T7 物化 LogicalPlan 的改造对象）。
 | T7 | transform/groupby_aggregate | 6.219 M rows/s | 8.072 M rows/s | **+30%** | 2026-10-17 |
 | T7 | macro 吞吐（file→file debug） | 25138 rows/s | 25094 rows/s | 持平（噪声内，见 §4.4） | 2026-10-17 |
 | T7 | macro node 峰值 RSS | 46888 KiB | 49124 KiB | +2.2 MiB（物化计划常驻，见 §4.4） | 2026-10-17 |
+| T5 | macro 多分区 kafka(P=6)→file 吞吐（debug） | 21396 rows/s（串行 decode） | 24658 rows/s | **+15.2%**（交错 A/B，见 §4.5） | 2026-10-17 |
+| T5 | macro file→file 吞吐（debug，顺带受益） | 24697-24876 rows/s | 28802-29394 rows/s | **+16~19%** | 2026-10-17 |
 
 ### §4.1 T3 热路径零拷贝（2026-10-17，同机同日复测）
 
@@ -218,6 +220,53 @@ passed，契约 7/7）：
 增益空间（机制修正节），全链 debug 档由 decode 与 fsync 落盘主导（§2.2 观察），transform
 段微基准增益被链路稀释为持平；聚合形语句的批数收益由单测与微基准
 groupby（+30%）证实。RSS 小幅上浮是每语句物化 LogicalPlan + plan 缓存的常驻代价。
+
+### §4.5 T5 分区并行·方案 a（2026-10-17，同机同日复测）
+
+改造内容（roadmap §四 T5）：同一 poll 的 chunks 相互独立——`decode_poll` 把 chunks
+按连续切片分组，scoped 线程并行 decode 到**各自 ColBatch**（容量按组行数预分配），
+`concat_batches` 按 chunk 序合并为单批后走原 transform→write→flush 路径。
+低于扇出门槛（`PARALLEL_DECODE_MIN_CHUNKS=512`×2）的 poll 走原串行路径（复用
+statement 常驻 batch，涓流流量零开销不变）。游标语义完全不动：decode 发生在
+`source.poll()` 与 flush 点整体提交之间；NO_PROGRESS_LIMIT=3 判据不变。牵连一处
+trait 声明：`Decoder: Send + Sync`（`&dyn Decoder` 跨 scoped 线程共享所需；全部
+4 个实现是无状态 unit struct，零实现改动）。
+
+**方法学修正（本节数字以此为准）**：多分区对比采用**交错 A/B**——串行版与并行版
+两个 node 二进制同窗口交替各跑 4 轮（`scripts/bench/macro-partitions.sh
+--rows 100000 --partitions 6`，kafka 6 分区→file，debug 档；串行版=同一工作树把
+扇出门槛临时抬到不可达的对照构建）。不交错的先后测量在本机漂移可达 16.4K→25.0K
+（同一二进制！），先后口径不可比——这正是 §4.1 噪声界警示的放大版，如实登记。
+
+| 口径 | 串行（现状语义） | 并行（T5） | 变化 |
+|---|---|---|---|
+| kafka(P=6)→file 4 轮样本 | 21133 / 21358 / 21445 / 21455 | 24021 / 24618 / 24697 / 24802 | 中位 **21396 → 24658（+15.2%）** |
+| file→file 2 轮样本（顺带受益） | 24697 / 24876 | 28802 / 29394 | **+16~19%** |
+| worker 上限 12（HT）vs 6（物理核） | — | 24366/24814 vs 24131/25044 | 无显著差（保留 available_parallelism() 简单口径） |
+
+复现：`docker compose up -d kafka && bash scripts/bench/macro-partitions.sh --rows
+100000 --partitions 6 --report out.md`（脚本断言播种量==N 与 sink 行数==N，不丢行）。
+注：kafka 群组首次加入（rebalance）耗时计入 elapsed（两侧同口径）。
+
+语义回归（动工前先写、改造后全绿）：
+- `partial_partition_progress_moves_the_cursor_fingerprint`（registry 单测）：
+  部分分区推进=进步（指纹必变，NO_PROGRESS 不误杀）；游标冻结=指纹逐位稳定。
+- `t5_partial_partition_commit_and_restart_no_loss_no_dup`（runtime 集成测试）：
+  部分分区 poll → flush 点整体提交（p2 无数据不进 map；重启后 p1 冻结在 2000）；
+  重启不丢不重——真 FileSink 提交面 6800 行恰好 6800 个唯一 order_no；台账
+  totals 跨 deploy 单调续涨（5000→6800，无重放）。
+- `t5_no_progress_limit_three_failures_terminal`：sink flush 永远失败 → 3 次无
+  进步重启 → FAILED 终态（STATEMENT_FAILED 事件含「3 consecutive failures without
+  cursor progress」判决）+ 台账零提交。
+- `t5_progress_resets_no_progress_counter`：首次 flush 失败→重启重放→成功 → 游标
+  过界 → RUNNING 不误杀，sink 恰好一次提交 100 行。
+- `t5_parallel_decode_equivalence`（runtime 单测）：4096 chunks（Append/Skip/Bad
+  混合，4+ worker）并行 decode 与串行逐 chunk decode 的 RecordBatch 经 arrow
+  JSON-lines 编码**字节级一致**（行序锁定）；stats/bad 载荷逐项相等；Fail 策略
+  bad_now=全量坏行、首样本在 chunk 序。
+- 过程修复：契约套件 `bad_row_policy_branches` 抓到并行化初版把 Fail 策略的
+  bad 计数错接为 DLQ 载荷数（bad_now=0 → fail 不触发）——已修（PollDecode.bad_now
+  独立字段），该测试恢复绿。
 
 ## 五、CI 口径
 
