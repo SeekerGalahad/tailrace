@@ -77,6 +77,27 @@ jobs:
       - run: cd web && pnpm install --frozen-lockfile
       - run: cd web && pnpm typecheck && pnpm build
 
+  chaos:                                           # T11: live tests on an ephemeral stack via testcontainers-rs
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # opt-in mode of the chaos + conn-kafka live tests: boot temporary
+      # Kafka (apache module) and Doris (fe/be 2.1.7) containers from the
+      # test itself; the default live-gate semantics stay for local runs
+      TAILRACE_TESTCONTAINERS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # rust-embed requires web/dist at compile time; jobs that compile the
+      # console without a real web build provide a placeholder instead.
+      - run: mkdir -p web/dist && echo '<!doctype html><title>placeholder</title>' > web/dist/index.html
+      # Doris BE requires vm.max_map_count >= 2000000 on the docker host
+      # (runners default to 65530; OrbStack/Docker Desktop set it already)
+      - run: sudo sysctl -w vm.max_map_count=2000000
+      - run: cargo test --locked -p tailrace-node --test chaos -- --nocapture
+      - run: cargo test --locked -p tailrace-conn-kafka kafka_source_live -- --nocapture
+
   smoke:                                           # 端到端冒烟：起 console+node，跑通 healthz/注册/心跳
     needs: [rust, web]
     runs-on: ubuntu-latest
@@ -95,4 +116,9 @@ jobs:
             cache-dependency-path: web/pnpm-lock.yaml,
           }
       - run: ./scripts/build.sh
-      - run: ./scripts/smoke.sh                   # P1 交付件（启动→探活→示例管道→断言）
+      # Doris BE mmap requirement on runners (same as the chaos job)
+      - run: sudo sysctl -w vm.max_map_count=2000000
+      # --full: compose Kafka+Doris e2e + poison soak (T11). The soak is
+      # shortened to fit the 45-min job budget (build+pull+boot ≈ 20 min);
+      # the ≥10-minute acceptance runs locally on OrbStack (default 600s).
+      - run: SMOKE_FULL_SOAK_SECS=180 ./scripts/smoke.sh --full

@@ -15,3 +15,9 @@ datafusion = { workspace = true }
 tailrace-ir = { workspace = true }
 tailrace-catalog = { workspace = true }
 tailrace-connector = { workspace = true }
+
+[dev-dependencies]
+# T11: the liveness test boots an ephemeral Kafka via testcontainers when
+# TAILRACE_TESTCONTAINERS=1 (CI chaos job); default stays live-gated.
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }

@@ -96,6 +96,16 @@ tracing-opentelemetry = { version = "0.34", default-features = false }
 # per-crate benches/ and reference this as a workspace dev-dependency —
 # never a runtime dependency.
 criterion = "0.8"
+# dev-only (roadmap T11): ephemeral docker dependency stack for live tests —
+# chaos.rs + conn-kafka liveness spin temporary Kafka (and Doris for chaos)
+# via testcontainers in CI; local live-gate semantics stay the default.
+# Pairing rule: testcontainers-modules 0.15 pins core 0.27.x; reqwest 0.13
+# matches the workspace line (no duplicate). Features: blocking sync runner
+# only — daemon over the unix socket needs no bollard TLS (pulling it drags
+# rustls + aws-lc-sys, a C toolchain burden); readiness probes that need
+# HTTP poll the workspace reqwest instead of the http_wait feature.
+testcontainers = { version = "0.27.3", default-features = false, features = ["blocking"] }
+testcontainers-modules = { version = "0.15", default-features = false, features = ["kafka", "blocking"] }
 # internal crates (path + version, mirrors original engine practice)
 tailrace-connector = { path = "engine/crates/tailrace-connector", version = "0.1.0" }
 tailrace-conn-kafka = { path = "engine/crates/tailrace-conn-kafka", version = "0.1.0" }

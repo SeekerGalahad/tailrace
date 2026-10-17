@@ -113,3 +113,22 @@ parse+plan——T7 物化 LogicalPlan 的改造对象）。
 
 - 微基准在 CI 只做**编译验证**（`cargo bench -p <crate> --no-run`），不上传数据、
   不跑测量（runner 抖动大，无参考价值；数字一律本机复测）。
+- 2026-10-17（T11）起 CI 增 `chaos` job（testcontainers 起临时 Kafka+Doris，
+  chaos kill-9 + conn-kafka 活性；runner 预置 `vm.max_map_count=2000000`），
+  `smoke` job 升级为 `SMOKE_FULL_SOAK_SECS=180 ./scripts/smoke.sh --full`
+  （compose Kafka+Doris 端到端 + 毒数据浸泡；≥10min 口径由本地默认 600s 承担）。
+
+### §5.1 T11 docker 链路首跑数字（OrbStack，2026-10-17）
+
+| 口径 | 数字 |
+|---|---|
+| `smoke.sh --full`（600s 毒浸泡，release 二进制） | **44/44 步全绿**，全程 11m20s |
+| kafka→doris 端到端（S8） | 10 条 OGG → flushed=10 → `COUNT(*)`=10 |
+| 毒数据浸泡（S9，JSON-lines 载体） | produced=consumed=flushed=Doris COUNT=**1700**（守恒）；字段内换行/引号/emoji/中文字节级往返 ✅ |
+| 容器内存峰值（runner 预算依据） | kafka 371.7MiB / doris-fe 867.4MiB / doris-be 1.082GiB（23.54GiB 宿主） |
+| chaos kill-9（testcontainers 模式） | 1 passed / 60.56s（kill@5s → 重启 → COUNT==5 幂等对账） |
+| conn-kafka 活性（testcontainers 模式） | 1 passed / 8.60s（ephemeral kafka 起停 + sink 3 条播种 + source 消回） |
+| 现场残留 | `down -v` 后容器/网络均 0 |
+
+（过程与修复清单见 `docs/dev/T11-docker-compose-smoke-full-first-run-2026-10-17.md`；
+注：毒浸泡吞吐受 15s/批节奏限制，非吞吐口径——吞吐见 §三宏基准。）

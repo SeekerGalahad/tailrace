@@ -203,9 +203,16 @@ async fn pipeline_full_lifecycle() {
         .find(|t| t["reference"] == format!("{doris}.ods.orders"))
         .expect("sink table");
     assert_eq!(sink["kind"], "doris");
-    assert_eq!(sink["streamLoadUrl"], "http://127.0.0.1:18040");
+    // the engine DorisSink PUTs this verbatim: the FULL endpoint
+    // base + /api/{db}/{table}/_stream_load (a plan that once carried
+    // `orders_stream_load` — no slash — 404'd every flush in the wild;
+    // T11 first-run finding)
     assert_eq!(
-        sink["authEnv"],
+        sink["stream_load_url"],
+        "http://127.0.0.1:18040/api/ods/orders/_stream_load"
+    );
+    assert_eq!(
+        sink["auth_env"],
         format!("TAILRACE_DS_{doris}"),
         "engine credential_from_env only accepts TAILRACE_ (engine-v1.md §四)"
     );

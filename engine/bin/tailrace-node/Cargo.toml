@@ -62,3 +62,7 @@ rdkafka = { workspace = true }
 reqwest = { workspace = true }
 # chaos live-gate skip notice goes through tracing (T2)
 tracing = { workspace = true }
+# T11: chaos test boots an ephemeral Kafka+Doris stack via testcontainers
+# when TAILRACE_TESTCONTAINERS=1 (CI chaos job); default stays live-gated.
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }

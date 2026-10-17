@@ -891,15 +891,35 @@ fn build_plan_table(
     let auth_env = matches!(kind.as_str(), "doris" | "starrocks")
         .then(|| format!("TAILRACE_DS_{}", ds.id))
         .filter(|_| has_credential);
+    // stream_load_url: the engine's DorisSink PUTs this verbatim, and the
+    // /v1 contract (docs/protocol/engine-v1.md example) is the FULL endpoint
+    // `http://be:8040/api/{db}/{table}/_stream_load` — compose it from the
+    // datasource's BE base + this table's db/table.
+    let stream_load_url = conn
+        .get("streamLoadUrl")
+        .and_then(Value::as_str)
+        .filter(|_| matches!(kind.as_str(), "doris" | "starrocks"))
+        .map(|base| {
+            format!(
+                "{}/api/{}/{}/_stream_load",
+                base.trim_end_matches('/'),
+                table.db_name,
+                table.table_name
+            )
+        });
     Ok(Some(json!({
         "reference": reference,
         "kind": kind,
         "format": table.format,
         "columns": columns,
         "bootstrap": conn.get("bootstrap").and_then(Value::as_str),
-        "streamLoadUrl": conn.get("streamLoadUrl").and_then(Value::as_str),
-        "authEnv": auth_env,
-        "sequenceColumn": null,
+        // table-entry keys follow the engine /v1 plan contract (snake_case —
+        // tailrace-catalog PlanTableObject has no serde renames; the camelCase
+        // keys here were silently dropped, killing every doris deploy with
+        // "must declare auth_env" — T11 first-run finding)
+        "stream_load_url": stream_load_url,
+        "auth_env": auth_env,
+        "sequence_column": null,
     })))
 }
 

@@ -5,12 +5,18 @@
 # Kafka on 127.0.0.1:9092 (bootstrap) and Doris Stream Load on 127.0.0.1:8040
 # (BE webserver_port); MySQL protocol for DDL/queries on 127.0.0.1:9030 (FE).
 #
-# Defaults target the local arch (aarch64 on Apple Silicon). On x86_64 hosts:
-#   DORIS_ARCH=x86_64 docker compose up -d
+# Kafka runs the official apache/kafka image (bitnami/kafka was removed from
+# Docker Hub — the 2025 Bitnami archive — T11 first-run finding F1). Env vars
+# follow the apache/kafka KAFKA_* -> server.properties convention.
+#
+# Doris runs the multi-arch fe-2.1.7 / be-2.1.7 tags (the old
+# 2.1.7-fe-${arch} tags were renamed upstream and 2.1.7-be-x86_64 404s —
+# T11 first-run finding F2). Docker auto-selects the host arch; no DORIS_ARCH
+# is needed anymore.
 # Doris BE needs vm.max_map_count>=2000000 on the docker host (Linux hosts:
 # sysctl -w vm.max_map_count=2000000; OrbStack/Docker Desktop handle this).
-# Image tag scheme verified against apache/doris master
-# docker/runtime/docker-compose-demo (FE_SERVERS/FE_ID/BE_ADDR contract).
+# Image env contract verified against apache/doris master
+# docker/runtime/docker-compose-demo (FE_SERVERS/FE_ID/BE_ADDR).
 #
 # Optional observability profile (roadmap T2, NOT part of the smoke stack):
 #   docker compose --profile otel up -d
@@ -18,35 +24,60 @@
 # (spans over OTLP/HTTP). Point the node at it with
 # OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318.
 
+# Host port overrides (defaults keep the documented contract): shared dev
+# machines may already run another Doris on 8030/8040/9030 — export e.g.
+# TAILRACE_FE_HTTP_PORT=38030 TAILRACE_FE_MYSQL_PORT=39030
+# TAILRACE_BE_HTTP_PORT=38040 docker compose up -d
+# (scripts/smoke.sh --full reads the same variables.)
+
 services:
   kafka:
-    image: bitnami/kafka:3.9
+    image: apache/kafka:3.9.0
     container_name: tailrace-kafka
     ports:
-      - "127.0.0.1:9092:9092"
+      - "127.0.0.1:${TAILRACE_KAFKA_PORT:-9092}:9092"
     environment:
-      KAFKA_CFG_NODE_ID: "0"
-      KAFKA_CFG_PROCESS_ROLES: controller,broker
-      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://127.0.0.1:9092
-      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 0@kafka:9093
-      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://127.0.0.1:9092
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: "tailR4ceSmokeKraft1"
     healthcheck:
-      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server 127.0.0.1:9092 --list >/dev/null 2>&1"]
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server 127.0.0.1:9092 --list >/dev/null 2>&1"]
       interval: 5s
       timeout: 10s
       retries: 24
       start_period: 10s
 
   doris-fe:
-    image: apache/doris:2.1.7-fe-${DORIS_ARCH:-aarch64}
+    image: apache/doris:fe-2.1.7
     container_name: tailrace-doris-fe
+    # doris_be/fe refuse to start below 60000 open file descriptors (the
+    # entrypoint warns and exits cleanly otherwise)
+    ulimits:
+      nofile:
+        soft: 655350
+        hard: 655350
+    networks:
+      doris_net:
+        ipv4_address: 172.28.0.2
     ports:
-      - "127.0.0.1:8030:8030"   # FE http
-      - "127.0.0.1:9030:9030"   # FE mysql protocol
+      - "127.0.0.1:${TAILRACE_FE_HTTP_PORT:-8030}:8030"   # FE http
+      - "127.0.0.1:${TAILRACE_FE_MYSQL_PORT:-9030}:9030"   # FE mysql protocol
     environment:
-      FE_SERVERS: "fe1:doris-fe:9010"
+      # FE_SERVERS wants a literal IP (the image entrypoint regex rejects
+      # hostnames) — static IPs on the dedicated doris_net, per the upstream
+      # docker-compose-demo contract
+      FE_SERVERS: "fe1:172.28.0.2:9010"
       FE_ID: "1"
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8030/api/bootstrap >/dev/null"]
@@ -56,18 +87,31 @@ services:
       start_period: 20s
 
   doris-be:
-    image: apache/doris:2.1.7-be-${DORIS_ARCH:-aarch64}
+    image: apache/doris:be-2.1.7
     container_name: tailrace-doris-be
+    ulimits:
+      nofile:
+        soft: 655350
+        hard: 655350
+    networks:
+      doris_net:
+        ipv4_address: 172.28.0.3
     depends_on:
       doris-fe:
         condition: service_healthy
     ports:
-      - "127.0.0.1:8040:8040"   # BE webserver (Stream Load target)
+      - "127.0.0.1:${TAILRACE_BE_HTTP_PORT:-8040}:8040"   # BE webserver (Stream Load target)
     environment:
-      FE_SERVERS: "fe1:doris-fe:9010"
-      BE_ADDR: "doris-be:9050"
+      FE_SERVERS: "fe1:172.28.0.2:9010"
+      BE_ADDR: "172.28.0.3:9050"
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8040/api/health >/dev/null"]
+      # process liveness AND FE registration: the BE webserver answers
+      # /api/health before the ALTER SYSTEM ADD BACKEND round completes,
+      # and DDL/stream load against an unregistered BE fails with
+      # "available backend num is 0" (T11 first-run finding F6) — `--wait`
+      # must not report healthy for a half-formed cluster. The BE image
+      # ships the mysql client (its own entrypoint uses it).
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8040/api/health >/dev/null && mysql -h172.28.0.2 -P9030 -uroot -N -e 'show backends' 2>/dev/null | grep -q 172.28.0.3"]
       interval: 5s
       timeout: 10s
       retries: 60
@@ -85,3 +129,9 @@ services:
       - "127.0.0.1:4318:4318"   # OTLP http/protobuf (engine exporter target)
     command:
       - "--config=yaml:{receivers: {otlp: {protocols: {http: {endpoint: 0.0.0.0:4318}}}}, exporters: {debug: {verbosity: basic}}, service: {pipelines: {traces: {receivers: [otlp], exporters: [debug]}}}}"
+
+networks:
+  doris_net:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

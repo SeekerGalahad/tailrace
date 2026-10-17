@@ -543,12 +543,91 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// Shared liveness flow (both modes): seed 3 one-column records via the
+    /// crate's own sink, consume them back through the source, assert chunks
+    /// arrive and the cursor map advanced.
+    fn live_roundtrip(bootstrap: &str, topic: &str) -> anyhow::Result<()> {
+        let mk = |v: &str| -> anyhow::Result<RecordBatch> {
+            Ok(RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)])),
+                vec![Arc::new(StringArray::from(vec![v.to_string()]))],
+            )?)
+        };
+        let mut sink = KafkaSink::new(bootstrap, topic)?;
+        sink.write(vec![mk("live-a")?, mk("live-b")?, mk("live-c")?])?;
+        let ack = sink.flush()?;
+        assert_eq!(ack.rows, 3, "sink must deliver all 3 seeded records");
+        let mut src = KafkaSource::new(
+            bootstrap,
+            topic,
+            format!("tailrace-src-test-{}", std::process::id()),
+        );
+        src.open(&Cursor::None)?;
+        // a fresh group join/rebalance takes seconds
+        let chunks = src.poll(3, Duration::from_secs(30))?;
+        assert!(!chunks.is_empty(), "seeded samples must be pullable");
+        let Cursor::Kafka { offsets, .. } = src.cursor() else {
+            panic!()
+        };
+        assert!(!offsets.is_empty());
+        Ok(())
+    }
+
     #[test]
     fn kafka_source_live() -> anyhow::Result<()> {
-        // Runs only against the tailrace dev Kafka stack (docker-compose.yml);
-        // the topic must be pre-seeded by the local dev environment. The gate
-        // checks the *documented* precondition (the seeded topic), not bare
-        // TCP reachability — an unrelated listener on 9092 (another project's
+        // Mode ① (opt-in, CI chaos job): ephemeral Kafka via testcontainers
+        // (TAILRACE_TESTCONTAINERS=1) — the apache module (default image:
+        // apache/kafka-native, which ships no /opt/kafka/bin scripts, so
+        // topic creation is best-effort; brokers auto-create on produce).
+        // Round-trip sink→source is the actual assertion.
+        if std::env::var("TAILRACE_TESTCONTAINERS").ok().as_deref() == Some("1") {
+            use testcontainers::core::ExecCommand;
+            use testcontainers::runners::SyncRunner;
+            use testcontainers_modules::kafka::apache;
+            match apache::Kafka::default().start() {
+                Ok(kafka) => {
+                    let bootstrap = format!(
+                        "127.0.0.1:{}",
+                        kafka.get_host_port_ipv4(apache::KAFKA_PORT)?
+                    );
+                    let topic = format!("tailrace.live.{}", std::process::id());
+                    if let Ok(create) = kafka.exec(ExecCommand::new([
+                        "/opt/kafka/bin/kafka-topics.sh",
+                        "--bootstrap-server",
+                        "localhost:9092",
+                        "--create",
+                        "--if-not-exists",
+                        "--topic",
+                        topic.as_str(),
+                        "--partitions",
+                        "1",
+                        "--replication-factor",
+                        "1",
+                    ])) {
+                        // JVM image path; the native image has no scripts —
+                        // log-and-continue (auto-create covers it)
+                        if create.exit_code()?.unwrap_or(1) != 0 {
+                            tracing::warn!(
+                                "[testcontainers] explicit topic create failed — \
+                                 relying on broker auto-create"
+                            );
+                        }
+                    }
+                    return live_roundtrip(&bootstrap, &topic);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "[testcontainers] docker unavailable — falling back to the live gate"
+                    );
+                }
+            }
+        }
+        // Mode ② (default): documented live gate — runs only against the
+        // tailrace dev Kafka stack (docker-compose.yml); the topic must be
+        // pre-seeded by the local dev environment. The gate checks the
+        // *documented* precondition (the seeded topic), not bare TCP
+        // reachability — an unrelated listener on 9092 (another project's
         // stack) must not turn this into a spurious failure (same rationale
         // as the runtime live gate).
         if std::net::TcpStream::connect("localhost:9092").is_err() {
@@ -561,19 +640,7 @@ mod tests {
             );
             return Ok(()); // local-liveness only
         }
-        let mut src = KafkaSource::new(
-            "localhost:9092",
-            "tailrace.discover.test",
-            format!("tailrace-src-test-{}", std::process::id()),
-        );
-        src.open(&Cursor::None)?;
-        let chunks = src.poll(3, Duration::from_secs(8))?; // a fresh group join/rebalance takes seconds
-        assert!(!chunks.is_empty(), "seeded samples must be pullable");
-        let Cursor::Kafka { offsets, .. } = src.cursor() else {
-            panic!()
-        };
-        assert!(!offsets.is_empty());
-        Ok(())
+        live_roundtrip("localhost:9092", "tailrace.discover.test")
     }
 
     /// Poison rows (in-field newlines / quotes / emoji) ride the JSON-lines

@@ -3,15 +3,121 @@
 //!
 //! reqwest blocking connects straight to the BE (an FE 307 redirect strips
 //! the Authorization header — redirects are explicitly not followed).
+//! Carrier is JSON lines (`format: json` + `read_json_by_line: true`):
+//! apache/doris be-2.1.7's CSV splitter has no RFC4180 mode — `""` doubled
+//! quotes are unparseable with every enclose/escape header combination
+//! (T11 first-run matrix), while JSON escaping is total over arbitrary
+//! UTF-8 (in-field newlines / quotes / emoji / backslashes).
 
 use std::time::Duration;
 
-use datafusion::arrow::csv;
+use datafusion::arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
 use datafusion::arrow::record_batch::RecordBatch;
 
 use tailrace_catalog::{credential_from_env, ReliabilityOptions, TableObject};
 use tailrace_connector::registry::ConnectorRegistry;
 use tailrace_connector::{Sink, SinkAck};
+
+/// Append one JSON object per row (Doris stream load `format: json` +
+/// `read_json_by_line`): column i of the batch is emitted under
+/// `columns[i]` (the sink's declared column order — the same positional
+/// contract the CSV carrier used). Types follow the engine's column
+/// vocabulary (tailrace-ir `arrow_type`): int64/float64/bool as JSON
+/// numbers/literals, everything else as a JSON string; nulls stay null.
+/// serde_json escaping makes the carrier total over arbitrary UTF-8 —
+/// no field value can break the framing.
+fn append_json_lines(
+    out: &mut Vec<u8>,
+    batch: &RecordBatch,
+    columns: &[String],
+) -> anyhow::Result<()> {
+    use datafusion::arrow::datatypes::DataType;
+    use std::fmt::Write as _;
+    anyhow::ensure!(
+        batch.num_columns() == columns.len(),
+        "doris sink: batch has {} columns but {} were declared ({})",
+        batch.num_columns(),
+        columns.len(),
+        columns.join(",")
+    );
+    let mut line = String::with_capacity(64 + 16 * columns.len());
+    for row in 0..batch.num_rows() {
+        line.clear();
+        line.push('{');
+        for (ci, name) in columns.iter().enumerate() {
+            if ci > 0 {
+                line.push(',');
+            }
+            let _ = write!(line, "{}:", serde_json::to_string(name)?);
+            let col = batch.column(ci);
+            if col.is_null(row) {
+                line.push_str("null");
+                continue;
+            }
+            match col.data_type() {
+                DataType::Int64 => {
+                    let _ = write!(
+                        line,
+                        "{}",
+                        col.as_any()
+                            .downcast_ref::<Int64Array>()
+                            .expect("Int64 column")
+                            .value(row)
+                    );
+                }
+                DataType::Float64 => {
+                    let v = col
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .expect("Float64 column")
+                        .value(row);
+                    // JSON has no NaN/Infinity — degrade to null rather
+                    // than emit an unparseable token
+                    if v.is_finite() {
+                        let _ = write!(line, "{v}");
+                    } else {
+                        line.push_str("null");
+                    }
+                }
+                DataType::Boolean => {
+                    let _ = write!(
+                        line,
+                        "{}",
+                        col.as_any()
+                            .downcast_ref::<BooleanArray>()
+                            .expect("Boolean column")
+                            .value(row)
+                    );
+                }
+                DataType::Utf8 => {
+                    let _ = write!(
+                        line,
+                        "{}",
+                        serde_json::to_string(
+                            col.as_any()
+                                .downcast_ref::<StringArray>()
+                                .expect("Utf8 column")
+                                .value(row)
+                        )?
+                    );
+                }
+                // any other arrow type (dates/timestamps/decimal…) formats
+                // through the display formatter and rides as a JSON string
+                _ => {
+                    let f = datafusion::arrow::util::display::ArrayFormatter::try_new(
+                        col,
+                        &datafusion::arrow::util::display::FormatOptions::default(),
+                    )?;
+                    let s = f.value(row).to_string();
+                    let _ = write!(line, "{}", serde_json::to_string(&s)?);
+                }
+            }
+        }
+        line.push_str("}\n");
+        out.extend_from_slice(line.as_bytes());
+    }
+    Ok(())
+}
 
 /// Register the doris sink factory (plus the "starrocks" alias when that
 /// feature is on — the Stream Load protocol is shared).
@@ -194,21 +300,19 @@ impl DorisSink {
             .put(&self.url)
             .header("Authorization", &self.auth)
             .header("label", label)
-            .header("column_separator", ",")
-            .header("columns", self.columns.join(","))
+            // JSON-lines carrier (one object per line): Doris maps by key
+            // name; serde_json escaping carries any UTF-8 payload verbatim.
+            // The old CSV path sent enclose/escape headers and be-2.1.7
+            // could not parse RFC4180 doubled quotes under any combination
+            // of them (T11 first-run matrix) — quoted/comma'd fields died.
+            .header("format", "json")
+            .header("read_json_by_line", "true")
             // Doris sequence column declaration (the out-of-order dedup basis
             // for UNIQUE KEY tables)
             .header(
                 "sequence_column",
                 self.sequence_column.as_deref().unwrap_or(""),
             )
-            // Arrow CSV quotes fields containing commas per RFC4180; Doris
-            // naively splits on commas unless enclose/escape are set. Setting
-            // both to double-quote enables RFC4180 mode (verified locally
-            // across five shapes: commas / doubled embedded quotes / in-field
-            // newlines / empty strings / backslashes).
-            .header("enclose", "\"")
-            .header("escape", "\"")
             .header("Expect", "100-continue")
             .body(body.to_vec())
             .send();
@@ -296,13 +400,8 @@ impl Sink for DorisSink {
     }
 
     fn write(&mut self, batches: Vec<RecordBatch>) -> anyhow::Result<()> {
-        {
-            let mut w = csv::WriterBuilder::new()
-                .with_header(false)
-                .build(&mut self.buf);
-            for b in &batches {
-                w.write(b)?;
-            }
+        for b in &batches {
+            append_json_lines(&mut self.buf, b, &self.columns)?;
         }
         self.pending_rows += batches.iter().map(|b| b.num_rows() as u64).sum::<u64>();
         Ok(())
@@ -463,6 +562,66 @@ mod tests {
         fn url(&self) -> String {
             format!("http://{}/api/db/t/_stream_load", self.addr)
         }
+    }
+
+    #[test]
+    fn doris_json_carrier_poison_roundtrip() -> anyhow::Result<()> {
+        // The carrier must be total over arbitrary UTF-8: in-field
+        // newlines / doubled quotes / commas / emoji / CJK / backslashes
+        // ride JSON escaping verbatim (the old CSV carrier died on these
+        // against apache/doris be-2.1.7 — T11 first-run finding).
+        let poison = "line1\nline2 \"quoted, comma\" 🎉🚀 中文毒数据 <tag>&tailrace \\path";
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("order_no", DataType::Utf8, false),
+            Field::new("note", DataType::Utf8, true),
+            Field::new("qty", DataType::Int64, true),
+        ]));
+        let rb = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["P-1"])),
+                Arc::new(StringArray::from(vec![Some(poison)])),
+                Arc::new(Int64Array::from(vec![Some(7)])),
+            ],
+        )?;
+        // null column + boolean column coverage
+        let rb2 = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("order_no", DataType::Utf8, false),
+                Field::new("note", DataType::Utf8, true),
+                Field::new("qty", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["P-2"])),
+                Arc::new(StringArray::from(vec![None::<String>])),
+                Arc::new(Int64Array::from(vec![None])),
+            ],
+        )?;
+
+        let m = MockDoris::start(vec![(200, r#"{"Status":"Success"}"#.into())]);
+        let mut sink = DorisSink::new(
+            m.url(),
+            "Basic dGVzdDp0ZXN0",
+            vec!["order_no".into(), "note".into(), "qty".into()],
+            "mjson",
+        );
+        sink.write(vec![rb, rb2])?;
+        assert_eq!(sink.flush()?.rows, 2);
+
+        let bodies = m.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1);
+        let text = std::str::from_utf8(&bodies[0])?;
+        // two JSON lines, each independently parseable (read_json_by_line)
+        let mut lines = text.lines();
+        let l1: serde_json::Value = serde_json::from_str(lines.next().expect("line 1"))?;
+        let l2: serde_json::Value = serde_json::from_str(lines.next().expect("line 2"))?;
+        assert!(lines.next().is_none(), "exactly two lines");
+        assert_eq!(l1["order_no"], "P-1");
+        assert_eq!(l1["note"], poison, "poison value must roundtrip verbatim");
+        assert_eq!(l1["qty"], 7);
+        assert_eq!(l2["note"], serde_json::Value::Null);
+        assert_eq!(l2["qty"], serde_json::Value::Null);
+        Ok(())
     }
 
     #[test]

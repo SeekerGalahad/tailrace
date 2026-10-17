@@ -128,7 +128,7 @@
 - **文件域**：console api/pipelines.rs（SSE 桥）、web LogTerminal.vue、monitor.vue。
 - **结果**（2026-10-17）：SSE 桥接受 `after_seq` 查询参数种子化引擎游标（>0 首拉即增量、跳过尾屏重放；背压结构 bounded 64/断连感知/300s 未动）；LogTerminal 接管重连（2s 节奏）：重建 channel 携带 `&after_seq=<lastSeq>`、`seq<=lastSeq` 丢弃、重连不清空已显示行；monitor.vue `v-if="deployed"` 才挂 LogTerminal（未部署管道不再发起 SSE → 无无限重连死循环）。验收数字：新增集成测试 2 个——重连不重放（首屏收 seq 1..3 断开，引擎补 seq 4，`after_seq=3` 重连仅流 seq=4，且 mock 引擎侧证实首拉即 `after_seq=3` 而非 tail）与未部署单帧 `eof:not_deployed` 即收流；`cargo test -p tailrace-console` **25 passed / 0 failed**；clippy `--all-targets --locked -D warnings` 绿；`pnpm typecheck` + `pnpm build` 绿。
 
-### T11 CI/测试深化 + docker 链路首跑（~2 人日）☐
+### T11 CI/测试深化 + docker 链路首跑（~2 人日）☑
 
 - **现状**：契约测试已进 CI，但 chaos/活性测试仍 live-gated 跳过；`docker-compose.yml`（Kafka+Doris）与 `smoke.sh --full` 编排就绪**从未实跑**（v0.1.0 如实登记的遗留）。
 - **方案**：
@@ -137,6 +137,7 @@
   3. smoke job 增 `--full`（GitHub runner 内起 compose Kafka+Doris，超时与内存预算先行验证）。
 - **验收**：本地 OrbStack 全链绿（截图/日志摘要入 docs/dev/）；CI 新增 chaos job 绿；`docker compose down -v` 后现场无残留（`docker ps` 空）。
 - **文件域**：tests/chaos.rs、conn-kafka 测试、docker-compose.yml、smoke.sh、ci.yml。
+- **结果**（2026-10-17）：本地 OrbStack 首跑**两轮 38/44 → 修复后 44/44 全绿**（全程 11m20s 含 600s 毒数据浸泡；S9 守恒 1700==1700==1700==COUNT，S9.9 换行/引号/emoji/中文字节级往返；`down -v` 后容器/网络 0 残留；容器内存峰值 kafka 372MiB / fe 867MiB / be 1.08GiB——runner 预算依据）。首跑挖出并修掉一串真问题（详见 `docs/dev/T11-docker-compose-smoke-full-first-run-2026-10-17.md` F1–F10）：镜像源（bitnami 消失/Doris tag 改名）、宿主盘满两轮复发（BDB `DiskLimitException`，清 17G target/debug 后 BE 5s 注册 Alive）、console 部署计划 `stream_load_url` 丢斜杠→全量 flush 404（已加回归断言钉住完整 URL）、BE healthcheck 不感知 FE 注册 + smoke 建表步假绿（`mysql -e` 出错仍 exit 0）、**Doris CSV 载体在官方 be-2.1.7 无 RFC4180 模式**（实测矩阵：任一 enclose/escape 组合都毁掉双写引号/逗号行）→ conn-doris 载体换 **JSON lines**（`format:json`+`read_json_by_line`，serde_json 转义全覆盖；新增 `doris_json_carrier_poison_roundtrip` 单测钉毒值往返）。testcontainers 接入：chaos 与 conn-kafka 活性在 `TAILRACE_TESTCONTAINERS=1` 下自起 ephemeral Kafka+Doris（确定端口/泄漏清理重试/nofile ulimit/Alive 门/group 加入窗口，F7/F8 八轮调试收敛），本地实跑 chaos **1 passed 60.56s**（kill-9@5s → 重启 → COUNT==5 幂等对账）、conn-kafka 活性 **1 passed 8.60s**，默认 live-gate 语义保留；ci.yml 新增 chaos job（+runner vm.max_map_count=2e6）并把 smoke job 升级 `SMOKE_FULL_SOAK_SECS=180 --full`（≥10min 口径由本地默认 600s 承担）。CI 绿门禁留待 push 后 GitHub Actions 实跑（本波门禁统一执行）。
 
 ## 五、波次编排（agent 工作流执行协议）
 
