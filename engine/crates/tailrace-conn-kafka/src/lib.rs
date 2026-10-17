@@ -563,8 +563,12 @@ mod tests {
             format!("tailrace-src-test-{}", std::process::id()),
         );
         src.open(&Cursor::None)?;
-        // a fresh group join/rebalance takes seconds
-        let chunks = src.poll(3, Duration::from_secs(30))?;
+        // a fresh group join/rebalance takes seconds — and the FIRST join on
+        // a cold ephemeral broker (offsets-topic creation + SyncGroup) took
+        // 23s+ on a 4-vCPU CI runner (2026-10-17, chaos run 39023147490);
+        // poll returns as soon as data arrives, so a 90s ceiling is free on
+        // fast hosts and only rescues the slow cold-join case
+        let chunks = src.poll(3, Duration::from_secs(90))?;
         assert!(!chunks.is_empty(), "seeded samples must be pullable");
         let Cursor::Kafka { offsets, .. } = src.cursor() else {
             panic!()

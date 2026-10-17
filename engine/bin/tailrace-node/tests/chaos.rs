@@ -586,8 +586,13 @@ fn main_flow(d: &Deps) -> anyhow::Result<()> {
     // restart path covers both)
 
     // Phase 2: restart (same state_dir — the cursor ledger restores)
-    // 25s: group join + consume + flush + final commit (same rebalance budget)
-    let mut child2 = spawn_run(binary, &spec, &state_dir, 25, &d.auth, 2);
+    // 60s: the group-join window dominates on CI runners — the first
+    // consumer-group join on a cold ephemeral broker (offsets-topic
+    // creation + SyncGroup) was STILL blocking at +23s on a 4-vCPU
+    // runner (2026-10-17: 0 rows consumed inside the old 25s window →
+    // reconciliation found 0). 60s = 2× the 30s rebalance budget the
+    // conn-kafka liveness test uses, plus consume + flush + commit.
+    let mut child2 = spawn_run(binary, &spec, &state_dir, 60, &d.auth, 2);
     let status = child2.wait()?;
     anyhow::ensure!(status.success(), "restart phase failed: {status:?}");
 
