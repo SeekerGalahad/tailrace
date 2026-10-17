@@ -93,12 +93,13 @@
 > 结果：`decode_poll` 同 poll chunks 连续切片分组→scoped 线程并行 decode 到各自 ColBatch→`concat_batches` 按 chunk 序合并；低于 512×2 chunks 走原串行路径（涓流零开销）；游标语义（flush 点整体提交）与 NO_PROGRESS_LIMIT=3 完全不动；牵连 `Decoder: Send + Sync` 一处 trait 声明（4 个实现均无状态 unit struct，零实现改动）；conn-kafka poll 路径验证后无需 diff（rdkafka 单 consumer 拉取边界，属 R3 方案 b）。验收数字（交错 A/B，同窗口各 4 轮，BENCHMARKS §4.5）：多分区 kafka(P=6)→file **21396→24658 rows/s（+15.2%，debug 档）**，file→file 顺带 +16~19%；方法学修正：不交错先后测量同二进制漂移 16.4K→25.0K，不可比。动工前先写的 5 个语义回归测试（部分分区指纹/重启不丢不重 6800 行唯一键/totals 单调 5000→6800/NO_PROGRESS=3 FAILED 判决/进步复位不误杀）+ 并行等价性单测（4096 chunks 混合 Append/Skip/Bad，JSON-lines 编码字节级一致）全绿；契约套件抓到并行化初版 Fail 策略 bad_now 错接（=DLQ 载荷数）已修。clippy -D warnings 0；runtime/decode/contract 32 passed/0 failed。
 > 结果：50ee4b5 T5 方案a落地：同 poll chunks 连续切片分组→scoped 线程并行 decode 到各自 ColBatch→concat_batches 按 chunk 序合并（<1024 chunks 走原串行路径），游标 flush 点整体提交与 NO_PROGRESS_LIMIT=3 语义不动；交错 A/B 验收 kafka(6分区)→file 21396→24658 rows/s（+15.2%，debug 档），file→file 顺带 +16~19%；动工前先写的 5 个语义回归测试（指纹/重启不丢不重 6800 唯一键/totals 单调/NO_PROGRESS=3/进步复位）+ 并行等价性单测（4096 chunks 字节级一致）全绿，clippy 0 警告，32 测试 0 失败。
 
-### T6 攒批三阈值（~2 人日）☐〔依赖 T1；与 T5 串行〕
+### T6 攒批三阈值（~2 人日）✅〔依赖 T1；与 T5 串行〕
 
 - **现状**：攒批参数（行/时间）无字节维度且无下游反压联动；Sink trait 的 `buffered_bytes()` 默认返回 0 = 字节边界永不触发。
 - **方案**：行数/字节/时间三阈值任一满足即 flush；参数命名对齐 Doris Flink connector 语义（`sink.buffer-flush.max-rows / max-bytes / interval` 风格）；Doris/kafka/file sink 实现真实 `buffered_bytes()`。（在途反压属 v1.x，不做。）
 - **验收**：三阈值各自触发的单测（构造行数触发/字节触发/时间触发三场景）；批大小分布指标入 BENCHMARKS.md；契约测试全绿。
 - **文件域**：tailrace-runtime flush 逻辑、tailrace-connector sink trait、conn-doris / conn-kafka / conn-file。
+> 结果（2026-10-17）：三阈值条件提取为 `RunOptions::flush_due` 单一谓词（两语句主循环共用；RunOptions/registry 注释钉住 `sink.buffer-flush.max-rows/max-bytes/interval` 参数映射，plan 面同名三维 flushRows/flushBytes/flushIntervalMs 经 clamp 接线不变）；`KafkaSink::buffered_bytes()` 从默认 0 改为**真实在途计量**（SinkProducerContext 投递回调记账：enqueue +payload/ delivery −payload，`in_flight_bytes` 原子计数）——至此 file（arrow 内存）/doris（carrier 字节）/kafka（在途 payload）三类 sink 字节边界全部真实（v0.1.0 时仅 kafka 缺）。验收数字：三阈值隔离单测（谓词级 13 断言 + 真 file→file 集成 3 场景：行数 500/200/100→恰 2 次 200 行 flush；字节 300/1024B/100→3 次 100 行；时间 100/1s→idle 路径 1 次；另两阈值各场景不可达保证归属）全绿，稳定性 6/6 轮；kafka buffered_bytes 离线精确账（==JSON-lines 字节总量、失败 flush 保留）+ testcontainers 真链路 flush 后==0（8.80s）；批大小分布入 BENCHMARKS.md §4.6（默认阈值 6 批全 16000+终局 4000；128KiB 字节档 13 批 p50=8000）+ 粒度事实如实登记（检查点在微批边界，行数边界以 poll_rows 为步进，Doris connector 逐 record 检查）；契约 7/7 绿；clippy -D warnings 0。
 
 ### T7 内存治理（~2 人日）✅〔依赖 T1；与 T5/T6 串行〕
 

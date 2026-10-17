@@ -43,16 +43,27 @@ pub fn default_registry() -> ConnectorRegistry {
 }
 
 /// Run options.
+///
+/// The three sink batching thresholds follow the Doris Flink connector
+/// `sink.buffer-flush.*` parameter semantics — row / byte / time, **any one
+/// satisfied → flush** ([`RunOptions::flush_due`]). The plan surface carries
+/// the same three dimensions (`PlanOptions::tuning`: `flushRows` /
+/// `flushBytes` / `flushIntervalMs`, registry-clamped).
 #[derive(Debug, Clone)]
 pub struct RunOptions {
     /// Max run duration
     pub duration: Duration,
-    /// sink batching row boundary
+    /// sink batching row boundary — Doris Flink connector
+    /// `sink.buffer-flush.max-rows` (default 10_000)
     pub flush_rows: u64,
-    /// sink batching time boundary
+    /// sink batching time boundary — Doris Flink connector
+    /// `sink.buffer-flush.interval` (default 10s; also drains the trailing
+    /// batch on idle polls after a stream stops)
     pub flush_interval: Duration,
-    /// sink batching byte boundary (fewer stream loads at low traffic — flush
-    /// once N bytes accumulate)
+    /// sink batching byte boundary — Doris Flink connector
+    /// `sink.buffer-flush.max-bytes` (default 8 MiB; 0 = the byte boundary is
+    /// disabled — sinks without a real [`tailrace_connector::Sink::buffered_bytes`]
+    /// report 0 and never trigger it)
     pub flush_bytes: u64,
     /// micro-batch pull row cap
     pub poll_rows: usize,
@@ -70,6 +81,20 @@ impl Default for RunOptions {
             poll_rows: 8_000,
             poll_slice: Duration::from_millis(100),
         }
+    }
+}
+
+impl RunOptions {
+    /// Three-threshold flush boundary (Doris Flink connector
+    /// `sink.buffer-flush.max-rows / max-bytes / interval` semantics): flush
+    /// when ANY of the row, byte or time boundary is reached. The flush
+    /// checkpoint is one micro-batch (poll), so a boundary can overshoot by at
+    /// most one poll's rows — the connector checks per record (granularity
+    /// documented in docs/BENCHMARKS.md §4.6).
+    pub fn flush_due(&self, pending_rows: u64, buffered_bytes: u64, since_flush: Duration) -> bool {
+        pending_rows >= self.flush_rows
+            || since_flush >= self.flush_interval
+            || (self.flush_bytes > 0 && buffered_bytes >= self.flush_bytes)
     }
 }
 
@@ -815,14 +840,16 @@ fn run_statement_serve(
             st.sink.write(out)?;
         }
         st.pending_rows += rows;
-        // flush_bytes byte-boundary wiring (previously declared but never
-        // checked — a dead config). Sinks whose buffered_bytes()=0 (Kafka's
-        // internal queue is unmeasurable) degrade honestly: this condition
-        // never triggers for them.
-        if st.pending_rows >= options.flush_rows
-            || st.last_flush.elapsed() >= options.flush_interval
-            || (options.flush_bytes > 0 && st.sink.buffered_bytes() >= options.flush_bytes)
-        {
+        // three-threshold boundary (Doris Flink connector
+        // `sink.buffer-flush.max-rows / max-bytes / interval`: any satisfied →
+        // flush) — byte boundary wired through the sink's real
+        // buffered_bytes() (file/doris/kafka all measure; other sinks
+        // reporting 0 degrade honestly and never trigger the byte boundary)
+        if options.flush_due(
+            st.pending_rows,
+            st.sink.buffered_bytes(),
+            st.last_flush.elapsed(),
+        ) {
             let span = sink_flush_span(pipeline_id, &st);
             let _flush_span = span.enter();
             let flush_t0 = Instant::now();
@@ -1001,13 +1028,13 @@ fn run_statement(
         }
         st.pending_rows += rows;
         // batching boundary reached: flush (idempotency boundary) → cursor
-        // commit (at-least-once anchor). flush_bytes byte boundary (same
-        // condition as the serve loop; unmeasurable sinks degrade and never
-        // trigger)
-        if st.pending_rows >= options.flush_rows
-            || st.last_flush.elapsed() >= options.flush_interval
-            || (options.flush_bytes > 0 && st.sink.buffered_bytes() >= options.flush_bytes)
-        {
+        // commit (at-least-once anchor). Same three-threshold predicate as
+        // the serve loop (`sink.buffer-flush.max-rows / max-bytes / interval`)
+        if options.flush_due(
+            st.pending_rows,
+            st.sink.buffered_bytes(),
+            st.last_flush.elapsed(),
+        ) {
             let span = sink_flush_span(pipeline_id, &st);
             let _flush_span = span.enter();
             let flush_t0 = Instant::now();
@@ -1120,6 +1147,39 @@ pub fn run_standalone(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T6: the three-threshold flush boundary in isolation — each dimension
+    /// fires alone with the other two held far below their thresholds, and
+    /// nothing fires when all three are below (Doris Flink connector
+    /// `sink.buffer-flush.max-rows / max-bytes / interval` semantics: any
+    /// satisfied → flush).
+    #[test]
+    fn t6_flush_boundary_threshold_isolation() {
+        let opts = RunOptions {
+            flush_rows: 10_000,
+            flush_interval: Duration::from_secs(10),
+            flush_bytes: 8 * 1024 * 1024,
+            ..Default::default()
+        };
+        // rows alone (no bytes buffered, no time elapsed)
+        assert!(!opts.flush_due(9_999, 0, Duration::ZERO));
+        assert!(opts.flush_due(10_000, 0, Duration::ZERO));
+        // bytes alone
+        assert!(!opts.flush_due(0, 8 * 1024 * 1024 - 1, Duration::ZERO));
+        assert!(opts.flush_due(0, 8 * 1024 * 1024, Duration::ZERO));
+        // time alone
+        assert!(!opts.flush_due(0, 0, Duration::from_millis(9_999)));
+        assert!(opts.flush_due(0, 0, Duration::from_secs(10)));
+        // flush_bytes = 0 disables the byte boundary entirely (the honest
+        // degradation for sinks that cannot measure)
+        let no_bytes = RunOptions {
+            flush_bytes: 0,
+            ..opts.clone()
+        };
+        assert!(!no_bytes.flush_due(0, u64::MAX, Duration::from_secs(9)));
+        // all three far below their boundaries → no flush
+        assert!(!opts.flush_due(1, 1, Duration::from_millis(1)));
+    }
 
     /// T5 equivalence acceptance: the parallel decode path (fan-out above
     /// PARALLEL_DECODE_MIN_CHUNKS×2, one ColBatch per worker, concat_batches

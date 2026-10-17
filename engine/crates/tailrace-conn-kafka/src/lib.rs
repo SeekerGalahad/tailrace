@@ -384,7 +384,9 @@ impl Source for KafkaSource {
 /// Delivery-report collection context: librdkafka silently drops undeliverable
 /// messages while flush still "succeeds" — a false-success data-loss channel.
 /// The explicit callback turns failures into pipeline errors → the cursor is
-/// not committed → the batch replays.
+/// not committed → the batch replays. The same callback also accounts
+/// in-flight payload bytes (T6 `buffered_bytes`): enqueue +len / delivery
+/// report −len.
 #[derive(Clone, Default)]
 struct SinkProducerContext {
     /// first delivery failure (drained once; later failures do not overwrite)
@@ -392,6 +394,10 @@ struct SinkProducerContext {
     /// in-flight acks: send +1 / delivery report -1 (must be 0 after flush
     /// drains)
     pending_acks: Arc<AtomicI64>,
+    /// in-flight payload bytes: send +len / delivery report −len — the byte
+    /// count handed to librdkafka but not yet delivery-confirmed (the
+    /// `sink.buffer-flush.max-bytes` boundary input)
+    in_flight_bytes: Arc<AtomicI64>,
 }
 
 impl rdkafka::client::ClientContext for SinkProducerContext {}
@@ -400,6 +406,11 @@ impl rdkafka::producer::ProducerContext for SinkProducerContext {
     type DeliveryOpaque = ();
     fn delivery(&self, result: &rdkafka::producer::DeliveryResult, _opaque: ()) {
         self.pending_acks.fetch_sub(1, Ordering::Relaxed);
+        let delivered = match result {
+            Ok(msg) => msg.payload_len(),
+            Err((_, msg)) => msg.payload_len(),
+        } as i64;
+        self.in_flight_bytes.fetch_sub(delivered, Ordering::Relaxed);
         if let Err((e, _)) = result {
             let mut g = self.failed.lock().unwrap();
             if g.is_none() {
@@ -478,6 +489,16 @@ fn encode_json_lines(batches: &[RecordBatch]) -> anyhow::Result<Vec<u8>> {
 }
 
 impl Sink for KafkaSink {
+    /// Real in-flight measurement (T6): payload bytes enqueued to librdkafka
+    /// minus bytes whose delivery report already arrived — the byte boundary
+    /// (`sink.buffer-flush.max-bytes`) no longer degrades to "never triggers"
+    /// for kafka sinks. Drains toward 0 as the broker acks (acks=all);
+    /// after a failed flush the undelivered share stays counted (at-least-once
+    /// — the batch replays).
+    fn buffered_bytes(&self) -> u64 {
+        self.ctx.in_flight_bytes.load(Ordering::Relaxed).max(0) as u64
+    }
+
     fn write(&mut self, batches: Vec<RecordBatch>) -> anyhow::Result<()> {
         let buf = encode_json_lines(&batches)?;
         // one \n-terminated JSON object per row — splitting on line
@@ -491,6 +512,9 @@ impl Sink for KafkaSink {
                 anyhow::bail!("kafka enqueue: {e}");
             }
             self.ctx.pending_acks.fetch_add(1, Ordering::Relaxed);
+            self.ctx
+                .in_flight_bytes
+                .fetch_add(line.len() as i64, Ordering::Relaxed);
             self.pending += 1;
         }
         self.producer.poll(Duration::ZERO);
@@ -557,6 +581,11 @@ mod tests {
         sink.write(vec![mk("live-a")?, mk("live-b")?, mk("live-c")?])?;
         let ack = sink.flush()?;
         assert_eq!(ack.rows, 3, "sink must deliver all 3 seeded records");
+        assert_eq!(
+            sink.buffered_bytes(),
+            0,
+            "delivered+flushed records drain the in-flight byte count"
+        );
         let mut src = KafkaSource::new(
             bootstrap,
             topic,
@@ -645,6 +674,54 @@ mod tests {
             return Ok(()); // local-liveness only
         }
         live_roundtrip("localhost:9092", "tailrace.discover.test")
+    }
+
+    /// T6: `buffered_bytes()` is a real in-flight measurement — payload bytes
+    /// enqueued minus delivery-confirmed. Offline (unreachable broker: send
+    /// only queues locally): the count equals the exact JSON-lines byte total
+    /// written and survives a failed flush (nothing delivered → nothing
+    /// drained). The drain-to-zero half of the property is pinned by
+    /// `live_roundtrip` (testcontainers / live-gated modes).
+    #[test]
+    fn kafka_sink_buffered_bytes_tracks_in_flight_payload() -> anyhow::Result<()> {
+        let mk = |v: &str| -> anyhow::Result<RecordBatch> {
+            Ok(RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)])),
+                vec![Arc::new(StringArray::from(vec![v.to_string()]))],
+            )?)
+        };
+        let mut sink = KafkaSink::new("localhost:1", "t-t6bytes")?;
+        assert_eq!(sink.buffered_bytes(), 0, "empty sink buffers nothing");
+        let rows = vec![
+            mk("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?,
+            mk("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")?,
+            mk("cccccccccccccccccccccccccccccc")?,
+        ];
+        // expected = the exact per-line byte sum the sink enqueues
+        let encoded = encode_json_lines(&rows)?;
+        let expect: u64 = std::str::from_utf8(&encoded)?
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.len() as u64)
+            .sum();
+        sink.write(rows)?;
+        assert_eq!(
+            sink.buffered_bytes(),
+            expect,
+            "in-flight bytes == the exact enqueued payload byte total"
+        );
+        // a second write accumulates on top
+        sink.write(vec![mk("dddddddddddddddddddddddddddddd")?])?;
+        assert!(sink.buffered_bytes() > expect, "count keeps accumulating");
+        // unreachable broker: flush fails and the undelivered share stays
+        // counted (at-least-once — the batch replays)
+        sink.flush_timeout = Duration::from_millis(300);
+        assert!(sink.flush().is_err());
+        assert!(
+            sink.buffered_bytes() > 0,
+            "undelivered bytes stay counted after a failed flush"
+        );
+        Ok(())
     }
 
     /// Poison rows (in-field newlines / quotes / emoji) ride the JSON-lines

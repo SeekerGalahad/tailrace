@@ -106,7 +106,7 @@ parse+plan——T7 物化 LogicalPlan 的改造对象）。
 | （待 T3 填） | transform 各项 | 见 §2.2 | — | — | — |
 | （待 T3 填） | sink/jsonl_flush_10k_rows | 205.7 K rows/s（磁盘敏感） | — | — | — |
 | （待 T5 填） | macro 多分区对比 | — | — | — | — |
-| （待 T6 填） | 批大小分布指标 | — | — | — | — |
+| T6 | 批大小分布指标 | — | 默认 6 批全 16000；字节 128KiB 档 13 批 p50=8000 | 见 §4.6 | 2026-10-17 |
 | T7 | transform/identity_select_star | 19.348 M rows/s | 30.647 M rows/s | **+58%** | 2026-10-17 |
 | T7 | transform/filter_project | 7.454 M rows/s | 8.958 M rows/s | **+20%** | 2026-10-17 |
 | T7 | transform/groupby_aggregate | 6.219 M rows/s | 8.072 M rows/s | **+30%** | 2026-10-17 |
@@ -267,6 +267,51 @@ trait 声明：`Decoder: Send + Sync`（`&dyn Decoder` 跨 scoped 线程共享�
 - 过程修复：契约套件 `bad_row_policy_branches` 抓到并行化初版把 Fail 策略的
   bad 计数错接为 DLQ 载荷数（bad_now=0 → fail 不触发）——已修（PollDecode.bad_now
   独立字段），该测试恢复绿。
+
+### §4.6 T6 攒批三阈值（2026-10-17）
+
+改造内容（roadmap §四 T6）：行数/字节/时间三阈值**任一满足即 flush**，参数
+语义对齐 Doris Flink connector 的 `sink.buffer-flush.max-rows / max-bytes /
+interval`（`RunOptions::flush_rows / flush_bytes / flush_interval`，提取为
+单一谓词 `RunOptions::flush_due` 供两个语句主循环共用；plan 面同名三维
+`flushRows / flushBytes / flushIntervalMs` 经 registry clamp 接线）。
+`KafkaSink::buffered_bytes()` 从默认 0（字节边界永不触发）改为**真实在途
+计量**：`SinkProducerContext` 投递回调内记账——enqueue +payload len /
+delivery report −payload len（`in_flight_bytes` 原子计数；acks=all 语义下
+delivery report 即「leader+全部副本已持久化」）。至此 file（pending 批 arrow
+内存）/ doris（carrier 字节）/ kafka（在途 payload 字节）三类 sink 的
+`buffered_bytes()` 均为真实测量。
+
+验收数字：
+
+- 三阈值隔离单测（`tailrace-runtime` lib `t6_flush_boundary_threshold_isolation`
+  + 集成 `t6_{row,byte,time}_boundary_triggers_flush`，真 file→file + 真
+  tuning 参数面）：行数场景 500 行/poll 100/flush_rows 200 → RUNNING 期间
+  恰 2 次 flush 各 200 行；字节场景 300 行/flush_bytes 1024 → 3 次 flush
+  各 100 行；时间场景 100 行/interval 1s → idle 路径 1 次 flush 100 行；
+  另两阈值在各自场景中均放到不可达（1M 行/1GiB/600s）保证归属唯一。
+- kafka `buffered_bytes` 单测：离线（broker 不可达，send 仅入本地队列）
+  计数 == 精确 JSON-lines 字节总量、失败 flush 后保留；testcontainers
+  真链路（`kafka_source_live` 8.80s）flush 成功后 == 0（投递确认即清零）。
+- 契约测试 7/7 绿；`clippy --all-targets -D warnings` 0 告警。
+
+**批大小分布指标**（数据源：`t6_flush_size_distribution_*` 测试，从 hub
+FLUSH_OK 事件提取每次 flush 行数；file→file 100k 行、行形态
+`{"order_no":"ORD-<24位>","qty":<i>}` ≈45B/行，debug 档、单语句、无 console
+中转，单轮 wall ≈14s——非吞吐口径，吞吐见 §三）：
+
+| 配置 | flush 次数 | min | p50 | p90 | p99 | max | 终局 flush |
+|---|---|---|---|---|---|---|---|
+| 默认阈值（10k rows / 8MiB / 10s / poll 8000） | 6 | 16000 | 16000 | 16000 | 16000 | 16000 | 4000 |
+| 字节阈值 128KiB（其余不可达 / poll 8000） | 13 | 4000 | 8000 | 8000 | 8000 | 8000 | 0（尾部 4000 行自身过界） |
+
+**粒度事实（如实登记）**：flush 检查点在**微批边界**（每 poll 一次，
+decode→transform→write 之后），行数边界过界判断只能以整 poll 为步进——
+默认阈值下批恒为 2×poll_rows=16000 而非 10000±ε；Doris Flink connector
+逐 record 检查，其 max-rows=10k 的批接近 10000。若需消粒度差，需把阈值
+检查下沉进 write 路径（逐批/逐 chunk），属 R3+ 取舍，本轮不做。字节阈值
+塑形同理以 poll 为步进（128KiB 配置下每 poll ≈320KiB arrow 内存恒过界，
+批=poll 大小 8000）。
 
 ## 五、CI 口径
 

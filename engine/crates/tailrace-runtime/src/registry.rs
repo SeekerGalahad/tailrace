@@ -304,7 +304,10 @@ impl PipelineRegistry {
             options.flush_interval = std::time::Duration::from_millis(ms);
         }
         // tuning: RunOptions knobs exposed for the first time (empty section
-        // = defaults)
+        // = defaults). The three flush thresholds are the Doris Flink
+        // connector `sink.buffer-flush.max-rows / max-bytes / interval`
+        // parameter set (any satisfied → flush); clamps are the plan-surface
+        // guardrails.
         if let Some(t) = plan_options.as_ref().and_then(|o| o.tuning.as_ref()) {
             if let Some(v) = t.flush_rows {
                 options.flush_rows = v.clamp(100, 1_000_000);
