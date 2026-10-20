@@ -233,6 +233,55 @@ fn mysql_keyset_cursor_restart_no_loss_no_dup() -> anyhow::Result<()> {
     assert_eq!(v["ratio"], serde_json::json!(1.5)); // id=1 → ratio = 1.5
     assert_eq!(v["born"], serde_json::json!("2026-01-01T10:00:00Z"));
 
+    // ⑦ keyset precondition (R3-W1 review fix): a cursor column with only a
+    // NON-unique index is refused — duplicate values straddling a LIMIT
+    // boundary would otherwise be skipped forever by the next `>` window.
+    // The probe failure is deferred from open() to poll() (connectivity
+    // convention), so the refusal surfaces as the poll error.
+    rt.block_on(async {
+        use sqlx_core::connection::Connection;
+        use sqlx_core::executor::Executor;
+        use sqlx_core::sql_str::AssertSqlSafe;
+        use sqlx_mysql::MySqlConnection;
+        let mut conn = MySqlConnection::connect(&url).await?;
+        conn.execute(AssertSqlSafe(
+            "CREATE TABLE ticks (id BIGINT PRIMARY KEY, ts DATETIME NOT NULL, KEY ticks_ts (ts))",
+        ))
+        .await?;
+        conn.execute(AssertSqlSafe(
+            "INSERT INTO ticks VALUES (1, '2026-03-01 00:00:00'), (2, '2026-03-01 00:00:00'), (3, '2026-03-01 00:00:00')",
+        ))
+        .await?;
+        anyhow::Ok(())
+    })?;
+    let mut non_unique = build_source(&url, "ticks", "ts");
+    non_unique.open(&Cursor::None)?;
+    let err = non_unique
+        .poll(2, Duration::from_secs(5))
+        .expect_err("non-unique cursor column must be refused");
+    assert!(
+        format!("{err:#}").contains("has no PRIMARY KEY / single-column UNIQUE index"),
+        "refusal names the missing UNIQUE index: {err:#}"
+    );
+    // ...the PK of the same table passes the gate, and so does a
+    // schema-qualified table name (COALESCE(?, DATABASE()) path)
+    let mut by_pk = build_source(&url, "ticks", "id");
+    by_pk.open(&Cursor::None)?;
+    let (tick_raw, _) = drain(&mut by_pk, 2);
+    assert_eq!(
+        tick_raw.len(),
+        3,
+        "PK cursor column passes the uniqueness gate"
+    );
+    let mut qualified = build_source(&url, "test.orders", "id");
+    qualified.open(&Cursor::None)?;
+    let (q_raw, _) = drain(&mut qualified, 10);
+    assert_eq!(
+        q_raw.len(),
+        7,
+        "schema-qualified table passes the uniqueness gate"
+    );
+
     node.rm()?; // cleanup
     Ok(())
 }
@@ -354,6 +403,44 @@ fn postgres_keyset_cursor_int_and_timestamptz() -> anyhow::Result<()> {
     assert_eq!(late_t_raw.len(), 1);
     let v: serde_json::Value = serde_json::from_slice(&late_t_raw[0])?;
     assert_eq!(v["payload"], serde_json::json!("e4"));
+
+    // ④ keyset precondition (R3-W1 review fix): the leading column of a
+    // composite PRIMARY KEY is not unique by itself → refused (pg_index
+    // indnkeyatts = 1 predicate); a schema-qualified name resolves through
+    // the pg_namespace join and passes for the real PK.
+    rt.block_on(async {
+        use sqlx_core::connection::Connection;
+        use sqlx_core::executor::Executor;
+        use sqlx_core::sql_str::AssertSqlSafe;
+        use sqlx_postgres::PgConnection;
+        let mut conn = PgConnection::connect(&url).await?;
+        conn.execute(AssertSqlSafe(
+            "CREATE TABLE pairs (a BIGINT NOT NULL, b BIGINT NOT NULL, PRIMARY KEY (a, b))",
+        ))
+        .await?;
+        conn.execute(AssertSqlSafe(
+            "INSERT INTO pairs VALUES (1, 1), (1, 2), (2, 1)",
+        ))
+        .await?;
+        anyhow::Ok(())
+    })?;
+    let mut composite = build_source(&url, "pairs", "a");
+    composite.open(&Cursor::None)?;
+    let err = composite
+        .poll(2, Duration::from_secs(5))
+        .expect_err("composite-PK leading column must be refused");
+    assert!(
+        format!("{err:#}").contains("has no PRIMARY KEY / single-column UNIQUE index"),
+        "refusal names the missing UNIQUE index: {err:#}"
+    );
+    let mut qualified = build_source(&url, "public.orders", "id");
+    qualified.open(&Cursor::None)?;
+    let (q_raw, _) = drain(&mut qualified, 10);
+    assert_eq!(
+        q_raw.len(),
+        5,
+        "schema-qualified table passes the uniqueness gate"
+    );
 
     node.rm()?;
     Ok(())

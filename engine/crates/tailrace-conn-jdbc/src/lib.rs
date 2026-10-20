@@ -13,13 +13,16 @@
 //! Resume = the same window query with the saved value as the exclusive
 //! lower bound, so a restart continues without loss or duplication **given a
 //! unique cursor column** (PK / unique time column). Keyset caveat: ties on a
-//! non-unique column can strand rows inserted with an already-flushed value.
+//! non-unique column straddling a LIMIT boundary would be skipped forever by
+//! the next `>` window (silent data loss) — so the connect probe **enforces**
+//! that the cursor column is unique by itself (PRIMARY KEY or a single-column
+//! UNIQUE index, catalog-view lookup) and fails the source otherwise.
 //!
 //! Catalog mapping (TableObject reuse, no schema changes):
 //! - `bootstrap` = database URL; the scheme selects the dialect
 //!   (`mysql://user:pass@host:port/db`, `postgres://…`);
-//! - `sequence_column` = incremental cursor column (primary key or time
-//!   column; NOT NULL and unique);
+//! - `sequence_column` = incremental cursor column (primary key or a unique
+//!   time column; NOT NULL, unique by itself — enforced at connect);
 //! - `format` should be `json` for jdbc tables (the source emits JSON).
 //!
 //! Driver choice (roadmap T13; supply-chain gate ran FIRST, both candidates):
@@ -55,6 +58,7 @@ use sqlx_core::column::Column;
 use sqlx_core::connection::Connection;
 use sqlx_core::executor::Executor;
 use sqlx_core::query::{query, Query};
+use sqlx_core::query_scalar::query_scalar;
 use sqlx_core::row::Row;
 use sqlx_core::sql_str::{AssertSqlSafe, SqlSafeStr};
 use sqlx_core::statement::Statement;
@@ -84,7 +88,7 @@ fn source_factory(
     let dialect = Dialect::from_url(url)?;
     let cursor_col = obj.sequence_column.as_deref().ok_or_else(|| {
         anyhow::anyhow!(
-            "jdbc source {} requires `sequence_column` (incremental cursor column: PK or time column)",
+            "jdbc source {} requires `sequence_column` (incremental cursor column: PK or a UNIQUE time column — must be unique by itself)",
             obj.name
         )
     })?;
@@ -276,7 +280,8 @@ impl Source for JdbcSource {
 }
 
 /// Connect + probe the cursor column kind via prepared-statement metadata
-/// (no data read; also validates table/SQL early).
+/// (no data read; also validates table/SQL early), then gate the keyset
+/// precondition (cursor column unique by itself — see crate docs).
 async fn connect_and_probe(st: &mut State) -> anyhow::Result<()> {
     let probe = format!(
         "SELECT * FROM {} WHERE {} > {} ORDER BY {} ASC LIMIT 1",
@@ -297,7 +302,9 @@ async fn connect_and_probe(st: &mut State) -> anyhow::Result<()> {
                 &st.cursor_col,
             )?;
             st.cursor_kind = Some(mysql_cursor_kind(col.1)?);
-            st.backend = Some(Backend::MySql(conn));
+            let mut backend = Backend::MySql(conn);
+            assert_unique_cursor(&mut backend, &st.table, &st.cursor_col).await?;
+            st.backend = Some(backend);
         }
         Dialect::Postgres => {
             let mut conn = PgConnection::connect(&st.url).await?;
@@ -310,7 +317,9 @@ async fn connect_and_probe(st: &mut State) -> anyhow::Result<()> {
                 &st.cursor_col,
             )?;
             st.cursor_kind = Some(pg_cursor_kind(col.1)?);
-            st.backend = Some(Backend::Pg(conn));
+            let mut backend = Backend::Pg(conn);
+            assert_unique_cursor(&mut backend, &st.table, &st.cursor_col).await?;
+            st.backend = Some(backend);
         }
     }
     tracing::info!(
@@ -320,6 +329,72 @@ async fn connect_and_probe(st: &mut State) -> anyhow::Result<()> {
         kind = ?st.cursor_kind,
         "jdbc source connected"
     );
+    Ok(())
+}
+
+/// MySQL: count unique indexes (PRIMARY included) whose ONLY key part is the
+/// cursor column. `COALESCE(?, DATABASE())` resolves an unqualified table to
+/// the connection's default schema; the NOT EXISTS clause rejects composite
+/// unique keys (a leading part of `UNIQUE (ts, id)` is not unique by itself).
+const MYSQL_UNIQUE_SQL: &str = "SELECT COUNT(*) FROM information_schema.STATISTICS s \
+     WHERE s.TABLE_SCHEMA = COALESCE(?, DATABASE()) AND s.TABLE_NAME = ? \
+       AND s.COLUMN_NAME = ? AND s.NON_UNIQUE = 0 \
+       AND NOT EXISTS (SELECT 1 FROM information_schema.STATISTICS o \
+                        WHERE o.TABLE_SCHEMA = s.TABLE_SCHEMA AND o.TABLE_NAME = s.TABLE_NAME \
+                          AND o.INDEX_NAME = s.INDEX_NAME AND o.SEQ_IN_INDEX <> s.SEQ_IN_INDEX)";
+
+/// PostgreSQL: same predicate over pg_index — unique, non-partial (a partial
+/// unique index proves nothing for the rows it excludes), exactly one key
+/// column (`indnkeyatts`, INCLUDE columns don't count) and that column is the
+/// cursor column (`indkey` is 0-based). Unquoted identifiers fold to lower
+/// case in PG, so the lookup binds lower-cased names.
+const PG_UNIQUE_SQL: &str = "SELECT COUNT(*) FROM pg_index i \
+     JOIN pg_class t ON t.oid = i.indrelid \
+     JOIN pg_namespace n ON n.oid = t.relnamespace \
+     JOIN pg_attribute a ON a.attrelid = t.oid AND a.attname::text = $3::text \
+     WHERE n.nspname::text = COALESCE($1::text, current_schema()::text) \
+       AND t.relname::text = $2::text \
+       AND i.indisunique AND i.indpred IS NULL AND i.indnkeyatts = 1 \
+       AND i.indkey[0] = a.attnum";
+
+/// Keyset safety gate (R3-W1 review): `WHERE col > ? ORDER BY col LIMIT n`
+/// has no tie-breaker, so a cursor column with duplicate values straddling a
+/// LIMIT boundary would have the remaining ties skipped forever by the next
+/// window — silent data loss. Refuse to run unless the column is unique by
+/// itself (PRIMARY KEY or single-column UNIQUE index), checked once per
+/// connect via the catalog views.
+async fn assert_unique_cursor(
+    backend: &mut Backend,
+    table: &str,
+    cursor_col: &str,
+) -> anyhow::Result<()> {
+    let (schema, name) = match table.rsplit_once('.') {
+        Some((s, n)) => (Some(s), n),
+        None => (None, table),
+    };
+    let unique_indexes: i64 = match backend {
+        Backend::MySql(conn) => query_scalar::<MySql, i64>(AssertSqlSafe(MYSQL_UNIQUE_SQL))
+            .bind(schema)
+            .bind(name)
+            .bind(cursor_col)
+            .fetch_one(conn)
+            .await
+            .map_err(|e| anyhow::anyhow!("mysql cursor uniqueness probe failed: {e}"))?,
+        Backend::Pg(conn) => query_scalar::<Postgres, i64>(AssertSqlSafe(PG_UNIQUE_SQL))
+            .bind(schema.map(str::to_ascii_lowercase))
+            .bind(name.to_ascii_lowercase())
+            .bind(cursor_col.to_ascii_lowercase())
+            .fetch_one(conn)
+            .await
+            .map_err(|e| anyhow::anyhow!("postgres cursor uniqueness probe failed: {e}"))?,
+    };
+    if unique_indexes == 0 {
+        anyhow::bail!(
+            "jdbc source {table}: cursor column {cursor_col} has no PRIMARY KEY / single-column UNIQUE index — \
+             keyset polling (WHERE {cursor_col} > ?) would silently skip duplicate values across a LIMIT boundary; \
+             use the primary key or a UNIQUE time column as `sequence_column`"
+        );
+    }
     Ok(())
 }
 
