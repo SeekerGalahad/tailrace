@@ -166,7 +166,7 @@
 
 **执行纪律（对所有参与 agent 生效）**：
 
-1. 工作目录固定 `~/IdeaProjects/tailrace`（2026-10-20 勘正：原 `~/GLMProjects/tailrace` 已删除重建于此）；开工先读本文件对应任务卡与「做得好的红线」；
+1. 工作目录固定 `~/GLMProjects/tailrace`（双开发机一致的正典路径；本地 `~/IdeaProjects/tailrace` 为指向此处的软链）；开工先读本文件对应任务卡与「做得好的红线」；
 2. 红线：状态账本四步持久化与 assign-only 恢复路径不动；emit 结构化事件不被 tracing 化破坏；SSE 桥背压结构（bounded 64/断连感知/300s 上限）不动；smoke.sh 骨架不拆；
 3. 提交：Conventional Commits（perf:/feat:/test:/chore:），一任务一提交；**只 `git add` 自己任务卡的文件域**；禁止 amend/rebase/改 tag/动 v0.1.0；push 只由波门禁执行；
 4. 测试：按 §三分层严格跑；失败即修，修不好即停波上报（不静默降级）；
@@ -175,7 +175,7 @@
 ## 六、R2 收口标准（全轮验收）
 
 ```bash
-cd ~/IdeaProjects/tailrace   # 2026-10-20 勘正：原 ~/GLMProjects/tailrace 已删除
+cd ~/GLMProjects/tailrace
 cargo fmt --all --check && CARGO_PROFILE_DEV_DEBUG=0 cargo clippy --workspace --all-targets --locked -- -D warnings
 CARGO_PROFILE_DEV_DEBUG=0 cargo test --workspace --locked          # ≥ 基线 124 passed，0 failed
 grep -rn 'eprintln' engine/crates --include='*.rs' | wc -l         # = 0
