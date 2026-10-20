@@ -68,7 +68,13 @@ fn cursor_progress(state_dir: &std::path::Path, pipeline_id: u64, n_statements: 
                         .wrapping_add(*o as u64)
                 }),
                 Cursor::File { byte_pos, .. } => 11 + *byte_pos,
-                Cursor::JdbcKey { .. } => 13,
+                // fold key+value bytes: a keyset advance must read as progress
+                // (a constant here made every JDBC failure "no progress" and
+                // let 3 transient outages be judged poison data)
+                Cursor::JdbcKey { key, value } => key
+                    .bytes()
+                    .chain(value.bytes())
+                    .fold(13u64, |a, b| a.wrapping_mul(31).wrapping_add(b as u64)),
                 Cursor::None => 5,
             };
             acc = acc.wrapping_mul(1_000_003).wrapping_add(h);
@@ -774,6 +780,69 @@ mod tests {
             fp3,
             cursor_progress(&dir, 9901, 1),
             "frozen cursor → identical fingerprint across restarts"
+        );
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// 评审修复回归（R3-W1）：JDBC keyset 位点推进必须移动指纹——此前
+    /// `JdbcKey{..} => 13` 常量让任何 JDBC 失败都算"无进展"，3 次瞬时断库即被
+    /// 误判毒数据；同时冻结位点仍须逐位稳定（毒数据判据的确定性基础）。
+    #[test]
+    fn jdbc_keyset_advance_moves_the_cursor_fingerprint() -> anyhow::Result<()> {
+        let jcursor = |value: &str| Cursor::JdbcKey {
+            key: "id".into(),
+            value: value.into(),
+        };
+        let dir = std::env::temp_dir().join(format!("tailrace-jdbc-fp-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        {
+            let mut store = FileOffsetStore::new(&dir)?;
+            store.save(9902, 0, &jcursor("100"), Some("run1"), None)?;
+        }
+        let fp1 = cursor_progress(&dir, 9902, 1);
+        assert_eq!(
+            fp1,
+            cursor_progress(&dir, 9902, 1),
+            "same ledger → identical fingerprint (deterministic fold)"
+        );
+        {
+            let mut store = FileOffsetStore::new(&dir)?;
+            store.save(9902, 0, &jcursor("101"), Some("run2"), None)?;
+        }
+        let fp2 = cursor_progress(&dir, 9902, 1);
+        assert_ne!(
+            fp1, fp2,
+            "keyset advance must move the fingerprint (no false NO_PROGRESS)"
+        );
+        // frozen cursor (same value re-committed) → identical fingerprint
+        {
+            let mut store = FileOffsetStore::new(&dir)?;
+            store.save(9902, 0, &jcursor("101"), Some("run3"), None)?;
+        }
+        assert_eq!(
+            fp2,
+            cursor_progress(&dir, 9902, 1),
+            "frozen cursor → identical fingerprint across restarts"
+        );
+        // a cursor-column rename (key change) is also a visible change
+        {
+            let mut store = FileOffsetStore::new(&dir)?;
+            store.save(
+                9902,
+                0,
+                &Cursor::JdbcKey {
+                    key: "ts".into(),
+                    value: "101".into(),
+                },
+                Some("run4"),
+                None,
+            )?;
+        }
+        assert_ne!(
+            fp2,
+            cursor_progress(&dir, 9902, 1),
+            "key change moves the fingerprint"
         );
         std::fs::remove_dir_all(&dir)?;
         Ok(())
