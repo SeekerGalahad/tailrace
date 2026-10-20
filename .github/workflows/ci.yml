@@ -81,9 +81,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      # opt-in mode of the chaos + conn-kafka live tests: boot temporary
-      # Kafka (apache module) and Doris (fe/be 2.1.7) containers from the
-      # test itself; the default live-gate semantics stay for local runs
+      # opt-in mode of the chaos + conn-kafka + conn-jdbc live tests: boot
+      # temporary Kafka (apache module), Doris (fe/be 2.1.7), MySQL 8.0 and
+      # Postgres 15 containers from the test itself; the default live-gate
+      # semantics stay for local runs
       TAILRACE_TESTCONTAINERS: "1"
     steps:
       - uses: actions/checkout@v4
@@ -101,6 +102,10 @@ jobs:
       - run: sudo swapoff -a
       - run: cargo test --locked -p tailrace-node --test chaos -- --nocapture
       - run: cargo test --locked -p tailrace-conn-kafka kafka_source_live -- --nocapture
+      # T13 JDBC batch source against real mysql:8.0 / postgres:15 (the
+      # `rust` job runs the same tests ungated, where they print [skip] and
+      # count as passed — only this job gives real-database coverage)
+      - run: cargo test --locked -p tailrace-conn-jdbc --test jdbc_sources -- --nocapture
 
   smoke:                                           # 端到端冒烟：起 console+node，跑通 healthz/注册/心跳
     needs: [rust, web]
