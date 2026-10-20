@@ -198,7 +198,7 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 1. `utoipa-swagger-ui 10.0.1` 锁定的 `zip 8.6.0`（仅 build-dep，构建脚本解压 crate 自带的 vendored swagger-ui dist）：2026-10-13 后被上游 yank（现又恢复可装，deny.toml `yanked="warn"` 保留）；2026-10-17 RustSec 连发 RUSTSEC-2026-0367/0368/0369 三个 extract 漏洞（修复仅入 zip 9.0.x，`^8.6` 不可达且无 8.x backport；build-dep 威胁模型不适用——不链接进产物二进制、不解压外部归档）——deny.toml 已 ignore 三条带跟踪注释。其发新版（zip 9 线）后回收 warn+ignore 并重新收紧；
 2. OTLP 的 `opentelemetry` 0.33 / `tracing-opentelemetry` 0.34 版本锚定后是否升格默认开启（当前 feature 门控默认关）；
 3. R3 升格评审五项的门槛数据（本 R2 的 BENCHMARKS.md 即门槛输入）；
-4. CodeMirror6 替换 monaco 评估（编辑器体积档位，R3 裁决；T9 实测 monaco gzip 883kB vs CM6 预期 ~200-300kB 级，2026-10-17 立项）——R3 由 T17 承接。
+4. CodeMirror6 替换 monaco 评估（编辑器体积档位，R3 裁决；T9 实测 monaco gzip 883kB vs CM6 预期 ~200-300kB 级，2026-10-17 立项）——R3 由 T17 承接。**2026-10-20 T17 裁决（PoC 分支 poc/codemirror6@7f32c26，不进主干）**：实测编辑器异步 chunk gzip **883.22→140.45 kB（−84.1%）**，好于本条 200-300kB 预期档；编辑器相关资产合计（JS+CSS gzip + worker/ttf 折算）1,078→140.70 kB——CM6 零 worker/零字体/零外部 CSS（T9 的 CSS 晚到/布局塌缩补丁整类消失）。能力面为现用面超集：`db.` 表补全 parser 驱动+FROM 别名感知、SQL 关键字补全（monaco 无）、SQLNamespace 列槽位为 T14 infer-schema 就绪（`db.table.` 列补全届时零编辑器侧代码）；delta 三项（库名大小写敏感 vs monaco 不敏感、`db.e` 后关键字混入、补全+插 `-- @tag:ds` 为单 undo 步）均有廉价修法（自写 ~30 行 CompletionSource 可全对齐）。迁移面：PoC 已完成内核替换 7 文件（SqlMonaco.vue 365→246 行、edit.vue 零改动、对外 props/emits 不变），typecheck+build 绿+浏览器实测（补全弹窗/接受插 tag/诊断波浪线/v-model 双向/主题切换/tables 热更新全过）。**结论：升级为 R4 落地卡（替换 monaco，估 ~2 人日=PoC 基线 + 视觉走查/大小写对齐决策/IME 手测/真页 e2e）；PoC 分支保留为实施基线不删不合并。**
 
 ## 九、R3 任务卡（亮点特性轮，共 10 张，2026-10-20 立项）
 
@@ -242,12 +242,13 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 - **验收**：裁剪档 smoke 变体（file→doris 最小面）绿；体积对比表入档；CI 增可选 job 或本地档登记。
 - **文件域**：engine/bin/tailrace-node、scripts/smoke.sh（裁剪档变体）、.github/workflows/ci.yml。
 
-### T17 CodeMirror6 评估（~1 人日）〔裁决卡，PoC 不进主干〕
+### T17 CodeMirror6 评估（~1 人日）〔裁决卡，PoC 不进主干〕✅
 
 - **现状**：T9 实测 monaco 裁剪极限 gzip 883.22kB（raw 3.46MB，含 SQL 补全可用面）；§八.4 已挂号。
 - **方案**：CM6 PoC（@codemirror/lang-sql + autocomplete 面板）量三件事：gzip chunk 体积、补全功能面（表/列补全数据源 API 可用性）、迁移工作量估计（SqlMonaco.vue 替换面）。
 - **验收**：对比表（体积/能力/工作量）产出，裁决结论写回 §八.4 并关闭或升级为落地卡——本卡不落地编辑器替换。
 - **文件域**：PoC 分支（不进 main）；结论落本文件 §八。
+> 结果：7f32c26（poc/codemirror6，保留不合并）编辑器异步 chunk gzip **883.22→140.45 kB（−84.1%）**、编辑器相关资产合计 1,078→140.70 kB（零 worker/字体/外部 CSS）；能力为现用面超集（+SQL 关键字补全、FROM 别名感知，SQLNamespace 列槽位就绪 T14）；迁移=PoC 已换核（edit.vue 零改动），转产余量 ~1-1.5 人日——裁决=升级 R4 落地卡（详见 §八.4）
 
 ### T18 R3 末升格评审（~1 人日）〔门槛数据=BENCHMARKS.md〕
 
