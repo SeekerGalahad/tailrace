@@ -92,6 +92,18 @@ opentelemetry = { version = "0.33", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "internal-logs"] }
 tracing-opentelemetry = { version = "0.34", default-features = false }
+# T13 JDBC batch source (roadmap §九): sqlx 0.9 over a dedicated
+# current-thread runtime. Subcrates direct (NOT the `sqlx` facade): the
+# facade carries an optional `sqlx-sqlite` dep whose libsqlite3-sys range
+# (<0.38) clashes with console-store's rusqlite 0.40 (links="sqlite3"
+# conflict at resolve time even with the feature off); the mysql/postgres
+# subcrates are the exact same code the facade re-exports. NO tls feature —
+# rustls/native-tls/aws-lc stay out of the product graph (deny gates ran on
+# this exact set). "_"-prefixed runtime feature mirrors the facade's own
+# runtime-tokio wiring.
+sqlx-core = { version = "0.9", default-features = false, features = ["_rt-tokio", "time", "json", "uuid"] }
+sqlx-mysql = { version = "0.9", default-features = false, features = ["time", "json"] }
+sqlx-postgres = { version = "0.9", default-features = false, features = ["time", "json", "uuid"] }
 # dev-only (roadmap T1 benchmark suite): criterion micro-benches live in
 # per-crate benches/ and reference this as a workspace dev-dependency —
 # never a runtime dependency.
@@ -105,7 +117,10 @@ criterion = "0.8"
 # rustls + aws-lc-sys, a C toolchain burden); readiness probes that need
 # HTTP poll the workspace reqwest instead of the http_wait feature.
 testcontainers = { version = "0.27.3", default-features = false, features = ["blocking"] }
-testcontainers-modules = { version = "0.15", default-features = false, features = ["kafka", "blocking"] }
+# mysql/postgres modules added by roadmap T13: conn-jdbc integration tests
+# boot ephemeral MySQL/Postgres under TAILRACE_TESTCONTAINERS=1 — per-test
+# tags are pinned to the preheated local images (mysql:8.0, postgres:15).
+testcontainers-modules = { version = "0.15", default-features = false, features = ["kafka", "mysql", "postgres", "blocking"] }
 # internal crates (path + version, mirrors original engine practice)
 tailrace-connector = { path = "engine/crates/tailrace-connector", version = "0.1.0" }
 tailrace-conn-kafka = { path = "engine/crates/tailrace-conn-kafka", version = "0.1.0" }

@@ -121,11 +121,11 @@ pub fn validate(catalog: &dyn CatalogProvider, compiled: &Compiled) -> Vec<Diagn
     let mut out = Vec::new();
     for (i, st) in compiled.statements.iter().enumerate() {
         match catalog.resolve(&st.source) {
-            Ok(t) if matches!(t.kind.as_str(), "kafka" | "file") => {}
+            Ok(t) if matches!(t.kind.as_str(), "kafka" | "file" | "jdbc") => {}
             Ok(t) => out.push(Diagnostic {
                 statement: Some(i),
                 message: format!(
-                    "source {} only supports kafka/file (got {})",
+                    "source {} only supports kafka/file/jdbc (got {})",
                     st.source, t.kind
                 ),
             }),

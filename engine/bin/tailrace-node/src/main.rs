@@ -24,7 +24,10 @@ fn build_registry() -> ConnectorRegistry {
     tailrace_conn_file::register(&mut reg);
     #[cfg(feature = "connector-doris")]
     tailrace_conn_doris::register(&mut reg);
-    // P2 connector crates (mqtt/jdbc/s3) are one-line placeholders with no
+    // T13: jdbc batch source (MySQL/PostgreSQL keyset polling); source-only
+    #[cfg(feature = "connector-jdbc")]
+    tailrace_conn_jdbc::register(&mut reg);
+    // P2 connector crates (mqtt/s3) are one-line placeholders with no
     // `register` — enabling their features links them but registers nothing
     // (engine M10: placeholder crates must not break the build).
     reg

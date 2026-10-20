@@ -4,5 +4,41 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "JDBC-style batch source: MySQL/PostgreSQL keyset incremental polling (cursor = Cursor::JdbcKey)"
 
 [dependencies]
+anyhow = "1"
+# T2: engine-wide structured logging (tracing macros with table/dialect fields)
+tracing = { workspace = true }
+# T13 driver choice (supply-chain gated first, conclusion in the crate docs):
+# sqlx 0.9 subcrates (core+mysql+postgres, no tls feature — keeps
+# rustls/native-tls/aws-lc out of the product graph). NOT the `sqlx` facade:
+# its optional sqlx-sqlite dep conflicts with console-store's rusqlite at
+# resolve time (libsqlite3-sys links clash, feature off notwithstanding).
+# The source bridges the sync Source trait over a dedicated current-thread
+# runtime (conn-kafka's sync data-plane stance is preserved).
+sqlx-core = { workspace = true }
+sqlx-mysql = { workspace = true, features = ["uuid"] }
+sqlx-postgres = { workspace = true }
+# bridge runtime (workspace line already carries rt/time/sync; sqlx adds net)
+tokio = { workspace = true }
+# cursor canonicalization + row JSON carrier (BTreeMap key order = stable bytes)
+serde_json = { workspace = true }
+# temporal value mapping / typed cursor binds (same 0.3 line sqlx locks)
+time = { version = "0.3", default-features = false, features = ["formatting", "parsing", "macros"] }
+uuid = "1"
+tailrace-ir = { workspace = true }
+tailrace-catalog = { workspace = true }
+tailrace-connector = { workspace = true }
+
+[dev-dependencies]
+# T13: integration tests boot ephemeral MySQL 8.0 / Postgres 15 via
+# testcontainers when TAILRACE_TESTCONTAINERS=1 (tags pinned to the preheated
+# local images); default runs skip (same live-gate convention as conn-kafka).
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+# bad-row proof: chunks decoded by the standard JsonDecoder against a
+# mismatched schema yield Decoded::Bad (the runtime's existing DLQ route)
+tailrace-decode = { workspace = true }
+# arrow schema construction for the decode-chain assertions (workspace line)
+datafusion = { workspace = true }

@@ -118,6 +118,7 @@ pub fn normalize_kind(kind: &str) -> String {
         "FILE" => "file".into(),
         "DORIS_TABLE" | "JDBC_TABLE" | "DORIS" => "doris".into(),
         "STARROCKS" => "starrocks".into(),
+        "JDBC" => "jdbc".into(),
         other => other.to_lowercase(),
     }
 }
