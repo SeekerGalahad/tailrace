@@ -92,6 +92,12 @@ opentelemetry = { version = "0.33", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "internal-logs"] }
 tracing-opentelemetry = { version = "0.34", default-features = false }
+# T20 allocator A/B (roadmap §九 T20): jemalloc as the process-wide allocator,
+# feature-gated on tailrace-node (`jemalloc`, default OFF — the default build
+# keeps the system allocator and its artifact is byte-identical). 0.7 line =
+# bundled jemalloc 5.3.1 (tikv-jemalloc-sys 0.7.1); prefixed symbols (`_rjem_`),
+# so the C side of the process (rdkafka/openssl) stays on the system malloc.
+tikv-jemallocator = "0.7"
 # T13 JDBC batch source (roadmap §九): sqlx 0.9 over a dedicated
 # current-thread runtime. Subcrates direct (NOT the `sqlx` facade): the
 # facade carries an optional `sqlx-sqlite` dep whose libsqlite3-sys range

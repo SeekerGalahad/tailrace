@@ -312,10 +312,13 @@ pub fn build_heartbeat_payload(
 // ==================== node resource sampling (/proc direct reads — musl-static, zero external deps) ====================
 
 /// One raw sample (Linux /proc): RSS/physical totals + process and system
-/// CPU jiffies + NIC cumulative bytes.
+/// CPU jiffies + NIC cumulative bytes. `peak_rss_bytes` is the kernel
+/// high-water mark (VmHWM) — the true process-lifetime peak, unlike a
+/// beat-interval sample max it cannot miss spikes between two beats.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ResourceSample {
     pub rss_bytes: u64,
+    pub peak_rss_bytes: u64,
     pub mem_total_bytes: u64,
     /// utime+stime from /proc/self/stat (jiffies)
     pub proc_jiffies: u64,
@@ -332,6 +335,7 @@ pub struct ResourceSample {
 pub fn read_proc_sample() -> Option<ResourceSample> {
     Some(ResourceSample {
         rss_bytes: proc_status_kb("VmRSS")? * 1024,
+        peak_rss_bytes: proc_status_kb("VmHWM")? * 1024,
         mem_total_bytes: proc_status_kb("MemTotal")? * 1024,
         proc_jiffies: proc_self_stat_jiffies()?,
         total_jiffies: proc_stat_total_jiffies()?,
@@ -413,7 +417,7 @@ fn net_dev_sum(tx: bool) -> Option<u64> {
 /// Delta between two adjacent beats (a pure function, unit-testable on any
 /// platform): rates = B/s; CPU% = the process jiffies delta's share of the
 /// whole-machine delta (machine-relative, clamped 0..100); the first beat
-/// (no prev) omits the rate keys and carries only the RSS/total
+/// (no prev) omits the rate keys and carries only the RSS/peak-RSS/total
 /// instantaneous values.
 pub fn resource_delta_json(
     prev: Option<(ResourceSample, f64)>,
@@ -422,6 +426,7 @@ pub fn resource_delta_json(
 ) -> serde_json::Value {
     let mut v = serde_json::json!({
         "rssBytes": cur.rss_bytes,
+        "peakRssBytes": cur.peak_rss_bytes,
         "memTotalBytes": cur.mem_total_bytes,
     });
     if let Some((p, _)) = prev {
@@ -984,6 +989,7 @@ mod tests {
     fn resource_delta_first_tick_has_no_rates() {
         let cur = ResourceSample {
             rss_bytes: 200 * 1024 * 1024,
+            peak_rss_bytes: 260 * 1024 * 1024,
             mem_total_bytes: 8 * 1024 * 1024 * 1024,
             proc_jiffies: 5,
             total_jiffies: 100,
@@ -992,6 +998,9 @@ mod tests {
         };
         let v = resource_delta_json(None, cur, 0.0);
         assert_eq!(v["rssBytes"], 200 * 1024 * 1024);
+        // T20: kernel high-water mark rides along from the very first beat
+        // (it is an instantaneous read, not a delta)
+        assert_eq!(v["peakRssBytes"], 260 * 1024 * 1024);
         assert_eq!(v["memTotalBytes"], 8_u64 * 1024 * 1024 * 1024);
         assert!(
             v.get("cpuPercent").is_none(),
@@ -1004,6 +1013,7 @@ mod tests {
     fn resource_delta_computes_rates_and_cpu_share() {
         let prev = ResourceSample {
             rss_bytes: 100,
+            peak_rss_bytes: 100,
             mem_total_bytes: 1000,
             proc_jiffies: 10,
             total_jiffies: 1000,
@@ -1012,6 +1022,7 @@ mod tests {
         };
         let cur = ResourceSample {
             rss_bytes: 150,
+            peak_rss_bytes: 180,
             mem_total_bytes: 1000,
             proc_jiffies: 60,
             total_jiffies: 2000,
@@ -1025,6 +1036,8 @@ mod tests {
         assert_eq!(v["rxBps"], 100);
         assert_eq!(v["txBps"], 233);
         assert_eq!(v["rssBytes"], 150);
+        // peak is the current sample's HWM (monotonic by kernel contract, ≥ rss)
+        assert_eq!(v["peakRssBytes"], 180);
     }
 
     #[test]

@@ -10,6 +10,15 @@ use std::time::Duration;
 
 use tailrace_connector::ConnectorRegistry;
 
+/// T20: jemalloc as the process-wide Rust allocator (feature `jemalloc`,
+/// default OFF — roadmap §九 T20). Off, this item does not exist and the
+/// binary keeps the system allocator unchanged; on, every Rust allocation in
+/// the node (arrow buffers, decode batches, DataFusion) goes through jemalloc.
+/// A/B numbers: docs/BENCHMARKS.md §六.
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 /// Connector wiring: explicit register calls gated by Cargo features — no
 /// macro magic (inventory/linkme would add deps and cognitive load; with
 /// ≤10 connectors, explicit registration stays obvious at a glance).

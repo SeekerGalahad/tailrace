@@ -26,6 +26,11 @@ otel = [
     "dep:opentelemetry-otlp",
     "dep:tracing-opentelemetry",
 ]
+# T20 allocator A/B (roadmap §九 T20): swap the Rust global allocator for
+# jemalloc. Default OFF: the default artifact must stay byte-identical (no
+# allocator change for users who do not opt in). Numbers (throughput + peak
+# RSS, default vs jemalloc) live in docs/BENCHMARKS.md §六.
+jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]
 anyhow = "1"
@@ -36,6 +41,8 @@ opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
+# T20: #[global_allocator] behind the `jemalloc` feature only
+tikv-jemallocator = { workspace = true, optional = true }
 tailrace-connector = { workspace = true }
 tailrace-conn-kafka = { workspace = true, optional = true }
 tailrace-conn-file = { workspace = true, optional = true }

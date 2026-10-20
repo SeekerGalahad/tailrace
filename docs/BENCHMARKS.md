@@ -336,3 +336,95 @@ decode→transform→write 之后），行数边界过界判断只能以整 poll
 
 （过程与修复清单见 `docs/dev/T11-docker-compose-smoke-full-first-run-2026-10-17.md`；
 注：毒浸泡吞吐受 15s/批节奏限制，非吞吐口径——吞吐见 §三宏基准。）
+
+## 六、R3 对比账本（roadmap §九，逐项追加，不删旧行）
+
+> R3 起数字采自**第二台开发机**（下表），与 §一 Intel 机器的 R2 数字**跨机器不可比**
+> （§一注记同样适用）；同一小节内的 A/B 均为同机同日交错复测。
+
+| 项 | 值 |
+|---|---|
+| 机型 | Apple M4（10 核），16 GB |
+| 系统 | macOS 26.6.2（arm64，16 KiB 页） |
+| 工具链 | rustc 1.98.1（stable，workspace rust-version 1.95） |
+| 构建前缀 | `CARGO_PROFILE_DEV_DEBUG=0`（debug 档去 debuginfo；两档一致） |
+
+| 任务 | bench/口径 | 默认档 | jemalloc 档 | 变化 | 日期 |
+|---|---|---|---|---|---|
+| T20 | macro 吞吐（file→file debug，3 轮中位） | 33670 rows/s | 33738 rows/s | 持平（+0.2%，远在噪声界内） | 2026-10-20 |
+| T20 | node 峰值 RSS（内核 ru_maxrss，3 轮中位） | 53616 KiB（52.4 MiB） | 57808 KiB（56.5 MiB） | **+4192 KiB（+7.8%）**，两档区间不重叠 | 2026-10-20 |
+| T20 | node 二进制体积（debug 档） | 264,674,112 B | 265,573,776 B | +879 KiB（jemalloc 5.3.1 静态链入） | 2026-10-20 |
+
+### §6.1 T20 jemalloc + 峰值 RSS 指标（2026-10-20，同机同日交错复测）
+
+改造内容（roadmap §九 T20）：
+
+1. **allocator feature 门控**：`tailrace-node` 新增 feature `jemalloc`（默认 OFF）→
+   `tikv-jemallocator 0.7.0`（bundled jemalloc 5.3.1，`_rjem_` 前缀符号，C 侧
+   rdkafka/openssl 仍走系统 malloc），`main.rs` 中 `#[cfg(feature = "jemalloc")]
+   #[global_allocator]`。**默认档零变化（字节级实证）**：仅改 Cargo.toml/Cargo.lock
+   （feature 声明、依赖 OFF）时默认档二进制 sha256 与改造前**完全一致**
+   （`c32c65a1…`，debug 档本机可复现构建）；main.rs 加入 cfg 块后仅 182 字节差异
+   （Mach-O LC_UUID + 后续 `line!()` 行号常量平移），`nm` 符号表逐项一致、
+   `cargo tree` 默认依赖树一致、jemalloc 符号 0 个。feature 档 `nm` 含 516 个
+   `_rjem_*` 符号（`__rjem_malloc/calloc/realloc` 在列）。Cargo.lock 仅新增
+   `tikv-jemallocator` / `tikv-jemalloc-sys` 两包，无其它版本移动。
+2. **峰值 RSS 指标就位（心跳 stats 面）**：node 现有暴露面为心跳 payload 的
+   `resources` 键（`tailrace-api/src/heartbeat.rs`，Linux `/proc` 直读，已有瞬时
+   `rssBytes`/`memTotalBytes`/`cpuPercent`/`rxBps`/`txBps`）；本卡在 `ResourceSample`
+   增 `peak_rss_bytes` = `/proc/self/status` **VmHWM**（内核高水位，进程生命期真峰值，
+   不受心跳间隔采样漏峰影响），payload 新增 `peakRssBytes`（首拍即带，非 delta 键）。
+   纯加性字段：console 侧 `parse_resources` 按键取值（`api/nodes.rs:235`），无
+   `deny_unknown_fields`；console/web 暂不消费该键（node_metrics 表无 peak 列，
+   属 console 域后续工作）。**如实登记**：非 Linux（本开发机 macOS）`read_proc_sample`
+   返回 None、`resources` 键整体省略——本节 RSS 数字因此全部来自**外部**测量，
+   不是该字段的产出。
+3. **宏基准脚本 hook**：`scripts/bench/macro.sh` 增环境变量 `MACRO_NODE_WRAP`
+   （默认空 = 启动命令行与清理路径逐字不变）；设为 `/usr/bin/time -l` 时 node 由
+   包装器拉起，rusage 落 node.log。实测 BSD `time` **不转发 SIGTERM**（杀包装器会
+   孤儿化 node 且丢 rusage），故包装模式下清理改为给其子进程发信号。
+
+**方法学**：`bash scripts/bench/macro.sh --rows 100000`（debug 档、file→file、口径同
+§三）；两档二进制各构建一次（`cargo build -p tailrace-node --locked` /
+`--features jemalloc --locked`，sha256 分别 `1f7270c7…` / `55066ae4…`），每轮前把对应
+产物换入 `target/debug/` 并校验 sha256 后再跑；**A/B 交错**（A1 B1 A2 B2 A3 B3），
+前置 1 轮弃置预热。峰值 RSS 双口径同轮并行测得：(1) **内核 `ru_maxrss`**——
+`MACRO_NODE_WRAP="/usr/bin/time -l"`（macOS 报字节，÷1024 列为 KiB）；(2) 外部采样器
+200ms 轮询 node pid `ps -o rss=` 取最大（§4.4 T7 同口径）。
+
+| 轮 | 档 | 吞吐（rows/s） | elapsed | 峰值 RSS·内核 HWM（KiB） | 峰值 RSS·200ms 采样（KiB） |
+|---|---|---|---|---|---|
+| A1 | default | 33670 | 2.970 s | 53232 | 53200 |
+| B1 | jemalloc | 33956 | 2.945 s | 57808 | 55904 |
+| A2 | default | 33512 | 2.984 s | 53616 | 53616 |
+| B2 | jemalloc | 33704 | 2.967 s | 57632 | 55696 |
+| A3 | default | 41305 | 2.421 s | 55376 | 55376 |
+| B3 | jemalloc | 33738 | 2.964 s | 58656 | 56896 |
+| **中位** | default | **33670** | 2.970 s | **53616** | 53616 |
+| **中位** | jemalloc | **33738** | 2.964 s | **57808** | 55904 |
+
+（A1/B1 即任务指定报告 `/tmp/r3w1-bench-default.md` / `/tmp/r3w1-bench-jemalloc.md`；
+sink 行数校验 6 轮均 100000 ✓；引擎 `git@caa842e` + T20 工作树。）
+
+**结论（如实）**：
+
+- **吞吐**：两档中位 33670 vs 33738 rows/s，差 0.2%——**无可测差异**。A3 的 41305
+  为离群样本：本机全链仅 ~3s 完成，macro.sh 的 stats 轮询步进 0.5s 本身就是 ±17%
+  的量化误差，debug 档 decode/fsync 主导下 allocator 不是瓶颈。
+- **峰值 RSS**：jemalloc 档**更高**——中位 +4192 KiB（+7.8%），且三轮区间
+  53232–55376 vs 57632–58656 **不重叠**，是确定性代价而非噪声。成因符合 jemalloc
+  特性：arena/tcache/元数据常驻 + 脏页按 decay 周期（默认 ~10s）延迟归还——对一个
+  ~50 MiB、3s 跑完的小进程，开销显露而碎片收益无从体现。
+- **口径发现**：默认档两种口径完全吻合（差 0–32 KiB）；jemalloc 档 200ms 采样器
+  **系统性低报 1.7–1.9 MiB**（存在采样漏掉的短尖峰）——T7 的采样口径对系统 allocator
+  够用，对 jemalloc 不够；这也是心跳字段选 VmHWM 而非「拍间采样最大值」的实证依据。
+- **裁决建议**：feature 保持默认 OFF（本轮验收口径「默认档行为零变化」成立）。
+  在本工作负载（短跑、单语句、file→file）jemalloc 无吞吐收益且多占 ~4 MiB 常驻；
+  其预期收益场景（长时运行多语句的碎片抑制、多线程分配竞争）本轮**未测**——
+  碎片指标（`stats.allocated` vs `stats.resident`，需 `tikv-jemalloc-ctl` stats
+  feature）与 release 档长跑留待有需求时补测，不在本卡数字内下结论。
+
+复现：`CARGO_PROFILE_DEV_DEBUG=0 cargo build -p tailrace-node --locked [--features jemalloc]`
+→ `MACRO_NODE_WRAP="/usr/bin/time -l" MACRO_KEEP=1 bash scripts/bench/macro.sh --rows 100000
+--report out.md` → `grep 'maximum resident' $MACRO_DIR/node.log`（macOS；Linux 包装器
+改用 GNU time `-v`，或直接读 Linux 心跳 `resources.peakRssBytes`）。

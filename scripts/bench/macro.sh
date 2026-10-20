@@ -14,6 +14,10 @@
 #   --rows    种子行数（默认 100000）
 #   --report  报告落盘路径（markdown，同时打印摘要到 stdout；缺省仅打印）
 #   --mode    二进制档位（默认 debug；release 缺二进制时会先构建）
+#   环境 MACRO_NODE_WRAP（T20 峰值 RSS 口径，默认空=行为不变）：node 进程的
+#   前置包装命令，如 MACRO_NODE_WRAP="/usr/bin/time -l" MACRO_KEEP=1 ——
+#   包装器的 rusage（macOS "maximum resident set size"，单位字节）落在
+#   $MACRO_DIR/node.log 尾部；需 MACRO_KEEP=1 保留工作目录后自行提取。
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -35,6 +39,7 @@ NODE_ADDR="${MACRO_NODE_ADDR:-127.0.0.1:18300}"
 BOOTSTRAP_TOKEN="${TAILRACE_BOOTSTRAP_TOKEN:-tr_b_macro_00112233445566778899aabbccddeeff}"
 WORK="${MACRO_DIR:-/tmp/tailrace-macro-bench}"
 KEEP="${MACRO_KEEP:-0}"
+NODE_WRAP="${MACRO_NODE_WRAP:-}"
 TIMEOUT_SECS=$(( ROWS / 500 + 120 ))   # <500 rows/s 即判失败（追赶余量 120s）
 
 command -v jq >/dev/null || { echo "jq is required"; exit 2; }
@@ -54,7 +59,16 @@ done
 
 CONSOLE_PID=""; NODE_PID=""
 cleanup() {
-  [ -n "$NODE_PID" ] && kill -TERM "$NODE_PID" 2>/dev/null
+  if [ -n "$NODE_PID" ]; then
+    if [ -n "$NODE_WRAP" ]; then
+      # 包装模式下 NODE_PID 是包装器（如 /usr/bin/time）：BSD time 不转发
+      # SIGTERM，直接杀它会孤儿化 node 且丢失 rusage——改为给其子进程发信号，
+      # node 优雅退出后包装器自行结束并打印 rusage
+      pkill -TERM -P "$NODE_PID" 2>/dev/null
+    else
+      kill -TERM "$NODE_PID" 2>/dev/null
+    fi
+  fi
   [ -n "$CONSOLE_PID" ] && kill -TERM "$CONSOLE_PID" 2>/dev/null
   wait 2>/dev/null
   [ "$KEEP" = "1" ] || rm -rf "$WORK"
@@ -108,7 +122,9 @@ awk -v n="$ROWS" 'BEGIN {
 IN_BYTES="$(wc -c < "$WORK/node/orders_in" | tr -d ' ')"
 
 # ---------- engine node ----------
-( cd "$WORK/node" && exec "$BIN_DIR/tailrace-node" serve \
+# $NODE_WRAP 故意不加引号：空时展开为无、设为 "/usr/bin/time -l" 时按词拆成命令+参数
+# shellcheck disable=SC2086
+( cd "$WORK/node" && exec $NODE_WRAP "$BIN_DIR/tailrace-node" serve \
     --addr "$NODE_ADDR" \
     --control-plane "http://$CONSOLE_ADDR" \
     --advertise "$NODE_ADDR" \
