@@ -276,6 +276,20 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 - **验收**：fuzz 目标 `cargo fuzz build` 绿；首轮语料 30 分钟零 panic（发现的 panic 修复或登记）；deny licenses 无新增问题。
 - **文件域**：fuzz/（独立 workspace 新目录）、.github/workflows/（可选定时 job）。
 
+### R3-W1 评审登记（2026-10-21）
+
+> **medium 三条已修（各一提交）**：① `tailrace-runtime/src/registry.rs` `Cursor::JdbcKey` 指纹常量 13 → fold key+value（JDBC 位点推进对 NO_PROGRESS 可见，3 次瞬时断库不再误判毒数据；488efcc）；② `tailrace-conn-jdbc` keyset `WHERE col > ? LIMIT n` 无 tie-breaker → 连接探针经目录视图强制游标列自身唯一（PK / 单列 UNIQUE，非唯一即 fail-fast；13d1c2b）；③ CI chaos job 追加 `jdbc_sources` 真库步（此前 CI 对 JDBC 真库覆盖为 0；19bb80b）。注：① 按评审建议触碰了 runtime 本体 1 处——属既有判据缺陷修复而非连接器引入，单独提交可审计。
+>
+> **low 六条仅登记未修，待后续卡 / 收口承接**：
+>
+> 1. `tailrace-conn-jdbc/src/lib.rs` `pg_cursor_kind` 接受 FLOAT4 为游标类型，但 `pg_cell` FLOAT4 臂无 is_cursor 分支、永不产出 canonical → FLOAT4 游标列探针通过后每轮 poll 以"cursor column is NULL"文案失败进入永久退避。处置：补 FLOAT4 臂 is_cursor（镜像 FLOAT8）或在 pg_cursor_kind 拒绝 FLOAT4。
+> 2. `tailrace-catalog/src/lib.rs:121` 新增 `"JDBC"→"jdbc"`（源）紧邻既有 `"JDBC_TABLE"→"doris"`（汇）：MySQL 源写 kind=jdbc_table 会得 doris 并收到"source only supports kafka/file/jdbc (got doris)"费解诊断；新臂功能冗余（fallthrough 已小写化）；`lib.rs:25` canonical kind 注释未加 jdbc。处置：normalize_kind 注释与 parser 诊断点明 JDBC（源）/ JDBC_TABLE（Doris 汇）之别，补 :25 注释。
+> 3. T13 卡验收"`git diff` 零触碰 runtime/api/parser 本体"与文件域"parser kind 枚举"不是同一集合：caa842e 改了 `tailrace-parser/src/lib.rs:124` 白名单两行（域内允许），而 commit 证据改述为"runtime/api/console 本体为空"。处置：卡片措辞改为"零触碰 runtime/api 本体 + parser 仅 kind 白名单"，证据中明示 parser 触碰行，而非换一组路径宣称零触碰。
+> 4. `console-store/src/datasources.rs:227` cursor_semantics 派生仅 kafka→KAFKA_OFFSET / file→FILE_POINTER，jdbc 落 "NONE"；当前因 console 无 mysql/postgres 数据源类型（`tailrace-console/src/api/datasources.rs:104-110` registry_type 返回 None）不可达，一旦补类型即静默误标。处置：console 域后续项——补 "jdbc"→"JDBC_KEY"（对齐 IR `Cursor::JdbcKey`），新增数据源类型时一并加测试断言。
+> 5. `docs/BENCHMARKS.md:354` §六 T20 汇总表"持平（+0.2%）"为 debug 档 / 单轮 ~3s / stats 0.5s 量化口径（文中自认 ±17%），对 <~17% 的 allocator 效应无检出力但表行不带注记；卡方案"碎片"口径无表行（仅结论段"未测"）；:356 默认档体积 264,674,112 B 与本机 target/debug 现存默认二进制（264,703,456 B、0 个 `_rjem_` 符号）不一致——基准二进制非最终提交树产物，仅标"caa842e + T20 工作树"。处置：表行加脚注（debug/短跑/量化误差）、补"碎片：未测"行、记录基准二进制对应精确树；release 长跑补测后再下 allocator 结论。
+> 6. `docs/dev/roadmap.md:251` T17 结果"转产余量 ~1-1.5 人日"与 §八.4（:201）"估 ~2 人日"两个工作量口径；"1,078 kB" monaco 资产合计仅见于 T17 文本，T9 记录（:130）只有 883.22 kB gzip 与 CSS/ttf/worker raw 字节、无 gzip 值与折算规则，不可从仓库复算（883.22→140.45 / −84.1% 两处一致且锚定 T9；PoC 7f32c26 未混入 main）。处置：统一一个工作量数字并说明是否含 PoC 基线；补 1,078 的分项或改用 T9 已记录的 883.22 单口径。
+> 7. （附，评审建议未采纳项）`jdbc_sources` 未门控时以 `return Ok` 跳过并计 passed（conn-kafka 同款 live-gate 惯例）：评审建议改 `#[ignore]`+`--ignored` 使跳过在计数中可见——本波只补 CI 真库覆盖，门控形态留作后续项与 conn-kafka 一并裁决。
+
 ## 十、R3 波次编排（文件域冲突分析，动工前按最终文件域复核）
 
 | 波 | 任务（并行 ‖） | 冲突分析 | 波门禁 |
