@@ -213,12 +213,13 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 - **验收**：file→starrocks e2e（本地 compose profile）+ 重启 label 幂等回归；`cargo test -p tailrace-conn-doris` 绿；差异矩阵文档化入卡内结果。回退门：allin1 镜像本机不可拉时降级 mock http 契约测试 + 矩阵文档，e2e 缺口如实登记留待有环境补。
 - **文件域**：engine/crates/tailrace-conn-doris、docker-compose.yml、README.md / README.zh-CN.md。
 
-### T13 JDBC 批源（~4 人日）
+### T13 JDBC 批源（~4 人日）✅
 
 - **现状**：`tailrace-conn-jdbc` 为 1 行占位 crate（`//! Placeholder ... real engine code lands in the migration stage (P0)`）；node feature `connector-jdbc` 已接线但注册零（`engine/bin/tailrace-node/Cargo.toml:17`）；conn-s3/conn-mqtt 同为占位不在本卡。
 - **方案**：占位 crate 内实现 Source trait：MySQL/PostgreSQL 两方言，按主键/时间列区间增量轮询，`cursor_semantics` 登记轮询位点（对齐 IR 游标语义）；驱动选型须过 cargo deny licenses（倾向 sqlx 或各官方 async 驱动，deny 报告先行）；注册走 node feature 门控，不动 registry 本体。
 - **验收**：testcontainers 起 mysql:8 + postgres:15 批源测试（chaos job 先例复用）；位点断言——重启续读不丢不重、totals 单调；parser/catalog 认 jdbc kind；**`git diff` 零触碰 runtime/api/parser 本体**（红线验收字面化）。
 - **文件域**：engine/crates/tailrace-conn-jdbc、engine/bin/tailrace-node（注册行）、tailrace-parser/tailrace-catalog kind 枚举、tests/。
+> 结果：caa842e T13 已提交（`feat: T13 JDBC 批源——MySQL/PostgreSQL 增量轮询 Source（testcontainers 双方言测试）`）：严格限 8 个文件域路径（Cargo.toml/Cargo.lock/conn-jdbc crate+tests/node 注册行/parser 白名单/catalog normalize），1520 增 / 8 删；提交说明含驱动选型结论（sqlx 0.9 子 crate——门面 sqlx-sqlite 与 rusqlite `links` 冲突改走子 crate，无 tls）与验证数字（conn-jdbc 7/0、workspace 156/0、clippy 0、deny 四门 ok）；提交后工作树干净，runtime/api/console 零触碰，未 push（ahead 1，留波门禁）。
 
 ### T14 discover / infer-schema 落地（~3 人日）
 
@@ -263,12 +264,13 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 - **验收**：501 → 真实现；本地 docker 目标机集成测试（含中途失败触发回滚）；smoke 不强制纳入。
 - **文件域**：console api/nodes_admin.rs、web 部署页（如有）、tests/。
 
-### T20 jemalloc + RSS 指标（~1 人日）〔选做〕
+### T20 jemalloc + RSS 指标（~1 人日）〔选做〕✅
 
 - **现状**：T7 已有 DataFusion memory pool+RSS 探针口径（峰值 RSS 49124 KiB 入档）；未做 allocator 切换对比。
 - **方案**：tikv-jemallocator feature 门控默认关；RSS 指标先就位（stats 面）；A/B 宏基准（吞吐+峰值 RSS+碎片）入 BENCHMARKS。
 - **验收**：feature 档构建绿+对比表入档；默认档行为零变化（不引入 jemalloc）。
-- **文件域**：engine/bin/tailrace-node、Cargo.toml（feature）、scripts/bench/。
+- **文件域**：engine/bin/tailrace-node、Cargo.toml（feature）、scripts/bench/、engine/crates/tailrace-api/src/heartbeat.rs（stats 面实际所在，首跑实证勘正）。
+> 结果：9a9f8a2 Committed T20 as 9a9f8a2 on main (parent caa842e, linear, not pushed): exactly the 7 file-domain files (Cargo.toml, Cargo.lock, engine/bin/tailrace-node/{Cargo.toml,src/main.rs}, engine/crates/tailrace-api/src/heartbeat.rs, scripts/bench/macro.sh, docs/BENCHMARKS.md; +168/−4) with the prescribed subject `feat: T20 jemalloc 门控+RSS 指标——A/B 宏基准对比入 BENCHMARKS` and a body recording the VmHWM/file-domain tradeoff and the A/B numbers (throughput 33670 vs 33738 rows/s +0.2%; kernel peak RSS 53616 vs 57808 KiB +7.8% jemalloc higher; feature stays default OFF); working tree clean, branch ahead 2 of origin/main.
 
 ### T21 parser/decode fuzz 起步（~2 人日）〔选做〕
 
