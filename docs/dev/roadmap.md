@@ -166,7 +166,7 @@
 
 **执行纪律（对所有参与 agent 生效）**：
 
-1. 工作目录固定 `~/GLMProjects/tailrace`；开工先读本文件对应任务卡与「做得好的红线」；
+1. 工作目录固定 `~/IdeaProjects/tailrace`（2026-10-20 勘正：原 `~/GLMProjects/tailrace` 已删除重建于此）；开工先读本文件对应任务卡与「做得好的红线」；
 2. 红线：状态账本四步持久化与 assign-only 恢复路径不动；emit 结构化事件不被 tracing 化破坏；SSE 桥背压结构（bounded 64/断连感知/300s 上限）不动；smoke.sh 骨架不拆；
 3. 提交：Conventional Commits（perf:/feat:/test:/chore:），一任务一提交；**只 `git add` 自己任务卡的文件域**；禁止 amend/rebase/改 tag/动 v0.1.0；push 只由波门禁执行；
 4. 测试：按 §三分层严格跑；失败即修，修不好即停波上报（不静默降级）；
@@ -175,7 +175,7 @@
 ## 六、R2 收口标准（全轮验收）
 
 ```bash
-cd ~/GLMProjects/tailrace
+cd ~/IdeaProjects/tailrace   # 2026-10-20 勘正：原 ~/GLMProjects/tailrace 已删除
 cargo fmt --all --check && CARGO_PROFILE_DEV_DEBUG=0 cargo clippy --workspace --all-targets --locked -- -D warnings
 CARGO_PROFILE_DEV_DEBUG=0 cargo test --workspace --locked          # ≥ 基线 124 passed，0 failed
 grep -rn 'eprintln' engine/crates --include='*.rs' | wc -l         # = 0
@@ -189,7 +189,7 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 
 ## 七、R3 / R4 展望（本轮收口后按同格式立项任务卡）
 
-**R3 亮点特性（~3-4 周）**：StarRocks sink 完整化（现仅注册别名，共享 Stream Load 协议）；JDBC 批源（MySQL/PostgreSQL，cursor_semantics 登记轮询位点；验收=新增连接器零改动 runtime/api/parser 本体）；discover / infer-schema 落地（替换 501 占位，Kafka/Doris 元数据客户端）；分区并行方案 b（split 化+动态分区发现，动工前先写部分分区推进的指纹回归测试）；feature 裁剪验证（`--no-default-features --features connector-file,connector-doris` 跑通 file→doris）；选做：SSH 部署链八步、jemalloc（RSS 指标先就位）、parser/decode fuzz 起步。**R3 末升格评审**：deltalake sink / DataFusion 升级 / 事务接口 / group commit / 本地两步 WAL 五项，默认结论=排 v1.x，纪要落 docs/dev/。
+**R3 亮点特性（~3-4 周）**（2026-10-20 已立项为任务卡，见 §九 T12-T21）：StarRocks sink 完整化（现仅注册别名，共享 Stream Load 协议）；JDBC 批源（MySQL/PostgreSQL，cursor_semantics 登记轮询位点；验收=新增连接器零改动 runtime/api/parser 本体）；discover / infer-schema 落地（替换 501 占位，Kafka/Doris 元数据客户端）；分区并行方案 b（split 化+动态分区发现，动工前先写部分分区推进的指纹回归测试）；feature 裁剪验证（`--no-default-features --features connector-file,connector-doris` 跑通 file→doris）；选做：SSH 部署链八步、jemalloc（RSS 指标先就位）、parser/decode fuzz 起步。**R3 末升格评审**：deltalake sink / DataFusion 升级 / 事务接口 / group commit / 本地两步 WAL 五项，默认结论=排 v1.x，纪要落 docs/dev/。
 
 **R4 1.0 发布（~1.5-2 周）**：README 双语定稿（徽章矩阵+三命令 quickstart+连接器矩阵+FAQ）；mdBook 文档站骨架（协议/连接器/架构；设计文档以脱敏干净版重新入仓）；crate 元数据补齐 + doc-test；crates.io 发包（`tailrace-node` + `tailrace-console` 两 bin + `tailrace-connector` trait 契约面）；tag v1.0.0 → release（9 资产）；基准报告入 README；i18n 最小动作（错误码字典化接口预留，中文单轨明示）。
 
@@ -198,4 +198,105 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 1. `utoipa-swagger-ui 10.0.1` 锁定的 `zip 8.6.0`（仅 build-dep，构建脚本解压 crate 自带的 vendored swagger-ui dist）：2026-10-13 后被上游 yank（现又恢复可装，deny.toml `yanked="warn"` 保留）；2026-10-17 RustSec 连发 RUSTSEC-2026-0367/0368/0369 三个 extract 漏洞（修复仅入 zip 9.0.x，`^8.6` 不可达且无 8.x backport；build-dep 威胁模型不适用——不链接进产物二进制、不解压外部归档）——deny.toml 已 ignore 三条带跟踪注释。其发新版（zip 9 线）后回收 warn+ignore 并重新收紧；
 2. OTLP 的 `opentelemetry` 0.33 / `tracing-opentelemetry` 0.34 版本锚定后是否升格默认开启（当前 feature 门控默认关）；
 3. R3 升格评审五项的门槛数据（本 R2 的 BENCHMARKS.md 即门槛输入）；
-4. CodeMirror6 替换 monaco 评估（编辑器体积档位，R3 裁决；T9 实测 monaco gzip 883kB vs CM6 预期 ~200-300kB 级，2026-10-17 立项）。
+4. CodeMirror6 替换 monaco 评估（编辑器体积档位，R3 裁决；T9 实测 monaco gzip 883kB vs CM6 预期 ~200-300kB 级，2026-10-17 立项）——R3 由 T17 承接。
+
+## 九、R3 任务卡（亮点特性轮，共 10 张，2026-10-20 立项）
+
+> 立项依据：R2 收官内部档 §五 草案 + 2026-10-20 对公仓 @0fe8f6f 的代码核实（现状字段均带代码锚点，非草案转抄）。
+> 总量评估：必做 T12-T18 共 ~17 业余人日；选做 T19-T21 共 ~6 人日（R2 同期 ~23 人日口径）。
+> 红线（全轮生效）：**新增连接器零改动 runtime/api/parser 本体**（架构验收，git diff 钉住）；游标 flush 点整体提交语义不动摇；SSE/emit 红线沿用 §五。
+
+### T12 StarRocks sink 完整化（~3 人日）
+
+- **现状**：`conn-doris` 的 `starrocks` feature 仅注册同名别名指向 Doris sink 工厂（`conn-doris/src/lib.rs:127-128`）；catalog normalize（`tailrace-catalog/src/lib.rs:120`）与 parser kind 白名单（`tailrace-parser/src/lib.rs:138`）已认 starrocks——即类型链路通、协议差异零核对、零 e2e。
+- **方案**：Doris 通道共享为底（Stream Load 同构），核对差异矩阵（URL/端口/`read_json_by_line` 载体/label 幂等/buffer-flush 三阈值语义），StarRocks 特有默认值与差异点落在 conn-doris 内 feature 门控或 datasource 配置项，不另起 crate；docker-compose 增 `--profile starrocks`（starrocks allin1，本地档）；README 连接器矩阵补列。
+- **验收**：file→starrocks e2e（本地 compose profile）+ 重启 label 幂等回归；`cargo test -p tailrace-conn-doris` 绿；差异矩阵文档化入卡内结果。回退门：allin1 镜像本机不可拉时降级 mock http 契约测试 + 矩阵文档，e2e 缺口如实登记留待有环境补。
+- **文件域**：engine/crates/tailrace-conn-doris、docker-compose.yml、README.md / README.zh-CN.md。
+
+### T13 JDBC 批源（~4 人日）
+
+- **现状**：`tailrace-conn-jdbc` 为 1 行占位 crate（`//! Placeholder ... real engine code lands in the migration stage (P0)`）；node feature `connector-jdbc` 已接线但注册零（`engine/bin/tailrace-node/Cargo.toml:17`）；conn-s3/conn-mqtt 同为占位不在本卡。
+- **方案**：占位 crate 内实现 Source trait：MySQL/PostgreSQL 两方言，按主键/时间列区间增量轮询，`cursor_semantics` 登记轮询位点（对齐 IR 游标语义）；驱动选型须过 cargo deny licenses（倾向 sqlx 或各官方 async 驱动，deny 报告先行）；注册走 node feature 门控，不动 registry 本体。
+- **验收**：testcontainers 起 mysql:8 + postgres:15 批源测试（chaos job 先例复用）；位点断言——重启续读不丢不重、totals 单调；parser/catalog 认 jdbc kind；**`git diff` 零触碰 runtime/api/parser 本体**（红线验收字面化）。
+- **文件域**：engine/crates/tailrace-conn-jdbc、engine/bin/tailrace-node（注册行）、tailrace-parser/tailrace-catalog kind 枚举、tests/。
+
+### T14 discover / infer-schema 落地（~3 人日）
+
+- **现状**：console `api/datasources.rs:680/702` 两 handler 返回 `not_implemented`（HTTP 501，"需要 Kafka/Doris 元数据客户端，尚未交付"）；openapi 已登记路径；web 侧对应入口空挂。
+- **方案**：engine 侧元数据客户端（Kafka list/describe topics；Doris SHOW TABLES/DESC 走 9030 mysql 协议）落独立模块；console 转发并缓存；infer-schema 由样本行或 DDL 推 Arrow schema（复用 tailrace-decode 推断面）；web 数据源页接线（发现/建表辅助动线）。
+- **验收**：501 → 真实现；testcontainers/mock 集成测试（kafka 返回 topic 列表、doris 返回表列表、infer-schema 输出 schema JSON 契约快照）；web 手测动线（typecheck+build 绿）。
+- **文件域**：console/crates/tailrace-console/src/api/datasources.rs、engine 元数据客户端新模块、web/src/pages/datasources/。
+
+### T15 分区并行·方案 b（~4 人日）〔引擎热路径；本卡动游标边界，R3 最险〕
+
+- **现状**：方案 a 后单 consumer 拉取边界仍在（T5 记录：rdkafka 单 consumer poll 串行，decode 已并行）；无 split 化、无动态分区发现；T5 的 5 个语义回归测试是现成防线。
+- **方案**：**动工前先写部分分区推进的指纹回归测试**（先测后改）；split 化=分区子集独立拉取执行单元（评估游标拆分语义）；动态分区发现=新增分区自动纳入 poll 面（不重启管道）。
+- **验收**：指纹回归+重启不丢不重+NO_PROGRESS 语义全绿后收工；多分区宏基准 vs 方案 a（24658 rows/s 基线，BENCHMARKS §4.5）对比入档；并行等价性字节级一致测试沿用 T5 口径。
+- **回退门（写死）**：split 化若无法等价证明"游标按 flush 点整体提交"语义，降级为仅交付动态分区发现，split 化并入 T18 升格评审议程——不硬上。
+- **文件域**：engine/crates/tailrace-conn-kafka、tailrace-runtime 主循环、tailrace-state。
+
+### T16 feature 裁剪验证（~1 人日）
+
+- **现状**：node features default=kafka/file/doris（`engine/bin/tailrace-node/Cargo.toml:12`）；CI `no-default-features` job 只验编译，未验链路；裁剪档二进制体积无数字。
+- **方案**：`--no-default-features --features connector-file,connector-doris` 构建 tailrace-node，跑通 file→doris 端到端（依赖 L3 compose Doris）；体积对比（default vs 裁剪档）入 BENCHMARKS/README——单二进制轻量卖点需要数字支撑。
+- **验收**：裁剪档 smoke 变体（file→doris 最小面）绿；体积对比表入档；CI 增可选 job 或本地档登记。
+- **文件域**：engine/bin/tailrace-node、scripts/smoke.sh（裁剪档变体）、.github/workflows/ci.yml。
+
+### T17 CodeMirror6 评估（~1 人日）〔裁决卡，PoC 不进主干〕
+
+- **现状**：T9 实测 monaco 裁剪极限 gzip 883.22kB（raw 3.46MB，含 SQL 补全可用面）；§八.4 已挂号。
+- **方案**：CM6 PoC（@codemirror/lang-sql + autocomplete 面板）量三件事：gzip chunk 体积、补全功能面（表/列补全数据源 API 可用性）、迁移工作量估计（SqlMonaco.vue 替换面）。
+- **验收**：对比表（体积/能力/工作量）产出，裁决结论写回 §八.4 并关闭或升级为落地卡——本卡不落地编辑器替换。
+- **文件域**：PoC 分支（不进 main）；结论落本文件 §八。
+
+### T18 R3 末升格评审（~1 人日）〔门槛数据=BENCHMARKS.md〕
+
+- **方案**：五项评审——deltalake sink / DataFusion 升级 / StarRocks 事务接口 / group commit / 本地两步 WAL——逐项给门槛数据（R2+R3 的 BENCHMARKS 为输入）、触发条件与结论；**默认结论=排 v1.x**，纪要落 `docs/dev/R3-升格评审-<date>.md`。
+- **验收**：纪要存在且五项各有结论+依据；若有升格项，转 R4 任务卡或 v1.x 议程。
+- **文件域**：docs/dev/。
+
+### T19 SSH 部署链八步（~3 人日）〔选做〕
+
+- **现状**：console `api/nodes_admin.rs:749` 起为设计文档 §4.4 八步链的 501 标记（/api/nodes/deploy 等）。
+- **方案**：八步落地（上传/解压/停旧/替二进制/启新/健康/回滚/版本核对——以设计文档 §4.4 为准）；console 编排 + SSH 客户端；失败回滚路径是验收重心。
+- **验收**：501 → 真实现；本地 docker 目标机集成测试（含中途失败触发回滚）；smoke 不强制纳入。
+- **文件域**：console api/nodes_admin.rs、web 部署页（如有）、tests/。
+
+### T20 jemalloc + RSS 指标（~1 人日）〔选做〕
+
+- **现状**：T7 已有 DataFusion memory pool+RSS 探针口径（峰值 RSS 49124 KiB 入档）；未做 allocator 切换对比。
+- **方案**：tikv-jemallocator feature 门控默认关；RSS 指标先就位（stats 面）；A/B 宏基准（吞吐+峰值 RSS+碎片）入 BENCHMARKS。
+- **验收**：feature 档构建绿+对比表入档；默认档行为零变化（不引入 jemalloc）。
+- **文件域**：engine/bin/tailrace-node、Cargo.toml（feature）、scripts/bench/。
+
+### T21 parser/decode fuzz 起步（~2 人日）〔选做〕
+
+- **方案**：cargo-fuzz 目标两个——parser SQL 文法、decode JSON/CSV/OGG 毒输入；种子=T4/T11 毒数据语料；CI 定时档或本地手动档（不上常规 job）。
+- **验收**：fuzz 目标 `cargo fuzz build` 绿；首轮语料 30 分钟零 panic（发现的 panic 修复或登记）；deny licenses 无新增问题。
+- **文件域**：fuzz/（独立 workspace 新目录）、.github/workflows/（可选定时 job）。
+
+## 十、R3 波次编排（文件域冲突分析，动工前按最终文件域复核）
+
+| 波 | 任务（并行 ‖） | 冲突分析 | 波门禁 |
+|---|---|---|---|
+| R3-W1 | T13 JDBC 批源 ‖ T17 CM6 评估(PoC 分支) ‖ T20 jemalloc | 新 crate / PoC 分支 / node bin feature，零交集 | L0+L1+push+CI 绿 |
+| R3-W2 | T12 StarRocks ‖ T14 discover/infer-schema | conn-doris+README vs console+engine 元数据模块，零交集 | L0+L1+L3(starrocks profile 本地档)+push+CI 绿 |
+| R3-W3 | T16 feature 裁剪验证 | 在 T12/T13 落地后复核全 feature 面 | L0+L1+裁剪档 e2e+push+CI 绿 |
+| R3-W4 | T15 分区并行 b（指纹回归先行） | 引擎热路径独占波 | L0+L1+L3+L4+push+CI 绿 |
+| R3-W5 | T19 SSH 部署链〔选做〕 | console 域 | L0+L1+push+CI 绿 |
+| R3-W6 | T21 fuzz 起步〔选做〕 | fuzz/ 新目录 | 语料跑绿 |
+| R3-W7 | T18 升格评审 + 终验：全量 L0-L4 + BENCHMARKS 终稿 + 收官报告 | — | 全绿收官 |
+
+## 十一、R3 收口标准（全轮验收）
+
+```bash
+cd ~/IdeaProjects/tailrace
+cargo fmt --all --check && CARGO_PROFILE_DEV_DEBUG=0 cargo clippy --workspace --all-targets --locked -- -D warnings
+CARGO_PROFILE_DEV_DEBUG=0 cargo test --workspace --locked          # 0 failed，不低于 R2 收官通过数
+cargo deny check advisories bans licenses sources                  # 四门 ok
+bash scripts/bench/macro.sh --rows 100000 --report /tmp/r3-final.md # 吞吐行存在（vs R2 24649-25246 对比）
+docker compose up -d && ./scripts/smoke.sh --full && docker compose down -v   # 全链绿（OrbStack；kafka 端口与常驻栈冲突时 TAILRACE_KAFKA_PORT 覆盖）
+CARGO_PROFILE_DEV_DEBUG=0 cargo build --locked --no-default-features --features connector-file,connector-doris   # T16 裁剪档
+git push origin main && gh run watch <最新>                          # CI 七 job 绿
+test -s docs/dev/R3-升格评审-*.md                                   # T18 纪要存在
+```
