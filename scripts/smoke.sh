@@ -15,6 +15,20 @@
 # RUNNING and rows conserved end to end. Requires Docker; that path is not
 # part of the dependency-free gate.
 #
+# --slim: connector-trimmed node variant (roadmap §九 T16) — the engine node
+# is the kafka-less build and the pipeline is file→doris (the connectors the
+# trim keeps). Build the slim binary first:
+#   cargo build --release --locked -p tailrace-node \
+#     --no-default-features --features connector-file,connector-doris
+#   cp target/release/tailrace-node target/release/tailrace-node-slim
+# (the plain default rebuild restores target/release/tailrace-node; cargo
+# caches both variants under deps/). The console keeps the standard build —
+# only the node is trimmed. Compose brings up doris-fe+doris-be ONLY (kafka
+# is the connector the trim removes; TAILRACE_KAFKA_PORT is irrelevant here
+# because the kafka service never starts). Teardown happens in the exit trap
+# (L3 discipline) regardless of outcome. SMOKE_DORIS_MYSQL switches the
+# variant onto a standing Doris instead of compose (see below).
+#
 # Artifacts: binaries from target/release/ (run ./scripts/build.sh first).
 # Work dir: /tmp/tailrace-smoke (kept on failure for post-mortem).
 set -uo pipefail
@@ -27,7 +41,27 @@ BOOTSTRAP_TOKEN="${TAILRACE_BOOTSTRAP_TOKEN:-tr_b_smoke_00112233445566778899aabb
 WORK="${SMOKE_DIR:-/tmp/tailrace-smoke}"
 KEEP="${SMOKE_KEEP:-0}"
 FULL=0
+SLIM=0
 [ "${1:-}" = "--full" ] && FULL=1
+[ "${1:-}" = "--slim" ] && SLIM=1
+if [ "$FULL" = "1" ] && [ "$SLIM" = "1" ]; then
+  echo "usage: $0 [--full | --slim]  (--full and --slim are mutually exclusive)" >&2
+  exit 2
+fi
+# T16 --slim: the trimmed node binary (kafka-less). SMOKE_NODE_BIN overrides
+# for any variant; the default path per variant keeps the gate deterministic.
+NODE_BIN="${SMOKE_NODE_BIN:-$ROOT/target/release/tailrace-node}"
+[ "$SLIM" = "1" ] && NODE_BIN="${SMOKE_NODE_BIN:-$ROOT/target/release/tailrace-node-slim}"
+COMPOSE="docker compose -f $ROOT/docker-compose.yml"
+# --slim against a standing Doris instead of the compose 2.1.7 stack: dev
+# boxes whose docker VM cannot drop swap (Doris BE 2.1.7 refuses to start
+# with ANY active swap — T11 F11; the standing 3.1.4 has no such check). Set
+# SMOKE_DORIS_MYSQL to a mysql-client command prefix that reaches that FE
+# (e.g. "docker exec -i doris-2.1 mysql -h127.0.0.1 -P9030 -uroot") plus
+# TAILRACE_FE_MYSQL_PORT / TAILRACE_BE_HTTP_PORT = its host ports. Compose
+# up/down are skipped; the smoke database is dropped FORCE at exit.
+DORIS_MYSQL="${SMOKE_DORIS_MYSQL:-}"
+SLIM_DB="tailrace_smoke"   # dedicated name: must not collide on a shared instance
 
 PASS=0; FAIL=0
 CONSOLE_PID=""; NODE_PID=""
@@ -45,6 +79,13 @@ cleanup() {
   [ -n "$NODE_PID" ] && kill -TERM "$NODE_PID" 2>/dev/null
   [ -n "$CONSOLE_PID" ] && kill -TERM "$CONSOLE_PID" 2>/dev/null
   wait 2>/dev/null
+  # T16 --slim: L3 discipline — teardown regardless of outcome (--full tears
+  # down inside run_full; slim never enters run_full). Compose mode: down -v
+  # (its "Removed" lines are the zero-residue evidence); external-Doris mode:
+  # drop the smoke database FORCE (no recycle-bin residue on a shared FE).
+  if [ "$SLIM" = "1" ]; then
+    if [ -n "$DORIS_MYSQL" ]; then $DORIS_MYSQL -e "DROP DATABASE IF EXISTS $SLIM_DB FORCE;"; else $COMPOSE down -v; fi
+  fi
   [ "$FAIL" -gt 0 ] && KEEP=1
   [ "$KEEP" = "1" ] || rm -rf "$WORK"
 }
@@ -90,7 +131,42 @@ json_sql() { # embed SQL (single line) into a JSON string literal
   printf '%s' "$1" | jq -Rs .
 }
 
-echo "== tailrace smoke: work=$WORK console=$CONSOLE_ADDR node=$NODE_ADDR full=$FULL =="
+# Doris helpers (top level: shared by --full's run_full and --slim's
+# file→doris path). doris_mysql reaches the FE's mysql protocol — the compose
+# doris-fe by default, or SMOKE_DORIS_MYSQL when --slim targets a standing
+# instance. DDL retry: the FE may still be finishing bootstrap right after
+# --wait; mysql -e can print a statement error yet exit 0 (T11 first-run:
+# CREATE TABLE failed with "available backend num is 0" while the step
+# logged ok) — DDL success is asserted on SHOW TABLES, not the exit code
+# alone.
+doris_mysql() { # doris_mysql <mysql-client args...>
+  if [ -n "$DORIS_MYSQL" ]; then $DORIS_MYSQL "$@"; else $COMPOSE exec -T doris-fe mysql -h127.0.0.1 -P9030 -uroot "$@"; fi
+}
+
+doris_exec() { # doris_exec <retries> <sql...>
+  local r
+  for r in $(seq 1 "${1:-6}"); do
+    doris_mysql -e "${2}" && return 0
+    sleep 5
+  done
+  return 1
+}
+
+doris_wait_table() { # doris_wait_table <db> <table> <retries>
+  local r out
+  for r in $(seq 1 "${3:-6}"); do
+    out="$(doris_mysql -N -e "SHOW TABLES FROM $1 LIKE '$2';" 2>/dev/null)"
+    grep -q "$2" <<<"$out" && return 0
+    sleep 5
+  done
+  return 1
+}
+
+doris_query() { # doris_query <sql> → single scalar (mysql -N, whitespace-stripped)
+  doris_mysql -N -e "$1" 2>/dev/null | tr -d '[:space:]'
+}
+
+echo "== tailrace smoke: work=$WORK console=$CONSOLE_ADDR node=$NODE_ADDR full=$FULL slim=$SLIM node_bin=$NODE_BIN =="
 command -v jq >/dev/null || { echo "jq is required"; exit 2; }
 
 # ---------- S0 prerequisites ----------
@@ -98,9 +174,9 @@ rm -rf "$WORK"; mkdir -p "$WORK/run" "$WORK/node" "$WORK/node-state"
 [ -x "$ROOT/target/release/tailrace-console" ] \
   && step pass "S0.1 target/release/tailrace-console binary" \
   || step fail "S0.1" "missing target/release/tailrace-console (run ./scripts/build.sh)"
-[ -x "$ROOT/target/release/tailrace-node" ] \
-  && step pass "S0.2 target/release/tailrace-node binary" \
-  || step fail "S0.2" "missing target/release/tailrace-node"
+[ -x "$NODE_BIN" ] \
+  && step pass "S0.2 engine node binary ($NODE_BIN)" \
+  || step fail "S0.2" "missing $NODE_BIN"
 
 # ---------- S1 console boot ----------
 TAILRACE_BOOTSTRAP_TOKEN="$BOOTSTRAP_TOKEN" "$ROOT/target/release/tailrace-console" \
@@ -148,23 +224,27 @@ req POST "/api/datasources/$DS_ID/tables" \
 # seed input rows (engine cwd = $WORK/node → bare file names resolve)
 append_rows 1 3
 
-# ---------- S3.9 (--full only) kafka+doris datasources BEFORE the node ----------
+# ---------- S3.9 (--full / --slim) kafka+doris datasources BEFORE the node ----------
 # The engine reads sink credentials from its own process env at deploy time
 # (authEnv = TAILRACE_DS_<id>); the doris datasource must therefore exist
-# (and its id be known) before the node is spawned.
+# (and its id be known) before the node is spawned. --full needs kafka+doris;
+# --slim (T16) needs doris only — the trimmed node has no kafka connector.
 KDS=""; DDS=""; DDS_ENV_NAME=""; DDS_ENV_VALUE="Basic cm9vdDo="   # root:
-if [ "$FULL" = "1" ]; then
-  KPORT="${TAILRACE_KAFKA_PORT:-9092}"
+if [ "$FULL" = "1" ] || [ "$SLIM" = "1" ]; then
   FEPORT="${TAILRACE_FE_MYSQL_PORT:-39030}"
   BEPORT="${TAILRACE_BE_HTTP_PORT:-38040}"
-  req POST /api/datasources "{\"name\":\"smoke-kafka\",\"type\":\"kafka\",\"connJson\":{\"bootstrap\":\"127.0.0.1:$KPORT\"}}" "$TOKEN"
-  KDS="$(jq -r '.id // empty' <<<"$BODY" 2>/dev/null)"
+  if [ "$FULL" = "1" ]; then
+    KPORT="${TAILRACE_KAFKA_PORT:-9092}"
+    req POST /api/datasources "{\"name\":\"smoke-kafka\",\"type\":\"kafka\",\"connJson\":{\"bootstrap\":\"127.0.0.1:$KPORT\"}}" "$TOKEN"
+    KDS="$(jq -r '.id // empty' <<<"$BODY" 2>/dev/null)"
+  fi
   # doris datasource contract (console api/datasources.rs): jdbcUrl AND
   # streamLoadUrl are both required; username seals a credential (authEnv
   # gate) — root has an empty password on a fresh container
   req POST /api/datasources "{\"name\":\"smoke-doris\",\"type\":\"doris\",\"connJson\":{\"jdbcUrl\":\"jdbc:mysql://127.0.0.1:$FEPORT\",\"streamLoadUrl\":\"http://127.0.0.1:$BEPORT\"},\"username\":\"root\",\"password\":\"\"}" "$TOKEN"
   DDS="$(jq -r '.id // empty' <<<"$BODY" 2>/dev/null)"
-  { [ -n "$KDS" ] && [ -n "$DDS" ]; } && step pass "S3.9 (--full) kafka+doris datasources pre-created (k=$KDS d=$DDS)" \
+  { [ -n "$KDS" ] || [ "$FULL" != "1" ]; } && [ -n "$DDS" ] \
+    && step pass "S3.9 doris datasource pre-created (d=$DDS${KDS:+ k=$KDS})" \
     || step fail "S3.9" "kds=$KDS dds=$DDS body=$BODY"
   DDS_ENV_NAME="TAILRACE_DS_$DDS"
 fi
@@ -172,7 +252,7 @@ fi
 # ---------- S4 engine node self-registration ----------
 if [ -n "$DDS_ENV_NAME" ]; then
   ( cd "$WORK/node" && exec env "$DDS_ENV_NAME=$DDS_ENV_VALUE" \
-      "$ROOT/target/release/tailrace-node" serve \
+      "$NODE_BIN" serve \
       --addr "$NODE_ADDR" \
       --control-plane "http://$CONSOLE_ADDR" \
       --advertise "$NODE_ADDR" \
@@ -180,7 +260,7 @@ if [ -n "$DDS_ENV_NAME" ]; then
       --heartbeat-secs 2 \
       --bootstrap-token "$BOOTSTRAP_TOKEN" ) >"$WORK/node.log" 2>&1 &
 else
-  ( cd "$WORK/node" && exec "$ROOT/target/release/tailrace-node" serve \
+  ( cd "$WORK/node" && exec "$NODE_BIN" serve \
       --addr "$NODE_ADDR" \
       --control-plane "http://$CONSOLE_ADDR" \
       --advertise "$NODE_ADDR" \
@@ -204,14 +284,52 @@ done
 [ "$ONLINE" = "1" ] && step pass "S4.2 node self-registered → ONLINE in console" \
   || step fail "S4.2 node ONLINE" "nodes=$BODY; node.log=$(tail -5 "$WORK/node.log")"
 
+# ---------- S4.5 (--slim only) doris-only compose stack + DDL ----------
+# T16: the trimmed node keeps exactly file+doris — so the minimal real path is
+# file→doris. Kafka is NOT started (it is the connector the trim removes);
+# doris-be depends on doris-fe, so one `up` covers the stack. With
+# SMOKE_DORIS_MYSQL the stack is a standing instance and compose is skipped.
+if [ "$SLIM" = "1" ]; then
+  if [ -n "$DORIS_MYSQL" ]; then
+    step pass "S4.5.1 external doris via SMOKE_DORIS_MYSQL (compose skipped; fe=127.0.0.1:$FEPORT be=127.0.0.1:$BEPORT)"
+  else
+    echo "  (--slim) starting docker compose doris-fe+doris-be (kafka intentionally absent)"
+    if $COMPOSE up -d --wait doris-fe doris-be; then
+      step pass "S4.5.1 docker compose doris (fe+be) healthy"
+    else
+      $COMPOSE logs --tail 50 doris-be doris-fe || true   # same rationale as S8.1
+      step fail "S4.5.1 docker compose doris up" "--wait failed"
+    fi
+  fi
+  if doris_exec 6 "CREATE DATABASE IF NOT EXISTS $SLIM_DB; CREATE TABLE IF NOT EXISTS $SLIM_DB.orders (order_no VARCHAR(64) NOT NULL, qty INT NOT NULL) DUPLICATE KEY(order_no) DISTRIBUTED BY HASH(order_no) BUCKETS 1 PROPERTIES('replication_num' = '1');" \
+     && doris_wait_table "$SLIM_DB" orders 6; then
+    step pass "S4.5.2 doris table $SLIM_DB.orders"
+  else
+    step fail "S4.5.2 doris ddl" "create failed"
+  fi
+  # sink table object (two-part dbName must match the dsMapping key below)
+  req POST "/api/datasources/$DDS/tables" "{\"dbName\":\"$SLIM_DB\",\"tableName\":\"orders\",\"format\":null,\"columnsJson\":[[\"order_no\",\"utf8\"],[\"qty\",\"int64\"]]}" "$TOKEN"
+  { [ "$CODE" = "201" ] || [ "$CODE" = "200" ]; } && step pass "S4.5.3 doris sink table object ($SLIM_DB.orders)" \
+    || step fail "S4.5.3" "http=$CODE body=$BODY"
+fi
+
 # ---------- S5 pipeline: compile → publish → deploy ----------
-SQL="INSERT INTO local.orders_out SELECT order_no, qty FROM local.orders_in"
-req POST /api/pipelines "{\"name\":\"smoke-file-copy\",\"sqlContent\":$(json_sql "$SQL"),\"dsMapping\":{\"local\":$DS_ID},\"checkpointMs\":2000}" "$TOKEN"
+if [ "$SLIM" = "1" ]; then
+  # T16: file→doris — the exact connector surface the trimmed binary ships
+  SQL="INSERT INTO $SLIM_DB.orders SELECT order_no, qty FROM local.orders_in"
+  MAPPING="{\"local\":$DS_ID,\"$SLIM_DB\":$DDS}"
+  PNAME="smoke-slim-file-doris"
+else
+  SQL="INSERT INTO local.orders_out SELECT order_no, qty FROM local.orders_in"
+  MAPPING="{\"local\":$DS_ID}"
+  PNAME="smoke-file-copy"
+fi
+req POST /api/pipelines "{\"name\":\"$PNAME\",\"sqlContent\":$(json_sql "$SQL"),\"dsMapping\":$MAPPING,\"checkpointMs\":2000}" "$TOKEN"
 P_ID="$(jq -r '.id // empty' <<<"$BODY" 2>/dev/null)"
 [ -n "$P_ID" ] && step pass "S5.1 pipeline created (id=$P_ID)" \
   || step fail "S5.1" "http=$CODE body=$BODY"
 
-req POST /api/pipelines/compile "{\"sql\":$(json_sql "$SQL"),\"dsMapping\":{\"local\":$DS_ID}}" "$TOKEN"
+req POST /api/pipelines/compile "{\"sql\":$(json_sql "$SQL"),\"dsMapping\":$MAPPING}" "$TOKEN"
 { [ "$CODE" = "200" ] && [ "$(jq -r '.ok' <<<"$BODY")" = "true" ] && [ "$(jq -r '.diagnostics | length' <<<"$BODY")" = "0" ]; } \
   && step pass "S5.2 compile: ok=true, 0 diagnostics" \
   || step fail "S5.2" "http=$CODE body=$BODY"
@@ -237,9 +355,22 @@ if wait_totals "$P_ID" 3 20; then step pass "S6.1 stats totals ≥ 3 (seed batch
 append_rows 4 5
 if wait_totals "$P_ID" 8 25; then step pass "S6.2 stats totals grew to ≥ 8 after +5 append (consumed=$CONSUMED)"; \
   else step fail "S6.2" "consumed=$CONSUMED flushed=$FLUSHED"; fi
-OUT_LINES="$( [ -f "$WORK/node/orders_out" ] && wc -l < "$WORK/node/orders_out" | tr -d ' ' || echo 0 )"
-[ "${OUT_LINES:-0}" -ge 8 ] && step pass "S6.3 sink file orders_out has ≥ 8 jsonl lines ($OUT_LINES)" \
-  || step fail "S6.3" "orders_out lines=$OUT_LINES"
+if [ "$SLIM" = "1" ]; then
+  # T16: sink is doris — assert rows landed (retry: stream load flushes on
+  # the 10s time boundary, stats may lead the table by one flush)
+  DROWS=0
+  for i in $(seq 1 15); do
+    DROWS="$(doris_query "SELECT COUNT(*) FROM $SLIM_DB.orders;")"
+    [ "${DROWS:-0}" -ge 8 ] && break
+    sleep 2
+  done
+  [ "${DROWS:-0}" -ge 8 ] && step pass "S6.3 sink doris $SLIM_DB.orders has ≥ 8 rows ($DROWS)" \
+    || step fail "S6.3" "doris rows=${DROWS:-0}"
+else
+  OUT_LINES="$( [ -f "$WORK/node/orders_out" ] && wc -l < "$WORK/node/orders_out" | tr -d ' ' || echo 0 )"
+  [ "${OUT_LINES:-0}" -ge 8 ] && step pass "S6.3 sink file orders_out has ≥ 8 jsonl lines ($OUT_LINES)" \
+    || step fail "S6.3" "orders_out lines=$OUT_LINES"
+fi
 
 append_rows 9 4
 if wait_totals "$P_ID" 12 25; then step pass "S6.4 stats totals grew to ≥ 12 after +4 more (consumed=$CONSUMED)"; \
@@ -261,6 +392,14 @@ req POST "/api/pipelines/$P_ID/stop" "" "$TOKEN"
 req GET "/api/pipelines/$P_ID" "" "$TOKEN"
 [ "$(jq -r '.status' <<<"$BODY")" = "PUBLISHED" ] && step pass "S7.4 console pipeline back to PUBLISHED" \
   || step fail "S7.4" "body=$BODY"
+if [ "$SLIM" = "1" ]; then
+  # T16: row conservation through the trimmed binary — stop performs the
+  # final flush + cursor commit, so every consumed row must be in Doris
+  # (DUPLICATE KEY table: a replay would show as > 12, a lost batch as < 12)
+  DROWS="$(doris_query "SELECT COUNT(*) FROM $SLIM_DB.orders;")"
+  [ "${DROWS:-0}" = "12" ] && step pass "S7.5 doris rows == consumed after stop (12 == 12, final flush landed)" \
+    || step fail "S7.5 row conservation" "doris rows=${DROWS:-0} consumed=12"
+fi
 
 # ---------- S8 (only with --full) kafka→doris via docker compose ----------
 # --full path: Kafka (ogg envelope) → Doris (duplicate-key table). Requires
@@ -294,27 +433,6 @@ run_full() {
   else
     step fail "S8.2 kafka topic" "create failed"
   fi
-  # DDL retry: the FE may still be finishing bootstrap right after --wait
-  doris_exec() { # doris_exec <retries> <sql...>
-    local r
-    for r in $(seq 1 "${1:-6}"); do
-      $COMPOSE exec -T doris-fe mysql -h127.0.0.1 -P9030 -uroot -e "${2}" && return 0
-      sleep 5
-    done
-    return 1
-  }
-  # mysql -e can print a statement error yet exit 0 (T11 first-run: CREATE
-  # TABLE failed with "available backend num is 0" while the step logged
-  # ok) — DDL success is asserted on SHOW TABLES, not the exit code alone
-  doris_wait_table() { # doris_wait_table <db> <table> <retries>
-    local r out
-    for r in $(seq 1 "${3:-6}"); do
-      out="$($COMPOSE exec -T doris-fe mysql -N -h127.0.0.1 -P9030 -uroot -e "SHOW TABLES FROM $1 LIKE '$2';" 2>/dev/null)"
-      grep -q "$2" <<<"$out" && return 0
-      sleep 5
-    done
-    return 1
-  }
   if doris_exec 6 "CREATE DATABASE IF NOT EXISTS shop; CREATE TABLE IF NOT EXISTS shop.orders (order_no VARCHAR(64) NOT NULL, qty INT NOT NULL, etl_ts BIGINT) DUPLICATE KEY(order_no) DISTRIBUTED BY HASH(order_no) BUCKETS 1 PROPERTIES('replication_num' = '1');" \
      && doris_wait_table shop orders 6; then
     step pass "S8.3 doris table shop.orders"

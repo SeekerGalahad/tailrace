@@ -142,7 +142,17 @@ tailrace-transform = { path = "engine/crates/tailrace-transform", version = "0.1
 tailrace-parser = { path = "engine/crates/tailrace-parser", version = "0.1.0" }
 tailrace-state = { path = "engine/crates/tailrace-state", version = "0.1.0" }
 tailrace-catalog = { path = "engine/crates/tailrace-catalog", version = "0.1.0" }
-tailrace-runtime = { path = "engine/crates/tailrace-runtime", version = "0.1.0" }
+# T16 (roadmap §九): default-features = false so a connector-trimmed
+# tailrace-node actually drops the connector crates from its link graph.
+# Without it every runtime edge (node AND tailrace-api, which sits in the
+# node's graph) re-enables the runtime's own defaults (kafka/file/doris) via
+# feature unification, and a `--no-default-features --features
+# connector-file,connector-doris` node still links rdkafka/curl/vendored
+# OpenSSL — the trim was cosmetic. The node re-enables exactly its own
+# connector set through engine/bin/tailrace-node's connector-* features
+# (dep:<crate> + tailrace-runtime/<feature>), so the DEFAULT build graph is
+# unchanged; tailrace-api / tests/contract never instantiate connectors.
+tailrace-runtime = { path = "engine/crates/tailrace-runtime", version = "0.1.0", default-features = false }
 tailrace-metadata = { path = "engine/crates/tailrace-metadata", version = "0.1.0" }
 tailrace-api = { path = "engine/crates/tailrace-api", version = "0.1.0" }
 console-store = { path = "console/crates/console-store", version = "0.1.0" }

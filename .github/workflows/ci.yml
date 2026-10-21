@@ -1,6 +1,7 @@
 # CI per design doc §8.3 (three jobs: rust / web / smoke), hardened per
 # upgrade plan §3.1 (research-oss ③): rust-cache, pinned cargo-deny-action,
-# MSRV job, --no-default-features guard, macOS core-test job, workflow hygiene.
+# MSRV job, --no-default-features guard, slim-features guard (T16), macOS
+# core-test job, workflow hygiene.
 name: ci
 on: [push, pull_request]
 
@@ -50,6 +51,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: mkdir -p web/dist && echo '<!doctype html><title>placeholder</title>' > web/dist/index.html
       - run: cargo check --workspace --locked --no-default-features
+
+  slim-features:                                  # T16: the shipped connector-trimmed combo (file+doris, no kafka)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # -p tailrace-node never compiles the console, so no web/dist placeholder
+      - run: cargo check --locked -p tailrace-node --no-default-features --features connector-file,connector-doris
+      # Graph contract (docs/BENCHMARKS.md §6.2): the trim must drop the kafka
+      # stack from the LINK GRAPH, not merely skip register(). Before T16 the
+      # runtime's own default features leaked back through the tailrace-api
+      # edge and the "trimmed" binary was 48 bytes smaller than the default —
+      # `cargo check` alone cannot see that regression, `cargo tree` can.
+      - run: |
+          cargo tree --locked -p tailrace-node --no-default-features --features connector-file,connector-doris -e normal --prefix none > slim-tree.txt
+          if grep -E '^(rdkafka|rdkafka-sys|tailrace-conn-kafka|openssl|openssl-sys|curl-sys) ' slim-tree.txt; then
+            echo "::error::kafka/curl/openssl stack leaked back into the connector-file,connector-doris graph"
+            exit 1
+          fi
 
   macos:                                           # released platform runs at least the core tests (§3.1)
     runs-on: macos-latest

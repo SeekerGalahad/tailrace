@@ -349,16 +349,21 @@ decode→transform→write 之后），行数边界过界判断只能以整 poll
 | 工具链 | rustc 1.98.1（stable，workspace rust-version 1.95） |
 | 构建前缀 | `CARGO_PROFILE_DEV_DEBUG=0`（debug 档去 debuginfo；两档一致） |
 
-| 任务 | bench/口径 | 默认档 | jemalloc 档 | 变化 | 日期 |
+| 任务 | bench/口径 | 默认档 | 对比档（T20=jemalloc 档；T16=裁剪档） | 变化 | 日期 |
 |---|---|---|---|---|---|
 | T20 | macro 吞吐（file→file debug，3 轮中位）¹ | 33670 rows/s | 33738 rows/s | 持平（+0.2%，远在噪声界内）¹ | 2026-10-20 |
 | T20 | node 峰值 RSS（内核 ru_maxrss，3 轮中位） | 53616 KiB（52.4 MiB） | 57808 KiB（56.5 MiB） | **+4192 KiB（+7.8%）**，两档区间不重叠 | 2026-10-20 |
 | T20 | node 二进制体积（debug 档）² | 264,674,112 B | 265,573,776 B | +879 KiB（jemalloc 5.3.1 静态链入） | 2026-10-20 |
 | T20 | 碎片（jemalloc `stats.allocated` vs `stats.resident`） | 未测 | 未测 | 未测³ | 2026-10-20 |
+| T16 | node 二进制体积（**release 档**，改造后；`--no-default-features --features connector-file,connector-doris`）⁴ | 61,571,936 B（`394cd774…`） | **55,788,080 B**（`c5758910…`） | **−5,783,856 B（−5.52 MiB，−9.4%）** | 2026-10-21 |
+| T16 | 同上，**改造前**（旧接线：runtime 默认 feature 把 kafka 栈拉回）⁴ | 61,571,920 B（`e1d479e7…`） | 61,571,872 B（`3b9cda96…`） | −48 B（0.0001%，裁剪纯装饰） | 2026-10-21 |
+| T16 | 依赖图包数（`cargo tree -e normal` 去重） | 435 | 413 | −22（rdkafka/rdkafka-sys/curl-sys/openssl/openssl-sys/tailrace-conn-kafka 等出图） | 2026-10-21 |
+| T16 | file→doris e2e（裁剪档 node，`smoke.sh --slim`） | —（默认档 `smoke.sh` 25/25 回归） | **30/30**，11.9 s；行数守恒 12==12 | 见 §6.2 | 2026-10-21 |
 
 > ¹ 吞吐口径脚注（R3-W1 评审 low#5 补注）：**debug 档**（`CARGO_PROFILE_DEV_DEBUG=0`，非 release）、单轮全链仅 ~3s、macro.sh stats 轮询步进 0.5s → **量化误差 ±17%**（§6.1 结论段自认）——本口径对 <~17% 的 allocator 效应**无检出力**，「持平」仅指差值未超出该噪声界；allocator 吞吐结论以 release 档长跑补测后为准。
 > ² 体积口径脚注（low#5）：两个体积数字来自**基准二进制**（sha256 前缀 `1f7270c7…`/`55066ae4…`，§6.1 方法段），构建树 = **caa842e + T20 提交前工作树**（= 9a9f8a2 落章前的树；其后 488efcc/13d1c2b（engine 改动）、19bb80b（CI）均未包含）——**非任何已提交树的可复现产物**。2026-10-21 复查：本机现存 `target/debug/tailrace-node`（264,705,488 B，`nm` 计 `_rjem_` 符号 0 个）属其后另一树的重建产物，与表中默认档数字不可互推。
 > ³ 碎片行（low#5）：T20 卡方案列有「碎片」对比项，实测未做（无 jemalloc-ctl stats 面，§6.1 结论段「未测」）——此行为显式占位，防「表里没有＝测过没事」的误读；补测需 `tikv-jemalloc-ctl` stats feature + release 长跑。
+> ⁴ T16 体积口径：**release 档**（`[profile.release]` lto="thin" / codegen-units=1 / strip=true），宿主 target aarch64-apple-darwin（命令不带 `--target`，产物 `target/release/`），`--locked`（Cargo.lock 零变动）；字节数 `stat -f %z`、sha256 `shasum -a 256`，sha256 为前 8 位。「改造前」两行 = `4881c39` 干净树；「改造后」两行 = `4881c39` + T16 工作树（根 Cargo.toml / engine/bin/tailrace-node/Cargo.toml / scripts/smoke.sh / .github/workflows/ci.yml）。方法与结论见 §6.2。
 
 ### §6.1 T20 jemalloc + 峰值 RSS 指标（2026-10-20，同机同日交错复测）
 
@@ -433,3 +438,85 @@ sink 行数校验 6 轮均 100000 ✓；引擎 `git@caa842e` + T20 工作树。�
 → `MACRO_NODE_WRAP="/usr/bin/time -l" MACRO_KEEP=1 bash scripts/bench/macro.sh --rows 100000
 --report out.md` → `grep 'maximum resident' $MACRO_DIR/node.log`（macOS；Linux 包装器
 改用 GNU time `-v`，或直接读 Linux 心跳 `resources.peakRssBytes`）。
+
+### §6.2 T16 feature 裁剪验证（2026-10-21，同机同日）
+
+目标（roadmap §九 T16 / §一 北极星「2-4 GB 盒子可跑」）：裁剪档 `--no-default-features
+--features connector-file,connector-doris` 必须**真实可用**（file→doris 链路实跑）且
+**体积数字可复现**。口径与四个二进制的字节数/sha256 见上表 T16 行与脚注 ⁴。
+
+**发现（改造前）**：裁剪是装饰性的。`tailrace-runtime` 自带
+`default = ["connector-kafka","connector-file","connector-doris"]`（`engine/crates/tailrace-runtime/Cargo.toml:12`），
+node 关掉 `connector-kafka` 只是去掉 `build_registry()` 里的一次 `register()`
+（`engine/bin/tailrace-node/src/main.rs:30`），而 runtime 的两条入边（node→runtime、
+**tailrace-api→runtime**，后者在 node 的依赖图内）都带 runtime 默认 feature，经 feature
+统一把 kafka 整栈拉回：旧接线裁剪图仍含 rdkafka / tailrace-conn-kafka / openssl（`cargo tree`
+3 命中），二进制仅 **−48 B**。另一处不一致：`run` 子命令走 runtime 的 `default_registry()`
+（`engine/crates/tailrace-runtime/src/lib.rs:1134`），`serve` 走 node 的 `build_registry()`——
+旧接线下"裁剪档"的 run 有 kafka、serve 没有。
+
+**改造（最小 wiring，不动 runtime / main.rs 源码；Cargo.lock 零变动）**：
+
+1. 根 `Cargo.toml` workspace 表 `tailrace-runtime` 加 `default-features = false`——只在 node 侧
+   写 `default-features = false` **不够**（cargo 1.98 静默接受，但 `tailrace-api→runtime` 边
+   仍启用 runtime 的 default：`cargo tree -e features -i tailrace-runtime` 实证链
+   `tailrace-api feature "default" → tailrace-runtime feature "default"`，rdkafka 回到图内）；
+   workspace 表是**唯一不触碰 tailrace-api 自身 manifest** 的落点（api 不感知连接器 feature，
+   `tests/contract` 与 api 均不实例化连接器，两者零改动）。
+2. `engine/bin/tailrace-node/Cargo.toml`：`connector-{kafka,file,doris}` 各透传
+   `tailrace-runtime/connector-*`（两张注册表自此同源，run/serve 一致）；`openssl` 改
+   optional 并挂在 `connector-kafka` 下（vendored OpenSSL 只为 rdkafka 的 curl-static 存在，
+   裁剪图里没有 curl-sys）。
+3. `scripts/smoke.sh --slim`：裁剪档 node + 标准 console，file→doris 最小面；compose 只起
+   doris-fe+doris-be；`SMOKE_DORIS_MYSQL` 可把变体指向一台常驻 Doris（见下）；退出 trap
+   内 `down -v` 或 `DROP DATABASE … FORCE`。
+4. `.github/workflows/ci.yml`：新增 `slim-features` job（`cargo check --locked -p tailrace-node
+   --no-default-features --features connector-file,connector-doris`）——现有
+   `no-default-features` job 只覆盖**空**组合，可售裁剪组合此前无 CI 契约。
+
+**结果（如实）**：
+
+- 裁剪档 **55,788,080 B vs 默认 61,571,936 B：−5,783,856 B（−5.52 MiB，−9.4%）**；依赖图
+  435→413 包，rdkafka / rdkafka-sys / curl-sys / openssl / openssl-sys / tailrace-conn-kafka
+  全部出图（`cargo tree -e normal` 0 命中）。二进制层面的佐证（`otool`/`nm`，默认 vs 裁剪）：
+  动态导入 297→182 项，掉的全是 librdkafka/libcurl/OpenSSL/zlib 的 C 面（`_deflate*/_inflate*`、
+  `_regcomp/_regexec`、`_SCDynamicStoreCopyProxies`、`_dlopen/_dlsym`、`_pthread_rwlock_*`…）；
+  链接 dylib 少了 CoreServices / Security / SystemConfiguration 三个框架与 `libz.1.dylib`；
+  `__TEXT,__text` −3,495,460 B、`__TEXT,__const` −903,376 B、`__DATA_CONST,__const` −634,128 B、
+  `__TEXT,__cstring` −385,771 B。−9.4% 是诚实的数字：剩余 ~42.2 MB `__text` 的归属**本卡未测**
+  （`strip = true` 产物无静态符号表，无法按 crate 归因）——连接器裁剪对"单二进制轻量"是
+  必要而非充分条件。
+- **默认档零行为变化**：改造前后默认依赖图一致（435 包、kafka 栈齐全）、动态导入表（`nm`，
+  297 项）与链接 dylib 列表逐项一致（strip 产物无静态符号表，故只能比到这一层）；二进制
+  +16 B / sha256 变化（`e1d479e7…`→`394cd774…`）——`otool -l` 对比仅
+  `__unwind_info` +8 B 与 `__LINKEDIT` +16 B，其余全部段/节尺寸一致：openssl 从直接依赖改为
+  经 `dep:openssl` 启用，rlib 链接序平移（与 §6.1 记录的 182 B 同类布局漂移）。行为由默认档
+  `./scripts/smoke.sh` **25/25** 复跑实证。两档 sha256 经 cargo deps/ 指纹缓存二次恢复**完全
+  一致**（可复现）。
+- **e2e 实跑**（裁剪档 node `c5758910…` + 标准 console，2026-10-21 本机）：
+
+  | 项 | 结果 |
+  |---|---|
+  | `TAILRACE_FE_MYSQL_PORT=9030 TAILRACE_BE_HTTP_PORT=8040 SMOKE_DORIS_MYSQL="docker exec -i doris-2.1 mysql -h127.0.0.1 -P9030 -uroot" ./scripts/smoke.sh --slim` | **30/30 全绿**，11.9 s（首跑 29/29，未含后加的 S7.5） |
+  | file→doris 行数守恒（S7.5，停止后终刷） | consumed=12 == Doris `COUNT(*)`=12 |
+  | 负向探针：kafka 源管道部署到裁剪档 node | console 返回 `ENGINE_REJECTED`：`源类型未支持：kafka（本二进制未编译该连接器 feature）`——裁剪是注册表级语义，不只是字节 |
+  | 默认档回归 `./scripts/smoke.sh` | 25/25 |
+  | 环境残留 | 常驻 Doris `SHOW DATABASES` 前后一致（scratch 库 `tailrace_smoke` 已 FORCE drop）、mdop doris 双容器全程 Up、swap 未动、tailrace compose 容器 0、工作目录已清 |
+
+**配方降级登记（如实）**：契约 §3 的 2.1.7 配方 = privileged `swapoff -a` → 停 mdop doris
+腾内存 → `TAILRACE_KAFKA_PORT=39092 docker compose up`。实测 OrbStack VM 8004 MB / 可用
+789 MB，`/proc/swaps`：**zram0 已用 4,125,768 KB（≈3.9 GB，压缩驻留 904 MB）** + /vdc 123 MB；
+按规则「zram 用量 >0 且余量不足则不 swapoff」：停 doris 腾 ~1.9 GB 后可用 ≈2.7 GB < 回灌
+≈4 GB，2.1.7 fe+be 再需 ~1.9 GB——不可行（BE 2.1.7 `start_be.sh` 有活动 swap 即拒启）。故
+**未执行** swapoff / `docker stop doris-*` / `compose up`，环境零触碰；e2e 改由常驻 Doris
+**3.1.4**（无 swap 检查，FE 9030 / BE 8040 已映射宿主）承接。因此 `--slim` 的 **compose 模式
+代码路径本机未实跑**（仅 `bash -n` + 与 `--full` 共用的 doris helper）；CI 也不跑 `--slim`
+（新 job 为 cargo check 级）——compose 2.1.7 下的裁剪档 e2e 留待 swap 可清空的机器或 CI 扩展。
+`vm.max_map_count` 实测已为 2000000。
+
+复现：`CARGO_PROFILE_DEV_DEBUG=0 cargo build --release --locked -p tailrace-node`（默认档）；
+`CARGO_PROFILE_DEV_DEBUG=0 cargo build --release --locked -p tailrace-node --no-default-features
+--features connector-file,connector-doris && cp target/release/tailrace-node target/release/tailrace-node-slim`
+（裁剪档；再跑一次默认命令即恢复 `target/release/tailrace-node`）→ `shasum -a 256
+target/release/tailrace-node*` → `./scripts/smoke.sh --slim`（compose 2.1.7；或按上表
+`SMOKE_DORIS_MYSQL` 指向常驻 Doris）。

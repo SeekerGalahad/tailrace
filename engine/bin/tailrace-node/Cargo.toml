@@ -9,10 +9,19 @@ description = "tailrace single-binary node entry: CLI (run / serve / compile) wi
 [features]
 # Connector wiring: default registers kafka/file/doris; mqtt/jdbc/s3 stay
 # placeholder crates and register nothing until implemented.
+# T16 (roadmap §九): each real connector feature also drives the matching
+# tailrace-runtime feature. The two registries must agree — `serve` uses
+# build_registry() here, `run` goes through the runtime's default_registry()
+# — and the runtime edge is default-features = false (workspace table), so a
+# `--no-default-features --features connector-file,connector-doris` build
+# really drops conn-kafka/rdkafka/curl from the link graph. The default
+# feature set resolves to the SAME dependency graph as before; the default
+# binary differs only by a +16 B link-layout shift (§6.2: openssl became a
+# dep:openssl, rlib link order moved; dynamic imports identical).
 default = ["connector-kafka", "connector-file", "connector-doris"]
-connector-kafka = ["dep:tailrace-conn-kafka"]
-connector-file  = ["dep:tailrace-conn-file"]
-connector-doris = ["dep:tailrace-conn-doris"]
+connector-kafka = ["dep:tailrace-conn-kafka", "dep:openssl", "tailrace-runtime/connector-kafka"]
+connector-file  = ["dep:tailrace-conn-file", "tailrace-runtime/connector-file"]
+connector-doris = ["dep:tailrace-conn-doris", "tailrace-runtime/connector-doris"]
 connector-mqtt  = ["dep:tailrace-conn-mqtt"]
 connector-jdbc  = ["dep:tailrace-conn-jdbc"]
 connector-s3    = ["dep:tailrace-conn-s3"]
@@ -60,7 +69,10 @@ tokio = { workspace = true, features = ["signal"] }
 # Vendored OpenSSL: curl-sys (via rdkafka curl-static) links OpenSSL, and
 # cross-compilation containers have no target-arch OpenSSL. Vendoring makes
 # every release target self-contained. Unused as a library on purpose.
-openssl = { workspace = true }
+# T16: gated behind connector-kafka — vendored OpenSSL exists solely for the
+# rdkafka/curl-static stack; a kafka-trimmed build has no curl-sys in its
+# graph and would otherwise link a dead OpenSSL.
+openssl = { workspace = true, optional = true }
 
 [dev-dependencies]
 # chaos live-gate probes only (documented-precondition checks; both crates
