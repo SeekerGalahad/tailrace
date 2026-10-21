@@ -7,9 +7,9 @@ A single-binary data ingestion engine with a built-in web console. SQL-first, no
 ## Status
 
 v0.1.0 baseline (2026-10-13). Working: engine data plane in `engine/` (SQL
-transforms, offset cursors, kafka/file/jdbc sources, Doris Stream Load sink),
-plus the management console (`console/` + `web/`). The starrocks sink is an
-alias sharing the Doris Stream Load path (full parity in progress); mqtt/s3
+transforms, offset cursors, kafka/file/jdbc sources, Doris / StarRocks Stream
+Load sinks), plus the management console (`console/` + `web/`). The starrocks
+sink shares the Doris Stream Load path with kind-gated StarRocks deltas; mqtt/s3
 connectors are placeholders.
 
 ## Quickstart
@@ -46,7 +46,7 @@ docker compose).
 | file | ✅ | — | local / mounted files |
 | jdbc | ✅ | — | MySQL / PostgreSQL keyset batch source ([docs](docs/connectors/jdbc.md)) |
 | doris | — | ✅ | Stream Load |
-| starrocks | — | ✅ | alias sharing the Doris Stream Load path — full parity in progress (roadmap T12) |
+| starrocks | — | ✅ | Stream Load via the Doris sink with kind-gated StarRocks deltas (FE 307 redirect following, header set); e2e'd against `starrocks/allin1` (`docker compose --profile starrocks`) |
 | mqtt | — | — | placeholder, not yet implemented (route decision pending, roadmap T18) |
 | s3 | — | — | placeholder, not yet implemented (route decision pending, roadmap T18) |
 

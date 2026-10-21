@@ -4,7 +4,7 @@
 
 ## 状态
 
-v0.1.0 基线（2026-10-13）。已可用：`engine/` 数据面（SQL 变换、offset 游标、kafka/file/jdbc 源、Doris Stream Load 汇）与管理台（`console/` + `web/`）；starrocks 汇为共享 Doris Stream Load 协议的别名（完整化进行中）；mqtt/s3 连接器为占位。
+v0.1.0 基线（2026-10-13）。已可用：`engine/` 数据面（SQL 变换、offset 游标、kafka/file/jdbc 源、Doris / StarRocks Stream Load 汇）与管理台（`console/` + `web/`）；starrocks 汇共享 Doris Stream Load 通道、按 kind 门控 StarRocks 差异；mqtt/s3 连接器为占位。
 
 ## 快速开始
 
@@ -39,7 +39,7 @@ v0.1.0 基线（2026-10-13）。已可用：`engine/` 数据面（SQL 变换、o
 | file | ✅ | — | 本地/挂载文件 |
 | jdbc | ✅ | — | MySQL / PostgreSQL keyset 批源（[文档](docs/connectors/jdbc.md)） |
 | doris | — | ✅ | Stream Load |
-| starrocks | — | ✅ | 别名共享 Doris Stream Load 协议——完整化进行中（roadmap T12） |
+| starrocks | — | ✅ | 经 Doris 汇走 Stream Load，按 kind 门控 StarRocks 差异（FE 307 重定向跟随、头部集）；已对 `starrocks/allin1` e2e（`docker compose --profile starrocks`） |
 | mqtt | — | — | 占位，未实现（路线裁决在 roadmap T18） |
 | s3 | — | — | 占位，未实现（路线裁决在 roadmap T18） |
 

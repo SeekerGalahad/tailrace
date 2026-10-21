@@ -1,5 +1,5 @@
-//! tailrace-conn-doris: Doris sink (BE-direct stream load + label
-//! idempotency + Status: Success judgment).
+//! tailrace-conn-doris: Doris / StarRocks sink (BE-direct stream load +
+//! label idempotency + Status: Success judgment).
 //!
 //! reqwest blocking connects straight to the BE (an FE 307 redirect strips
 //! the Authorization header — redirects are explicitly not followed).
@@ -8,6 +8,20 @@
 //! quotes are unparseable with every enclose/escape header combination
 //! (T11 first-run matrix), while JSON escaping is total over arbitrary
 //! UTF-8 (in-field newlines / quotes / emoji / backslashes).
+//!
+//! T12 StarRocks flavor (feature "starrocks", kind=starrocks): same Stream
+//! Load protocol, three flavor-gated deltas (full matrix in roadmap §九
+//! T12): (1) FE 307 redirects ARE followed — re-attaching Authorization,
+//! curl `--location-trusted` semantics (StarRocks' canonical entry is the
+//! FE http port 8030, which redirects every load to a BE/CN 8040; docs
+//! "Load data from a local file system" + Flink connector network notes);
+//! (2) no `read_json_by_line` header — current StarRocks has no such
+//! parameter (0 hits in source + BE http_load_params.h), and parses JSON
+//! document streams (ndjson) natively when `strip_outer_array` is false
+//! (the default; be/src/formats/json/json_parser.h
+//! `JsonDocumentStreamParser`), so the JSON-lines carrier rides unchanged;
+//! (3) no `sequence_column` header — StarRocks declares sequence columns
+//! at table level, not at load time.
 
 use std::time::Duration;
 
@@ -120,8 +134,19 @@ fn append_json_lines(
     Ok(())
 }
 
+/// Protocol flavor of the stream-load sink (T12). The "starrocks" kind
+/// rides the same protocol with three flavor-gated deltas — FE redirect
+/// following, no `read_json_by_line` header, no `sequence_column` header
+/// (module doc above + the roadmap §九 T12 difference matrix).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkFlavor {
+    Doris,
+    StarRocks,
+}
+
 /// Register the doris sink factory (plus the "starrocks" alias when that
-/// feature is on — the Stream Load protocol is shared).
+/// feature is on — same Stream Load protocol, StarRocks deltas gated on
+/// the table object's kind, see [`SinkFlavor`]).
 pub fn register(reg: &mut ConnectorRegistry) {
     reg.register_sink("doris", sink_factory);
     #[cfg(feature = "starrocks")]
@@ -145,9 +170,17 @@ fn sink_factory(
         .label_prefix
         .clone()
         .unwrap_or_else(|| format!("p{}", obj.datasource));
+    // the kind itself is the datasource-level knob selecting the flavor
+    // (catalog normalize_kind keeps "starrocks" canonical)
+    let flavor = if obj.kind == "starrocks" {
+        SinkFlavor::StarRocks
+    } else {
+        SinkFlavor::Doris
+    };
     // sequence column wiring + reliability knobs (retry backoff / request timeout)
     let mut sink =
-        DorisSink::with_sequence(url, auth, columns, prefix, obj.sequence_column.clone());
+        DorisSink::with_sequence(url, auth, columns, prefix, obj.sequence_column.clone())
+            .with_flavor(flavor);
     if let Some(r) = rel {
         sink = sink
             .with_retry_backoff(r.flush_backoff_ms())
@@ -155,6 +188,10 @@ fn sink_factory(
     }
     Ok(Box::new(sink))
 }
+
+/// Redirect budget for the StarRocks flavor (FE → BE is one hop; chained
+/// FE proxies are rare but tolerated up to this bound, then fatal).
+const MAX_REDIRECT_HOPS: u32 = 3;
 
 /// Terminal outcome of one stream load attempt.
 #[derive(Debug, PartialEq, Eq)]
@@ -202,6 +239,9 @@ pub struct DorisSink {
     /// blocking is not allowed"). The statement thread is fully synchronous —
     /// legal. OnceCell is single-thread-written, Send-safe.
     client: std::cell::OnceCell<reqwest::blocking::Client>,
+    /// Protocol flavor (T12): StarRocks follows FE 307 redirects and omits
+    /// the Doris-only load headers (read_json_by_line / sequence_column).
+    flavor: SinkFlavor,
     url: String,
     auth: String,
     columns: Vec<String>,
@@ -247,6 +287,7 @@ impl DorisSink {
         Self {
             sequence_column,
             client: std::cell::OnceCell::new(),
+            flavor: SinkFlavor::Doris,
             url: url.into(),
             auth: auth.into(),
             columns,
@@ -266,6 +307,13 @@ impl DorisSink {
         if !backoff_ms.is_empty() {
             self.retry_backoff_ms = backoff_ms;
         }
+        self
+    }
+
+    /// Protocol flavor override (T12): the factory derives it from the table
+    /// object's kind; tests and embedders can pin it explicitly.
+    pub fn with_flavor(mut self, flavor: SinkFlavor) -> Self {
+        self.flavor = flavor;
         self
     }
 
@@ -294,109 +342,166 @@ impl DorisSink {
         Ok(self.client.get().expect("just initialized"))
     }
 
+    /// Ack label: honest about which engine committed the rows (a purely
+    /// diagnostic field — nothing downstream pattern-matches on it).
+    fn ack_kind(&self) -> &'static str {
+        match self.flavor {
+            SinkFlavor::Doris => "DORIS_STREAM_LOAD",
+            SinkFlavor::StarRocks => "STARROCKS_STREAM_LOAD",
+        }
+    }
+
     /// One send attempt with terminal-outcome judgment. The body is a
     /// refcounted `Bytes` — the reqwest clone is free, and on failure the
     /// shared buffer stays intact for the retry (a failure never drops the
-    /// buffered rows).
+    /// buffered rows). StarRocks flavor: FE redirects are followed with the
+    /// Authorization header re-attached (curl `--location-trusted`
+    /// semantics — a plain reqwest redirect policy silently drops the
+    /// credential cross-host).
     fn send_once(&self, label: &str, body: &Bytes) -> Result<FlushOutcome, FlushError> {
         let brief = |t: &str| -> String { t.chars().take(300).collect() };
-        let resp = self
-            .client()
-            .map_err(|e| FlushError::fatal(e.to_string()))?
-            .put(&self.url)
-            .header("Authorization", &self.auth)
-            .header("label", label)
-            // JSON-lines carrier (one object per line): Doris maps by key
-            // name; serde_json escaping carries any UTF-8 payload verbatim.
-            // The old CSV path sent enclose/escape headers and be-2.1.7
-            // could not parse RFC4180 doubled quotes under any combination
-            // of them (T11 first-run matrix) — quoted/comma'd fields died.
-            .header("format", "json")
-            .header("read_json_by_line", "true")
-            // Doris sequence column declaration (the out-of-order dedup basis
-            // for UNIQUE KEY tables)
-            .header(
-                "sequence_column",
-                self.sequence_column.as_deref().unwrap_or(""),
-            )
-            .header("Expect", "100-continue")
-            .body(body.clone())
-            .send();
-        let resp = match resp {
-            Ok(r) => r,
-            // network-layer errors (connection refused/timeout/reset) —
-            // typically transient, retryable
-            Err(e) => return Err(FlushError::retry(format!("network error: {e}"))),
-        };
-        let status = resp.status();
-        let text = resp.text().unwrap_or_default();
-        if status.is_redirection() {
-            return Err(FlushError::fatal(format!(
-                "HTTP {} redirect — stream_load_url points at an FE (which strips the Authorization header); use a BE:8040 direct URL: {}",
-                status.as_u16(),
-                brief(&text)
-            )));
-        }
-        if status.as_u16() == 401 || status.as_u16() == 403 {
-            return Err(FlushError::fatal(format!(
-                "authentication failed (HTTP {}): {} — check TAILRACE_DORIS_AUTH",
-                status.as_u16(),
-                brief(&text)
-            )));
-        }
-        if status.is_client_error() {
-            return Err(FlushError::fatal(format!(
-                "HTTP {}: {}",
-                status.as_u16(),
-                brief(&text)
-            )));
-        }
-        // JSON parsing instead of string sniffing + char-boundary-safe
-        // truncation (slicing at a non-char boundary used to panic)
-        let v = match serde_json::from_str::<serde_json::Value>(&text) {
-            Ok(v) => v,
-            // non-JSON response (a gateway/proxy error page) — likely
-            // transient, retryable
-            Err(_) => {
-                return Err(FlushError::retry(format!(
-                    "non-JSON response (HTTP {}): {}",
+        let mut url = self.url.clone();
+        let mut hops = 0u32;
+        loop {
+            let mut req = self
+                .client()
+                .map_err(|e| FlushError::fatal(e.to_string()))?
+                .put(&url)
+                .header("Authorization", &self.auth)
+                .header("label", label)
+                // JSON-lines carrier (one object per line): both engines
+                // map by key name; serde_json escaping carries any UTF-8
+                // payload verbatim. The old CSV path sent enclose/escape
+                // headers and be-2.1.7 could not parse RFC4180 doubled
+                // quotes under any combination of them (T11 first-run
+                // matrix) — quoted/comma'd fields died.
+                .header("format", "json");
+            if self.flavor == SinkFlavor::Doris {
+                req = req
+                    // Doris: per-line JSON objects are opt-in via this
+                    // header. StarRocks has no such parameter — the
+                    // document-stream (ndjson) parser is already the
+                    // default when strip_outer_array=false (module doc,
+                    // T12 difference matrix).
+                    .header("read_json_by_line", "true")
+                    // Doris sequence column declaration (the out-of-order
+                    // dedup basis for UNIQUE KEY tables). StarRocks
+                    // declares sequence columns at table level instead —
+                    // no load-time header exists there.
+                    .header(
+                        "sequence_column",
+                        self.sequence_column.as_deref().unwrap_or(""),
+                    );
+            }
+            let resp = req
+                .header("Expect", "100-continue")
+                .body(body.clone())
+                .send();
+            let resp = match resp {
+                Ok(r) => r,
+                // network-layer errors (connection refused/timeout/reset) —
+                // typically transient, retryable
+                Err(e) => return Err(FlushError::retry(format!("network error: {e}"))),
+            };
+            let status = resp.status();
+            if status.is_redirection() {
+                let location = resp
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                let text = resp.text().unwrap_or_default();
+                // StarRocks: following the FE's redirect IS the protocol —
+                // the FE http port (8030) forwards every load request to a
+                // BE/CN webserver (8040) via redirect (docs "Load data from
+                // a local file system"; Flink connector network notes).
+                // The Authorization header must be re-attached by hand:
+                // clients strip it cross-host on redirect.
+                if self.flavor == SinkFlavor::StarRocks {
+                    if let Some(loc) = &location {
+                        if (loc.starts_with("http://") || loc.starts_with("https://"))
+                            && hops < MAX_REDIRECT_HOPS
+                        {
+                            tracing::debug!(from = %url, to = %loc, hops, "starrocks fe redirect followed");
+                            url = loc.clone();
+                            hops += 1;
+                            continue;
+                        }
+                    }
+                    return Err(FlushError::fatal(format!(
+                        "HTTP {} redirect chain not followable (hops={hops}): Location={location:?} {} — check the StarRocks FE http_port/be_http_port wiring",
+                        status.as_u16(),
+                        brief(&text)
+                    )));
+                }
+                return Err(FlushError::fatal(format!(
+                    "HTTP {} redirect — stream_load_url points at an FE (which strips the Authorization header); use a BE:8040 direct URL: {}",
                     status.as_u16(),
                     brief(&text)
-                )))
+                )));
             }
-        };
-        let st = v.get("Status").and_then(|s| s.as_str()).unwrap_or("");
-        if st == "Success" || st == "Publish Timeout" {
-            return Ok(FlushOutcome::Success);
+            let text = resp.text().unwrap_or_default();
+            if status.as_u16() == 401 || status.as_u16() == 403 {
+                return Err(FlushError::fatal(format!(
+                    "authentication failed (HTTP {}): {} — check TAILRACE_DORIS_AUTH",
+                    status.as_u16(),
+                    brief(&text)
+                )));
+            }
+            if status.is_client_error() {
+                return Err(FlushError::fatal(format!(
+                    "HTTP {}: {}",
+                    status.as_u16(),
+                    brief(&text)
+                )));
+            }
+            // JSON parsing instead of string sniffing + char-boundary-safe
+            // truncation (slicing at a non-char boundary used to panic)
+            let v = match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(v) => v,
+                // non-JSON response (a gateway/proxy error page) — likely
+                // transient, retryable
+                Err(_) => {
+                    return Err(FlushError::retry(format!(
+                        "non-JSON response (HTTP {}): {}",
+                        status.as_u16(),
+                        brief(&text)
+                    )))
+                }
+            };
+            let st = v.get("Status").and_then(|s| s.as_str()).unwrap_or("");
+            if st == "Success" || st == "Publish Timeout" {
+                return Ok(FlushOutcome::Success);
+            }
+            let reason = v
+                .get("Reason")
+                .or_else(|| v.get("Message"))
+                .and_then(|r| r.as_str())
+                .unwrap_or("");
+            // ErrorURL passthrough: the bad-row details of DATA_QUALITY-type
+            // failures (original row + column + reason) only exist in ErrorURL.
+            // Truncation applies to the reason text only (Doris quality messages
+            // are long templates); the URL must stay complete and curl-able — a
+            // half URL is unusable for triage.
+            let error_url = v.get("ErrorURL").and_then(|u| u.as_str()).unwrap_or("");
+            let reason = if error_url.is_empty() {
+                brief(reason).to_string()
+            } else {
+                format!("{} | bad rows: {}", brief(reason), error_url)
+            };
+            let lower = format!("{st} {reason}").to_lowercase();
+            // The same label already committed successfully (a restart replay) →
+            // converge to success (the data is in the warehouse); do not kill
+            if lower.contains("label already exists") || lower.contains("has already been used") {
+                return Ok(FlushOutcome::Dedup);
+            }
+            if lower.contains("timeout") || lower.contains("too many") || status.is_server_error() {
+                return Err(FlushError::retry(format!("Status={st} Reason={reason}")));
+            }
+            // Other Fail outcomes (strict-mode filtering, schema mismatch, syntax
+            // errors) — deterministic failures, retrying is pointless
+            return Err(FlushError::fatal(format!("Status={st} Reason={reason}")));
         }
-        let reason = v
-            .get("Reason")
-            .or_else(|| v.get("Message"))
-            .and_then(|r| r.as_str())
-            .unwrap_or("");
-        // ErrorURL passthrough: the bad-row details of DATA_QUALITY-type
-        // failures (original row + column + reason) only exist in ErrorURL.
-        // Truncation applies to the reason text only (Doris quality messages
-        // are long templates); the URL must stay complete and curl-able — a
-        // half URL is unusable for triage.
-        let error_url = v.get("ErrorURL").and_then(|u| u.as_str()).unwrap_or("");
-        let reason = if error_url.is_empty() {
-            brief(reason).to_string()
-        } else {
-            format!("{} | bad rows: {}", brief(reason), error_url)
-        };
-        let lower = format!("{st} {reason}").to_lowercase();
-        // The same label already committed successfully (a restart replay) →
-        // converge to success (the data is in the warehouse); do not kill
-        if lower.contains("label already exists") || lower.contains("has already been used") {
-            return Ok(FlushOutcome::Dedup);
-        }
-        if lower.contains("timeout") || lower.contains("too many") || status.is_server_error() {
-            return Err(FlushError::retry(format!("Status={st} Reason={reason}")));
-        }
-        // Other Fail outcomes (strict-mode filtering, schema mismatch, syntax
-        // errors) — deterministic failures, retrying is pointless
-        Err(FlushError::fatal(format!("Status={st} Reason={reason}")))
     }
 }
 
@@ -417,7 +522,7 @@ impl Sink for DorisSink {
         if self.pending_rows == 0 {
             return Ok(SinkAck {
                 rows: 0,
-                kind: "DORIS_STREAM_LOAD",
+                kind: self.ack_kind(),
                 idempotency_key: format!("{}.noop", self.label_prefix),
             });
         }
@@ -438,7 +543,7 @@ impl Sink for DorisSink {
                     self.buf = BytesMut::with_capacity(16 * 1024 * 1024);
                     return Ok(SinkAck {
                         rows,
-                        kind: "DORIS_STREAM_LOAD",
+                        kind: self.ack_kind(),
                         idempotency_key: label,
                     });
                 }
@@ -485,12 +590,14 @@ mod tests {
     use std::sync::atomic::Ordering as Ord2;
     use std::sync::{Arc, Mutex};
 
-    /// Minimal Doris mock (std TcpListener — zero new deps): responds to PUTs
-    /// in scripted order, counting hits and keeping bodies.
+    /// Minimal Doris/StarRocks mock (std TcpListener — zero new deps):
+    /// responds to PUTs in scripted order, counting hits and keeping
+    /// bodies (plus the raw request head, for header-contract asserts).
     struct MockDoris {
         addr: std::net::SocketAddr,
         hits: Arc<std::sync::atomic::AtomicUsize>,
         bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+        heads: Arc<Mutex<Vec<String>>>,
     }
 
     fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -501,12 +608,20 @@ mod tests {
         /// script: respond in order with (HTTP status, body); requests beyond
         /// the script block on accept (tests assert on hits to intercept)
         fn start(script: Vec<(u16, String)>) -> Self {
+            Self::start_with_redirect(script, None)
+        }
+
+        /// Same, but 307 responses carry the given Location instead of the
+        /// historical `http://127.0.0.1:1/fe` (the StarRocks FE-redirect
+        /// tests point it at a second mock BE).
+        fn start_with_redirect(script: Vec<(u16, String)>, location: Option<String>) -> Self {
             use std::io::{Read, Write};
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let bodies = Arc::new(Mutex::new(Vec::new()));
-            let (h2, b2) = (Arc::clone(&hits), Arc::clone(&bodies));
+            let heads = Arc::new(Mutex::new(Vec::new()));
+            let (h2, b2, hd2) = (Arc::clone(&hits), Arc::clone(&bodies), Arc::clone(&heads));
             std::thread::spawn(move || {
                 for (code, body) in script {
                     let Ok((mut s, _)) = listener.accept() else {
@@ -529,6 +644,7 @@ mod tests {
                     }
                     let Some(pos) = head_end else { continue };
                     let head = String::from_utf8_lossy(&data[..pos]).to_ascii_lowercase();
+                    hd2.lock().unwrap().push(head.clone());
                     // honor Expect: 100-continue first (matches a real BE and
                     // avoids a 1s hyper wait)
                     if head.contains("expect: 100-continue") {
@@ -556,10 +672,13 @@ mod tests {
                         500 => "Internal Server Error",
                         _ => "Status",
                     };
+                    let loc = location
+                        .clone()
+                        .unwrap_or_else(|| "http://127.0.0.1:1/fe".to_string());
                     let extra = if code == 307 {
-                        "Location: http://127.0.0.1:1/fe\r\n"
+                        format!("Location: {loc}\r\n")
                     } else {
-                        ""
+                        String::new()
                     };
                     let resp = format!(
                         "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\n{extra}\
@@ -570,7 +689,12 @@ mod tests {
                     let _ = s.flush();
                 }
             });
-            Self { addr, hits, bodies }
+            Self {
+                addr,
+                hits,
+                bodies,
+                heads,
+            }
         }
 
         fn url(&self) -> String {
@@ -824,6 +948,216 @@ mod tests {
         let ack = sink.flush()?;
         assert_eq!(ack.kind, "DORIS_STREAM_LOAD");
         assert_eq!(ack.rows, 1);
+        Ok(())
+    }
+
+    /// T12 StarRocks flavor contract (mock FE/BE): FE 307 redirect is
+    /// followed with the Authorization header re-attached (curl
+    /// --location-trusted semantics), the Doris-only load headers are
+    /// absent, and the JSON-lines carrier rides unchanged.
+    #[cfg(feature = "starrocks")]
+    #[test]
+    fn starrocks_flavor_contract_mock() -> anyhow::Result<()> {
+        let mk = |v: &str| -> anyhow::Result<RecordBatch> {
+            Ok(RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)])),
+                vec![Arc::new(StringArray::from(vec![v.to_string()]))],
+            )?)
+        };
+
+        // ① FE 307 → BE: exactly one request each; the BE request carries
+        // Authorization + label + the same carrier bytes; ack kind is
+        // StarRocks-honest
+        let be = MockDoris::start(vec![(200, r#"{"Status":"Success"}"#.into())]);
+        let fe = MockDoris::start_with_redirect(vec![(307, "{}".into())], Some(be.url()));
+        let mut sink = DorisSink::new(fe.url(), "Basic dGVzdDp0ZXN0", vec!["name".into()], "srfe")
+            .with_flavor(SinkFlavor::StarRocks);
+        sink.retry_backoff_ms = vec![0, 0];
+        sink.write(vec![mk("a")?])?;
+        let ack = sink.flush()?;
+        assert_eq!(ack.rows, 1);
+        assert_eq!(ack.kind, "STARROCKS_STREAM_LOAD");
+        assert_eq!(fe.hits.load(Ord2::Relaxed), 1, "one FE request");
+        assert_eq!(be.hits.load(Ord2::Relaxed), 1, "one BE request");
+        let fe_head = fe.heads.lock().unwrap()[0].clone();
+        let be_head = be.heads.lock().unwrap()[0].clone();
+        assert!(
+            fe_head.contains("authorization: basic"),
+            "initial leg authenticated"
+        );
+        assert!(
+            be_head.contains("authorization: basic dgvzddp0zxn0"),
+            "credential re-attached on redirect: {be_head}"
+        );
+        assert!(be_head.contains("label: "), "label rides the redirect");
+        // header contract (BE request): shared headers present …
+        assert!(be_head.contains("format: json"));
+        assert!(be_head.contains("expect: 100-continue"));
+        // … Doris-only headers absent (T12 matrix: StarRocks has no
+        // read_json_by_line parameter and no load-time sequence column)
+        assert!(
+            !be_head.contains("read_json_by_line"),
+            "starrocks must not send read_json_by_line: {be_head}"
+        );
+        assert!(
+            !be_head.contains("sequence_column"),
+            "starrocks must not send sequence_column: {be_head}"
+        );
+        // carrier identical on both legs (the buffer survives the hop)
+        assert_eq!(fe.bodies.lock().unwrap()[0], be.bodies.lock().unwrap()[0]);
+
+        // ② redirect budget: hops are bounded — a chain longer than
+        // MAX_REDIRECT_HOPS is fatal (4 chained mocks: the initial request
+        // plus 3 followed hops, the 4th redirect is not followed)
+        let m4 = MockDoris::start(vec![(307, "{}".into())]);
+        let m3 = MockDoris::start_with_redirect(vec![(307, "{}".into())], Some(m4.url()));
+        let m2 = MockDoris::start_with_redirect(vec![(307, "{}".into())], Some(m3.url()));
+        let m1 = MockDoris::start_with_redirect(vec![(307, "{}".into())], Some(m2.url()));
+        let mut sink = DorisSink::new(m1.url(), "Basic dGVzdDp0ZXN0", vec!["name".into()], "srlp")
+            .with_flavor(SinkFlavor::StarRocks);
+        sink.retry_backoff_ms = vec![0, 0];
+        sink.write(vec![mk("b")?])?;
+        let err = sink.flush().unwrap_err().to_string();
+        assert!(
+            err.contains("redirect chain not followable"),
+            "hop budget error: {err}"
+        );
+        let total = m1.hits.load(Ord2::Relaxed)
+            + m2.hits.load(Ord2::Relaxed)
+            + m3.hits.load(Ord2::Relaxed)
+            + m4.hits.load(Ord2::Relaxed);
+        assert_eq!(total, 4, "1 initial + MAX_REDIRECT_HOPS follows");
+
+        // ③ relative Location → fatal without following (StarRocks FEs emit
+        // absolute URLs; anything else is a wiring bug, not to be guessed at)
+        let m = MockDoris::start_with_redirect(
+            vec![(307, "{}".into())],
+            Some("/relative/api/db/t/_stream_load".into()),
+        );
+        let mut sink = DorisSink::new(m.url(), "Basic dGVzdDp0ZXN0", vec!["name".into()], "srna")
+            .with_flavor(SinkFlavor::StarRocks);
+        sink.retry_backoff_ms = vec![0, 0];
+        sink.write(vec![mk("c")?])?;
+        let err = sink.flush().unwrap_err().to_string();
+        assert!(err.contains("redirect chain not followable"), "{err}");
+        assert_eq!(m.hits.load(Ord2::Relaxed), 1);
+
+        // ④ label idempotency, StarRocks wording: the reference page lists
+        // "Label Already Exists" among the Status values (Doris instead
+        // answers Status:Fail + Message) — both must converge to success
+        let m = MockDoris::start(vec![
+            (200, r#"{"Status":"Success"}"#.into()),
+            (200, r#"{"Status":"Label Already Exists"}"#.into()),
+        ]);
+        let prefix = "srreplay";
+        let mut a = DorisSink::new(m.url(), "Basic dGVzdDp0ZXN0", vec!["name".into()], prefix)
+            .with_flavor(SinkFlavor::StarRocks);
+        let mut b = DorisSink::new(m.url(), "Basic dGVzdDp0ZXN0", vec!["name".into()], prefix)
+            .with_flavor(SinkFlavor::StarRocks);
+        a.write(vec![mk("d")?])?;
+        assert_eq!(a.flush()?.rows, 1);
+        // restart replay: same label (same prefix, same seq) → Dedup converge
+        b.write(vec![mk("d")?])?;
+        assert_eq!(b.flush()?.rows, 1, "label replay converges to success");
+        assert_eq!(m.hits.load(Ord2::Relaxed), 2);
+        let h0 = m.heads.lock().unwrap()[0].clone();
+        let h1 = m.heads.lock().unwrap()[1].clone();
+        let l0 = h0.lines().find(|l| l.starts_with("label:"));
+        let l1 = h1.lines().find(|l| l.starts_with("label:"));
+        assert_eq!(l0, l1, "the replay must reuse the exact label");
+
+        // ⑤ Doris flavor on a 307 stays fatal (regression guard for the
+        // existing stance — test ⑤ of doris_status_matrix_mock covers the
+        // Doris-flavor wording; here we pin the flavor split itself)
+        let be = MockDoris::start(vec![(200, r#"{"Status":"Success"}"#.into())]);
+        let fe = MockDoris::start_with_redirect(vec![(307, "{}".into())], Some(be.url()));
+        let mut sink = DorisSink::new(fe.url(), "Basic dGVzdDp0ZXN0", vec!["name".into()], "drfs");
+        sink.retry_backoff_ms = vec![0, 0];
+        sink.write(vec![mk("e")?])?;
+        let err = sink.flush().unwrap_err().to_string();
+        assert!(
+            err.contains("BE:8040"),
+            "doris keeps the fatal stance: {err}"
+        );
+        assert_eq!(be.hits.load(Ord2::Relaxed), 0, "doris never follows");
+        Ok(())
+    }
+
+    /// T12 live gate: runs only against the tailrace dev StarRocks stack
+    /// (docker-compose.yml `--profile starrocks`, feprocks entry on
+    /// 127.0.0.1:48080 — the profile pre-creates user tailrace + db
+    /// tailrace_spike.sr_e2e). CI-safe: skipped when the port is closed.
+    #[cfg(feature = "starrocks")]
+    #[test]
+    fn starrocks_sink_live_stream_load() -> anyhow::Result<()> {
+        // compose default (TAILRACE_SR_PROXY_PORT); hardcoded like the Doris
+        // live gate hardcodes 8040/8030
+        let entry = "localhost:48080";
+        if std::net::TcpStream::connect(entry).is_err() {
+            return Ok(()); // CI-safe: profile not up
+        }
+        // liveness probe: the feproxy forwards to the FE http port — an
+        // unrelated listener on 48080 must not turn this into a spurious pass
+        let probe = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()?;
+        let fe_ok = probe
+            .get(format!("http://{entry}/api/health"))
+            .send()
+            .and_then(|r| r.error_for_status())
+            .is_ok();
+        if !fe_ok {
+            tracing::warn!(
+                "[live-gate] the StarRocks entry on {entry} does not answer /api/health — \
+                 skipping the live test"
+            );
+            return Ok(());
+        }
+        std::env::set_var(
+            "TAILRACE_TEST_SR_AUTH",
+            "Basic dGFpbHJhY2U6dGFpbHJhY2VfbG9jYWw=",
+        );
+        let url = format!("http://{entry}/api/tailrace_spike/sr_e2e/_stream_load");
+        let mk = |order_no: &str| -> anyhow::Result<RecordBatch> {
+            Ok(RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("order_no", DataType::Utf8, false),
+                    Field::new("qty", DataType::Int64, true),
+                    Field::new("etl_ts", DataType::Int64, true),
+                ])),
+                vec![
+                    Arc::new(StringArray::from(vec![order_no])),
+                    Arc::new(Int64Array::from(vec![Some(7)])),
+                    Arc::new(Int64Array::from(vec![Some(1726000000000)])),
+                ],
+            )?)
+        };
+        let prefix = format!("srlive{}", std::process::id());
+        // first flush commits label {prefix}_0
+        let mut a = DorisSink::new(
+            &url,
+            "Basic dGFpbHJhY2U6dGFpbHJhY2VfbG9jYWw=",
+            vec!["order_no".into(), "qty".into(), "etl_ts".into()],
+            &prefix,
+        )
+        .with_flavor(SinkFlavor::StarRocks);
+        a.write(vec![mk("SR-LIVE-1")?])?;
+        let ack = a.flush()?;
+        assert_eq!(ack.kind, "STARROCKS_STREAM_LOAD");
+        assert_eq!(ack.rows, 1);
+        // restart replay with the same label: Label Already Exists must
+        // converge to success (the row must not double-commit)
+        let mut b = DorisSink::new(
+            &url,
+            "Basic dGFpbHJhY2U6dGFpbHJhY2VfbG9jYWw=",
+            vec!["order_no".into(), "qty".into(), "etl_ts".into()],
+            &prefix,
+        )
+        .with_flavor(SinkFlavor::StarRocks);
+        b.write(vec![mk("SR-LIVE-1")?])?;
+        let ack2 = b.flush()?;
+        assert_eq!(ack2.rows, 1, "label replay converges (dedup)");
+        assert_eq!(ack2.idempotency_key, ack.idempotency_key);
         Ok(())
     }
 

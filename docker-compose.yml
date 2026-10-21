@@ -137,6 +137,42 @@ services:
     command:
       - "--config=yaml:{receivers: {otlp: {protocols: {http: {endpoint: 0.0.0.0:4318}}}}, exporters: {debug: {verbosity: basic}}, service: {pipelines: {traces: {receivers: [otlp], exporters: [debug]}}}}"
 
+  # Optional StarRocks allin1 for the T12 e2e (profile "starrocks"; never
+  # started by smoke.sh or a plain `docker compose up -d`):
+  #   docker compose --profile starrocks up -d --wait starrocks
+  # starrocks/allin1-ubuntu runs FE + BE + an nginx "feproxy" under one
+  # supervisor. Image internals (entrypoint.sh / feproxy.conf.template,
+  # verified 2026-10-21): FE and BE both bind loopback with
+  # priority_networks=127.0.0.1/32, and feproxy is the ONLY host-facing
+  # HTTP entry — it listens on 8080, proxies to FE:8030, and INTERCEPTS the
+  # FE→BE 307 redirect internally (error_page 307 = @handle_redirect re-posts
+  # to the BE's Location). So stream_load_url for this stack is
+  # http://127.0.0.1:48080/api/<db>/<table>/_stream_load and the engine's
+  # client-side redirect following (StarRocks flavor, T12) is NOT exercised
+  # here — that path is covered by the conn-doris mock contract tests; a
+  # bare FE:8030 URL against a normal StarRocks deployment is what uses it.
+  # DDL goes through the FE mysql protocol (9030, host side 49030).
+  # Ports steer clear of the standing stack (8030/8040/9030 = mdop
+  # doris-2.1, 38030/38040/39030 = this file's Doris defaults) — same
+  # TAILRACE_* override pattern.
+  starrocks:
+    image: starrocks/allin1-ubuntu:latest
+    container_name: tailrace-starrocks
+    profiles: ["starrocks"]
+    ports:
+      - "127.0.0.1:${TAILRACE_SR_PROXY_PORT:-48080}:8080"   # feproxy (stream load entry)
+      - "127.0.0.1:${TAILRACE_SR_FE_MYSQL_PORT:-49030}:9030" # FE mysql (DDL/queries)
+    healthcheck:
+      # the image's own health_check.sh contract: director's bootstrap done
+      # (FE liveness + ALTER SYSTEM ADD BACKEND + heartbeat wait) AND both
+      # http health endpoints — a half-formed cluster is not healthy
+      # (same rationale as the doris-be healthcheck above)
+      test: ["CMD-SHELL", "test -f $$SR_HOME/bootstrap_done && curl -sf http://127.0.0.1:8030/api/health >/dev/null && curl -sf http://127.0.0.1:8040/api/health >/dev/null"]
+      interval: 5s
+      timeout: 10s
+      retries: 120
+      start_period: 60s
+
 networks:
   doris_net:
     ipam:

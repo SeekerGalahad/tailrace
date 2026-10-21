@@ -7,9 +7,15 @@ rust-version.workspace = true
 description = "Doris sink: BE-direct stream load with idempotent labels, bounded retries, group commit and sequence columns"
 
 [features]
-# StarRocks speaks the same Stream Load protocol: enabling this only registers
-# the extra "starrocks" sink kind (same factory). A dedicated default
-# user-agent can ride on this feature later — the protocol is shared.
+# StarRocks speaks the same Stream Load protocol: enabling this registers the
+# extra "starrocks" sink kind on the same factory, which switches to the
+# StarRocks flavor (FE redirect following, StarRocks header set — T12).
+# Default ON (T12): the console already accepts kind=starrocks
+# (console-proxy probe / pipelines / datasources), so a node built without
+# it could not assemble a pipeline the console had let through. Registering
+# a kind no pipeline references is a no-op; `--no-default-features` still
+# builds the Doris-only sink (CI no-default-features guard).
+default = ["starrocks"]
 starrocks = []
 
 [dependencies]
