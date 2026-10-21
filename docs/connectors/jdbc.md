@@ -106,6 +106,19 @@ numeric/数组/扩展类型。类型图收窄是首版有意为之（sqlx 需要
   mysql:8.0 / postgres:15（tag 钉住本地预热镜像，不拉取）——断言重启续读不丢不
   重、totals 单调、坏行走 `Decoded::Bad`→DLQ；无门控变量时跳过（conn-kafka
   live-gate 惯例）。CI chaos job 已纳入（19bb80b）。
-- console 数据源类型当前只有 kafka/doris/file（`api/datasources.rs`
-  `registry_type`）——jdbc 表对象目前经 FileCatalog / plan 通道下发；console 侧
-  mysql/postgresql 类型与 `cursor_semantics=JDBC_KEY` 派生由 roadmap T14 补。
+- **console 通道（T14，1c5dcf6 后现状）**：mysql/postgresql 已入
+  `GET /api/datasource-types`（`api/datasources.rs` 静态注册表，jdbcUrl 字段、
+  凭据走密封拆分）；登记表对象时 `table_kind_for` 派生 `kind=jdbc`，
+  console-store `cursor_semantics` 派生 `jdbc → JDBC_KEY`（对齐 IR
+  `Cursor::JdbcKey`，单测+集成双断言）；**discover / infer-schema 通道可用**
+  （`POST /api/datasources/{id}/discover` 列库表、`/infer-schema` 读 DDL 列型
+  推断 arrow 列，PG 走 `information_schema`——`engine/crates/tailrace-metadata`）。
+- **剩余缺口（T14 结果行登记遗留）**：① jdbc 管道 console 端到端未通——
+  `build_plan_table`（`api/pipelines.rs`）的 `bootstrap` 取 connJson `bootstrap`
+  键而 mysql/postgresql 数据源只有 `jdbcUrl`，且 `sequence_column` 恒 null，两
+  者恰为 jdbc 源工厂必填（`tailrace-conn-jdbc/src/lib.rs:82/89`）——部署期才
+  会炸，jdbc 管道动线留后续；② discover/infer-schema 对 **doris 型数据源**的
+  9030 文本协议未在真 Doris FE 上实测（测试覆盖为 testcontainers mysql/pg）；
+  ③ openapi components 缺新 DTO 与 protocol 文档 501 残留——**T24③④ 已清偿**
+  （openapi.rs 补 `DiscoverResponse`/`DiscoveredAssetDto`/`InferSchemaBody`/
+  `InferSchemaResponse`；console-api.md 改真实现契约）。

@@ -6,8 +6,9 @@ use crate::api::artifacts::{ArtifactItem, ArtifactUploaded, ArtifactsResponse};
 use crate::api::auth::{LoginRequest, LoginResponse, MeResponse, UserInfo};
 use crate::api::datasources::{
     DatasourceCreated, DatasourceItem, DatasourceListResponse, DatasourceType,
-    DatasourceTypesResponse, DatasourceUpsertBody, DiscoverBody, TableListResponse,
-    TableObjectItem, TableRegisterBody, TableRegistered, TestBody, TestResponse, TypeField,
+    DatasourceTypesResponse, DatasourceUpsertBody, DiscoverBody, DiscoverResponse,
+    DiscoveredAssetDto, InferSchemaBody, InferSchemaResponse, TableListResponse, TableObjectItem,
+    TableRegisterBody, TableRegistered, TestBody, TestResponse, TypeField,
 };
 use crate::api::nodes::{
     HeartbeatBody, HeartbeatResponse, NodeCreated, NodeEcho, RegisterBody, RegisterResponse,
@@ -104,6 +105,10 @@ use crate::compile::{CompileDiag, StatementOut};
         DatasourceTypesResponse, DatasourceType, TypeField,
         DatasourceListResponse, DatasourceItem, DatasourceUpsertBody, DatasourceCreated,
         TestBody, TestResponse, DiscoverBody,
+        // T14 discover/infer-schema DTOs (T24③: the paths at
+        // datasources::{discover, infer_schema} referenced these bodies —
+        // without components entries every $ref dangled in swagger-ui)
+        DiscoverResponse, DiscoveredAssetDto, InferSchemaBody, InferSchemaResponse,
         TableRegisterBody, TableRegistered, TableListResponse, TableObjectItem,
         // nodes admin
         NodesListResponse, NodeListItem, NodesSummary, NodeCapacity, NodeDetail,
@@ -121,3 +126,62 @@ use crate::compile::{CompileDiag, StatementOut};
         ErrorResponse, ErrorBody,
     )))]
 pub struct ApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::ApiDoc;
+    use utoipa::OpenApi;
+
+    /// T24③ regression guard: every `#/components/schemas/…` $ref anywhere in
+    /// the document must resolve to a declared schema. The T14 paths
+    /// (discover / infer-schema) referenced response bodies that were missing
+    /// from components — swagger-ui rendered dangling $refs. Walking ALL refs
+    /// (request bodies, responses, nested) keeps the whole document honest.
+    #[test]
+    fn every_schema_ref_resolves() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("openapi serializes");
+        let schemas = doc
+            .pointer("/components/schemas")
+            .and_then(|v| v.as_object())
+            .expect("components.schemas object")
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<String>>();
+        assert!(
+            schemas.contains("DiscoverResponse")
+                && schemas.contains("DiscoveredAssetDto")
+                && schemas.contains("InferSchemaBody")
+                && schemas.contains("InferSchemaResponse"),
+            "T24③: discover/infer-schema DTOs must be registered, got: {schemas:?}"
+        );
+        let mut dangling = Vec::new();
+        fn walk(
+            v: &serde_json::Value,
+            schemas: &std::collections::BTreeSet<String>,
+            out: &mut Vec<String>,
+        ) {
+            match v {
+                serde_json::Value::Object(map) => {
+                    if let Some(r) = map.get("$ref").and_then(|r| r.as_str()) {
+                        if let Some(name) = r.strip_prefix("#/components/schemas/") {
+                            if !schemas.contains(name) {
+                                out.push(r.to_string());
+                            }
+                        }
+                    }
+                    for child in map.values() {
+                        walk(child, schemas, out);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for child in items {
+                        walk(child, schemas, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk(&doc, &schemas, &mut dangling);
+        assert!(dangling.is_empty(), "dangling $refs: {dangling:?}");
+    }
+}
