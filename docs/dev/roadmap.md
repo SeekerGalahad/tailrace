@@ -191,14 +191,14 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 
 **R3 亮点特性（~3-4 周）**（2026-10-20 已立项为任务卡，见 §九 T12-T21）：StarRocks sink 完整化（现仅注册别名，共享 Stream Load 协议）；JDBC 批源（MySQL/PostgreSQL，cursor_semantics 登记轮询位点；验收=新增连接器零改动 runtime/api/parser 本体）；discover / infer-schema 落地（替换 501 占位，Kafka/Doris 元数据客户端）；分区并行方案 b（split 化+动态分区发现，动工前先写部分分区推进的指纹回归测试）；feature 裁剪验证（`--no-default-features --features connector-file,connector-doris` 跑通 file→doris）；选做：SSH 部署链八步、jemalloc（RSS 指标先就位）、parser/decode fuzz 起步。**R3 末升格评审**：deltalake sink / DataFusion 升级 / 事务接口 / group commit / 本地两步 WAL 五项，默认结论=排 v1.x，纪要落 docs/dev/。
 
-**R4 1.0 发布（~1.5-2 周）**：README 双语定稿（徽章矩阵+三命令 quickstart+连接器矩阵+FAQ）；mdBook 文档站骨架（协议/连接器/架构；设计文档以脱敏干净版重新入仓）；crate 元数据补齐 + doc-test；crates.io 发包（`tailrace-node` + `tailrace-console` 两 bin + `tailrace-connector` trait 契约面）；tag v1.0.0 → release（9 资产）；基准报告入 README；i18n 最小动作（错误码字典化接口预留，中文单轨明示）。
+**R4 1.0 发布（~1.5-2 周）**：**开工第一动作=crates.io 注册占位**（设计 §1.2 的 P0 期动作未执行——2026-10-21 实测 `tailrace` 与 `tailrace-node` 在 crates.io 均未注册，风险 R1 在途，需用户账号操作）；T22 CodeMirror6 转产落地（§九，T17 裁决）；README 双语定稿（徽章矩阵+三命令 quickstart+连接器矩阵+FAQ）；mdBook 文档站骨架（协议/连接器/架构；设计文档以脱敏干净版重新入仓）；crate 元数据补齐 + doc-test；crates.io 发包（`tailrace-node` + `tailrace-console` 两 bin + `tailrace-connector` trait 契约面）；tag v1.0.0 → release（9 资产）；基准报告入 README；i18n 最小动作（错误码字典化接口预留，中文单轨明示）。MQTT 源 / S3 / CDC 的路线裁决并入 T18 评审（设计 §7.4 P2 序 #3/#4 未排卡）。
 
 ## 八、开放问题（随轮裁决）
 
 1. `utoipa-swagger-ui 10.0.1` 锁定的 `zip 8.6.0`（仅 build-dep，构建脚本解压 crate 自带的 vendored swagger-ui dist）：2026-10-13 后被上游 yank（现又恢复可装，deny.toml `yanked="warn"` 保留）；2026-10-17 RustSec 连发 RUSTSEC-2026-0367/0368/0369 三个 extract 漏洞（修复仅入 zip 9.0.x，`^8.6` 不可达且无 8.x backport；build-dep 威胁模型不适用——不链接进产物二进制、不解压外部归档）——deny.toml 已 ignore 三条带跟踪注释。其发新版（zip 9 线）后回收 warn+ignore 并重新收紧；
 2. OTLP 的 `opentelemetry` 0.33 / `tracing-opentelemetry` 0.34 版本锚定后是否升格默认开启（当前 feature 门控默认关）；
 3. R3 升格评审五项的门槛数据（本 R2 的 BENCHMARKS.md 即门槛输入）；
-4. CodeMirror6 替换 monaco 评估（编辑器体积档位，R3 裁决；T9 实测 monaco gzip 883kB vs CM6 预期 ~200-300kB 级，2026-10-17 立项）——R3 由 T17 承接。**2026-10-20 T17 裁决（PoC 分支 poc/codemirror6@7f32c26，不进主干）**：实测编辑器异步 chunk gzip **883.22→140.45 kB（−84.1%）**，好于本条 200-300kB 预期档；编辑器相关资产合计（JS+CSS gzip + worker/ttf 折算）1,078→140.70 kB——CM6 零 worker/零字体/零外部 CSS（T9 的 CSS 晚到/布局塌缩补丁整类消失）。能力面为现用面超集：`db.` 表补全 parser 驱动+FROM 别名感知、SQL 关键字补全（monaco 无）、SQLNamespace 列槽位为 T14 infer-schema 就绪（`db.table.` 列补全届时零编辑器侧代码）；delta 三项（库名大小写敏感 vs monaco 不敏感、`db.e` 后关键字混入、补全+插 `-- @tag:ds` 为单 undo 步）均有廉价修法（自写 ~30 行 CompletionSource 可全对齐）。迁移面：PoC 已完成内核替换 7 文件（SqlMonaco.vue 365→246 行、edit.vue 零改动、对外 props/emits 不变），typecheck+build 绿+浏览器实测（补全弹窗/接受插 tag/诊断波浪线/v-model 双向/主题切换/tables 热更新全过）。**结论：升级为 R4 落地卡（替换 monaco，估 ~2 人日=PoC 基线 + 视觉走查/大小写对齐决策/IME 手测/真页 e2e）；PoC 分支保留为实施基线不删不合并。**
+4. CodeMirror6 替换 monaco 评估（编辑器体积档位，R3 裁决；T9 实测 monaco gzip 883kB vs CM6 预期 ~200-300kB 级，2026-10-17 立项）——R3 由 T17 承接。**2026-10-20 T17 裁决（PoC 分支 poc/codemirror6@7f32c26，不进主干）**：实测编辑器异步 chunk gzip **883.22→140.45 kB（−84.1%）**，好于本条 200-300kB 预期档；编辑器相关资产合计（JS+CSS gzip + worker/ttf 折算）1,078→140.70 kB——CM6 零 worker/零字体/零外部 CSS（T9 的 CSS 晚到/布局塌缩补丁整类消失）。能力面为现用面超集：`db.` 表补全 parser 驱动+FROM 别名感知、SQL 关键字补全（monaco 无）、SQLNamespace 列槽位为 T14 infer-schema 就绪（`db.table.` 列补全届时零编辑器侧代码）；delta 三项（库名大小写敏感 vs monaco 不敏感、`db.e` 后关键字混入、补全+插 `-- @tag:ds` 为单 undo 步）均有廉价修法（自写 ~30 行 CompletionSource 可全对齐）。迁移面：PoC 已完成内核替换 7 文件（SqlMonaco.vue 365→246 行、edit.vue 零改动、对外 props/emits 不变），typecheck+build 绿+浏览器实测（补全弹窗/接受插 tag/诊断波浪线/v-model 双向/主题切换/tables 热更新全过）。**结论：升级为 R4 落地卡（替换 monaco，估 ~2 人日=PoC 基线 + 视觉走查/大小写对齐决策/IME 手测/真页 e2e）；PoC 分支保留为实施基线不删不合并。**（2026-10-21 用户复核通过，落为 §九 T22 卡。）
 
 ## 九、R3 任务卡（亮点特性轮，共 10 张，2026-10-20 立项）
 
@@ -224,9 +224,9 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 ### T14 discover / infer-schema 落地（~3 人日）
 
 - **现状**：console `api/datasources.rs:680/702` 两 handler 返回 `not_implemented`（HTTP 501，"需要 Kafka/Doris 元数据客户端，尚未交付"）；openapi 已登记路径；web 侧对应入口空挂。
-- **方案**：engine 侧元数据客户端（Kafka list/describe topics；Doris SHOW TABLES/DESC 走 9030 mysql 协议）落独立模块；console 转发并缓存；infer-schema 由样本行或 DDL 推 Arrow schema（复用 tailrace-decode 推断面）；web 数据源页接线（发现/建表辅助动线）。
-- **验收**：501 → 真实现；testcontainers/mock 集成测试（kafka 返回 topic 列表、doris 返回表列表、infer-schema 输出 schema JSON 契约快照）；web 手测动线（typecheck+build 绿）。
-- **文件域**：console/crates/tailrace-console/src/api/datasources.rs、engine 元数据客户端新模块、web/src/pages/datasources/。
+- **方案**：engine 侧元数据客户端（Kafka list/describe topics；Doris SHOW TABLES/DESC 走 9030 mysql 协议）落独立模块；console 转发并缓存；infer-schema 由样本行或 DDL 推 Arrow schema（复用 tailrace-decode 推断面）；web 数据源页接线（发现/建表辅助动线）。**顺带承接 R3-W1 评审 low#4**：console 静态类型注册表（`datasources.rs` `list_types`）补 jdbc 家族（mysql/postgresql），console-store `cursor_semantics` 派生补 `"jdbc"→"JDBC_KEY"`（对齐 IR `Cursor::JdbcKey`），一并加测试断言。
+- **验收**：501 → 真实现；testcontainers/mock 集成测试（kafka 返回 topic 列表、doris 返回表列表、infer-schema 输出 schema JSON 契约快照）；web 手测动线（typecheck+build 绿）；datasource-types 含 jdbc 家族且 cursor_semantics 断言绿。
+- **文件域**：console/crates/tailrace-console/src/api/datasources.rs、console/crates/console-store/src/datasources.rs、engine 元数据客户端新模块、web/src/pages/datasources/。
 
 ### T15 分区并行·方案 b（~4 人日）〔引擎热路径；本卡动游标边界，R3 最险〕
 
@@ -253,8 +253,8 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 
 ### T18 R3 末升格评审（~1 人日）〔门槛数据=BENCHMARKS.md〕
 
-- **方案**：五项评审——deltalake sink / DataFusion 升级 / StarRocks 事务接口 / group commit / 本地两步 WAL——逐项给门槛数据（R2+R3 的 BENCHMARKS 为输入）、触发条件与结论；**默认结论=排 v1.x**，纪要落 `docs/dev/R3-升格评审-<date>.md`。
-- **验收**：纪要存在且五项各有结论+依据；若有升格项，转 R4 任务卡或 v1.x 议程。
+- **方案**：**七项评审**——deltalake sink / DataFusion 升级 / StarRocks 事务接口 / group commit / 本地两步 WAL 五项（默认结论=排 v1.x），另加：**MQTT 源路线**（设计 §7.4 P2 序 #3、称差异化最明显，但未进任何轮次——升格 R4/v1.x 或明确砍掉）与 **S3/CDC 路线**（P2 序 #4）；**jdbc live-gate 形态裁决**（`return Ok` 计 passed vs `#[ignore]`+`--ignored`，与 conn-kafka 同裁，R3-W1 评审附议）。逐项给门槛数据（R2+R3 的 BENCHMARKS 为输入）、触发条件与结论；纪要落 `docs/dev/R3-升格评审-<date>.md`。
+- **验收**：纪要存在且七项各有结论+依据；若有升格项，转 R4 任务卡或 v1.x 议程。
 - **文件域**：docs/dev/。
 
 ### T19 SSH 部署链八步（~3 人日）〔选做〕
@@ -278,6 +278,20 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 - **验收**：fuzz 目标 `cargo fuzz build` 绿；首轮语料 30 分钟零 panic（发现的 panic 修复或登记）；deny licenses 无新增问题。
 - **文件域**：fuzz/（独立 workspace 新目录）、.github/workflows/（可选定时 job）。
 
+### T22 CodeMirror6 转产落地（~2 人日）〔R4 承接；2026-10-21 T17 裁决落章〕
+
+- **现状**：PoC 基线 `poc/codemirror6@7f32c26` 已完成内核替换（SqlMonaco.vue 365→246 行、edit.vue 零改动、对外 props/emits 不变），编辑器异步 chunk gzip 883.22→140.45 kB；全部依据见 §八.4。
+- **方案**：以 PoC 分支为实施基线落到 main；三项 delta 对齐（~30 行自写 CompletionSource：库名大小写不敏感、`db.e` 后关键字混入过滤、补全+插 `-- @tag:ds` 拆为两步 undo）；SQLNamespace 列槽位与 T14 infer-schema 接线；视觉走查 + IME 中文输入手测 + 真页 e2e。
+- **验收**：CI web job 绿；编辑器相关 chunk gzip ≤300kB；真页 e2e（编辑/补全/撤销/主题切换）；monaco 依赖从 package.json 移除；T9 的 CSS 晚到/塌缩补丁整类移除并在 BENCHMARKS/CHANGELOG 登记。
+- **文件域**：web/。
+
+### T23 R3-W1 评审 low 债清偿 + 文档对齐（~1 人日）〔R3-W2 前置波 W0，2026-10-21 立项〕
+
+- **现状**：R3-W1 评审 low 六条中五条可修未修（low#4 已归 T14、low#7 留 T18）；另评估发现工程面漂移——README 连接器矩阵自相矛盾（matrix 全 ✅ 标 P2 vs Status 段自认 placeholder，jdbc 已落地未更新、starrocks 仅别名）、quickstart "smoke 25 assertions" 数字漂移（实际 --full 44 步）、CHANGELOG Unreleased 未入账 R3-W1、`docs/connectors/` 空目录（设计 §7.3 第 7 步从未执行）。
+- **方案**：① low#1：FLOAT4 游标臂补 is_cursor（镜像 FLOAT8）或 `pg_cursor_kind` 拒绝 FLOAT4——从优并加测试；② low#2：JDBC（源）/JDBC_TABLE（Doris 汇）诊断文案与 catalog 注释、parser 诊断点明；③ low#3：本文件 T13 卡验收措辞修正为"零触碰 runtime/api 本体 + parser 仅 kind 白名单两行"；④ low#5：BENCHMARKS §六 表行加脚注（debug 档/短跑/±17% 量化）+补"碎片：未测"行+基准二进制精确树标注；⑤ low#6：本文件统一 T17 工作量口径（~2 人日含 PoC 基线），1,078kB 补分项或改 T9 883.22 单口径；⑥ README 双语矩阵勘正（jdbc source ✅、starrocks 标"别名共享 Stream Load，完整化=T12"、mqtt/s3 标占位、smoke 步数改 44）；⑦ CHANGELOG Unreleased 入账 T13/T17/T20+评审修复；⑧ `docs/connectors/jdbc.md` 首篇（补设计 §7.3 第 7 步欠账）。
+- **验收**：`cargo test -p tailrace-conn-jdbc --locked` 绿（含 FLOAT4 新测试）；L0 绿；`grep -c 'P2' README.md` 矩阵段为 0、CHANGELOG 含 T13/T20 条目、`test -s docs/connectors/jdbc.md`。
+- **文件域**：engine/crates/tailrace-conn-jdbc、engine/crates/tailrace-catalog（注释）、docs/dev/roadmap.md、docs/BENCHMARKS.md、docs/connectors/、README.md、README.zh-CN.md、CHANGELOG.md。
+
 ### R3-W1 评审登记（2026-10-21）
 
 > **medium 三条已修（各一提交）**：① `tailrace-runtime/src/registry.rs` `Cursor::JdbcKey` 指纹常量 13 → fold key+value（JDBC 位点推进对 NO_PROGRESS 可见，3 次瞬时断库不再误判毒数据；488efcc）；② `tailrace-conn-jdbc` keyset `WHERE col > ? LIMIT n` 无 tie-breaker → 连接探针经目录视图强制游标列自身唯一（PK / 单列 UNIQUE，非唯一即 fail-fast；13d1c2b）；③ CI chaos job 追加 `jdbc_sources` 真库步（此前 CI 对 JDBC 真库覆盖为 0；19bb80b）。注：① 按评审建议触碰了 runtime 本体 1 处——属既有判据缺陷修复而非连接器引入，单独提交可审计。
@@ -297,7 +311,7 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 | 波 | 任务（并行 ‖） | 冲突分析 | 波门禁 |
 |---|---|---|---|
 | R3-W1 | T13 JDBC 批源 ‖ T17 CM6 评估(PoC 分支) ‖ T20 jemalloc | 新 crate / PoC 分支 / node bin feature，零交集 | L0+L1+push+CI 绿 |
-| R3-W2 | T12 StarRocks ‖ T14 discover/infer-schema | conn-doris+README vs console+engine 元数据模块，零交集 | L0+L1+L3(starrocks profile 本地档)+push+CI 绿 |
+| R3-W2 | W0：T23 评审债清偿（串行先行）→ T12 StarRocks ‖ T14 discover/infer-schema | T23 动 README/CHANGELOG 与 T12 文件域相交故先行；其后 conn-doris+compose vs console+engine 元数据模块零交集 | W0：L0+push+CI 绿；W1：L0+L1+L3(starrocks profile 本地档)+push+CI 绿 |
 | R3-W3 | T16 feature 裁剪验证 | 在 T12/T13 落地后复核全 feature 面 | L0+L1+裁剪档 e2e+push+CI 绿 |
 | R3-W4 | T15 分区并行 b（指纹回归先行） | 引擎热路径独占波 | L0+L1+L3+L4+push+CI 绿 |
 | R3-W5 | T19 SSH 部署链〔选做〕 | console 域 | L0+L1+push+CI 绿 |
