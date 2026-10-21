@@ -42,15 +42,22 @@ services:
     image: apache/kafka:3.9.0
     container_name: tailrace-kafka
     ports:
-      - "127.0.0.1:${TAILRACE_KAFKA_PORT:-9092}:9092"
+      - "127.0.0.1:${TAILRACE_KAFKA_PORT:-9092}:9094"
     environment:
       KAFKA_NODE_ID: "1"
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://127.0.0.1:9092
+      # Dual listeners: PLAINTEXT serves in-container clients (healthcheck, smoke's
+      # kafka-topics/producer execs on 127.0.0.1:9092) and advertises 9092; EXTERNAL
+      # serves host clients and advertises the host-mapped port. A single listener
+      # cannot do both — advertising the host port under TAILRACE_KAFKA_PORT breaks
+      # in-container healthchecks (R3-W2 smoke 实证: kafka stuck "starting"), while
+      # advertising 9092 redirects host clients to whatever else owns host 9092
+      # (实证: engine consumed=0 against the wrong broker).
+      KAFKA_LISTENERS: PLAINTEXT://:9092,EXTERNAL://:9094,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://127.0.0.1:9092,EXTERNAL://127.0.0.1:${TAILRACE_KAFKA_PORT:-9092}
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
