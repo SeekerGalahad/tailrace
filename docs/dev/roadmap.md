@@ -206,12 +206,13 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 > 总量评估：必做 T12-T18 共 ~17 业余人日；选做 T19-T21 共 ~6 人日（R2 同期 ~23 人日口径）。
 > 红线（全轮生效）：**新增连接器零改动 runtime/api/parser 本体**（架构验收，git diff 钉住）；游标 flush 点整体提交语义不动摇；SSE/emit 红线沿用 §五。
 
-### T12 StarRocks sink 完整化（~3 人日）
+### T12 StarRocks sink 完整化（~3 人日）✅
 
 - **现状**：`conn-doris` 的 `starrocks` feature 仅注册同名别名指向 Doris sink 工厂（`conn-doris/src/lib.rs:127-128`）；catalog normalize（`tailrace-catalog/src/lib.rs:120`）与 parser kind 白名单（`tailrace-parser/src/lib.rs:138`）已认 starrocks——即类型链路通、协议差异零核对、零 e2e。
 - **方案**：Doris 通道共享为底（Stream Load 同构），核对差异矩阵（URL/端口/`read_json_by_line` 载体/label 幂等/buffer-flush 三阈值语义），StarRocks 特有默认值与差异点落在 conn-doris 内 feature 门控或 datasource 配置项，不另起 crate；docker-compose 增 `--profile starrocks`（starrocks allin1，本地档）；README 连接器矩阵补列。
 - **验收**：file→starrocks e2e（本地 compose profile）+ 重启 label 幂等回归；`cargo test -p tailrace-conn-doris` 绿；差异矩阵文档化入卡内结果。回退门：allin1 镜像本机不可拉时降级 mock http 契约测试 + 矩阵文档，e2e 缺口如实登记留待有环境补。
 - **文件域**：engine/crates/tailrace-conn-doris、docker-compose.yml、README.md / README.zh-CN.md。
+> 结果：1cd38d0 T12 提交完成：1cd38d0（main，父 d9f51bd）feat: T12 StarRocks sink 完整化——差异矩阵+compose profile+e2e。git add 严格限 5 个文件域路径（conn-doris Cargo.toml+lib.rs、docker-compose.yml、双 README），+491/−115，Cargo.lock 零变化；提交说明完整承载差异矩阵（官方文档+源码+allin1 实测三方交叉五项）、SinkFlavor 实现、compose feproxy 架构注记、e2e 实跑证据与验证数字（默认 5/5、no-default-features 3/3、CI 双守卫 exit 0、compose config 过）。e2e 为实跑未回退（allin1 swap 墙未触发：consumed=10/flushed=10、重启表不增、同 label 重放 Dedup 不双写、down 拆净）。提交后工作树干净、未 push（ahead 2，留波门禁）。
 
 ### T13 JDBC 批源（~4 人日）✅
 
@@ -221,12 +222,13 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 - **文件域**：engine/crates/tailrace-conn-jdbc、engine/bin/tailrace-node（注册行）、tailrace-parser/tailrace-catalog kind 枚举、tests/。
 > 结果：caa842e T13 已提交（`feat: T13 JDBC 批源——MySQL/PostgreSQL 增量轮询 Source（testcontainers 双方言测试）`）：严格限 8 个文件域路径（Cargo.toml/Cargo.lock/conn-jdbc crate+tests/node 注册行/parser 白名单/catalog normalize），1520 增 / 8 删；提交说明含驱动选型结论（sqlx 0.9 子 crate——门面 sqlx-sqlite 与 rusqlite `links` 冲突改走子 crate，无 tls）与验证数字（conn-jdbc 7/0、workspace 156/0、clippy 0、deny 四门 ok）；提交后工作树干净，**runtime/api 本体零触碰；parser 触碰=`tailrace-parser/src/lib.rs:124` kind 白名单两行（域内允许，如实点名——评审 low#3 修正，原证词"runtime/api/console 零触碰"以 console 顶替 parser 属换组宣称）**，未 push（ahead 1，留波门禁）。
 
-### T14 discover / infer-schema 落地（~3 人日）
+### T14 discover / infer-schema 落地（~3 人日）✅
 
 - **现状**：console `api/datasources.rs:680/702` 两 handler 返回 `not_implemented`（HTTP 501，"需要 Kafka/Doris 元数据客户端，尚未交付"）；openapi 已登记路径；web 侧对应入口空挂。
 - **方案**：engine 侧元数据客户端（Kafka list/describe topics；Doris SHOW TABLES/DESC 走 9030 mysql 协议）落独立模块；console 转发并缓存；infer-schema 由样本行或 DDL 推 Arrow schema（复用 tailrace-decode 推断面）；web 数据源页接线（发现/建表辅助动线）。**顺带承接 R3-W1 评审 low#4**：console 静态类型注册表（`datasources.rs` `list_types`）补 jdbc 家族（mysql/postgresql），console-store `cursor_semantics` 派生补 `"jdbc"→"JDBC_KEY"`（对齐 IR `Cursor::JdbcKey`），一并加测试断言。
 - **验收**：501 → 真实现；testcontainers/mock 集成测试（kafka 返回 topic 列表、doris 返回表列表、infer-schema 输出 schema JSON 契约快照）；web 手测动线（typecheck+build 绿）；datasource-types 含 jdbc 家族且 cursor_semantics 断言绿。
 - **文件域**：console/crates/tailrace-console/src/api/datasources.rs、console/crates/console-store/src/datasources.rs、engine 元数据客户端新模块、web/src/pages/datasources/。
+> 结果：1c5dcf6 T14 已提交：1c5dcf6（main，父提交 1cd38d0 线性，未推送——push 留波门禁）。git add 严格限 8 条域路径（根 Cargo.toml+Cargo.lock、console-store/src/datasources.rs、tailrace-console 的 Cargo.toml/src/api/datasources.rs/tests/datasources_crud.rs、web/src/pages/datasources/parts/DiscoverModal.vue、engine/crates/tailrace-metadata/ 六文件），Conventional 提交：feat: T14 discover/infer-schema 落地——Kafka/Doris 元数据客户端+jdbc 类型登记+web 动线；正文记录实现面（kafka rdkafka fetch_metadata+OffsetTail 采样、Doris/MySQL 9030 文本协议 SHOW/DESC、PG information_schema、decode 链同款类型格推断、jdbc→JDBC_KEY 派生、web format 回传）、验证数字（-p 两包全绿、workspace 172/0、clippy -D warnings 零告警、deny 四门 ok、pnpm typecheck+build 绿、501 grep=0、live 3/3 实跑）与遗留项（Doris 直连未实测/openapi 组件与 protocol 文档待同步/jdbc 管道端到端留后续）。提交后工作树干净（status 0 行）。
 
 ### T15 分区并行·方案 b（~4 人日）〔引擎热路径；本卡动游标边界，R3 最险〕
 
@@ -285,18 +287,19 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 - **验收**：CI web job 绿；编辑器相关 chunk gzip ≤300kB；真页 e2e（编辑/补全/撤销/主题切换）；monaco 依赖从 package.json 移除；T9 的 CSS 晚到/塌缩补丁整类移除并在 BENCHMARKS/CHANGELOG 登记。
 - **文件域**：web/。
 
-### T23 R3-W1 评审 low 债清偿 + 文档对齐（~1 人日）〔R3-W2 前置波 W0，2026-10-21 立项〕
+### T23 R3-W1 评审 low 债清偿 + 文档对齐（~1 人日）〔R3-W2 前置波 W0，2026-10-21 立项〕✅
 
 - **现状**：R3-W1 评审 low 六条中五条可修未修（low#4 已归 T14、low#7 留 T18）；另评估发现工程面漂移——README 连接器矩阵自相矛盾（matrix 全 ✅ 标 P2 vs Status 段自认 placeholder，jdbc 已落地未更新、starrocks 仅别名）、quickstart "smoke 25 assertions" 数字漂移（实际 --full 44 步）、CHANGELOG Unreleased 未入账 R3-W1、`docs/connectors/` 空目录（设计 §7.3 第 7 步从未执行）。
 - **方案**：① low#1：FLOAT4 游标臂补 is_cursor（镜像 FLOAT8）或 `pg_cursor_kind` 拒绝 FLOAT4——从优并加测试；② low#2：JDBC（源）/JDBC_TABLE（Doris 汇）诊断文案与 catalog 注释、parser 诊断点明；③ low#3：本文件 T13 卡验收措辞修正为"零触碰 runtime/api 本体 + parser 仅 kind 白名单两行"；④ low#5：BENCHMARKS §六 表行加脚注（debug 档/短跑/±17% 量化）+补"碎片：未测"行+基准二进制精确树标注；⑤ low#6：本文件统一 T17 工作量口径（~2 人日含 PoC 基线），1,078kB 补分项或改 T9 883.22 单口径；⑥ README 双语矩阵勘正（jdbc source ✅、starrocks 标"别名共享 Stream Load，完整化=T12"、mqtt/s3 标占位、smoke 步数改 44）；⑦ CHANGELOG Unreleased 入账 T13/T17/T20+评审修复；⑧ `docs/connectors/jdbc.md` 首篇（补设计 §7.3 第 7 步欠账）。
 - **验收**：`cargo test -p tailrace-conn-jdbc --locked` 绿（含 FLOAT4 新测试）；L0 绿；`grep -c 'P2' README.md` 矩阵段为 0、CHANGELOG 含 T13/T20 条目、`test -s docs/connectors/jdbc.md`。
-- **文件域**：engine/crates/tailrace-conn-jdbc、engine/crates/tailrace-catalog（注释）、docs/dev/roadmap.md、docs/BENCHMARKS.md、docs/connectors/、README.md、README.zh-CN.md、CHANGELOG.md。
+- **文件域**：engine/crates/tailrace-conn-jdbc、engine/crates/tailrace-catalog（注释）、engine/crates/tailrace-parser/src/lib.rs、Cargo.lock、docs/dev/roadmap.md、docs/BENCHMARKS.md、docs/connectors/、README.md、README.zh-CN.md、CHANGELOG.md。（2026-10-21 落档勘正补入 parser 与 Cargo.lock：W2 首跑实证 parser 诊断是方案②交付；RUSTSEC-2026-0382 令 cc46490 CI 红，Cargo.lock 升级 rustls-webpki 0.103.15→0.103.16 是唯一合法修复落点。）
+> 结果：d9f51bd T23 已按波门禁指令提交为 d9f51bd（main，父 cc46490 线性，10 文件 +338/−34，含新文件 docs/connectors/jdbc.md）。staging 严格限文件域：CHANGELOG.md、Cargo.lock（授权的 rustls-webpki 0.103.16 单包门禁修复）、README.md、README.zh-CN.md、docs/BENCHMARKS.md、docs/dev/roadmap.md、tailrace-catalog/tailrace-conn-jdbc/tailrace-parser 三 crate 源、docs/connectors/jdbc.md——git status 实测无外来变更混入。提交主题与指令逐字一致，body 分段记录八项交付（low#1 FLOAT4 加宽 canonical/low#2 JDBC·JDBC_TABLE 诊断/low#3 T13 措辞/low#5 BENCHMARKS 三脚注/low#6 T17 口径统一）+门禁修复授权与验证数字（conn-jdbc 6+2+0、parser 7/catalog 4、L0 三件全绿，均上一轮实测）。未 push（留波门禁），工作树干净。
 
 ### R3-W1 评审登记（2026-10-21）
 
 > **medium 三条已修（各一提交）**：① `tailrace-runtime/src/registry.rs` `Cursor::JdbcKey` 指纹常量 13 → fold key+value（JDBC 位点推进对 NO_PROGRESS 可见，3 次瞬时断库不再误判毒数据；488efcc）；② `tailrace-conn-jdbc` keyset `WHERE col > ? LIMIT n` 无 tie-breaker → 连接探针经目录视图强制游标列自身唯一（PK / 单列 UNIQUE，非唯一即 fail-fast；13d1c2b）；③ CI chaos job 追加 `jdbc_sources` 真库步（此前 CI 对 JDBC 真库覆盖为 0；19bb80b）。注：① 按评审建议触碰了 runtime 本体 1 处——属既有判据缺陷修复而非连接器引入，单独提交可审计。
 >
-> **low 六条仅登记未修，待后续卡 / 收口承接**〔2026-10-21 T23 已清偿 low#1/#2/#3/#5/#6（见 T23 卡与 CHANGELOG Unreleased）；low#4 归 T14、low#7 留 T18 不变〕：
+> **low 六条仅登记未修，待后续卡 / 收口承接**〔2026-10-21 T23 已清偿 low#1/#2/#3/#5/#6（见 T23 卡与 CHANGELOG Unreleased）；low#4 已由 T14 清偿（1c5dcf6：console 静态类型注册表补 mysql/postgresql+console-store cursor_semantics 派生补 jdbc→JDBC_KEY，单测+集成双断言，见 T14 卡）；low#7 留 T18 不变〕：
 >
 > 1. `tailrace-conn-jdbc/src/lib.rs` `pg_cursor_kind` 接受 FLOAT4 为游标类型，但 `pg_cell` FLOAT4 臂无 is_cursor 分支、永不产出 canonical → FLOAT4 游标列探针通过后每轮 poll 以"cursor column is NULL"文案失败进入永久退避。处置：补 FLOAT4 臂 is_cursor（镜像 FLOAT8）或在 pg_cursor_kind 拒绝 FLOAT4。
 > 2. `tailrace-catalog/src/lib.rs:121` 新增 `"JDBC"→"jdbc"`（源）紧邻既有 `"JDBC_TABLE"→"doris"`（汇）：MySQL 源写 kind=jdbc_table 会得 doris 并收到"source only supports kafka/file/jdbc (got doris)"费解诊断；新臂功能冗余（fallthrough 已小写化）；`lib.rs:25` canonical kind 注释未加 jdbc。处置：normalize_kind 注释与 parser 诊断点明 JDBC（源）/ JDBC_TABLE（Doris 汇）之别，补 :25 注释。
