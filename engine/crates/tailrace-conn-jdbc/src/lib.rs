@@ -701,7 +701,15 @@ fn pg_cell(
             }
             v.map(Value::from)
         }
-        "FLOAT4" => row.try_get::<Option<f32>, _>(i)?.map(|x| Value::from(x as f64)),
+        "FLOAT4" => {
+            let v = row.try_get::<Option<f32>, _>(i)?;
+            if is_cursor {
+                // mirror FLOAT8 (R3-W1 review low#1): the canonical widens
+                // to f64 BEFORE formatting — see f32_cursor_canonical
+                return Ok((num(v.map(|x| x as f64)), v.map(f32_cursor_canonical)));
+            }
+            v.map(|x| Value::from(x as f64))
+        }
         "FLOAT8" => {
             let v = row.try_get::<Option<f64>, _>(i)?;
             if is_cursor {
@@ -755,6 +763,25 @@ fn pg_cell(
 }
 
 // ==================== shared helpers ====================
+
+/// FLOAT4 cursor canonical (R3-W1 review low#1): widen to f64 first, THEN
+/// format. f32→f64 widening is exact, and Postgres compares `float4 > float8`
+/// by promoting the column (exact), so the shortest round-trip f64 string
+/// binds back to the very value the emitted row promoted to — `col > bind`
+/// excludes it and keyset polling progresses. Formatting the f32 directly
+/// would emit "0.3", which parses to an f64 strictly BELOW the promoted
+/// `0.3f32` (= 0.30000001192092896…), and the same row would re-match every
+/// poll (permanent re-emission, no progress).
+///
+/// Why an arm instead of rejecting FLOAT4 in `pg_cursor_kind`: MySQL FLOAT
+/// is an accepted, working cursor kind (`mysql_cell` handles is_cursor), so
+/// rejecting FLOAT4 would break dialect symmetry and drop a legal (if
+/// unusual) single-column UNIQUE/PK shape the uniqueness gate otherwise
+/// allows — and the exactness argument above shows no correctness hole
+/// remains once the canonical widens first.
+fn f32_cursor_canonical(x: f32) -> String {
+    format!("{}", x as f64)
+}
 
 fn rfc3339_naive(dt: time::PrimitiveDateTime) -> String {
     dt.assume_utc()
@@ -891,6 +918,33 @@ mod tests {
     fn hex_shape() {
         assert_eq!(hex_encode(&[0x0f, 0xa1]), "0fa1");
         assert_eq!(hex_encode(&[]), "");
+    }
+
+    /// R3-W1 review low#1 regression: a FLOAT4 cursor column must produce a
+    /// canonical that binds back EXACTLY to the promoted f64 — otherwise
+    /// `WHERE col > bind` re-matches the emitted row every poll (permanent
+    /// re-emission, no keyset progress; previously the FLOAT4 arm had no
+    /// is_cursor branch at all and every poll died on a bogus "cursor
+    /// column is NULL").
+    #[test]
+    fn float4_cursor_canonical_binds_exact() {
+        // the probe accepts FLOAT4 (deliberate: mirror of MySQL FLOAT)
+        assert_eq!(pg_cursor_kind("FLOAT4").unwrap(), CursorKind::Float);
+        assert_eq!(pg_cursor_kind("FLOAT8").unwrap(), CursorKind::Float);
+        for x in [0.3f32, 0.1, 1.0e20, -2.25, 123456.78] {
+            let canonical = f32_cursor_canonical(x);
+            let bound: f64 = canonical.parse().unwrap();
+            assert_eq!(
+                bound, x as f64,
+                "{x}: canonical {canonical} must round-trip to the exact promoted value"
+            );
+        }
+        // counterexample locking WHY widening must precede formatting: the
+        // f32 shortest repr is NOT the promoted value — it parses strictly
+        // below it, so `col > bind` would re-match the row forever
+        assert_eq!(format!("{}", 0.3f32), "0.3");
+        assert!(0.3f32 as f64 > "0.3".parse::<f64>().unwrap());
+        assert_eq!(f32_cursor_canonical(0.3f32), "0.30000001192092896");
     }
 
     #[test]

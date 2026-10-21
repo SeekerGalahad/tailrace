@@ -4,7 +4,7 @@
 
 ## 状态
 
-v0.1.0 基线（2026-10-13）。已可用：`engine/` 数据面（SQL 变换、offset 游标、kafka/file 源、Doris Stream Load 汇）与管理台（`console/` + `web/`）；mqtt/jdbc/s3 连接器为占位。
+v0.1.0 基线（2026-10-13）。已可用：`engine/` 数据面（SQL 变换、offset 游标、kafka/file/jdbc 源、Doris Stream Load 汇）与管理台（`console/` + `web/`）；starrocks 汇为共享 Doris Stream Load 协议的别名（完整化进行中）；mqtt/s3 连接器为占位。
 
 ## 快速开始
 
@@ -28,7 +28,8 @@ v0.1.0 基线（2026-10-13）。已可用：`engine/` 数据面（SQL 变换、o
 ```
 
 浏览器打开 http://127.0.0.1:8080，用 `admin` + 抄下的密码登录建管道；或跑
-`./scripts/smoke.sh` 做脚本化端到端自检（25 步断言，无外部依赖）。
+`./scripts/smoke.sh` 做脚本化端到端自检（默认 25 步断言、无外部依赖；加 `--full`
+为 44 步——经 docker compose 走 Kafka→Doris）。
 
 ## 连接器矩阵
 
@@ -36,11 +37,11 @@ v0.1.0 基线（2026-10-13）。已可用：`engine/` 数据面（SQL 变换、o
 |---|---|---|---|
 | kafka | ✅ | — | 主力源，分区位点游标 |
 | file | ✅ | — | 本地/挂载文件 |
+| jdbc | ✅ | — | MySQL / PostgreSQL keyset 批源（[文档](docs/connectors/jdbc.md)） |
 | doris | — | ✅ | Stream Load |
-| starrocks | — | ✅ | P2 |
-| jdbc | ✅ | — | P2 |
-| mqtt | ✅ | — | P2 |
-| s3 | ✅ | — | P2 |
+| starrocks | — | ✅ | 别名共享 Doris Stream Load 协议——完整化进行中（roadmap T12） |
+| mqtt | — | — | 占位，未实现（路线裁决在 roadmap T18） |
+| s3 | — | — | 占位，未实现（路线裁决在 roadmap T18） |
 
 ## 开发
 

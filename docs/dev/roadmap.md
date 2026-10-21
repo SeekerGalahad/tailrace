@@ -198,7 +198,7 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 1. `utoipa-swagger-ui 10.0.1` 锁定的 `zip 8.6.0`（仅 build-dep，构建脚本解压 crate 自带的 vendored swagger-ui dist）：2026-10-13 后被上游 yank（现又恢复可装，deny.toml `yanked="warn"` 保留）；2026-10-17 RustSec 连发 RUSTSEC-2026-0367/0368/0369 三个 extract 漏洞（修复仅入 zip 9.0.x，`^8.6` 不可达且无 8.x backport；build-dep 威胁模型不适用——不链接进产物二进制、不解压外部归档）——deny.toml 已 ignore 三条带跟踪注释。其发新版（zip 9 线）后回收 warn+ignore 并重新收紧；
 2. OTLP 的 `opentelemetry` 0.33 / `tracing-opentelemetry` 0.34 版本锚定后是否升格默认开启（当前 feature 门控默认关）；
 3. R3 升格评审五项的门槛数据（本 R2 的 BENCHMARKS.md 即门槛输入）；
-4. CodeMirror6 替换 monaco 评估（编辑器体积档位，R3 裁决；T9 实测 monaco gzip 883kB vs CM6 预期 ~200-300kB 级，2026-10-17 立项）——R3 由 T17 承接。**2026-10-20 T17 裁决（PoC 分支 poc/codemirror6@7f32c26，不进主干）**：实测编辑器异步 chunk gzip **883.22→140.45 kB（−84.1%）**，好于本条 200-300kB 预期档；编辑器相关资产合计（JS+CSS gzip + worker/ttf 折算）1,078→140.70 kB——CM6 零 worker/零字体/零外部 CSS（T9 的 CSS 晚到/布局塌缩补丁整类消失）。能力面为现用面超集：`db.` 表补全 parser 驱动+FROM 别名感知、SQL 关键字补全（monaco 无）、SQLNamespace 列槽位为 T14 infer-schema 就绪（`db.table.` 列补全届时零编辑器侧代码）；delta 三项（库名大小写敏感 vs monaco 不敏感、`db.e` 后关键字混入、补全+插 `-- @tag:ds` 为单 undo 步）均有廉价修法（自写 ~30 行 CompletionSource 可全对齐）。迁移面：PoC 已完成内核替换 7 文件（SqlMonaco.vue 365→246 行、edit.vue 零改动、对外 props/emits 不变），typecheck+build 绿+浏览器实测（补全弹窗/接受插 tag/诊断波浪线/v-model 双向/主题切换/tables 热更新全过）。**结论：升级为 R4 落地卡（替换 monaco，估 ~2 人日=PoC 基线 + 视觉走查/大小写对齐决策/IME 手测/真页 e2e）；PoC 分支保留为实施基线不删不合并。**（2026-10-21 用户复核通过，落为 §九 T22 卡。）
+4. CodeMirror6 替换 monaco 评估（编辑器体积档位，R3 裁决；T9 实测 monaco gzip 883kB vs CM6 预期 ~200-300kB 级，2026-10-17 立项）——R3 由 T17 承接。**2026-10-20 T17 裁决（PoC 分支 poc/codemirror6@7f32c26，不进主干）**：实测编辑器异步 chunk gzip **883.22→140.45 kB（−84.1%，T9 记录锚定的单口径）**，好于本条 200-300kB 预期档——CM6 零 worker/零字体/零外部 CSS（T9 的 CSS 晚到/布局塌缩补丁整类消失）。（2026-10-21 T23 对齐，评审 low#6：原「编辑器相关资产合计 1,078→140.70 kB」为 PoC 复合口径——JS+CSS gzip 与 worker/ttf 折算分项未存档，不可从 T9 仓库记录复算，弃用，统一锚 T9 已记录的 883.22 单口径。）能力面为现用面超集：`db.` 表补全 parser 驱动+FROM 别名感知、SQL 关键字补全（monaco 无）、SQLNamespace 列槽位为 T14 infer-schema 就绪（`db.table.` 列补全届时零编辑器侧代码）；delta 三项（库名大小写敏感 vs monaco 不敏感、`db.e` 后关键字混入、补全+插 `-- @tag:ds` 为单 undo 步）均有廉价修法（自写 ~30 行 CompletionSource 可全对齐）。迁移面：PoC 已完成内核替换 7 文件（SqlMonaco.vue 365→246 行、edit.vue 零改动、对外 props/emits 不变），typecheck+build 绿+浏览器实测（补全弹窗/接受插 tag/诊断波浪线/v-model 双向/主题切换/tables 热更新全过）。**结论：升级为 R4 落地卡（替换 monaco，估 ~2 人日=PoC 基线 + 视觉走查/大小写对齐决策/IME 手测/真页 e2e）；PoC 分支保留为实施基线不删不合并。**（2026-10-21 用户复核通过，落为 §九 T22 卡。）
 
 ## 九、R3 任务卡（亮点特性轮，共 10 张，2026-10-20 立项）
 
@@ -217,9 +217,9 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 
 - **现状**：`tailrace-conn-jdbc` 为 1 行占位 crate（`//! Placeholder ... real engine code lands in the migration stage (P0)`）；node feature `connector-jdbc` 已接线但注册零（`engine/bin/tailrace-node/Cargo.toml:17`）；conn-s3/conn-mqtt 同为占位不在本卡。
 - **方案**：占位 crate 内实现 Source trait：MySQL/PostgreSQL 两方言，按主键/时间列区间增量轮询，`cursor_semantics` 登记轮询位点（对齐 IR 游标语义）；驱动选型须过 cargo deny licenses（倾向 sqlx 或各官方 async 驱动，deny 报告先行）；注册走 node feature 门控，不动 registry 本体。
-- **验收**：testcontainers 起 mysql:8 + postgres:15 批源测试（chaos job 先例复用）；位点断言——重启续读不丢不重、totals 单调；parser/catalog 认 jdbc kind；**`git diff` 零触碰 runtime/api/parser 本体**（红线验收字面化）。
+- **验收**：testcontainers 起 mysql:8 + postgres:15 批源测试（chaos job 先例复用）；位点断言——重启续读不丢不重、totals 单调；parser/catalog 认 jdbc kind；**`git diff` 零触碰 runtime/api 本体 + parser 仅 kind 白名单两行**（红线验收字面化；R3-W1 评审 low#3 修正——原措辞"零触碰 runtime/api/parser 本体"与文件域"parser kind 枚举"不是同一集合，证据须明示 parser 触碰行而非换一组路径宣称零触碰）。
 - **文件域**：engine/crates/tailrace-conn-jdbc、engine/bin/tailrace-node（注册行）、tailrace-parser/tailrace-catalog kind 枚举、tests/。
-> 结果：caa842e T13 已提交（`feat: T13 JDBC 批源——MySQL/PostgreSQL 增量轮询 Source（testcontainers 双方言测试）`）：严格限 8 个文件域路径（Cargo.toml/Cargo.lock/conn-jdbc crate+tests/node 注册行/parser 白名单/catalog normalize），1520 增 / 8 删；提交说明含驱动选型结论（sqlx 0.9 子 crate——门面 sqlx-sqlite 与 rusqlite `links` 冲突改走子 crate，无 tls）与验证数字（conn-jdbc 7/0、workspace 156/0、clippy 0、deny 四门 ok）；提交后工作树干净，runtime/api/console 零触碰，未 push（ahead 1，留波门禁）。
+> 结果：caa842e T13 已提交（`feat: T13 JDBC 批源——MySQL/PostgreSQL 增量轮询 Source（testcontainers 双方言测试）`）：严格限 8 个文件域路径（Cargo.toml/Cargo.lock/conn-jdbc crate+tests/node 注册行/parser 白名单/catalog normalize），1520 增 / 8 删；提交说明含驱动选型结论（sqlx 0.9 子 crate——门面 sqlx-sqlite 与 rusqlite `links` 冲突改走子 crate，无 tls）与验证数字（conn-jdbc 7/0、workspace 156/0、clippy 0、deny 四门 ok）；提交后工作树干净，**runtime/api 本体零触碰；parser 触碰=`tailrace-parser/src/lib.rs:124` kind 白名单两行（域内允许，如实点名——评审 low#3 修正，原证词"runtime/api/console 零触碰"以 console 顶替 parser 属换组宣称）**，未 push（ahead 1，留波门禁）。
 
 ### T14 discover / infer-schema 落地（~3 人日）
 
@@ -249,7 +249,7 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 - **方案**：CM6 PoC（@codemirror/lang-sql + autocomplete 面板）量三件事：gzip chunk 体积、补全功能面（表/列补全数据源 API 可用性）、迁移工作量估计（SqlMonaco.vue 替换面）。
 - **验收**：对比表（体积/能力/工作量）产出，裁决结论写回 §八.4 并关闭或升级为落地卡——本卡不落地编辑器替换。
 - **文件域**：PoC 分支（不进 main）；结论落本文件 §八。
-> 结果：7f32c26（poc/codemirror6，保留不合并）编辑器异步 chunk gzip **883.22→140.45 kB（−84.1%）**、编辑器相关资产合计 1,078→140.70 kB（零 worker/字体/外部 CSS）；能力为现用面超集（+SQL 关键字补全、FROM 别名感知，SQLNamespace 列槽位就绪 T14）；迁移=PoC 已换核（edit.vue 零改动），转产余量 ~1-1.5 人日——裁决=升级 R4 落地卡（详见 §八.4）
+> 结果：7f32c26（poc/codemirror6，保留不合并）编辑器异步 chunk gzip **883.22→140.45 kB（−84.1%，T9 记录锚定的单口径）**，CM6 侧零 worker/字体/外部 CSS；能力为现用面超集（+SQL 关键字补全、FROM 别名感知，SQLNamespace 列槽位就绪 T14）；迁移=PoC 已换核（edit.vue 零改动），转产工作量 **~2 人日（含 PoC 基线，与 §八.4/T22 统一口径）**——裁决=升级 R4 落地卡（详见 §八.4）。〔2026-10-21 T23 对齐（评审 low#6）：原「转产余量 ~1-1.5 人日」与 §八.4「~2 人日」两口径并存，统一为后者（含 PoC 基线）；原「编辑器相关资产合计 1,078→140.70 kB」为 PoC 复合口径（JS+CSS gzip+worker/ttf 折算），分项未存档、不可从 T9 仓库记录复算，弃用，统一锚 T9 已记录的 883.22 编辑器异步 chunk gzip。〕
 
 ### T18 R3 末升格评审（~1 人日）〔门槛数据=BENCHMARKS.md〕
 
@@ -296,7 +296,7 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 
 > **medium 三条已修（各一提交）**：① `tailrace-runtime/src/registry.rs` `Cursor::JdbcKey` 指纹常量 13 → fold key+value（JDBC 位点推进对 NO_PROGRESS 可见，3 次瞬时断库不再误判毒数据；488efcc）；② `tailrace-conn-jdbc` keyset `WHERE col > ? LIMIT n` 无 tie-breaker → 连接探针经目录视图强制游标列自身唯一（PK / 单列 UNIQUE，非唯一即 fail-fast；13d1c2b）；③ CI chaos job 追加 `jdbc_sources` 真库步（此前 CI 对 JDBC 真库覆盖为 0；19bb80b）。注：① 按评审建议触碰了 runtime 本体 1 处——属既有判据缺陷修复而非连接器引入，单独提交可审计。
 >
-> **low 六条仅登记未修，待后续卡 / 收口承接**：
+> **low 六条仅登记未修，待后续卡 / 收口承接**〔2026-10-21 T23 已清偿 low#1/#2/#3/#5/#6（见 T23 卡与 CHANGELOG Unreleased）；low#4 归 T14、low#7 留 T18 不变〕：
 >
 > 1. `tailrace-conn-jdbc/src/lib.rs` `pg_cursor_kind` 接受 FLOAT4 为游标类型，但 `pg_cell` FLOAT4 臂无 is_cursor 分支、永不产出 canonical → FLOAT4 游标列探针通过后每轮 poll 以"cursor column is NULL"文案失败进入永久退避。处置：补 FLOAT4 臂 is_cursor（镜像 FLOAT8）或在 pg_cursor_kind 拒绝 FLOAT4。
 > 2. `tailrace-catalog/src/lib.rs:121` 新增 `"JDBC"→"jdbc"`（源）紧邻既有 `"JDBC_TABLE"→"doris"`（汇）：MySQL 源写 kind=jdbc_table 会得 doris 并收到"source only supports kafka/file/jdbc (got doris)"费解诊断；新臂功能冗余（fallthrough 已小写化）；`lib.rs:25` canonical kind 注释未加 jdbc。处置：normalize_kind 注释与 parser 诊断点明 JDBC（源）/ JDBC_TABLE（Doris 汇）之别，补 :25 注释。

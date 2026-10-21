@@ -125,8 +125,17 @@ pub fn validate(catalog: &dyn CatalogProvider, compiled: &Compiled) -> Vec<Diagn
             Ok(t) => out.push(Diagnostic {
                 statement: Some(i),
                 message: format!(
-                    "source {} only supports kafka/file/jdbc (got {})",
-                    st.source, t.kind
+                    "source {} only supports kafka/file/jdbc (got {}{})",
+                    st.source,
+                    t.kind,
+                    // JDBC vs JDBC_TABLE is the classic mix-up (R3-W1 review
+                    // low#2): a MySQL/PostgreSQL source declared
+                    // `kind = jdbc_table` folds to doris and lands here
+                    if t.kind == "doris" {
+                        " — jdbc_table is the Doris SINK kind; a MySQL/PostgreSQL source is kind=jdbc"
+                    } else {
+                        ""
+                    }
                 ),
             }),
             Err(e) => out.push(Diagnostic {
@@ -139,8 +148,15 @@ pub fn validate(catalog: &dyn CatalogProvider, compiled: &Compiled) -> Vec<Diagn
             Ok(t) => out.push(Diagnostic {
                 statement: Some(i),
                 message: format!(
-                    "sink {} only supports kafka/file/doris (got {})",
-                    st.sink, t.kind
+                    "sink {} only supports kafka/file/doris/starrocks (got {}{})",
+                    st.sink,
+                    t.kind,
+                    // mirror mix-up: jdbc is source-only
+                    if t.kind == "jdbc" {
+                        " — jdbc is source-only (Doris/StarRocks sinks are kind=doris/starrocks)"
+                    } else {
+                        ""
+                    }
                 ),
             }),
             Err(e) => out.push(Diagnostic {
@@ -500,6 +516,63 @@ columns = [["a","utf8"]]
         assert!(
             d.iter()
                 .any(|x| x.message.contains("sink resolution failed")),
+            "{d:?}"
+        );
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// R3-W1 review low#2: a MySQL/PostgreSQL source mistakenly declared
+    /// `kind = jdbc_table` folds to doris — the diagnostic must name the
+    /// JDBC (source) / JDBC_TABLE (Doris sink) mix-up instead of a bare
+    /// "got doris"; dually, jdbc used as a sink must be called source-only.
+    #[test]
+    fn validator_names_the_jdbc_jdbc_table_mixup() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("tailrace-par-jdbc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let f = dir.join("j.toml");
+        std::fs::write(
+            &f,
+            r#"
+[pipeline]
+id = 9
+name = "t"
+[[datasource]]
+name = "d"
+type = "mysql"
+bootstrap = "mysql://root@localhost/test"
+[[table]]
+datasource = "d"
+name = "orders"
+kind = "JDBC_TABLE"
+columns = [["id","int64"]]
+[[table]]
+datasource = "d"
+name = "orders_jdbc"
+kind = "jdbc"
+columns = [["id","int64"]]
+"#,
+        )?;
+        let cat = tailrace_catalog::FileCatalog::load(&f)?;
+        // JDBC_TABLE (→ doris) as a SOURCE: the hint must name the mix-up
+        let (c, _) = compile(
+            "INSERT INTO ${ds:d.orders} SELECT id FROM ${ds:d.orders}",
+            9,
+        )?;
+        let d = validate(&cat, &c);
+        assert!(
+            d.iter()
+                .any(|x| x.message.contains("jdbc_table is the Doris SINK kind")),
+            "{d:?}"
+        );
+        // jdbc as a SINK: must be called source-only
+        let (c, _) = compile(
+            "INSERT INTO ${ds:d.orders_jdbc} SELECT id FROM ${ds:d.orders_jdbc}",
+            9,
+        )?;
+        let d = validate(&cat, &c);
+        assert!(
+            d.iter().any(|x| x.message.contains("jdbc is source-only")),
             "{d:?}"
         );
         std::fs::remove_dir_all(&dir)?;

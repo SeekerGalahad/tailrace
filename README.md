@@ -7,9 +7,10 @@ A single-binary data ingestion engine with a built-in web console. SQL-first, no
 ## Status
 
 v0.1.0 baseline (2026-10-13). Working: engine data plane in `engine/` (SQL
-transforms, offset cursors, kafka/file sources, Doris Stream Load sink), plus
-the management console (`console/` + `web/`). mqtt/jdbc/s3 connectors are
-placeholders.
+transforms, offset cursors, kafka/file/jdbc sources, Doris Stream Load sink),
+plus the management console (`console/` + `web/`). The starrocks sink is an
+alias sharing the Doris Stream Load path (full parity in progress); mqtt/s3
+connectors are placeholders.
 
 ## Quickstart
 
@@ -33,8 +34,9 @@ Prerequisites: Rust ≥ 1.95 (rustup; the repo pins a stable toolchain), Node.js
 ```
 
 Then open http://127.0.0.1:8080, log in with `admin` + the captured password, and create a
-pipeline. For a scripted end-to-end check (25 assertions, no external dependencies), run
-`./scripts/smoke.sh`.
+pipeline. For a scripted end-to-end check, run `./scripts/smoke.sh` (25 assertions, no
+external dependencies) or `./scripts/smoke.sh --full` (44 assertions — Kafka→Doris via
+docker compose).
 
 ## Connector matrix
 
@@ -42,11 +44,11 @@ pipeline. For a scripted end-to-end check (25 assertions, no external dependenci
 |---|---|---|---|
 | kafka | ✅ | — | primary source, offset-based cursors |
 | file | ✅ | — | local / mounted files |
+| jdbc | ✅ | — | MySQL / PostgreSQL keyset batch source ([docs](docs/connectors/jdbc.md)) |
 | doris | — | ✅ | Stream Load |
-| starrocks | — | ✅ | P2 |
-| jdbc | ✅ | — | P2 |
-| mqtt | ✅ | — | P2 |
-| s3 | ✅ | — | P2 |
+| starrocks | — | ✅ | alias sharing the Doris Stream Load path — full parity in progress (roadmap T12) |
+| mqtt | — | — | placeholder, not yet implemented (route decision pending, roadmap T18) |
+| s3 | — | — | placeholder, not yet implemented (route decision pending, roadmap T18) |
 
 ## Development
 

@@ -22,8 +22,9 @@ pub struct TableObject {
     pub datasource: String,
     /// Table object name (topic / table name)
     pub name: String,
-    /// Canonical connector kind: kafka / file / doris / starrocks (see
-    /// `normalize_kind` for the accepted aliases)
+    /// Canonical connector kind: kafka / file / jdbc / doris / starrocks (see
+    /// `normalize_kind` for the accepted aliases; jdbc is source-only,
+    /// doris/starrocks are sink-side)
     #[serde(default = "default_kind")]
     pub kind: String,
     /// Decode format: ogg / json / jsonl / csv / parquet
@@ -110,12 +111,20 @@ pub fn stream_load_url_allowed(
 }
 
 /// Canonical connector kind (the ConnectorRegistry key). Legacy aliases fold
-/// in: "topic"→"kafka", "doris_table"/"JDBC_TABLE"→"doris". Unknown kinds pass
-/// through lowercased (the registry reports "unsupported kind" at build time).
+/// in: "topic"→"kafka", "doris_table"/"JDBC_TABLE"→"doris", "JDBC"→"jdbc".
+/// Mind the JDBC pair (R3-W1 review low#2): **"JDBC" is the MySQL/
+/// PostgreSQL batch SOURCE kind; "JDBC_TABLE" is a Doris SINK alias** (it
+/// folds to "doris" — a source declared `kind = jdbc_table` resolves to a
+/// doris object and trips the "source only supports kafka/file/jdbc (got
+/// doris)" diagnostic). Unknown kinds pass through lowercased (the registry
+/// reports "unsupported kind" at build time).
 pub fn normalize_kind(kind: &str) -> String {
     match kind.to_uppercase().as_str() {
         "TOPIC" | "KAFKA" => "kafka".into(),
         "FILE" => "file".into(),
+        // JDBC_TABLE = Doris sink alias (legacy) sits next to JDBC = the
+        // jdbc SOURCE on purpose — they are distinct kinds, not aliases of
+        // each other (see the doc comment above)
         "DORIS_TABLE" | "JDBC_TABLE" | "DORIS" => "doris".into(),
         "STARROCKS" => "starrocks".into(),
         "JDBC" => "jdbc".into(),
@@ -585,6 +594,11 @@ select_sql = "SELECT * FROM src"
         assert_eq!(normalize_kind("file"), "file");
         assert_eq!(normalize_kind("doris_table"), "doris");
         assert_eq!(normalize_kind("JDBC_TABLE"), "doris");
+        assert_eq!(
+            normalize_kind("JDBC"),
+            "jdbc",
+            "jdbc is the SOURCE kind — distinct from the JDBC_TABLE→doris sink alias"
+        );
         assert_eq!(normalize_kind("starrocks"), "starrocks");
         assert_eq!(
             normalize_kind("mqtt"),

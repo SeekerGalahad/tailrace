@@ -351,9 +351,14 @@ decode→transform→write 之后），行数边界过界判断只能以整 poll
 
 | 任务 | bench/口径 | 默认档 | jemalloc 档 | 变化 | 日期 |
 |---|---|---|---|---|---|
-| T20 | macro 吞吐（file→file debug，3 轮中位） | 33670 rows/s | 33738 rows/s | 持平（+0.2%，远在噪声界内） | 2026-10-20 |
+| T20 | macro 吞吐（file→file debug，3 轮中位）¹ | 33670 rows/s | 33738 rows/s | 持平（+0.2%，远在噪声界内）¹ | 2026-10-20 |
 | T20 | node 峰值 RSS（内核 ru_maxrss，3 轮中位） | 53616 KiB（52.4 MiB） | 57808 KiB（56.5 MiB） | **+4192 KiB（+7.8%）**，两档区间不重叠 | 2026-10-20 |
-| T20 | node 二进制体积（debug 档） | 264,674,112 B | 265,573,776 B | +879 KiB（jemalloc 5.3.1 静态链入） | 2026-10-20 |
+| T20 | node 二进制体积（debug 档）² | 264,674,112 B | 265,573,776 B | +879 KiB（jemalloc 5.3.1 静态链入） | 2026-10-20 |
+| T20 | 碎片（jemalloc `stats.allocated` vs `stats.resident`） | 未测 | 未测 | 未测³ | 2026-10-20 |
+
+> ¹ 吞吐口径脚注（R3-W1 评审 low#5 补注）：**debug 档**（`CARGO_PROFILE_DEV_DEBUG=0`，非 release）、单轮全链仅 ~3s、macro.sh stats 轮询步进 0.5s → **量化误差 ±17%**（§6.1 结论段自认）——本口径对 <~17% 的 allocator 效应**无检出力**，「持平」仅指差值未超出该噪声界；allocator 吞吐结论以 release 档长跑补测后为准。
+> ² 体积口径脚注（low#5）：两个体积数字来自**基准二进制**（sha256 前缀 `1f7270c7…`/`55066ae4…`，§6.1 方法段），构建树 = **caa842e + T20 提交前工作树**（= 9a9f8a2 落章前的树；其后 488efcc/13d1c2b（engine 改动）、19bb80b（CI）均未包含）——**非任何已提交树的可复现产物**。2026-10-21 复查：本机现存 `target/debug/tailrace-node`（264,705,488 B，`nm` 计 `_rjem_` 符号 0 个）属其后另一树的重建产物，与表中默认档数字不可互推。
+> ³ 碎片行（low#5）：T20 卡方案列有「碎片」对比项，实测未做（无 jemalloc-ctl stats 面，§6.1 结论段「未测」）——此行为显式占位，防「表里没有＝测过没事」的误读；补测需 `tikv-jemalloc-ctl` stats feature + release 长跑。
 
 ### §6.1 T20 jemalloc + 峰值 RSS 指标（2026-10-20，同机同日交错复测）
 
