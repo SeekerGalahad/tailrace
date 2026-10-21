@@ -295,6 +295,13 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 - **文件域**：engine/crates/tailrace-conn-jdbc、engine/crates/tailrace-catalog（注释）、engine/crates/tailrace-parser/src/lib.rs、Cargo.lock、docs/dev/roadmap.md、docs/BENCHMARKS.md、docs/connectors/、README.md、README.zh-CN.md、CHANGELOG.md。（2026-10-21 落档勘正补入 parser 与 Cargo.lock：W2 首跑实证 parser 诊断是方案②交付；RUSTSEC-2026-0382 令 cc46490 CI 红，Cargo.lock 升级 rustls-webpki 0.103.15→0.103.16 是唯一合法修复落点。）
 > 结果：d9f51bd T23 已按波门禁指令提交为 d9f51bd（main，父 cc46490 线性，10 文件 +338/−34，含新文件 docs/connectors/jdbc.md）。staging 严格限文件域：CHANGELOG.md、Cargo.lock（授权的 rustls-webpki 0.103.16 单包门禁修复）、README.md、README.zh-CN.md、docs/BENCHMARKS.md、docs/dev/roadmap.md、tailrace-catalog/tailrace-conn-jdbc/tailrace-parser 三 crate 源、docs/connectors/jdbc.md——git status 实测无外来变更混入。提交主题与指令逐字一致，body 分段记录八项交付（low#1 FLOAT4 加宽 canonical/low#2 JDBC·JDBC_TABLE 诊断/low#3 T13 措辞/low#5 BENCHMARKS 三脚注/low#6 T17 口径统一）+门禁修复授权与验证数字（conn-jdbc 6+2+0、parser 7/catalog 4、L0 三件全绿，均上一轮实测）。未 push（留波门禁），工作树干净。
 
+### T24 R3-W2 评审尾债与文档债清偿（~1 人日）〔R3-W3 前置波 W0，2026-10-21 立项〕
+
+- **现状**：R3-W2 评审 low 两条（T12 allin1 e2e 无归档脚本可复跑——live gate 静默 skip 空过；`docs/connectors/jdbc.md` §七"console 尚无 mysql/postgresql 类型"被同日 T14 过时化）+ T14 自登记文档债两笔（openapi components 缺 discover/infer-schema 新 DTO 致 swagger $ref 悬空；`docs/protocol/console-api.md` 仍留 ⛔ 501 行）。
+- **方案**：① `scripts/e2e/starrocks.sh`：把 T12 手工 e2e 固化为可重跑脚本（`TAILRACE_SR_*` 覆盖变量、`--wait` 语义、DDL/数据/断言/清理全内建；live 栈不可达时打印一行 skip 说明再空过——对齐 `tests/jdbc_sources.rs:110` 惯例）；② `docs/connectors/jdbc.md` §七改为 T14 后现状（mysql/postgresql 已登记、JDBC_KEY 派生、discover/infer-schema 通道可用），剩余缺口点名 T14 登记遗留；③ console `openapi.rs` components 补新 DTO；④ `docs/protocol/console-api.md` 同步 discover/infer-schema 真实现。
+- **验收**：`bash scripts/e2e/starrocks.sh --help` 出用法（栈不可达时 skip 行可见）；`cargo test -p tailrace-console --locked` 绿；`grep -c '501' docs/protocol/console-api.md` 对应段落归零；jdbc.md 无"尚未登记"表述。
+- **文件域**：scripts/e2e/、docs/connectors/jdbc.md、docs/protocol/console-api.md、console/crates/tailrace-console/src/openapi.rs。
+
 ### R3-W1 评审登记（2026-10-21）
 
 > **medium 三条已修（各一提交）**：① `tailrace-runtime/src/registry.rs` `Cursor::JdbcKey` 指纹常量 13 → fold key+value（JDBC 位点推进对 NO_PROGRESS 可见，3 次瞬时断库不再误判毒数据；488efcc）；② `tailrace-conn-jdbc` keyset `WHERE col > ? LIMIT n` 无 tie-breaker → 连接探针经目录视图强制游标列自身唯一（PK / 单列 UNIQUE，非唯一即 fail-fast；13d1c2b）；③ CI chaos job 追加 `jdbc_sources` 真库步（此前 CI 对 JDBC 真库覆盖为 0；19bb80b）。注：① 按评审建议触碰了 runtime 本体 1 处——属既有判据缺陷修复而非连接器引入，单独提交可审计。
@@ -315,7 +322,7 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 |---|---|---|---|
 | R3-W1 | T13 JDBC 批源 ‖ T17 CM6 评估(PoC 分支) ‖ T20 jemalloc | 新 crate / PoC 分支 / node bin feature，零交集 | L0+L1+push+CI 绿 |
 | R3-W2 | W0：T23 评审债清偿（串行先行）→ T12 StarRocks ‖ T14 discover/infer-schema | T23 动 README/CHANGELOG 与 T12 文件域相交故先行；其后 conn-doris+compose vs console+engine 元数据模块零交集 | W0：L0+push+CI 绿；W1：L0+L1+L3(starrocks profile 本地档)+push+CI 绿 |
-| R3-W3 | T16 feature 裁剪验证 | 在 T12/T13 落地后复核全 feature 面 | L0+L1+裁剪档 e2e+push+CI 绿 |
+| R3-W3 | W0：T24 尾债清偿（串行先行）→ T16 feature 裁剪验证（本机 e2e，环境配方=AGENTS-环境契约 §3） | T24 动 docs/scripts 与 T16 文件域不相交；T16 裁剪档 e2e 依赖 Doris 栈窗口 | W0：L0+push+CI 绿；W1：L0+L1+裁剪档 e2e+体积表+环境复原终检+push+CI 绿 |
 | R3-W4 | T15 分区并行 b（指纹回归先行） | 引擎热路径独占波 | L0+L1+L3+L4+push+CI 绿 |
 | R3-W5 | T19 SSH 部署链〔选做〕 | console 域 | L0+L1+push+CI 绿 |
 | R3-W6 | T21 fuzz 起步〔选做〕 | fuzz/ 新目录 | 语料跑绿 |
