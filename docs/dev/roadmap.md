@@ -191,7 +191,7 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 
 **R3 亮点特性（~3-4 周）**（2026-10-20 已立项为任务卡，见 §九 T12-T21）：StarRocks sink 完整化（现仅注册别名，共享 Stream Load 协议）；JDBC 批源（MySQL/PostgreSQL，cursor_semantics 登记轮询位点；验收=新增连接器零改动 runtime/api/parser 本体）；discover / infer-schema 落地（替换 501 占位，Kafka/Doris 元数据客户端）；分区并行方案 b（split 化+动态分区发现，动工前先写部分分区推进的指纹回归测试）；feature 裁剪验证（`--no-default-features --features connector-file,connector-doris` 跑通 file→doris）；选做：SSH 部署链八步、jemalloc（RSS 指标先就位）、parser/decode fuzz 起步。**R3 末升格评审**：deltalake sink / DataFusion 升级 / 事务接口 / group commit / 本地两步 WAL 五项，默认结论=排 v1.x，纪要落 docs/dev/。
 
-**R4 1.0 发布（~1.5-2 周）**：**开工第一动作=crates.io 注册占位**（设计 §1.2 的 P0 期动作未执行——2026-10-21 实测 `tailrace` 与 `tailrace-node` 在 crates.io 均未注册，风险 R1 在途，需用户账号操作）；T22 CodeMirror6 转产落地（§九，T17 裁决）；README 双语定稿（徽章矩阵+三命令 quickstart+连接器矩阵+FAQ）；mdBook 文档站骨架（协议/连接器/架构；设计文档以脱敏干净版重新入仓）；crate 元数据补齐 + doc-test；crates.io 发包（`tailrace-node` + `tailrace-console` 两 bin + `tailrace-connector` trait 契约面）；tag v1.0.0 → release（9 资产）；基准报告入 README；i18n 最小动作（错误码字典化接口预留，中文单轨明示）。MQTT 源 / S3 / CDC 的路线裁决并入 T18 评审（设计 §7.4 P2 序 #3/#4 未排卡）。
+**R4 1.0 发布（~1.5-2 周）**：~~开工第一动作=crates.io 注册占位~~（**已完成 2026-10-21**：`tailrace`/`tailrace-node`/`tailrace-console` 三名各以 0.0.0 占位发布注册并经 API 核验，风险 R1 关闭；R4 发包以真实现版本号覆盖即可）；T22 CodeMirror6 转产落地（§九，T17 裁决）；README 双语定稿（徽章矩阵+三命令 quickstart+连接器矩阵+FAQ）；mdBook 文档站骨架（协议/连接器/架构；设计文档以脱敏干净版重新入仓）；crate 元数据补齐 + doc-test；crates.io 发包（`tailrace-node` + `tailrace-console` 两 bin + `tailrace-connector` trait 契约面）；tag v1.0.0 → release（9 资产）；基准报告入 README；i18n 最小动作（错误码字典化接口预留，中文单轨明示）。MQTT 源 / S3 / CDC 的路线裁决并入 T18 评审（设计 §7.4 P2 序 #3/#4 未排卡）。
 
 ## 八、开放问题（随轮裁决）
 
