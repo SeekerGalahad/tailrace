@@ -724,6 +724,268 @@ mod tests {
         Ok(())
     }
 
+    /// T15 dynamic partition discovery (pre-work test, written before touching
+    /// the poll path): a **running** KafkaSource folds newly added topic
+    /// partitions into its poll face **without reopen** — both open modes:
+    /// ① subscribe (no cursor: the source's own 30s metadata diff complements
+    /// the group's assignment with a cursor-map entry);
+    /// ② assign (resumed from a cursor: BaseConsumer does NOT extend a manual
+    /// assignment — the source must refresh it itself).
+    /// Discovery-latency caliber: the metadata diff runs every 30s
+    /// (`fetch_metadata` capped at 5s), so a new partition's first record
+    /// enters the poll face at most ~35s after the partition increase; this
+    /// test bounds it at 75s and reports the measured latency. `kc` runs
+    /// kafka-topics.sh inside the ephemeral container (create/alter — the
+    /// synchronous std-API path; no async AdminClient ⇒ no executor
+    /// dev-dependency). Returns the grow→consumed latency for the caliber log.
+    fn discovery_roundtrip(
+        bootstrap: &str,
+        topic: &str,
+        assign_mode: bool,
+        kc: &dyn Fn(&[&str]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Duration> {
+        fn wait_partition_count(bootstrap: &str, topic: &str, want: usize) -> anyhow::Result<()> {
+            let mut cfg = ClientConfig::new();
+            cfg.set("bootstrap.servers", bootstrap);
+            let c: BaseConsumer = cfg.create()?;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let meta = c.fetch_metadata(Some(topic), Duration::from_secs(5))?;
+                let n = meta
+                    .topics()
+                    .iter()
+                    .find(|t| t.name() == topic)
+                    .map(|t| t.partitions().len())
+                    .unwrap_or(0);
+                if n >= want {
+                    return Ok(());
+                }
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "topic {topic} never reached {want} partitions (has {n})"
+                );
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+
+        /// Produce one payload to an explicit partition (fresh producer = fresh
+        /// metadata; retries the metadata-race window where partition N is not
+        /// yet in the producer's cache).
+        fn produce_to(
+            bootstrap: &str,
+            topic: &str,
+            part: i32,
+            payload: &str,
+        ) -> anyhow::Result<()> {
+            let producer: BaseProducer = ClientConfig::new()
+                .set("bootstrap.servers", bootstrap)
+                .create()?;
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let rec = BaseRecord::<(), str>::to(topic)
+                    .partition(part)
+                    .payload(payload);
+                match producer.send(rec) {
+                    Ok(()) => {
+                        producer.flush(Duration::from_secs(10))?;
+                        return Ok(());
+                    }
+                    Err((e, _)) => {
+                        anyhow::ensure!(
+                            Instant::now() < deadline,
+                            "produce to {topic}:{part} kept failing: {e}"
+                        );
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                }
+            }
+        }
+
+        // ① topic with 2 partitions (in-container kafka-topics.sh — the JVM
+        // image ships /opt/kafka/bin; the native image does not)
+        kc(&[
+            "--create",
+            "--topic",
+            topic,
+            "--partitions",
+            "2",
+            "--replication-factor",
+            "1",
+        ])?;
+        wait_partition_count(bootstrap, topic, 2)?;
+        produce_to(bootstrap, topic, 0, "seed-p0")?;
+        produce_to(bootstrap, topic, 1, "seed-p1")?;
+
+        // ② open the source in the requested mode
+        let group = format!("tailrace-disc-{}-{assign_mode}", std::process::id());
+        let mut src = KafkaSource::new(bootstrap, topic, &group);
+        let resume = if assign_mode {
+            Cursor::Kafka {
+                topic: topic.into(),
+                group: group.clone(),
+                offsets: [(0, 0), (1, 0)].into_iter().collect(),
+            }
+        } else {
+            Cursor::None
+        };
+        src.open(&resume)?;
+
+        // ③ baseline: both seed partitions deliver
+        let mut seen: std::collections::BTreeSet<i32> = Default::default();
+        let t0 = Instant::now();
+        while seen.len() < 2 && t0.elapsed() < Duration::from_secs(90) {
+            for c in src.poll(100, Duration::from_secs(2))? {
+                if let Some(p) = c.partition {
+                    seen.insert(p);
+                }
+            }
+        }
+        assert_eq!(
+            seen.iter().copied().collect::<Vec<_>>(),
+            vec![0, 1],
+            "baseline: both seed partitions consumed (assign_mode={assign_mode})"
+        );
+
+        // ④ grow the topic 2 → 4 partitions and seed the new ones
+        kc(&["--alter", "--topic", topic, "--partitions", "4"])?;
+        wait_partition_count(bootstrap, topic, 4)?;
+        let t_grow = Instant::now();
+        produce_to(bootstrap, topic, 2, "new-p2")?;
+        produce_to(bootstrap, topic, 3, "new-p3")?;
+
+        // ⑤ keep polling the SAME source — the new partitions must join the
+        // poll face (30s diff interval + fetch_metadata; 75s ceiling)
+        while !(seen.contains(&2) && seen.contains(&3))
+            && t_grow.elapsed() < Duration::from_secs(75)
+        {
+            for c in src.poll(100, Duration::from_secs(2))? {
+                if let Some(p) = c.partition {
+                    seen.insert(p);
+                }
+            }
+        }
+        let latency = t_grow.elapsed();
+        assert!(
+            seen.contains(&2) && seen.contains(&3),
+            "new partitions joined the poll face without reopen (assign_mode={assign_mode}, seen={seen:?}, waited {latency:?})"
+        );
+        let Cursor::Kafka { offsets, .. } = src.cursor() else {
+            panic!("kafka cursor");
+        };
+        assert_eq!(
+            offsets.keys().copied().collect::<Vec<_>>(),
+            vec![0, 1, 2, 3],
+            "cursor map carries all four partitions (assign_mode={assign_mode})"
+        );
+        assert!(
+            offsets.values().all(|o| *o >= 1),
+            "each partition advanced past its record (assign_mode={assign_mode}): {offsets:?}"
+        );
+        Ok(latency)
+    }
+
+    /// Testcontainers-only (TAILRACE_TESTCONTAINERS=1, the CI chaos job):
+    /// ephemeral Kafka on the **JVM image** — `apache/kafka:3.9.0` (the exact
+    /// image docker-compose.yml runs, ships the /opt/kafka/bin scripts the
+    /// native image lacks and which this test execs for topic create/alter).
+    /// Booted as a raw image with the compose env recipe + a pre-allocated
+    /// fixed host port (advertised.listeners must name a routable address —
+    /// the testcontainers-modules apache module's 0.0.0.0 machinery trips the
+    /// JVM wrapper's validation). The test **creates and alters topics**, so
+    /// it must not run against a shared dev broker — default mode skips (the
+    /// non-mutating liveness stays in kafka_source_live).
+    #[test]
+    fn kafka_source_discovers_new_partitions_without_reopen() -> anyhow::Result<()> {
+        if std::env::var("TAILRACE_TESTCONTAINERS").ok().as_deref() != Some("1") {
+            eprintln!(
+                "[T15 discovery] TAILRACE_TESTCONTAINERS!=1 — skipping (this test creates and \
+                 alters topics; it must not run against a shared dev broker)"
+            );
+            return Ok(()); // CI-safe / default local
+        }
+        use testcontainers::core::{CmdWaitFor, ExecCommand, WaitFor};
+        use testcontainers::runners::SyncRunner;
+        use testcontainers::{GenericImage, ImageExt};
+
+        // pre-allocate a free host port (advertised.listeners needs a
+        // routable address BEFORE start; dynamic mapping is unknowable then)
+        let host_port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let p = l.local_addr()?.port();
+            drop(l);
+            p
+        };
+        let kafka = GenericImage::new("apache/kafka", "3.9.0")
+            .with_wait_for(WaitFor::message_on_stdout(
+                // the BROKER's transition — the ControllerServer logs the same
+                // phrase earlier, before the broker accepts clients
+                "[BrokerServer id=1] Transition from STARTING to STARTED",
+            ))
+            .with_env_var("KAFKA_NODE_ID", "1")
+            .with_env_var("KAFKA_PROCESS_ROLES", "broker,controller")
+            // dual listeners, verbatim the docker-compose.yml recipe: PLAINTEXT
+            // serves in-container clients (exec'd kafka-topics.sh) and
+            // advertises 9092; EXTERNAL serves host clients and advertises the
+            // pre-allocated host port (a single listener cannot do both)
+            .with_env_var(
+                "KAFKA_LISTENERS",
+                "PLAINTEXT://:9092,EXTERNAL://:9094,CONTROLLER://:9093",
+            )
+            .with_env_var(
+                "KAFKA_ADVERTISED_LISTENERS",
+                format!("PLAINTEXT://127.0.0.1:9092,EXTERNAL://127.0.0.1:{host_port}"),
+            )
+            .with_env_var("KAFKA_CONTROLLER_QUORUM_VOTERS", "1@localhost:9093")
+            .with_env_var("KAFKA_CONTROLLER_LISTENER_NAMES", "CONTROLLER")
+            .with_env_var(
+                "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP",
+                "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT",
+            )
+            .with_env_var("KAFKA_INTER_BROKER_LISTENER_NAME", "PLAINTEXT")
+            .with_env_var("KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR", "1")
+            .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+            .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
+            .with_env_var("KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS", "0")
+            .with_env_var("KAFKA_AUTO_CREATE_TOPICS_ENABLE", "true")
+            .with_env_var("CLUSTER_ID", "tailR4ceT15Discovery1")
+            .with_mapped_port(host_port, testcontainers::core::ContainerPort::Tcp(9094))
+            .start()?;
+        let bootstrap = format!("127.0.0.1:{host_port}");
+        // kafka-topics.sh inside the container (synchronous std API — no async
+        // AdminClient ⇒ no executor dev-dependency, Cargo.toml/lock untouched)
+        let kc = |args: &[&str]| -> anyhow::Result<()> {
+            let mut cmd = vec![
+                "/opt/kafka/bin/kafka-topics.sh",
+                "--bootstrap-server",
+                "localhost:9092",
+            ];
+            cmd.extend_from_slice(args);
+            // block until the script exits — the default CmdWaitFor::Nothing
+            // returns before the JVM finishes (exit code still unset)
+            let mut out =
+                kafka.exec(ExecCommand::new(cmd).with_cmd_ready_condition(CmdWaitFor::exit()))?;
+            let code = out.exit_code()?.unwrap_or(1);
+            let stdout_bytes = out.stdout_to_vec().unwrap_or_default();
+            let stderr_bytes = out.stderr_to_vec().unwrap_or_default();
+            anyhow::ensure!(
+                code == 0,
+                "kafka-topics {args:?} exited {code}: stdout={} stderr={}",
+                String::from_utf8_lossy(&stdout_bytes),
+                String::from_utf8_lossy(&stderr_bytes)
+            );
+            Ok(())
+        };
+        // ephemeral broker: the pid keeps the two topics distinct
+        let tag = format!("disc{}", std::process::id());
+        // both open modes on disjoint topics
+        let l_sub = discovery_roundtrip(&bootstrap, &format!("tailrace.{tag}.sub"), false, &kc)?;
+        let l_asg = discovery_roundtrip(&bootstrap, &format!("tailrace.{tag}.asg"), true, &kc)?;
+        eprintln!(
+            "[T15 discovery] subscribe-mode latency {l_sub:?}, assign-mode latency {l_asg:?} (30s diff interval caliber)"
+        );
+        Ok(())
+    }
+
     /// Poison rows (in-field newlines / quotes / emoji) ride the JSON-lines
     /// carrier without bailing — the CSV carrier used to fail the write
     /// explicitly, which escalated to a registry restart loop and a FAILED

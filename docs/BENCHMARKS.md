@@ -359,11 +359,14 @@ decode→transform→write 之后），行数边界过界判断只能以整 poll
 | T16 | 同上，**改造前**（旧接线：runtime 默认 feature 把 kafka 栈拉回）⁴ | 61,571,920 B（`e1d479e7…`） | 61,571,872 B（`3b9cda96…`） | −48 B（0.0001%，裁剪纯装饰） | 2026-10-21 |
 | T16 | 依赖图包数（`cargo tree -e normal` 去重） | 435 | 413 | −22（rdkafka/rdkafka-sys/curl-sys/openssl/openssl-sys/tailrace-conn-kafka 等出图） | 2026-10-21 |
 | T16 | file→doris e2e（裁剪档 node，`smoke.sh --slim`） | —（默认档 `smoke.sh` 25/25 回归） | **30/30**，11.9 s；行数守恒 12==12 | 见 §6.2 | 2026-10-21 |
+| T15 | macro-partitions 吞吐（kafka(P=6)→file **debug 档**，4 轮）⁵ | **M4 首档：中位 27861 rows/s**（23918 / 27678 / 28043 / 28474） | —（本卡热路径零改动，无 A/B 档） | **vs §4.5 的 24658 属跨机器（Intel i7→M4），不可比**；本组=该 bench 在 M4 的首个档位 | 2026-10-21 |
+| T15 | 动态分区发现延迟（testcontainers 真 kafka，topic 2→4 分区不重开） | subscribe 模式 **26.8 s** | assign 模式 **30.7 s** | 均在口径界内（≤~35 s = 30 s 差异对比 + fetch_metadata ≤5 s，见 §6.3） | 2026-10-21 |
 
 > ¹ 吞吐口径脚注（R3-W1 评审 low#5 补注）：**debug 档**（`CARGO_PROFILE_DEV_DEBUG=0`，非 release）、单轮全链仅 ~3s、macro.sh stats 轮询步进 0.5s → **量化误差 ±17%**（§6.1 结论段自认）——本口径对 <~17% 的 allocator 效应**无检出力**，「持平」仅指差值未超出该噪声界；allocator 吞吐结论以 release 档长跑补测后为准。
 > ² 体积口径脚注（low#5）：两个体积数字来自**基准二进制**（sha256 前缀 `1f7270c7…`/`55066ae4…`，§6.1 方法段），构建树 = **caa842e + T20 提交前工作树**（= 9a9f8a2 落章前的树；其后 488efcc/13d1c2b（engine 改动）、19bb80b（CI）均未包含）——**非任何已提交树的可复现产物**。2026-10-21 复查：本机现存 `target/debug/tailrace-node`（264,705,488 B，`nm` 计 `_rjem_` 符号 0 个）属其后另一树的重建产物，与表中默认档数字不可互推。
 > ³ 碎片行（low#5）：T20 卡方案列有「碎片」对比项，实测未做（无 jemalloc-ctl stats 面，§6.1 结论段「未测」）——此行为显式占位，防「表里没有＝测过没事」的误读；补测需 `tikv-jemalloc-ctl` stats feature + release 长跑。
 > ⁴ T16 体积口径：**release 档**（`[profile.release]` lto="thin" / codegen-units=1 / strip=true），宿主 target aarch64-apple-darwin（命令不带 `--target`，产物 `target/release/`），`--locked`（Cargo.lock 零变动）；字节数 `stat -f %z`、sha256 `shasum -a 256`，sha256 为前 8 位。「改造前」两行 = `4881c39` 干净树；「改造后」两行 = `4881c39` + T16 工作树（根 Cargo.toml / engine/bin/tailrace-node/Cargo.toml / scripts/smoke.sh / .github/workflows/ci.yml）。方法与结论见 §6.2。
+> ⁵ T15 吞吐口径：`TAILRACE_KAFKA_PORT=19092 bash scripts/bench/macro-partitions.sh --rows 100000 --partitions 6`（compose kafka 移位 19092——本机 9092 被常驻 kafka-local 占用；EXTERNAL 通告随端口走，口径不变）。4 有效轮 + 1 轮播种失败重试（console-producer 端 99850≠100000，基础设施毛刺非引擎行为，弃用重跑）；每轮断言播种量==N 与 sink 行数==N（不丢行）。脚注 ¹ 的量化噪声（±17%）同样适用；同组内极差 ±9% 在噪声界内。
 
 ### §6.1 T20 jemalloc + 峰值 RSS 指标（2026-10-20，同机同日交错复测）
 
@@ -520,3 +523,71 @@ node 关掉 `connector-kafka` 只是去掉 `build_registry()` 里的一次 `regi
 （裁剪档；再跑一次默认命令即恢复 `target/release/tailrace-node`）→ `shasum -a 256
 target/release/tailrace-node*` → `./scripts/smoke.sh --slim`（compose 2.1.7；或按上表
 `SMOKE_DORIS_MYSQL` 指向常驻 Doris）。
+
+### §6.3 T15 分区并行·方案 b（2026-10-21，同机同日）
+
+**现状修正（重要）**：任务卡所写「无动态分区发现」过时——Flink 式动态分区发现
+自 v0.1.0 基线（`d547630`，2026-10-17）起已落在 `KafkaSource::poll`
+（`engine/crates/tailrace-conn-kafka/src/lib.rs`：30s 元数据差异对比
+`fetch_metadata`，新分区按语句起始位点〔earliest=0 / latest=高水位〕入游标
+map；assign 模式显式刷新 assignment〔BaseConsumer 不自动扩展手动分配〕并补
+pause 态）。§4.5 的 24658 基线测量时该代码已在树内。**T15 交付=三层验证 +
+口径登记，热路径零改动**（工作树 diff 纯测试 + 文档；Cargo.toml / Cargo.lock
+零变动——发现测试的 topic 建/扩用容器内 `kafka-topics.sh` exec 驱动，不引入
+异步 AdminClient 及其执行器依赖）。
+
+**动工前先写的回归测试（生产代码未动，全绿）**：
+
+- `t15_growth_under_poison_sink_keeps_no_progress_verdict`（runtime 集成，毒
+  计数汇）：毒化（flush 永远失败）后**运行中**长出新分区 + 旧分区追加 →
+  未提交的发现/重放消费不得计为「进步」——3 次无进步重启后照常 FAILED
+  终态（判决含 3 consecutive failures without cursor progress），台账游标
+  冻结在毒化前提交（p2 永不入账），sink 侧零新增提交。发现项形态的指纹
+  语义由此黑盒钉住（未 flush 即无进步；发现不逃逸毒数据判决）。
+- `t15_new_partitions_join_mid_run_without_restart`（runtime 集成，mock 多分区
+  源）：单次 deploy 内**运行中**长出新分区 → 数据进 poll 面、游标 map 长项、
+  hub 零 PIPELINE_RESTART；跨发现边界重启不丢不重（真 FileSink 7300 行恰好
+  7300 唯一键）；totals 跨发现与重启单调（5000→6800→7300）。
+- `kafka_source_discovers_new_partitions_without_reopen`（conn-kafka，真
+  rdkafka 路径）：testcontainers 起 ephemeral Kafka（`apache/kafka:3.9.0` JVM
+  镜像 GenericImage，docker-compose.yml 同款双监听配方 + 预分配宿主端口；
+  建表/扩分区用容器内 `/opt/kafka/bin/kafka-topics.sh` exec——同步 std API，
+  零新增依赖）：create --partitions 2→播种 p0/p1→消费→**--alter
+  --partitions 4**→播种 p2/p3→同一 source 持续 poll 断言 p2/p3 到达且游标
+  map 含 4 分区。subscribe 与 assign 两种 open 模式各一轮。T5 的 5 个语义
+  回归 + 字节级并行等价性（`t5_parallel_decode_equivalence`）全部保持绿。
+
+**发现延迟口径（登记）**：差异对比每 **30s** 一次（`fetch_metadata` 超时 5s）
+→ 新分区首条数据最晚 **~35s** 进入 poll 面。实测（testcontainers，2→4 分区，
+终版测试在树复测）：subscribe 模式 **26.8s** / assign 模式 **30.7s**，均在界内
+（先行实现口径 AdminClient 版复测 25.0s/31.1s——两次独立实现同量级，口径
+稳定）。已知语义窄窗
+（如实登记，未修）：latest + subscribe 首跑时，发现项以**发现时刻高水位**
+入游标 map，与 group 实际消费位点（join 时刻高水位）之间若在发现窗口内生产
+了新纪录且尚未 poll，flush 提交该发现项后重启会把该窗口内的记录跳过——
+earliest（默认）全路径无此窗；修复需 subscribe 模式逐分区自行记账，属
+split 化同级的热路径重设计，随 T18 议程。
+
+**split 化：走写死回退门（不硬上）**。评估结论（本节为唯一存档）：游标语义本身在 watermark-通道设计下可证（每 split 交付携带本批
+位点，语句线程折叠成水位游标，flush 成功即整图 save——失败路径内存水位随
+线程消亡、重启自台账整图恢复，at-least-once 窗口与单 consumer 同类）；但
+验收同时要求「T5 口径字节级并行等价」——split 化**构造上**改变跨分区行序
+（broker 到达交错序 → split 序），「同一 chunk 序列」的参照不存在，字节级
+等价只能对 partition-major 特制夹具成立（夹具特化≠系统等价）；且聚合语句
+的微批粒度随批形状改变（每批部分聚合的发射行随之改变；first/last/collect
+类不可复原）。等价证明不完整 → 按卡内写死条款降级：**仅交付动态分区发现，
+split 化并入 T18 升格评审议程**。
+
+**宏基准（M4 首档）**：kafka(P=6)→file 100k 行 debug 档 4 轮（口径见脚注
+⁵）：**中位 27861 rows/s**（23918/27678/28043/28474），每轮不丢行断言过。
+与 §4.5 方案 a 基线 24658 的对比**跨机器不可比**（Intel i7-9750H → Apple
+M4；§六头部声明与本卡 uname 实证 `arm64` / `Apple M4`）。本卡热路径零改动
+（diff 无引擎数据面代码），无同机 A/B 意义（对照二进制=自身）；本组数字
+的价值=**该 bench 在 M4 的基线档位**，供 T18 split 化若立项时同机同日对比。
+旁证：M4 上 kafka(P=6)/file→file 比 ≈ 27861/33670 ≈ 0.83，与 Intel 机
+T5 顺带口径的比值（24658/29394 ≈ 0.84）一致。
+
+复现：`TAILRACE_KAFKA_PORT=19092 docker compose up -d kafka`（等 healthy）
+→ `TAILRACE_KAFKA_PORT=19092 bash scripts/bench/macro-partitions.sh --rows
+100000 --partitions 6`；发现延迟：`TAILRACE_TESTCONTAINERS=1 cargo test -p
+tailrace-conn-kafka kafka_source_discovers -- --nocapture`。
