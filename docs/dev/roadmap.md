@@ -230,20 +230,23 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 - **文件域**：console/crates/tailrace-console/src/api/datasources.rs、console/crates/console-store/src/datasources.rs、engine 元数据客户端新模块、web/src/pages/datasources/。
 > 结果：1c5dcf6 T14 已提交：1c5dcf6（main，父提交 1cd38d0 线性，未推送——push 留波门禁）。git add 严格限 8 条域路径（根 Cargo.toml+Cargo.lock、console-store/src/datasources.rs、tailrace-console 的 Cargo.toml/src/api/datasources.rs/tests/datasources_crud.rs、web/src/pages/datasources/parts/DiscoverModal.vue、engine/crates/tailrace-metadata/ 六文件），Conventional 提交：feat: T14 discover/infer-schema 落地——Kafka/Doris 元数据客户端+jdbc 类型登记+web 动线；正文记录实现面（kafka rdkafka fetch_metadata+OffsetTail 采样、Doris/MySQL 9030 文本协议 SHOW/DESC、PG information_schema、decode 链同款类型格推断、jdbc→JDBC_KEY 派生、web format 回传）、验证数字（-p 两包全绿、workspace 172/0、clippy -D warnings 零告警、deny 四门 ok、pnpm typecheck+build 绿、501 grep=0、live 3/3 实跑）与遗留项（Doris 直连未实测/openapi 组件与 protocol 文档待同步/jdbc 管道端到端留后续）。提交后工作树干净（status 0 行）。
 
-### T15 分区并行·方案 b（~4 人日）〔引擎热路径；本卡动游标边界，R3 最险〕
+### T15 分区并行·方案 b（~4 人日）〔引擎热路径；本卡动游标边界，R3 最险〕✅
 
 - **现状**：方案 a 后单 consumer 拉取边界仍在（T5 记录：rdkafka 单 consumer poll 串行，decode 已并行）；无 split 化、无动态分区发现；T5 的 5 个语义回归测试是现成防线。
 - **方案**：**动工前先写部分分区推进的指纹回归测试**（先测后改）；split 化=分区子集独立拉取执行单元（评估游标拆分语义）；动态分区发现=新增分区自动纳入 poll 面（不重启管道）。
 - **验收**：指纹回归+重启不丢不重+NO_PROGRESS 语义全绿后收工；多分区宏基准 vs 方案 a（24658 rows/s 基线，BENCHMARKS §4.5）对比入档；并行等价性字节级一致测试沿用 T5 口径。
 - **回退门（写死）**：split 化若无法等价证明"游标按 flush 点整体提交"语义，降级为仅交付动态分区发现，split 化并入 T18 升格评审议程——不硬上。
 - **文件域**：engine/crates/tailrace-conn-kafka、tailrace-runtime 主循环、tailrace-state。
+> 结果：288c3cf T15 提交完成：288c3cf（main，父提交 33cf61e 线性，未推送——push 留波门禁）。git add 严格限 3 条域路径（docs/BENCHMARKS.md、tailrace-conn-kafka/src/lib.rs〔唯一 hunk 全在 #[cfg(test)] 模块内，生产代码零改动〕、新增 tailrace-runtime/tests/t15_partition_discovery.rs），Conventional 提交：feat: T15 分区并行方案 b——动态分区发现+指纹回归先行（split 化回退门兑现），正文记录现状修正（发现机制自 v0.1.0 已在）、三层测试（运行中长分区不重启吸纳/毒汇下 NO_PROGRESS 判据不被发现扰动/真 kafka 双模式不重开即消费）、发现延迟口径（30s 差异对比+fetch≤5s→最晚 ~35s，实测 26.8-31.2s 三跑稳定）、**split 化未实施、按回退门降级**（字节级等价口径不可诚实构造→并入 T18 议程，回退门如约兑现不硬上）、宏基准 M4 首档中位 27861 rows/s（跨机器不可比已登记）。提交后工作树干净（status 0 行）。
+> t15-scope 门禁修复过程存档：两轮失败均因超出任务卡文件域（第一轮 Cargo.lock/Cargo.toml 的 tokio dev-dep——重写为容器内 kafka-topics.sh exec 驱动零依赖版测试；第二轮 roadmap.md/registry.rs——R3 任务提交 git 证据显示二者从不由任务提交触碰，指纹覆盖改为黑盒毒汇测试后两文件 checkout 还原）；终版 3 文件域门禁全绿。
 
-### T16 feature 裁剪验证（~1 人日）
+### T16 feature 裁剪验证（~1 人日）✅
 
 - **现状**：node features default=kafka/file/doris（`engine/bin/tailrace-node/Cargo.toml:12`）；CI `no-default-features` job 只验编译，未验链路；裁剪档二进制体积无数字。
 - **方案**：`--no-default-features --features connector-file,connector-doris` 构建 tailrace-node，跑通 file→doris 端到端（依赖 L3 compose Doris）；体积对比（default vs 裁剪档）入 BENCHMARKS/README——单二进制轻量卖点需要数字支撑。
 - **验收**：裁剪档 smoke 变体（file→doris 最小面）绿；体积对比表入档；CI 增可选 job 或本地档登记。
 - **文件域**：engine/bin/tailrace-node、scripts/smoke.sh（裁剪档变体）、.github/workflows/ci.yml。
+> 结果：33cf61e T16 已按门禁指令提交为 33cf61e（main，父 4881c39 线性，非 amend）：staging 严格限文件域 5 文件（.github/workflows/ci.yml、Cargo.toml、engine/bin/tailrace-node/Cargo.toml、scripts/smoke.sh、docs/BENCHMARKS.md，+296/−47）；主题与指令逐字一致，body 分段记录装饰性裁剪根因与最小 wiring、体积/图/导入表数字（裁剪档 55,788,080 B vs 默认档 61,571,936 B，−9.4%）、**本机 e2e 实跑（非降级）30/30**（`smoke.sh --slim` file→doris 裁剪档，BENCHMARKS §六 T16 行 11.9 s 行数守恒 12==12）与负向探针 ENGINE_REJECTED、2.1.7 配方降级缘由、CI slim-features 硬门禁、L0/L1 与环境复原自检结果。工作树提交后干净，未 push（留波门禁）。〔文件域勘正：根 Cargo.toml 与 docs/BENCHMARKS.md 为实施所需落点——workspace 表 `tailrace-runtime` 加 `default-features = false` 是唯一不触碰 tailrace-api manifest 的修法（BENCHMARKS §6.2），体积表入档为验收项。〕
 
 ### T17 CodeMirror6 评估（~1 人日）〔裁决卡，PoC 不进主干〕✅
 
@@ -253,11 +256,12 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 - **文件域**：PoC 分支（不进 main）；结论落本文件 §八。
 > 结果：7f32c26（poc/codemirror6，保留不合并）编辑器异步 chunk gzip **883.22→140.45 kB（−84.1%，T9 记录锚定的单口径）**，CM6 侧零 worker/字体/外部 CSS；能力为现用面超集（+SQL 关键字补全、FROM 别名感知，SQLNamespace 列槽位就绪 T14）；迁移=PoC 已换核（edit.vue 零改动），转产工作量 **~2 人日（含 PoC 基线，与 §八.4/T22 统一口径）**——裁决=升级 R4 落地卡（详见 §八.4）。〔2026-10-21 T23 对齐（评审 low#6）：原「转产余量 ~1-1.5 人日」与 §八.4「~2 人日」两口径并存，统一为后者（含 PoC 基线）；原「编辑器相关资产合计 1,078→140.70 kB」为 PoC 复合口径（JS+CSS gzip+worker/ttf 折算），分项未存档、不可从 T9 仓库记录复算，弃用，统一锚 T9 已记录的 883.22 编辑器异步 chunk gzip。〕
 
-### T18 R3 末升格评审（~1 人日）〔门槛数据=BENCHMARKS.md〕
+### T18 R3 末升格评审（~1 人日）〔门槛数据=BENCHMARKS.md〕✅
 
 - **方案**：**七项评审**——deltalake sink / DataFusion 升级 / StarRocks 事务接口 / group commit / 本地两步 WAL 五项（默认结论=排 v1.x），另加：**MQTT 源路线**（设计 §7.4 P2 序 #3、称差异化最明显，但未进任何轮次——升格 R4/v1.x 或明确砍掉）与 **S3/CDC 路线**（P2 序 #4）；**jdbc live-gate 形态裁决**（`return Ok` 计 passed vs `#[ignore]`+`--ignored`，与 conn-kafka 同裁，R3-W1 评审附议）。逐项给门槛数据（R2+R3 的 BENCHMARKS 为输入）、触发条件与结论；纪要落 `docs/dev/R3-升格评审-<date>.md`。
 - **验收**：纪要存在且七项各有结论+依据；若有升格项，转 R4 任务卡或 v1.x 议程。
 - **文件域**：docs/dev/。
+> 结果：5b44c76 T18 纪要已提交为 5b44c76（main，父 288c3cf 线性，主题逐字=docs: T18 R3 升格评审纪要——七项结论与门槛数据）。git add 严格限 docs/dev/，单文件 docs/dev/R3-升格评审-2026-10-21.md +134 行；提交 body 承载七项结论一览（① deltalake 排 v1.x 硬耦合 DF 升级；② DF 48→55 排 v1.x+RUSTSEC 硬触发器；③ StarRocks 2PC 排 v1.x 与⑤合并谱系；④ group commit 排 v1.x 先补 Doris 宏基准；⑤ 两步 WAL 排 v1.x；⑥ MQTT 不升格 R4 带 12 个月触发器；⑦a S3/CDC 排 v1.x；⑦b live-gate 裁决 #[ignore]+--include-ignored 唯一立即整改）、门槛数据锚点与门禁记录（t18-accept PASS / t18-scope 修复后 PASS）。提交后工作树干净（porcelain 空），未 push（ahead 4，留波门禁）。
 
 ### T19 SSH 部署链八步（~3 人日）〔选做〕
 
@@ -295,12 +299,13 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 - **文件域**：engine/crates/tailrace-conn-jdbc、engine/crates/tailrace-catalog（注释）、engine/crates/tailrace-parser/src/lib.rs、Cargo.lock、docs/dev/roadmap.md、docs/BENCHMARKS.md、docs/connectors/、README.md、README.zh-CN.md、CHANGELOG.md。（2026-10-21 落档勘正补入 parser 与 Cargo.lock：W2 首跑实证 parser 诊断是方案②交付；RUSTSEC-2026-0382 令 cc46490 CI 红，Cargo.lock 升级 rustls-webpki 0.103.15→0.103.16 是唯一合法修复落点。）
 > 结果：d9f51bd T23 已按波门禁指令提交为 d9f51bd（main，父 cc46490 线性，10 文件 +338/−34，含新文件 docs/connectors/jdbc.md）。staging 严格限文件域：CHANGELOG.md、Cargo.lock（授权的 rustls-webpki 0.103.16 单包门禁修复）、README.md、README.zh-CN.md、docs/BENCHMARKS.md、docs/dev/roadmap.md、tailrace-catalog/tailrace-conn-jdbc/tailrace-parser 三 crate 源、docs/connectors/jdbc.md——git status 实测无外来变更混入。提交主题与指令逐字一致，body 分段记录八项交付（low#1 FLOAT4 加宽 canonical/low#2 JDBC·JDBC_TABLE 诊断/low#3 T13 措辞/low#5 BENCHMARKS 三脚注/low#6 T17 口径统一）+门禁修复授权与验证数字（conn-jdbc 6+2+0、parser 7/catalog 4、L0 三件全绿，均上一轮实测）。未 push（留波门禁），工作树干净。
 
-### T24 R3-W2 评审尾债与文档债清偿（~1 人日）〔R3-W3 前置波 W0，2026-10-21 立项〕
+### T24 R3-W2 评审尾债与文档债清偿（~1 人日）〔R3-W3 前置波 W0，2026-10-21 立项〕✅
 
 - **现状**：R3-W2 评审 low 两条（T12 allin1 e2e 无归档脚本可复跑——live gate 静默 skip 空过；`docs/connectors/jdbc.md` §七"console 尚无 mysql/postgresql 类型"被同日 T14 过时化）+ T14 自登记文档债两笔（openapi components 缺 discover/infer-schema 新 DTO 致 swagger $ref 悬空；`docs/protocol/console-api.md` 仍留 ⛔ 501 行）。
 - **方案**：① `scripts/e2e/starrocks.sh`：把 T12 手工 e2e 固化为可重跑脚本（`TAILRACE_SR_*` 覆盖变量、`--wait` 语义、DDL/数据/断言/清理全内建；live 栈不可达时打印一行 skip 说明再空过——对齐 `tests/jdbc_sources.rs:110` 惯例）；② `docs/connectors/jdbc.md` §七改为 T14 后现状（mysql/postgresql 已登记、JDBC_KEY 派生、discover/infer-schema 通道可用），剩余缺口点名 T14 登记遗留；③ console `openapi.rs` components 补新 DTO；④ `docs/protocol/console-api.md` 同步 discover/infer-schema 真实现。
 - **验收**：`bash scripts/e2e/starrocks.sh --help` 出用法（栈不可达时 skip 行可见）；`cargo test -p tailrace-console --locked` 绿；`grep -c '501' docs/protocol/console-api.md` 对应段落归零；jdbc.md 无"尚未登记"表述。
 - **文件域**：scripts/e2e/、docs/connectors/jdbc.md、docs/protocol/console-api.md、console/crates/tailrace-console/src/openapi.rs。
+> 结果：4881c39 T24 按门禁指令提交为 4881c39（main，父 3b71f94 线性），staging 严格限 4 条文件域路径（scripts/e2e/starrocks.sh 新建可执行、docs/connectors/jdbc.md、docs/protocol/console-api.md、console/crates/tailrace-console/src/openapi.rs），+370/−9。提交主题与指令逐字一致，body 完整承载四项交付（① e2e 归档脚本含 TAILRACE_SR_* 覆盖/--wait/GRANT INSERT,SELECT ON ALL TABLES/三档断言/[skip] live-gate/T12 证据链；② jdbc.md §七 T14 后现状与剩余缺口；③ openapi 四 DTO+$ref 全文档走查测试；④ console-api.md discover/infer-schema 真实现契约）与验证数字。工作树干净，未 push。
 
 ### R3-W1 评审登记（2026-10-21）
 
@@ -314,7 +319,13 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 > 4. `console-store/src/datasources.rs:227` cursor_semantics 派生仅 kafka→KAFKA_OFFSET / file→FILE_POINTER，jdbc 落 "NONE"；当前因 console 无 mysql/postgres 数据源类型（`tailrace-console/src/api/datasources.rs:104-110` registry_type 返回 None）不可达，一旦补类型即静默误标。处置：console 域后续项——补 "jdbc"→"JDBC_KEY"（对齐 IR `Cursor::JdbcKey`），新增数据源类型时一并加测试断言。
 > 5. `docs/BENCHMARKS.md:354` §六 T20 汇总表"持平（+0.2%）"为 debug 档 / 单轮 ~3s / stats 0.5s 量化口径（文中自认 ±17%），对 <~17% 的 allocator 效应无检出力但表行不带注记；卡方案"碎片"口径无表行（仅结论段"未测"）；:356 默认档体积 264,674,112 B 与本机 target/debug 现存默认二进制（264,703,456 B、0 个 `_rjem_` 符号）不一致——基准二进制非最终提交树产物，仅标"caa842e + T20 工作树"。处置：表行加脚注（debug/短跑/量化误差）、补"碎片：未测"行、记录基准二进制对应精确树；release 长跑补测后再下 allocator 结论。
 > 6. `docs/dev/roadmap.md:251` T17 结果"转产余量 ~1-1.5 人日"与 §八.4（:201）"估 ~2 人日"两个工作量口径；"1,078 kB" monaco 资产合计仅见于 T17 文本，T9 记录（:130）只有 883.22 kB gzip 与 CSS/ttf/worker raw 字节、无 gzip 值与折算规则，不可从仓库复算（883.22→140.45 / −84.1% 两处一致且锚定 T9；PoC 7f32c26 未混入 main）。处置：统一一个工作量数字并说明是否含 PoC 基线；补 1,078 的分项或改用 T9 已记录的 883.22 单口径。
-> 7. （附，评审建议未采纳项）`jdbc_sources` 未门控时以 `return Ok` 跳过并计 passed（conn-kafka 同款 live-gate 惯例）：评审建议改 `#[ignore]`+`--ignored` 使跳过在计数中可见——本波只补 CI 真库覆盖，门控形态留作后续项与 conn-kafka 一并裁决。
+> 7. （附，评审建议未采纳项）`jdbc_sources` 未门控时以 `return Ok` 跳过并计 passed（conn-kafka 同款 live-gate 惯例）：评审建议改 `#[ignore]`+`--ignored` 使跳过在计数中可见——本波只补 CI 真库覆盖，门控形态留作后续项与 conn-kafka 一并裁决。〔2026-10-21 T18 ⑦b 已裁决采纳本条建议：改 `#[ignore]` + CI `--include-ignored`（本次评审唯一立即整改，~0.5 人日，建议 R4-W0 小卡；5 测+jdbc/kafka/chaos 三处、ci.yml:125-130 追加，见 T18 卡与纪要 ⑦b）——裁决已立、实施待 R4-W0。〕
+
+### R3-W3 评审登记（2026-10-21）
+
+> **medium 一条已修+勘误一并（修复提交 6f855f7，main，父 5b44c76）**：T16 workspace 级 `default-features = false` 后，tests/contract 单包构建（`cargo test -p tests-contract --locked`）得零连接器 runtime——spawn_node→`PipelineRegistry::new`→`default_registry()` 注册表为空，executor_loop 3/3 FAILED（"源类型未支持：file"），与套件自述 file→file 矛盾；CI rust job 跑 `--workspace` 因与 node 默认 feature 统一而掩盖。修复=该套件 manifest 显式 `tailrace-runtime` `features=["connector-file"]`（套件仅行使 file→file：executor_loop.rs:33/43、lib.rs:103 均 kind:"file"），Cargo.lock 零变动；同笔勘误 BENCHMARKS §6.2 与根 Cargo.toml 注释——原「tests/contract 与 api 均不实例化连接器，两者零改动」对 api 成立、对 tests/contract 不实（spawn_node 走 default_registry() 是真注册连接器的）。验证（本机 CARGO_PROFILE_DEV_DEBUG=0，--locked 全程）：修复前 3/3 FAILED 复现→修复后 executor_loop 3+v1_protocol 4 全绿；`-p tailrace-api -p console-store` 22+15 绿（CI macos job 命令）；`--workspace` 176 passed/0 failed/2 ignored（与评审基线一致）；Cargo.lock 零 diff。
+>
+> **low 一条仅登记未修（BENCHMARKS §6.3 已记，与 latest+subscribe 窄窗同批）**：分区发现单向（只增不减）——30s 差异对比只处理新分区（conn-kafka lib.rs:222-251），分区消失后 offsets 陈旧项永不清理，TPL 重建（lib.rs:260-263）与 `cursor()` 携带死分区项；现实触发面窄（Kafka `--alter` 不能减分区），收缩侧剔除+topic 重建回归测试与窄窗修复同批留待（窄窗已排 v1.x、届时并入 split 化同张热路径卡，T18 纪要 :131）。
 
 ## 十、R3 波次编排（文件域冲突分析，动工前按最终文件域复核）
 
