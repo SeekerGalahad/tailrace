@@ -33,6 +33,10 @@ console-auth = { workspace = true }
 console-proxy = { workspace = true }
 tailrace-parser = { workspace = true }
 tailrace-catalog = { workspace = true }
+# T14 discover / infer-schema: engine metadata clients embedded console-side
+# (same pattern as the local compile parser; sqlx subcrates unify with
+# conn-jdbc through the workspace table).
+tailrace-metadata = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }

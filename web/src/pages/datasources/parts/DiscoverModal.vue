@@ -19,6 +19,7 @@ import {
   datasourcesApi,
   type Datasource,
   type DiscoveredAsset,
+  type InferSchemaResponse,
 } from '../../../api/datasources'
 import MonoField from '../../../components/MonoField.vue'
 import StateTag from '../../../components/StateTag.vue'
@@ -102,6 +103,18 @@ function assetKey(a: DiscoveredAsset): string {
   return `${a.dbName}.${a.tableName}`
 }
 
+/** Kafka dot-less topics carry an empty logical db — show the bare table. */
+function assetLabel(a: DiscoveredAsset): string {
+  return a.dbName ? `${a.dbName}.${a.tableName}` : a.tableName
+}
+
+/**
+ * T14: infer-schema also returns the decode format kafka samples suggest
+ * ("ogg" | "json" | null); the shared api client type hasn't been widened
+ * yet (web/src/api is outside this card's file domain) — widen locally.
+ */
+type InferSchemaWithFormat = InferSchemaResponse & { format?: string | null }
+
 const checkedKeys = ref<string[]>([])
 
 // --- per-row registration results ---
@@ -125,18 +138,20 @@ async function registerSelected(): Promise<void> {
       const key = assetKey(asset)
       if (!checkedKeys.value.includes(key)) continue
       try {
-        // columns come from the no-persist inference endpoint (§4.2)
-        const schema = await datasourcesApi.inferSchema(
+        // columns come from the no-persist inference endpoint (§4.2); the
+        // same call reports the decode format kafka samples suggest (e.g.
+        // ogg vs json) — persist it with the table so decode matches
+        const schema = (await datasourcesApi.inferSchema(
           ds.id,
           { dbName: asset.dbName, tableName: asset.tableName, format: asset.format },
           { silent: true },
-        )
+        )) as InferSchemaWithFormat
         await datasourcesApi.registerTable(
           ds.id,
           {
             dbName: asset.dbName,
             tableName: asset.tableName,
-            format: asset.format,
+            format: schema.format ?? asset.format,
             columnsJson: schema.columns,
           },
           { silent: true },
@@ -169,9 +184,13 @@ const columns = computed<DataTableColumns<DiscoveredAsset>>(() => [
   {
     title: '资产',
     key: 'asset',
-    render: (row) => h(MonoField, { value: assetKey(row), headChars: 0 }),
+    render: (row) => h(MonoField, { value: assetLabel(row), headChars: 0 }),
   },
-  { title: '逻辑库', key: 'dbName' },
+  {
+    title: '逻辑库',
+    key: 'dbName',
+    render: (row) => (row.dbName ? row.dbName : '—'),
+  },
   {
     title: '类别',
     key: 'kind',

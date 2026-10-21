@@ -4885,6 +4885,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tailrace-catalog",
+ "tailrace-metadata",
  "tailrace-parser",
  "tokio",
  "tokio-stream",
@@ -4920,6 +4921,22 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "tailrace-metadata"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rdkafka",
+ "serde_json",
+ "sqlx-core",
+ "sqlx-mysql",
+ "sqlx-postgres",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

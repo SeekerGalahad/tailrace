@@ -97,6 +97,36 @@ fn registry() -> Vec<DatasourceType> {
                 placeholder: Some("/data/inbox/orders".into()),
             }],
         },
+        // jdbc family (T14 ← R3-W1 review low#4): the MySQL/PostgreSQL batch
+        // sources conn-jdbc serves (kind "jdbc", cursor JDBC_KEY). Same
+        // jdbcUrl field shape as doris so the probe / discover parsers are
+        // shared; credentials ride the sealed credential split.
+        DatasourceType {
+            ty: "mysql".into(),
+            label: "MySQL（JDBC 批源）".into(),
+            family: "jdbc".into(),
+            credential_label: Some("数据库账号".into()),
+            fields: vec![TypeField {
+                name: "jdbcUrl".into(),
+                label: "JDBC URL".into(),
+                input_type: "text".into(),
+                required: true,
+                placeholder: Some("jdbc:mysql://10.1.1.7:3306/shop".into()),
+            }],
+        },
+        DatasourceType {
+            ty: "postgresql".into(),
+            label: "PostgreSQL（JDBC 批源）".into(),
+            family: "jdbc".into(),
+            credential_label: Some("数据库账号".into()),
+            fields: vec![TypeField {
+                name: "jdbcUrl".into(),
+                label: "JDBC URL".into(),
+                input_type: "text".into(),
+                required: true,
+                placeholder: Some("jdbc:postgresql://10.1.1.8:5432/shop".into()),
+            }],
+        },
     ]
 }
 
@@ -106,6 +136,8 @@ fn registry_type(ty: &str) -> Option<&'static str> {
         "kafka" => Some("kafka"),
         "doris" => Some("doris"),
         "file" => Some("file"),
+        "mysql" => Some("mysql"),
+        "postgresql" => Some("postgresql"),
         _ => None,
     }
 }
@@ -116,7 +148,20 @@ fn required_conn_keys(ty: &str) -> &'static [&'static str] {
         "kafka" => &["bootstrap"],
         "doris" => &["jdbcUrl", "streamLoadUrl"],
         "file" => &["path"],
+        "mysql" | "postgresql" => &["jdbcUrl"],
         _ => &[],
+    }
+}
+
+/// Table-object kind for a datasource type (the console-store
+/// `cursor_semantics` derivation keys off this: kafka → KAFKA_OFFSET, file →
+/// FILE_POINTER, jdbc → JDBC_KEY, else NONE). The mysql/postgresql types
+/// both register `jdbc` objects — the conn-jdbc kind (IR `Cursor::JdbcKey`).
+fn table_kind_for(ds_type: &str) -> &str {
+    match ds_type {
+        "doris" | "starrocks" => "doris",
+        "mysql" | "postgresql" => "jdbc",
+        other => other,
     }
 }
 
@@ -228,8 +273,108 @@ pub struct TableListResponse {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct DiscoverBody {
     pub sample_rows: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredAssetDto {
+    pub db_name: String,
+    pub table_name: String,
+    /// Table-object kind the register step derives (kafka/doris/jdbc).
+    pub kind: String,
+    /// Decode format hint (null: not applicable / to be inferred).
+    pub format: Option<String>,
+    /// Kafka topic partition count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partitions: Option<i32>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DiscoverResponse {
+    pub assets: Vec<DiscoveredAssetDto>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct InferSchemaBody {
+    pub db_name: String,
+    pub table_name: String,
+    pub format: Option<String>,
+    /// Kafka only: how many tail messages to sample (default 20, clamped
+    /// 1..=100).
+    pub sample_rows: Option<i64>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct InferSchemaResponse {
+    /// (column, arrow-type-name) pairs — the runtime's `arrow_type`
+    /// vocabulary: int64 / float64 / bool / utf8.
+    pub columns: Vec<(String, String)>,
+    /// Kafka only: the decode format the samples suggest ("ogg" / "json");
+    /// null for SQL backends (no decode layer).
+    pub format: Option<String>,
+}
+
+// ---------------- discover cache (T14: console 转发并缓存) ----------------
+
+/// Successes only, invalidated by a TTL and by key change; failures are
+/// never cached so a retry after fixing conn params always re-probes.
+const DISCOVER_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Process-wide cache keyed by the full identity of what was probed —
+/// datasource id + generation + the exact connJson — so an entry is only
+/// reused for a byte-identical query (a pure-function cache: cross-request
+/// sharing of identical answers is the point; any edit changes the key).
+/// Kept here rather than AppState so the module stays self-contained
+/// (T14 file domain: this file only).
+type DiscoverCacheMap = std::collections::HashMap<(i64, i64, String), CachedDiscover>;
+static DISCOVER_CACHE: std::sync::OnceLock<std::sync::Mutex<DiscoverCacheMap>> =
+    std::sync::OnceLock::new();
+
+struct CachedDiscover {
+    at: std::time::Instant,
+    assets: std::sync::Arc<Vec<DiscoveredAssetDto>>,
+}
+
+fn cache_get(
+    id: i64,
+    generation: i64,
+    conn_json: &str,
+) -> Option<std::sync::Arc<Vec<DiscoveredAssetDto>>> {
+    let cache = DISCOVER_CACHE.get_or_init(Default::default);
+    let mut map = cache.lock().ok()?;
+    let key = (id, generation, conn_json.to_string());
+    match map.get_mut(&key) {
+        Some(c) if c.at.elapsed() < DISCOVER_TTL => Some(c.assets.clone()),
+        // stale (TTL) → drop so the miss path refetches
+        Some(_) => {
+            map.remove(&key);
+            None
+        }
+        None => None,
+    }
+}
+
+fn cache_put(
+    id: i64,
+    generation: i64,
+    conn_json: &str,
+    assets: std::sync::Arc<Vec<DiscoveredAssetDto>>,
+) {
+    let cache = DISCOVER_CACHE.get_or_init(Default::default);
+    if let Ok(mut map) = cache.lock() {
+        map.insert(
+            (id, generation, conn_json.to_string()),
+            CachedDiscover {
+                at: std::time::Instant::now(),
+                assets,
+            },
+        );
+    }
 }
 
 // ---------------- handlers ----------------
@@ -264,7 +409,7 @@ fn validate_upsert(body: &DatasourceUpsertBody) -> Result<String, Response> {
     }
     let Some(ty) = registry_type(&body.ty) else {
         return Err(ApiError::bad_request(format!(
-            "未知数据源类型 {}（注册表：kafka/doris/file）",
+            "未知数据源类型 {}（注册表：kafka/doris/file/mysql/postgresql）",
             body.ty
         ))
         .into_response());
@@ -651,61 +796,345 @@ async fn run_probe(ty: &str, conn_json: &Value) -> (bool, Response) {
             ApiError::bad_request(format!("未知数据源类型 {ty}")).into_response(),
         );
     }
-    let r = console_proxy::probe_datasource(ty, conn_json).await;
+    let r = match ty {
+        // jdbc family (T14 registry addition): the shared probe crate's
+        // registry has no mysql/postgresql arms yet — same semantics as its
+        // TCP probes, run console-side (one endpoint, 3s ceiling)
+        "mysql" | "postgresql" => {
+            let o = probe_jdbc_url(conn_json).await;
+            (o.ok, o.message, o.latency_ms)
+        }
+        _ => {
+            let p = console_proxy::probe_datasource(ty, conn_json).await;
+            (p.ok, p.message, p.latency_ms)
+        }
+    };
     let resp = Json(TestResponse {
-        status: if r.ok {
+        status: if r.0 {
             "CONN_OK".into()
         } else {
             "CONN_FAIL".into()
         },
-        message: r.message,
-        latency_ms: r.latency_ms,
+        message: r.1,
+        latency_ms: r.2,
     });
-    (r.ok, resp.into_response())
+    (r.0, resp.into_response())
 }
 
-/// `POST /api/datasources/{id}/discover` — TODO(§4.2 v1 minimal set, not yet
-/// implemented): real discovery needs live metadata clients (Kafka topic
-/// listing / Doris SHOW TABLES) the console does not embed yet. Note: what
-/// §4.2 actually defers to P2 is the catalog snapshot browser / sample
-/// preview / impact-analysis family — discover/infer-schema themselves are
-/// v1 scope and land once the metadata clients do.
+/// Local probe outcome (console_proxy::ProbeResult is not re-exported).
+struct ProbeOutcome {
+    ok: bool,
+    message: String,
+    latency_ms: u64,
+}
+
+/// TCP reachability of the jdbcUrl's host:port for mysql/postgresql
+/// datasources (mirrors the doris FE arm's semantics: 200 with CONN_OK /
+/// CONN_FAIL, never an error status).
+async fn probe_jdbc_url(conn_json: &Value) -> ProbeOutcome {
+    let started = std::time::Instant::now();
+    let url = conn_json
+        .get("jdbcUrl")
+        .and_then(Value::as_str)
+        .map(str::trim);
+    let Some(url) = url else {
+        return ProbeOutcome {
+            ok: false,
+            message: "connJson 缺少 jdbcUrl".into(),
+            latency_ms: started.elapsed().as_millis() as u64,
+        };
+    };
+    let Some((host, port, _db)) = jdbc_endpoint(url) else {
+        return ProbeOutcome {
+            ok: false,
+            message: format!("jdbcUrl 无法解析（需 host:port）: {url}"),
+            latency_ms: started.elapsed().as_millis() as u64,
+        };
+    };
+    let addr = format!("{host}:{port}");
+    let outcome = match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(format!("{addr}: {e}")),
+        Err(_) => Err(format!("{addr}: 超时 (>3s)")),
+    };
+    ProbeOutcome {
+        ok: outcome.is_ok(),
+        message: match outcome {
+            Ok(()) => format!("jdbc server 可达（{addr}）"),
+            Err(msg) => format!("jdbc server 不可达: {msg}"),
+        },
+        latency_ms: started.elapsed().as_millis() as u64,
+    }
+}
+
+/// Unsealed credential halves for a stored datasource (§5.3: opened in
+/// memory for one call, never logged, never returned).
+struct CredentialPair {
+    username: String,
+    password: String,
+}
+
+fn unsealed_credential(state: &AppState, id: i64) -> Result<Option<CredentialPair>, Response> {
+    let Some(c) = state.store().credential(id).ok().flatten() else {
+        return Ok(None);
+    };
+    let plain = state
+        .cipher()
+        .open(&c.nonce, &c.ciphertext)
+        .map_err(|e| ApiError::internal(&e).into_response())?;
+    let v: Value = serde_json::from_str(&plain)
+        .map_err(|e| ApiError::internal(&(e.into())).into_response())?;
+    Ok(Some(CredentialPair {
+        username: v
+            .get("username")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        password: v
+            .get("password")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    }))
+}
+
+/// "jdbc:mysql://fe-1:9030/shop?x=1" → ("fe-1", 9030, Some("shop")). Port is
+/// mandatory (the probe parser takes the same stance).
+fn jdbc_endpoint(url: &str) -> Option<(String, u16, Option<String>)> {
+    let rest = url.split_once("://")?.1;
+    let (hostport, tail) = rest.split_once('/').unwrap_or((rest, ""));
+    let hostport = hostport.split('?').next()?;
+    let (host, port) = hostport.rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    if host.is_empty() {
+        return None;
+    }
+    let database = tail.split('?').next().filter(|s| !s.is_empty());
+    Some((host.to_string(), port, database.map(str::to_string)))
+}
+
+/// Datasource row → metadata-client ConnSpec (T14): connJson shape plus the
+/// unsealed credential. Err(Response) = 400-shaped shape problems.
+fn conn_spec(
+    state: &AppState,
+    ds: &console_store::Datasource,
+) -> Result<tailrace_metadata::ConnSpec, Response> {
+    let conn: Value = serde_json::from_str(&ds.conn_json).unwrap_or(Value::Null);
+    let cred = unsealed_credential(state, ds.id)?;
+    let str_field = |k: &str| {
+        conn.get(k)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    match ds.ds_type.as_str() {
+        "kafka" => match str_field("bootstrap") {
+            Some(bootstrap) => Ok(tailrace_metadata::ConnSpec::Kafka {
+                bootstrap: bootstrap.to_string(),
+            }),
+            None => Err(ApiError::bad_request("connJson 缺少 bootstrap").into_response()),
+        },
+        "doris" | "mysql" => {
+            let url = str_field("jdbcUrl")
+                .ok_or_else(|| ApiError::bad_request("connJson 缺少 jdbcUrl").into_response())?;
+            let (host, port, database) = jdbc_endpoint(url).ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "jdbcUrl 无法解析（需 jdbc:mysql://host:port/db）: {url}"
+                ))
+                .into_response()
+            })?;
+            Ok(tailrace_metadata::ConnSpec::MySql {
+                host,
+                port,
+                database,
+                username: cred
+                    .as_ref()
+                    .map(|c| c.username.clone())
+                    .unwrap_or_default(),
+                password: cred
+                    .as_ref()
+                    .map(|c| c.password.clone())
+                    .unwrap_or_default(),
+            })
+        }
+        "postgresql" => {
+            let url = str_field("jdbcUrl")
+                .ok_or_else(|| ApiError::bad_request("connJson 缺少 jdbcUrl").into_response())?;
+            let (host, port, database) = jdbc_endpoint(url).ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "jdbcUrl 无法解析（需 jdbc:postgresql://host:port/db）: {url}"
+                ))
+                .into_response()
+            })?;
+            Ok(tailrace_metadata::ConnSpec::Postgres {
+                host,
+                port,
+                database,
+                username: cred
+                    .as_ref()
+                    .map(|c| c.username.clone())
+                    .unwrap_or_default(),
+                password: cred
+                    .as_ref()
+                    .map(|c| c.password.clone())
+                    .unwrap_or_default(),
+            })
+        }
+        "file" => Err(ApiError::bad_request(
+            "文件数据源不支持发现（路径下的文件请直接登记表对象）",
+        )
+        .into_response()),
+        other => Err(ApiError::bad_request(format!("未知数据源类型 {other}")).into_response()),
+    }
+}
+
+/// 502 for backend-side failures (unreachable broker / auth refused) — the
+/// request was well-formed, the datasource is not answering.
+fn unavailable(context: &str, e: anyhow::Error) -> Response {
+    ApiError::new(
+        axum::http::StatusCode::BAD_GATEWAY,
+        "UNAVAILABLE",
+        format!("{context}: {e}"),
+    )
+    .into_response()
+}
+
+/// `POST /api/datasources/{id}/discover` (T14): forward to the engine
+/// metadata client (embedded, same pattern as the local compile parser) and
+/// cache successes for `DISCOVER_TTL` keyed by (id, generation). Kafka
+/// topics map to assets via the first-dot split; SQL backends list tables
+/// per (schema-restricted) database.
 #[utoipa::path(
     post,
     path = "/api/datasources/{id}/discover",
     request_body = DiscoverBody,
     params(("id" = i64, Path)),
-    responses((status = 501, body = ErrorResponse, description = "v1 minimal-set member, metadata clients not yet embedded"))
-)]
-pub async fn discover(
-    State(_state): State<AppState>,
-    Path(id): Path<i64>,
-    _body: Bytes,
-) -> Response {
-    let _ = id;
-    crate::api::not_implemented(
-        "数据源发现（discover）",
-        "v1 最小集成员：需要 Kafka/Doris 元数据客户端，尚未交付",
+    responses(
+        (status = 200, body = DiscoverResponse),
+        (status = 400, body = ErrorResponse, description = "type/connJson not discoverable"),
+        (status = 404, body = ErrorResponse),
+        (status = 502, body = ErrorResponse, description = "UNAVAILABLE — datasource reachable-check failed"),
     )
-    .into_response()
+)]
+pub async fn discover(State(state): State<AppState>, Path(id): Path<i64>, body: Bytes) -> Response {
+    // sampleRows is accepted (wire shape the web sends) but listing itself
+    // samples nothing — only infer-schema does; keep the parse so a
+    // malformed body still 400s.
+    let _body: DiscoverBody = match parse_body(&body) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let store = state.store();
+    let Some(ds) = store.datasource(id).ok().flatten() else {
+        return ApiError::not_found(format!("数据源 #{id} 不存在")).into_response();
+    };
+    if let Some(assets) = cache_get(id, ds.generation, &ds.conn_json) {
+        return Json(DiscoverResponse {
+            assets: (*assets).clone(),
+        })
+        .into_response();
+    }
+    let spec = match conn_spec(&state, &ds) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let kind = table_kind_for(&ds.ds_type).to_string();
+    match tailrace_metadata::discover(&spec).await {
+        Ok(assets) => {
+            let assets: Vec<DiscoveredAssetDto> = assets
+                .into_iter()
+                .map(|a| DiscoveredAssetDto {
+                    db_name: a.db_name,
+                    table_name: a.table_name,
+                    kind: kind.clone(),
+                    format: None,
+                    partitions: a.partitions,
+                })
+                .collect();
+            cache_put(
+                id,
+                ds.generation,
+                &ds.conn_json,
+                std::sync::Arc::new(assets.clone()),
+            );
+            Json(DiscoverResponse { assets }).into_response()
+        }
+        Err(e) => unavailable("数据源探测失败", e),
+    }
 }
 
-/// `POST /api/datasources/{id}/infer-schema` — TODO(§4.2 v1 minimal set):
-/// same metadata-client dependency as discover (see the note there — v1
-/// scope, not part of the P2 deferral).
+/// `POST /api/datasources/{id}/infer-schema` (T14): Kafka samples the topic
+/// tail and infers columns through the decode chain's typed lattice (plus a
+/// detected decode format); SQL backends read DDL column types. Nothing is
+/// persisted — the register step (POST /tables) does that.
 #[utoipa::path(
     post,
     path = "/api/datasources/{id}/infer-schema",
+    request_body = InferSchemaBody,
     params(("id" = i64, Path)),
-    responses((status = 501, body = ErrorResponse))
-)]
-pub async fn infer_schema(State(_state): State<AppState>, Path(id): Path<i64>) -> Response {
-    let _ = id;
-    crate::api::not_implemented(
-        "模式推断（infer-schema）",
-        "v1 最小集成员：与 discover 同依赖（Kafka/Doris 元数据客户端），尚未交付",
+    responses(
+        (status = 200, body = InferSchemaResponse),
+        (status = 400, body = ErrorResponse, description = "bad db/table/format"),
+        (status = 404, body = ErrorResponse),
+        (status = 502, body = ErrorResponse, description = "UNAVAILABLE — backend query failed"),
     )
-    .into_response()
+)]
+pub async fn infer_schema(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    body: Bytes,
+) -> Response {
+    let body: InferSchemaBody = match parse_body(&body) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if body.db_name.trim().is_empty() || body.table_name.trim().is_empty() {
+        return ApiError::bad_request("缺少 dbName / tableName").into_response();
+    }
+    let store = state.store();
+    let Some(ds) = store.datasource(id).ok().flatten() else {
+        return ApiError::not_found(format!("数据源 #{id} 不存在")).into_response();
+    };
+    let spec = match conn_spec(&state, &ds) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if matches!(spec, tailrace_metadata::ConnSpec::Kafka { .. }) {
+        // client-input format problems 400 before any backend is touched
+        // (csv/parquet have no self-describing samples; unknown names too)
+        match body.format.as_deref() {
+            Some("ogg") | Some("json") | Some("jsonl") | None => {}
+            Some(other) => {
+                return ApiError::bad_request(format!(
+                    "kafka 样本推断不支持格式 {other:?}（ogg/json/jsonl；csv/parquet 请手工登记列）"
+                ))
+                .into_response()
+            }
+        }
+    }
+    // sample-row clamp (kafka sampling breadth; ignored by SQL backends)
+    let sample_rows = body.sample_rows.unwrap_or(20).clamp(1, 100) as usize;
+    match tailrace_metadata::infer_schema(
+        &spec,
+        body.db_name.trim(),
+        body.table_name.trim(),
+        body.format.as_deref(),
+        sample_rows,
+    )
+    .await
+    {
+        Ok(schema) => Json(InferSchemaResponse {
+            columns: schema.columns,
+            format: schema.format,
+        })
+        .into_response(),
+        Err(e) => unavailable("模式推断失败", e),
+    }
 }
 
 /// `POST /api/datasources/{id}/tables` — register a table object (§4.2 v1
@@ -740,11 +1169,9 @@ pub async fn register_table(
     let Some(ds) = store.datasource(id).ok().flatten() else {
         return ApiError::not_found(format!("数据源 #{id} 不存在")).into_response();
     };
-    // kind derives from the datasource type (kafka ds → kafka table …)
-    let kind = match ds.ds_type.as_str() {
-        "doris" | "starrocks" => "doris",
-        other => other,
-    };
+    // kind derives from the datasource type (kafka ds → kafka table …,
+    // mysql/postgresql ds → jdbc objects — see table_kind_for)
+    let kind = table_kind_for(&ds.ds_type).to_string();
     let columns_json = body
         .columns_json
         .as_ref()
@@ -753,7 +1180,7 @@ pub async fn register_table(
         id,
         body.db_name.trim(),
         body.table_name.trim(),
-        kind,
+        &kind,
         body.format.as_deref(),
         columns_json.as_deref(),
     ) {
@@ -867,4 +1294,57 @@ pub async fn remove_table(
         Some(json!({"datasourceId": t.datasource_id, "dbName": t.db_name, "tableName": t.table_name}).to_string()),
     );
     axum::http::StatusCode::NO_CONTENT.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn asset(name: &str) -> DiscoveredAssetDto {
+        DiscoveredAssetDto {
+            db_name: "shop".into(),
+            table_name: name.into(),
+            kind: "kafka".into(),
+            format: None,
+            partitions: Some(1),
+        }
+    }
+
+    /// T14 cache contract: a fresh hit returns the stored assets; any key
+    /// change (generation bump = config edit, or a different connJson / id)
+    /// misses. Failures are never inserted (the handler only caches Ok).
+    #[test]
+    fn discover_cache_key_invalidation() {
+        cache_put(
+            7,
+            3,
+            r#"{"bootstrap":"a:9092"}"#,
+            std::sync::Arc::new(vec![asset("orders")]),
+        );
+        let hit = cache_get(7, 3, r#"{"bootstrap":"a:9092"}"#).expect("fresh entry");
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].table_name, "orders");
+        // generation bump (config edit) misses
+        assert!(
+            cache_get(7, 4, r#"{"bootstrap":"a:9092"}"#).is_none(),
+            "generation bump busts the entry"
+        );
+        // same generation but edited connJson misses
+        assert!(
+            cache_get(7, 3, r#"{"bootstrap":"b:9092"}"#).is_none(),
+            "connJson change busts the entry"
+        );
+        cache_put(
+            7,
+            4,
+            r#"{"bootstrap":"a:9092"}"#,
+            std::sync::Arc::new(vec![asset("orders"), asset("bills")]),
+        );
+        let hit = cache_get(7, 4, r#"{"bootstrap":"a:9092"}"#).expect("re-populated");
+        assert_eq!(hit.len(), 2);
+        assert!(
+            cache_get(8, 3, r#"{"bootstrap":"a:9092"}"#).is_none(),
+            "other id misses"
+        );
+    }
 }

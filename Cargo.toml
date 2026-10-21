@@ -22,6 +22,7 @@ members = [
     "engine/crates/tailrace-state",
     "engine/crates/tailrace-catalog",
     "engine/crates/tailrace-runtime",
+    "engine/crates/tailrace-metadata",
     "engine/crates/tailrace-api",
     # console
     "console/crates/tailrace-console",
@@ -142,6 +143,7 @@ tailrace-parser = { path = "engine/crates/tailrace-parser", version = "0.1.0" }
 tailrace-state = { path = "engine/crates/tailrace-state", version = "0.1.0" }
 tailrace-catalog = { path = "engine/crates/tailrace-catalog", version = "0.1.0" }
 tailrace-runtime = { path = "engine/crates/tailrace-runtime", version = "0.1.0" }
+tailrace-metadata = { path = "engine/crates/tailrace-metadata", version = "0.1.0" }
 tailrace-api = { path = "engine/crates/tailrace-api", version = "0.1.0" }
 console-store = { path = "console/crates/console-store", version = "0.1.0" }
 console-auth = { path = "console/crates/console-auth", version = "0.1.0" }

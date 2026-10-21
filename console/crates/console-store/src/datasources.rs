@@ -212,8 +212,11 @@ impl Store {
     }
 
     /// Register a table object (§4.2). `cursor_semantics` derives from the
-    /// kind: kafka → KAFKA_OFFSET, file → FILE_POINTER, else NONE. Errors with
-    /// a constraint violation when (datasource, db, table) already exists.
+    /// kind: kafka → KAFKA_OFFSET, file → FILE_POINTER, jdbc → JDBC_KEY
+    /// (IR `Cursor::JdbcKey`, the mysql/postgresql batch sources — T14 ←
+    /// R3-W1 review low#4), else NONE (doris/starrocks sinks carry no
+    /// cursor). Errors with a constraint violation when (datasource, db,
+    /// table) already exists.
     pub fn insert_table_object(
         &self,
         datasource_id: i64,
@@ -226,6 +229,7 @@ impl Store {
         let cursor = match kind {
             "kafka" => "KAFKA_OFFSET",
             "file" => "FILE_POINTER",
+            "jdbc" => "JDBC_KEY",
             _ => "NONE",
         };
         self.with_conn(|conn| {
@@ -392,6 +396,31 @@ mod tests {
         assert_eq!(to.table_name, "orders");
         assert_eq!(to.cursor_semantics, "KAFKA_OFFSET");
         assert_eq!(to.source, "manual");
+        // jdbc derivation (T14 ← R3-W1 low#4): IR Cursor::JdbcKey — the
+        // mysql/postgresql batch sources register kind "jdbc" table objects
+        let jdbc_t = store
+            .insert_table_object(id, "shop", "mysql_src", "jdbc", Some("json"), None)
+            .unwrap();
+        assert_eq!(
+            store
+                .table_object(jdbc_t)
+                .unwrap()
+                .unwrap()
+                .cursor_semantics,
+            "JDBC_KEY"
+        );
+        // sink kinds stay cursor-less
+        let doris_t = store
+            .insert_table_object(id, "ods", "orders", "doris", None, None)
+            .unwrap();
+        assert_eq!(
+            store
+                .table_object(doris_t)
+                .unwrap()
+                .unwrap()
+                .cursor_semantics,
+            "NONE"
+        );
         assert_eq!(
             store
                 .table_object_by_ref(id, "shop", "orders")
@@ -404,7 +433,8 @@ mod tests {
         assert!(store
             .insert_table_object(id, "shop", "orders", "kafka", None, None)
             .is_err());
-        assert_eq!(store.table_count(id).unwrap(), 1);
+        // kafka + jdbc + doris registrations above
+        assert_eq!(store.table_count(id).unwrap(), 3);
         assert_eq!(
             store
                 .list_table_objects(Some(id), Some("kafka"))

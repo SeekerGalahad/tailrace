@@ -1,0 +1,28 @@
+[package]
+name = "tailrace-metadata"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Metadata clients for console discover / infer-schema: Kafka topic listing + tail sampling (rdkafka), Doris FE / MySQL SHOW-DESC over the MySQL wire protocol, PostgreSQL catalog (sqlx subcrates)"
+
+[dependencies]
+anyhow = "1"
+tracing = { workspace = true }
+tokio = { workspace = true }
+rdkafka = { workspace = true }
+serde_json = { workspace = true }
+# T14 driver reuse (same subcrate discipline as conn-jdbc/T13 — see the
+# workspace table note: no `sqlx` facade, no tls feature, so rustls/
+# native-tls/aws-lc stay out of the graph; versions unify with conn-jdbc
+# through the single workspace entry).
+sqlx-core = { workspace = true }
+sqlx-mysql = { workspace = true }
+sqlx-postgres = { workspace = true }
+
+[dev-dependencies]
+# T14 live tests: ephemeral Kafka (apache native image) and mysql:8.0 /
+# postgres:15 under TAILRACE_TESTCONTAINERS=1 — same live-gate convention as
+# conn-kafka / conn-jdbc (tags pinned to the preheated local images).
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }

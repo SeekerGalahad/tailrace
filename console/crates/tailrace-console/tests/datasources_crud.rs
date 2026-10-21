@@ -28,7 +28,8 @@ async fn datasource_types_registry_shape() {
     let (s, b) = req(&app, "GET", "/api/datasource-types", None).await;
     assert_eq!(s, StatusCode::OK);
     let types = b["types"].as_array().unwrap();
-    assert_eq!(types.len(), 3, "{b}");
+    // T14 + low#4: kafka/doris/file + the jdbc family (mysql/postgresql)
+    assert_eq!(types.len(), 5, "{b}");
     assert_eq!(types[0]["type"], "kafka");
     assert_eq!(types[0]["fields"][0]["name"], "bootstrap");
     assert_eq!(types[0]["fields"][0]["required"], true);
@@ -36,6 +37,14 @@ async fn datasource_types_registry_shape() {
     assert_eq!(types[1]["credentialLabel"], "数据库账号");
     assert_eq!(types[1]["fields"].as_array().unwrap().len(), 3);
     assert_eq!(types[2]["type"], "file");
+    assert_eq!(types[3]["type"], "mysql");
+    assert_eq!(types[3]["family"], "jdbc");
+    assert_eq!(types[3]["credentialLabel"], "数据库账号");
+    assert_eq!(types[3]["fields"][0]["name"], "jdbcUrl");
+    assert_eq!(types[3]["fields"][0]["required"], true);
+    assert_eq!(types[4]["type"], "postgresql");
+    assert_eq!(types[4]["family"], "jdbc");
+    assert_eq!(types[4]["fields"][0]["name"], "jdbcUrl");
 }
 
 #[tokio::test]
@@ -47,11 +56,26 @@ async fn datasource_crud_probe_and_tables() {
         &app,
         "POST",
         "/api/datasources",
-        Some(json!({"name": "x", "type": "mysql", "connJson": {}})),
+        Some(json!({"name": "x", "type": "oracle", "connJson": {}})),
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
     assert_eq!(b["error"]["code"], "INVALID_ARGUMENT");
+    // jdbc family is a first-class registry member now (T14 low#4): the
+    // mysql type itself passes the gate and only trips the missing-key
+    // precheck
+    let (s, b) = req(
+        &app,
+        "POST",
+        "/api/datasources",
+        Some(json!({"name": "x", "type": "mysql", "connJson": {}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert!(
+        b["error"]["message"].as_str().unwrap().contains("jdbcUrl"),
+        "{b}"
+    );
     let (s, b) = req(
         &app,
         "POST",
@@ -294,7 +318,9 @@ async fn datasource_crud_probe_and_tables() {
     let (s, _b) = req(&app, "GET", &format!("/api/datasources/{id}"), None).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 
-    // discover / infer-schema: honest 501 markers
+    // discover / infer-schema: real handlers now (T14) — the seeded doris
+    // endpoint is a dead loopback port, so both dial out and report the
+    // backend failure as 502 UNAVAILABLE
     let (s, b) = req(
         &app,
         "POST",
@@ -302,8 +328,8 @@ async fn datasource_crud_probe_and_tables() {
         Some(json!({"sampleRows": 20})),
     )
     .await;
-    assert_eq!(s, StatusCode::NOT_IMPLEMENTED, "{b}");
-    assert_eq!(b["error"]["code"], "NOT_IMPLEMENTED");
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{b}");
+    assert_eq!(b["error"]["code"], "UNAVAILABLE");
     let (s, _) = req(
         &app,
         "POST",
@@ -311,7 +337,7 @@ async fn datasource_crud_probe_and_tables() {
         None,
     )
     .await;
-    assert_eq!(s, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(s, StatusCode::BAD_REQUEST); // empty body -> missing dbName/tableName
 }
 
 #[tokio::test]
@@ -359,4 +385,175 @@ async fn sse_requires_session_and_rejects_unknown_api() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let _ = to_bytes(resp.into_body(), usize::MAX).await;
+}
+
+/// T14 discover / infer-schema: routing, error shapes and the jdbc-family
+/// registration path (cursorSemantics JDBC_KEY). Live listing/sampling
+/// against real brokers/servers lives in the tailrace-metadata crate's
+/// testcontainers suite; here the backends are unreachable by design.
+#[tokio::test]
+async fn discover_and_infer_schema_error_paths() {
+    let app = app().await;
+
+    // 404 unknown datasource
+    let (s, b) = req(
+        &app,
+        "POST",
+        "/api/datasources/999/discover",
+        Some(json!({"sampleRows": 5})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{b}");
+    let (s, b) = req(
+        &app,
+        "POST",
+        "/api/datasources/999/infer-schema",
+        Some(json!({"dbName": "a", "tableName": "b"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{b}");
+
+    // file datasource: not discoverable → 400 (path is a local scan, not a metadata service)
+    let (s, b) = req(
+        &app,
+        "POST",
+        "/api/datasources",
+        Some(json!({"name": "inbox", "type": "file", "connJson": {"path": "/tmp"}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let file_id = b["id"].as_i64().unwrap();
+    let (s, b) = req(
+        &app,
+        "POST",
+        &format!("/api/datasources/{file_id}/discover"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert!(
+        b["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("不支持发现"),
+        "{b}"
+    );
+
+    // kafka datasource pointing at a dead port → 502 UNAVAILABLE; failures
+    // are not cached (a retry re-probes)
+    let (s, b) = req(
+        &app,
+        "POST",
+        "/api/datasources",
+        Some(json!({"name": "dead-kafka", "type": "kafka", "connJson": {"bootstrap": "127.0.0.1:1"}})),
+    ).await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let kafka_id = b["id"].as_i64().unwrap();
+    for _ in 0..2 {
+        let (s, b) = req(
+            &app,
+            "POST",
+            &format!("/api/datasources/{kafka_id}/discover"),
+            Some(json!({"sampleRows": 3})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_GATEWAY, "{b}");
+        assert_eq!(b["error"]["code"], "UNAVAILABLE", "{b}");
+    }
+    // kafka infer-schema: unsupported format is a 400 before any dialing
+    let (s, b) = req(
+        &app,
+        "POST",
+        &format!("/api/datasources/{kafka_id}/infer-schema"),
+        Some(json!({"dbName": "shop", "tableName": "orders", "format": "csv"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    // missing identifiers → 400
+    let (s, b) = req(
+        &app,
+        "POST",
+        &format!("/api/datasources/{kafka_id}/infer-schema"),
+        Some(json!({"dbName": "", "tableName": "orders"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+
+    // doris datasource at a dead port → 502 on infer-schema (backend query failed)
+    let (s, b) = req(
+        &app,
+        "POST",
+        "/api/datasources",
+        Some(json!({"name": "dead-doris", "type": "doris", "connJson": {"jdbcUrl": "jdbc:mysql://127.0.0.1:1/ods", "streamLoadUrl": "http://127.0.0.1:1"}})),
+    ).await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let doris_id = b["id"].as_i64().unwrap();
+    let (s, b) = req(
+        &app,
+        "POST",
+        &format!("/api/datasources/{doris_id}/infer-schema"),
+        Some(json!({"dbName": "ods", "tableName": "orders"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{b}");
+    assert_eq!(b["error"]["code"], "UNAVAILABLE", "{b}");
+
+    // jdbc family end-to-end registration path (low#4): mysql datasource →
+    // table object kind jdbc → cursorSemantics JDBC_KEY
+    let (s, b) = req(
+        &app,
+        "POST",
+        "/api/datasources",
+        Some(json!({"name": "shop-mysql", "type": "mysql", "connJson": {"jdbcUrl": "jdbc:mysql://127.0.0.1:3306/shop"}, "username": "etl", "password": "pw"})),
+    ).await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let mysql_id = b["id"].as_i64().unwrap();
+    let (s, b) = req(
+        &app,
+        "POST",
+        &format!("/api/datasources/{mysql_id}/tables"),
+        Some(json!({"dbName": "shop", "tableName": "orders", "format": "json", "columnsJson": [["id", "int64"], ["order_no", "utf8"]]})),
+    ).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (s, b) = req(
+        &app,
+        "GET",
+        &format!("/api/datasources/tables?datasourceId={mysql_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["items"][0]["kind"], "jdbc", "{b}");
+    assert_eq!(b["items"][0]["cursorSemantics"], "JDBC_KEY", "{b}");
+    // same for postgresql
+    let (s, b) = req(
+        &app,
+        "POST",
+        "/api/datasources",
+        Some(json!({"name": "shop-pg", "type": "postgresql", "connJson": {"jdbcUrl": "jdbc:postgresql://127.0.0.1:5432/shop"}})),
+    ).await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let pg_id = b["id"].as_i64().unwrap();
+    let (s, b) = req(
+        &app,
+        "POST",
+        &format!("/api/datasources/{pg_id}/tables"),
+        Some(json!({"dbName": "shop", "tableName": "orders", "format": null, "columnsJson": null})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (_, b) = req(
+        &app,
+        "GET",
+        &format!("/api/datasources/tables?datasourceId={pg_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(b["items"][0]["cursorSemantics"], "JDBC_KEY", "{b}");
+
+    // credentials never come back on the mysql row (§4.2 unchanged)
+    let (s, b) = req(&app, "GET", &format!("/api/datasources/{mysql_id}"), None).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["hasPassword"], true, "{b}");
+    assert!(b.get("password").is_none(), "{b}");
 }
