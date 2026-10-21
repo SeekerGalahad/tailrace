@@ -464,8 +464,15 @@ node 关掉 `connector-kafka` 只是去掉 `build_registry()` 里的一次 `regi
    写 `default-features = false` **不够**（cargo 1.98 静默接受，但 `tailrace-api→runtime` 边
    仍启用 runtime 的 default：`cargo tree -e features -i tailrace-runtime` 实证链
    `tailrace-api feature "default" → tailrace-runtime feature "default"`，rdkafka 回到图内）；
-   workspace 表是**唯一不触碰 tailrace-api 自身 manifest** 的落点（api 不感知连接器 feature，
-   `tests/contract` 与 api 均不实例化连接器，两者零改动）。
+   workspace 表是**唯一不触碰 tailrace-api 自身 manifest** 的落点（api 不感知连接器
+   feature、也不实例化连接器，零改动）。原稿此处写「`tests/contract` 与 api 均不实例化
+   连接器，两者零改动」——对 api 成立，对 tests/contract **不实**（评审勘误 2026-10-21）：
+   该套件的 `spawn_node` 走 `PipelineRegistry::new → default_registry()`
+   （`tests/contract/src/lib.rs:67`），是真的要注册连接器的；workspace 关默认后单包构建
+   `cargo test -p tests-contract --locked` 零连接器 feature，executor_loop 3/3 FAILED
+   （`源类型未支持：file`）——`--workspace` 运行因与 node 的默认 feature 统一而掩盖了它。
+   修复=该套件 manifest 显式 `features = ["connector-file"]`（file→file 自述口径），
+   单包复跑全绿，Cargo.lock 仍零变动。
 2. `engine/bin/tailrace-node/Cargo.toml`：`connector-{kafka,file,doris}` 各透传
    `tailrace-runtime/connector-*`（两张注册表自此同源，run/serve 一致）；`openssl` 改
    optional 并挂在 `connector-kafka` 下（vendored OpenSSL 只为 rdkafka 的 curl-static 存在，
@@ -565,8 +572,16 @@ pause 态）。§4.5 的 24658 基线测量时该代码已在树内。**T15 交�
 （如实登记，未修）：latest + subscribe 首跑时，发现项以**发现时刻高水位**
 入游标 map，与 group 实际消费位点（join 时刻高水位）之间若在发现窗口内生产
 了新纪录且尚未 poll，flush 提交该发现项后重启会把该窗口内的记录跳过——
-earliest（默认）全路径无此窗；修复需 subscribe 模式逐分区自行记账，属
-split 化同级的热路径重设计，随 T18 议程。
+  earliest（默认）全路径无此窗；修复需 subscribe 模式逐分区自行记账，属
+  split 化同级的热路径重设计，随 T18 议程。**第二个已登记未修边界（评审
+  2026-10-21，low）——分区发现是单向（只增不减）**：30s 差异对比只处理
+  元数据里新出现的分区（`engine/crates/tailrace-conn-kafka/src/lib.rs:222`
+  起），分区消失（topic 删除重建、subscribe 模式 rebalance 撤销）后
+  `self.offsets` 中的陈旧项永不清理——后续任一新分区触发 assign 模式 TPL
+  重建时按含死分区的整个 offsets map 重建，`cursor()` 也会把死分区项永久
+  提交进台账。现实触发面窄（单机 v0.x、Kafka --alter 不能减分区；触发=
+  topic 删建重建后陈旧 offset 越界、共享 group 场景），收缩侧剔除 +
+  topic 重建回归测试留待 T18 与窄窗修复同批处理。
 
 **split 化：走写死回退门（不硬上）**。评估结论（本节为唯一存档）：游标语义本身在 watermark-通道设计下可证（每 split 交付携带本批
 位点，语句线程折叠成水位游标，flush 成功即整图 save——失败路径内存水位随

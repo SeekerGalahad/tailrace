@@ -151,7 +151,9 @@ tailrace-catalog = { path = "engine/crates/tailrace-catalog", version = "0.1.0" 
 # OpenSSL — the trim was cosmetic. The node re-enables exactly its own
 # connector set through engine/bin/tailrace-node's connector-* features
 # (dep:<crate> + tailrace-runtime/<feature>), so the DEFAULT build graph is
-# unchanged; tailrace-api / tests/contract never instantiate connectors.
+# unchanged; tailrace-api never instantiates connectors, while tests/contract
+# does exercise default_registry() and therefore re-enables connector-file
+# explicitly in its own manifest.
 tailrace-runtime = { path = "engine/crates/tailrace-runtime", version = "0.1.0", default-features = false }
 tailrace-metadata = { path = "engine/crates/tailrace-metadata", version = "0.1.0" }
 tailrace-api = { path = "engine/crates/tailrace-api", version = "0.1.0" }

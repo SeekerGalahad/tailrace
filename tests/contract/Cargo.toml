@@ -14,4 +14,11 @@ serde_json = { workspace = true }
 tailrace-api = { workspace = true }
 tailrace-catalog = { workspace = true }
 tailrace-connector = { workspace = true }
-tailrace-runtime = { workspace = true }
+# The suite exercises the registry default (spawn_node →
+# PipelineRegistry::new → default_registry), i.e. it really instantiates
+# connectors at runtime. Since T16 the workspace edge carries
+# default-features = false, so the file connector this suite's file→file
+# plans need must be requested explicitly — otherwise a standalone
+# `cargo test -p tests-contract --locked` builds a zero-connector runtime
+# and every executor_loop case fails with 源类型未支持：file.
+tailrace-runtime = { workspace = true, features = ["connector-file"] }
