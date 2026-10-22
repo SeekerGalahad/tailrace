@@ -138,7 +138,7 @@ SQL 编译诊断（编辑器内联报错数据源）。
 - 账本损坏（隔离后 .bak 亦坏）→ `ok:false`（fail-closed，宁死不脏）。
 - 旧格式条目（裸 Cursor / 无 totals 键）原样透传，`lastAck`/`totals` 缺省。
 
-### POST /v1/pipelines/{id}/{action}
+### POST /v1/pipelines/{id}/{action}（pause/resume/stop）
 
 动作状态机：`pause`（停拉取保游标，PAUSED 挂分区防组逐出）｜`resume`（续推）｜`stop`（收尾 flush+游标提交后移除注册）。
 
