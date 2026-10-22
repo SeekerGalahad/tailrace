@@ -4,7 +4,11 @@
 
 ## 状态
 
-v0.1.0 基线（2026-10-13）。已可用：`engine/` 数据面（SQL 变换、offset 游标、kafka/file/jdbc 源、Doris / StarRocks Stream Load 汇）与管理台（`console/` + `web/`）；starrocks 汇共享 Doris Stream Load 通道、按 kind 门控 StarRocks 差异；mqtt/s3 连接器为占位。
+R3 收官（2026-10-22）：数据面连接器 kafka / file / jdbc（MySQL/PostgreSQL
+keyset 批源）为源，Doris + StarRocks Stream Load（label 幂等）与 file 为汇；
+数据源发现与模式推断（discover / infer-schema）已落地；性能账本
+（docs/BENCHMARKS.md）与 8 job CI 矩阵齐备。mqtt/s3 仍为占位（路线裁决见
+docs/dev/roadmap.md T18）。R4（1.0 发布准备）进行中。
 
 ## 快速开始
 

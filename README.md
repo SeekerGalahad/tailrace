@@ -6,11 +6,12 @@ A single-binary data ingestion engine with a built-in web console. SQL-first, no
 
 ## Status
 
-v0.1.0 baseline (2026-10-13). Working: engine data plane in `engine/` (SQL
-transforms, offset cursors, kafka/file/jdbc sources, Doris / StarRocks Stream
-Load sinks), plus the management console (`console/` + `web/`). The starrocks
-sink shares the Doris Stream Load path with kind-gated StarRocks deltas; mqtt/s3
-connectors are placeholders.
+R3 complete (2026-10-22): engine data plane with kafka / file / jdbc sources
+(MySQL/PostgreSQL keyset), Doris + StarRocks Stream Load sinks with label
+idempotency, and a file sink; datasource discovery & schema inference
+(`discover` / `infer-schema`); a full performance ledger (docs/BENCHMARKS.md)
+and an 8-job CI matrix. mqtt/s3 connectors remain placeholders (route decision
+in docs/dev/roadmap.md T18). R4 (1.0 release preparation) is underway.
 
 ## Quickstart
 
