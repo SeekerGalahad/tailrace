@@ -284,12 +284,13 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 - **验收**：fuzz 目标 `cargo fuzz build` 绿；首轮语料 30 分钟零 panic（发现的 panic 修复或登记）；deny licenses 无新增问题。
 - **文件域**：fuzz/（独立 workspace 新目录）、.github/workflows/（可选定时 job）。
 
-### T22 CodeMirror6 转产落地（~2 人日）〔R4 承接；2026-10-21 T17 裁决落章〕
+### T22 CodeMirror6 转产落地（~2 人日）✅〔R4 承接；2026-10-21 T17 裁决落章〕
 
 - **现状**：PoC 基线 `poc/codemirror6@7f32c26` 已完成内核替换（SqlMonaco.vue 365→246 行、edit.vue 零改动、对外 props/emits 不变），编辑器异步 chunk gzip 883.22→140.45 kB；全部依据见 §八.4。
 - **方案**：以 PoC 分支为实施基线落到 main；三项 delta 对齐（~30 行自写 CompletionSource：库名大小写不敏感、`db.e` 后关键字混入过滤、补全+插 `-- @tag:ds` 拆为两步 undo）；SQLNamespace 列槽位与 T14 infer-schema 接线；视觉走查 + IME 中文输入手测 + 真页 e2e。
 - **验收**：CI web job 绿；编辑器相关 chunk gzip ≤300kB；真页 e2e（编辑/补全/撤销/主题切换）；monaco 依赖从 package.json 移除；T9 的 CSS 晚到/塌缩补丁整类移除并在 BENCHMARKS/CHANGELOG 登记。
 - **文件域**：web/。
+> 结果：f90e6a2 T22 提交完成：f90e6a2（main，父 7d4c7c6 线性，未 push——留波门禁）。git add 严格限 web/ 五文件（package.json/pnpm-lock.yaml/SqlMonaco.vue/editor-worker.ts/vite.config.ts，+401/−311，剔除 PoC harness 后的落地面），Conventional 主题与门禁指令逐字一致，body 分五段承载：①落地方式（PoC 7f32c26 cherry-pick -n 等效 rebase 落 main、harness 两文件剔除、edit.vue 零改动契约保真）；②三 delta 对齐实现（memberCompletion 大小写不敏感泛化深度遍历/keyword 点链门控/applyTable 双 dispatch 两步 undo）；③gzip 实测数字（138,962 B ≤300kB 门槛 + T9 883.22kB 单口径对照）；④monaco 全链移除+T9 CSS 晚到/塌缩补丁整类移除实证+真页 e2e 七项与 IME 记录；⑤T14 接线核对（console TableObjectItem DTO 不回 columns_json 为列补全最后一跳，编辑器侧双槽位就绪）。提交后工作树干净。（gzip 数字与 e2e 摘要保留）
 
 ### T23 R3-W1 评审 low 债清偿 + 文档对齐（~1 人日）〔R3-W2 前置波 W0，2026-10-21 立项〕✅
 
@@ -333,19 +334,21 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 > 总量评估：T25-T31 共 ~7.5 业余人日 + T22 承接 ~2 人日（§八.4 统一口径）≈ 9.5 人日，合 R4 ~1.5-2 周档。
 > 红线（全轮生效）：§五既有红线沿用（状态账本/emit/SSE/smoke 骨架；**禁改 tag/动 v0.1.0**）；**cargo publish 不可逆——独占波（R4-W2）集中执行，发包前必过全树 dry-run 与查名**；版本 lockstep 单文件 bump（根 Cargo.toml 为唯一改动点）。
 
-#### T25 ⑦b live-gate 整改（~0.5 人日）〔R4-W0 前置小卡；T18 ⑦b 裁决〕
+#### T25 ⑦b live-gate 整改（~0.5 人日）✅〔R4-W0 前置小卡；T18 ⑦b 裁决〕
 
 - **现状**：T18 ⑦b 裁决采纳 R3-W1 评审 low#7 建议——`return Ok` 计 passed 改 `#[ignore]`+CI `--include-ignored`（纪要 docs/dev/R3-升格评审-2026-10-21.md ⑦b 与 :120 五测清单）。五处逐一核实（勘察实测行号）：`engine/crates/tailrace-conn-jdbc/tests/jdbc_sources.rs:111`、`:293` 两处 `return Ok(());`；`engine/crates/tailrace-conn-kafka/src/lib.rs:667`（TcpStream 9092 探测）、`:674`（topic 未播种跳过）、`:904`（纪要 :903 漂移 +1，分区发现测试 `kafka_source_discovers_new_partitions_without_reopen`@fn:898）；`engine/bin/tailrace-node/tests/chaos.rs:625`（chaos_kill9_restart_idempotent@fn:612）。CI 配套：`.github/workflows/ci.yml` chaos job 三条命令均无 `--include-ignored`（:125 chaos 全文件 / :126 kafka 过滤 / :130 jdbc 全文件）。**整改陷阱（勘察实测）**：:126 过滤词 `kafka_source_live` 不匹配 :904 的 discovery 测试名——只加 `--include-ignored` 不放过滤词，该测在 CI 永不被真跑；过滤词放宽为公共前缀 `kafka_source` 可两测兼收。
 - **方案**：5 处 live-gate 块改 `#[ignore = "live: …"]` 属性（ignore 消息注明启用方式，`[skip]` 探测文案保留）；ci.yml chaos job 三条命令追加 `--include-ignored`，:126 过滤词放宽为 `kafka_source`；工作区级 :29 `cargo test --workspace --locked` 不动（ignored 默认跳过，跳过语义从「计 passed」变「ignored 计数可见」——诚实账本）。
 - **验收**：`cargo test --locked -p tailrace-conn-jdbc --test jdbc_sources` 输出含 `2 ignored`（原静默 passed 转可见计数）；`cargo test --locked -p tailrace-conn-kafka` 含 `2 ignored`；`cargo test --locked -p tailrace-node --test chaos` 含 `1 ignored`；`cargo test --workspace --locked` 总数守恒（passed+ignored 之和不变，基线 R3-W3 176 passed/2 ignored → 预期 171/7）；push 后 `gh run watch` 绿且 chaos job 日志含 5 测真执行。
 - **文件域**：engine/crates/tailrace-conn-jdbc/tests/jdbc_sources.rs、engine/crates/tailrace-conn-kafka/src/lib.rs（live-gate 测试块）、engine/bin/tailrace-node/tests/chaos.rs、.github/workflows/ci.yml。
+> 结果：7d4c7c6 T25 live-gate 整改已按门禁指令提交为 7d4c7c6（main，父 14eb66a 线性，无 merge）。staging 严格限卡内 4 条文件域路径（ci.yml / chaos.rs / jdbc_sources.rs / conn-kafka lib.rs），+19/−8，无域外混入；主题与指令逐字一致（test: T25 live-gate 整改——#[ignore] 可见化+CI --include-ignored 真跑（T18 ⑦b 裁决）），body 按仓例承载验收证据：5 测 #[ignore] 清单、过滤词陷阱实证 1 passed/4 filtered out vs 2 passed/3 filtered out、workspace 176/2→171/7 守恒、L0 全绿。提交后工作树干净（porcelain 空），未 push（ahead 1，留波门禁执行）。
 
-#### T26 crate 发布元数据补齐 + doc-test 起步（~1.5 人日）
+#### T26 crate 发布元数据补齐 + doc-test 起步（~1.5 人日）✅
 
 - **现状**：`[workspace.package]` 仅 version/edition/license/rust-version 四键（Cargo.toml:37-41，实读）——repository/homepage/documentation/readme/keywords/categories 于 22 个 manifest 全 0 命中（勘察 grep 实测；license 是唯一就位的发布元数据）；description 缺 6 个：engine 侧 tailrace-conn-mqtt/tailrace-conn-s3 + console 全员 4 个（tailrace-console/console-store/console-auth/console-proxy），已有 16/22；`tests/contract` manifest 无 `publish = false`（实读——name=tests-contract 会误入发包面）；doc-test 全空跑：21 crate `///` 示例围栏 0 个（`//!` 亦 0；文档注释本身 1652+424 行存在），`cargo test --doc -p tailrace-ir`/`-p console-store` 实跑 0 passed 0 failed——「过」但为空跑。
 - **方案**：① 共享键 repository/homepage/documentation 入 `[workspace.package]`，成员 manifest 以 `.workspace = true` 继承（两个 bin crate 的 readme 单独指）；② 6 个缺 description crate 补一句话描述（与 crate 功能面对齐）；③ keywords/categories 逐 crate 定制（crates.io 官方 category slug，以 `cargo publish` 校验为准）；④ `tests/contract/Cargo.toml` 加 `publish = false`；⑤ doc-test 最小面 3 个对外 API crate：tailrace-connector（Source/Sink trait+ConnectorRegistry）、tailrace-ir（Cursor/SourceChunk）、tailrace-state（OffsetStore commit 语义），示例合计 ≤10 个，令 `cargo test --doc --workspace` 非零（勘察建议口径）。
 - **验收**：`cargo publish --dry-run --registry crates-io -p tailrace-ir 2>&1 | grep -c 'no documentation, homepage or repository'` = 0（叶 crate 无 metadata warning；conn-mqtt/conn-s3 同验）；`cargo metadata --no-deps` 21 个发布成员均有 description/repository；`cargo test --doc --workspace --locked` 非 0 passed；L0（fmt/clippy/deny）绿。
 - **文件域**：根 Cargo.toml（workspace.package 键）、22 个成员 Cargo.toml（继承行+description/keywords/categories+publish=false）、tailrace-connector/tailrace-ir/tailrace-state 的 src 文档示例（不动逻辑）。
+> 结果：bf2848f T26 收口提交完成：git add 严格限 28 文件域（显式路径列表，非 add -A），以门禁给定 Conventional 消息提交为 bf2848f（main，父 f90e6a2 线性追加，28 files changed +361/−0），主题=chore: T26 crate 发布元数据补齐+doc-test 起步（21 成员 description/repository 就位+3 crate 文档示例）。工作树提交后干净，未 push（留波门禁）。
 
 #### T27 crates.io 全树发包（~1.5 人日）〔依赖 T26〕〔publish 不可逆，独占波〕
 
@@ -368,12 +371,13 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 - **验收**：`mdbook build` 零错误退出且 `test -f docs/book/book/html/index.html`（或构建输出目录）；SUMMARY 展开 ≥6 章节页且 `grep -c 'architecture' docs/book/src/SUMMARY.md` ≥1、include 生效（产物 HTML 含架构章正文文本抽样）；mermaid 块以源码块或预渲染占位呈现不丢内容；CI（如立 job）绿或本地构建档登记入卡结果。
 - **文件域**：book.toml（新）、docs/book/（新，SUMMARY+前言/占位章）、.github/workflows/ci.yml（仅当立 docs job）。
 
-#### T30 i18n 错误码字典化接口预留（~0.5 人日）〔§七 R4 段 i18n 最小动作〕
+#### T30 i18n 错误码字典化接口预留（~0.5 人日）✅〔§七 R4 段 i18n 最小动作〕
 
 - **现状**：console 错误码面已集中两处——`ErrorResponse/ErrorBody{code:String,message:String}`（console/crates/tailrace-console/src/api/mod.rs:22-29）与 `ApiError{status,code,message,refs}`（console/crates/console-auth/src/error.rs:11-16），后者 5 个构造帮助方法硬编码 **6 个规范码**（UNAUTHENTICATED/INVALID_ARGUMENT/NOT_FOUND/INTERNAL/IN_USE/BAD_NODE_TOKEN）——码面单点在 error.rs，枚举化只差 String→常量；中文文案散布 api/*.rs+spa.rs 约 67 行（43 处 format! 带中文，勘察 grep）；engine 侧 tailrace-api 无错误码（11 处 ad-hoc `json!({"error":…})`）——**不在本卡，登记 v1.x**。
 - **方案**：最小动作=接口预留、文案不动：① 6 码收敛为常量/枚举单点（error.rs），构造方法签名与现值不变；② `ErrorBody` 加 `message_key: Option<String>`（serde `skip_serializing_if = "Option::is_none"`——wire 兼容，默认响应零变化），为字典化查表预留通道；③ 中文单轨现状一句入 README（文案句由 T28 承接）；文案字典化本体（67 行收敛 key 查表）与 engine 侧 code 字段补齐留 v1.x 议程（卡内登记）。
 - **验收**：`cargo test -p console-auth -p tailrace-console --locked` 全绿含新增 wire 兼容断言（现网形态响应序列化后无 `message_key` 键）；`grep -c '"UNAUTHENTICATED"' console/crates/console-auth/src/error.rs` 收敛为常量定义单点（构造方法引用常量名而非字面量）；L0 绿。
 - **文件域**：console/crates/console-auth/src/error.rs、console/crates/tailrace-console/src/api/mod.rs（+对应测试）。
+> 结果：31fea8a T30 已按波门禁指令提交为 31fea8a（main，父 bf2848f 线性，非 amend）。staging 严格限文件域 2 文件（console-auth/src/error.rs +35、tailrace-console/src/api/mod.rs +48，共 +76/−7），无外来变更混入。提交主题与指令逐字一致（feat: T30 i18n 接口预留——错误码单点收敛+message_key wire 兼容通道），body 记录：6 规范码常量单点收敛（构造签名/现值不变）、message_key wire 兼容通道（默认响应 byte 级不变）、wire 兼容断言×2、cargo test -p console-auth -p tailrace-console --locked 全绿与 L0 三件绿（上一轮实测）、域外不动项（4 处 IN_USE 调用点/67 行中文文案/engine 侧留 v1.x，README 归 T28）。未 push（留波门禁）。工作树干净。
 
 #### T31 v1.0.0 终验：tag→release + checksums + 基准报告收口（~1 人日）〔门槛=T22/T25-T30 全 ✅〕
 
@@ -381,6 +385,13 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 - **方案**：① 全卡收口后 `git tag v1.0.0 && git push origin v1.0.0` 触发 release.yml；② 资产核验 9/9（8 tarball+checksums.txt）+ checksums 覆盖核对（下载抽验 `shasum -a 256 -c`）；③ README 基准段终验（与 BENCHMARKS 终稿数字一致、注记在位）；④ **全新机器三命令 quickstart 实测**：干净环境（rustup+Node 22+pnpm，无 target/无 pnpm store）按 README Quickstart 逐字执行三命令（build.sh→console→node serve）全成功；`cargo install` 档按 T27 ② 核查结论同验或登记；⑤ 收官报告 `docs/dev/v1.0-release-<date>.md`（发包 21 包/资产 9/基准摘要/全新机器实测记录/v1.x 遗留议程指针）；⑥ 本文件 §七 R4 段与各卡状态收口。
 - **验收**：`gh release view v1.0.0 --json assets --jq '.assets | length'` = **9** 且资产名单含 checksums.txt + 8 tarball（4 目标×2 bin）；§十一 R4 收口标准全绿（含 crates.io 21×1.0.0 复核）；quickstart 实测记录入收官报告；收官报告存在 `test -s docs/dev/v1.0-release-*.md`。
 - **文件域**：docs/dev/v1.0-release-<date>.md（新）、docs/dev/roadmap.md（状态收口）、README.md/README.zh-CN.md（仅终验勘误，如需）。
+
+### R4-W1 评审登记（2026-10-22）
+
+> 本波无独立评审档（docs/dev/ 现存仅 R3 升格评审纪要与 T11 事故档）；发现均随卡实测得来，登记如下：
+>
+> - **已修（修复即任务提交 7d4c7c6，无遗留）**：T25 过滤词陷阱实证——ci.yml kafka 过滤命令原过滤词 `kafka_source_live` 不匹配 discovery 测试名，只加 `--include-ignored` 不放宽过滤词则该测在 CI 永不被真跑；实测对照 1 passed/4 filtered out（未放宽）vs 2 passed/3 filtered out（放宽后），修复=过滤词放宽为公共前缀 `kafka_source`（立项勘察已预警、本波实证收口，卡内交付非债）。
+> - **low 仅登记未修（T30 域外不动项，卡内方案即预留 v1.x/后续卡承接）**：① console 侧 67 行中文文案字典化查表本体留 v1.x（本波只落 6 码常量单点+message_key wire 兼容通道）；② engine 侧 tailrace-api 11 处 ad-hoc error JSON 补码留 v1.x；③ 中文单轨现状一句入 README 归 T28（文案句由 T28 承接）；④ 4 处 IN_USE 构造调用点不动（构造签名/现值不变契约，字面量收敛后仅存于常量定义处）。
 
 ## 十、R3/R4 波次编排（文件域冲突分析，动工前按最终文件域复核）
 
