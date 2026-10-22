@@ -1,60 +1,44 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
-// T9 entry cut: `monaco-editor` (editor.main) bundles ~80 language
-// definitions + css/html/json/ts LSP features + monaco-lsp-client and their
-// workers (ts.worker alone is 6.9MB). Deep specifiers resolve through the
-// package exports map ("./*.js" → "./esm/vs/*.js"); the set below is
-// editor.api (core API + widget) + SQL tokenizer + the editor-side contribs
-// the SQL editor actually uses (completion/find/contextmenu/... — without
-// them editor.api alone registers no suggest/find controller and table
-// completion would render nothing). The single editor worker stays.
-import * as monaco from 'monaco-editor/editor/editor.api.js'
-import 'monaco-editor/languages/definitions/sql/register.js'
-// editor-side contributions (subset of editor.main's list, languages/LSP cut)
-import 'monaco-editor/editor/browser/coreCommands.js'
-import 'monaco-editor/features/find/register.js'
-import 'monaco-editor/editor/contrib/suggest/browser/suggestController.js'
-import 'monaco-editor/editor/contrib/snippet/browser/snippetController2.js'
-import 'monaco-editor/editor/contrib/contextmenu/browser/contextmenu.js'
-import 'monaco-editor/editor/contrib/hover/browser/hoverContribution.js'
-import 'monaco-editor/editor/contrib/bracketMatching/browser/bracketMatching.js'
-import 'monaco-editor/editor/contrib/folding/browser/folding.js'
-import 'monaco-editor/editor/contrib/wordHighlighter/browser/wordHighlighter.js'
-import 'monaco-editor/editor/contrib/comment/browser/comment.js'
-import 'monaco-editor/editor/contrib/linesOperations/browser/linesOperations.js'
-import 'monaco-editor/editor/contrib/wordOperations/browser/wordOperations.js'
-import 'monaco-editor/editor/contrib/wordPartOperations/browser/wordPartOperations.js'
-import 'monaco-editor/editor/contrib/smartSelect/browser/smartSelect.js'
-import 'monaco-editor/editor/contrib/multicursor/browser/multicursor.js'
-import 'monaco-editor/editor/contrib/lineSelection/browser/lineSelection.js'
-import 'monaco-editor/editor/contrib/indentation/browser/indentation.js'
-import 'monaco-editor/editor/contrib/cursorUndo/browser/cursorUndo.js'
-import 'monaco-editor/editor/contrib/caretOperations/browser/caretOperations.js'
-import 'monaco-editor/editor/contrib/caretOperations/browser/transpose.js'
-import 'monaco-editor/editor/contrib/clipboard/browser/clipboard.js'
-import 'monaco-editor/editor/contrib/unicodeHighlighter/browser/unicodeHighlighter.js'
-import 'monaco-editor/editor/contrib/unusualLineTerminators/browser/unusualLineTerminators.js'
-import 'monaco-editor/editor/contrib/links/browser/links.js'
-import 'monaco-editor/editor/contrib/dnd/browser/dnd.js'
-import 'monaco-editor/editor/standalone/browser/quickAccess/standaloneCommandsQuickAccess.js'
-import 'monaco-editor/editor/standalone/browser/quickAccess/standaloneHelpQuickAccess.js'
-import 'monaco-editor/base/browser/ui/codicons/codicon/codicon.css'
-import EditorWorker from './editor-worker?worker'
+// T22 (from T17 PoC): CodeMirror 6 kernel behind the unchanged SqlMonaco
+// contract (props/emits/template identical to the monaco version so edit.vue
+// needs zero changes). `basicSetup` is the editor-side feature set comparable
+// to the 25 monaco contribs T9 kept (history/fold/bracket-match/
+// close-brackets/search/multi-selection/autocompletion/active-line/
+// selection-matches). No worker, no external CSS, no icon font: CM6 injects
+// its styles from JS.
+import { basicSetup } from 'codemirror'
+import { Compartment, EditorState, type Extension } from '@codemirror/state'
+import { EditorView } from '@codemirror/view'
+import { HighlightStyle, indentUnit, syntaxHighlighting, LanguageSupport } from '@codemirror/language'
+import {
+  StandardSQL,
+  keywordCompletionSource,
+  schemaCompletionSource,
+  type SQLNamespace,
+} from '@codemirror/lang-sql'
+import {
+  pickedCompletion,
+  type Completion,
+  type CompletionContext,
+  type CompletionResult,
+  type CompletionSource,
+} from '@codemirror/autocomplete'
+import { setDiagnostics, type Diagnostic as CmDiagnostic } from '@codemirror/lint'
+import { tags } from '@lezer/highlight'
 import { useThemeStore } from '../../stores/theme'
-import { fontMono, neutral, semantic } from '../../theme/tokens'
+import { fontMono, neutral, semantic, type ThemeMode } from '../../theme/tokens'
 import type { Diagnostic } from '../../api/pipelines'
 
 /**
- * SqlMonaco (design doc §6.5.2): thin monaco-editor wrapper.
+ * SqlMonaco (design doc §6.5.2) — CodeMirror 6 kernel (T22, T17 PoC base).
  *
- * - SQL language + `库名.` table-object completion (max 50, detail shows
+ * - SQL language + `库名.` table-object completion (detail shows
  *   kind · format); applying a completion auto-inserts `-- @tag:ds` above
- *   the current line when missing (publish-gate requirement)
- * - compile diagnostics → monaco markers (wavy underlines)
+ *   the current line when missing (publish-gate requirement) as its own
+ *   undo step. Keyword completion comes with lang-sql.
+ * - compile diagnostics → lint diagnostics (wavy underlines)
  * - theme follows ThemeStore (colors from tokens, never hardcoded)
- * - monaco 0.57: SQL is a basic language (tokenizer only, no LSP worker) —
- *   the single editor worker covers tokenization; ES-module worker format
- *   per vite.config (§8.1)
  */
 
 const props = withDefaults(
@@ -75,262 +59,246 @@ const emit = defineEmits<{ 'update:modelValue': [value: string] }>()
 const theme = useThemeStore()
 const hostEl = ref<HTMLDivElement | null>(null)
 
-// --- editor worker (module scope: once per page chunk) ---
-;(self as unknown as { MonacoEnvironment: monaco.Environment }).MonacoEnvironment = {
-  getWorker(_workerId: string, _label: string): Worker {
-    return new EditorWorker()
-  },
-}
-
-// --- completion source + tag command: module-level, single editor per page ---
+// --- completion: tables → lang-sql schema namespace ---
 interface CompletionTable {
   dbName: string
   tableName: string
   kind: string
   format: string | null
 }
-let completionTables: CompletionTable[] = []
-let tagCommandId: string | null = null
-let activeModel: monaco.editor.ITextModel | null = null
-let activeEditor: monaco.editor.IStandaloneCodeEditor | null = null
-let providerRegistered = false
 
-function registerProvider(): void {
-  if (providerRegistered) return
-  providerRegistered = true
-  monaco.languages.registerCompletionItemProvider('sql', {
-    triggerCharacters: ['.'],
-    provideCompletionItems(model, position) {
-      const lineUpToCursor = model.getValueInRange({
-        startLineNumber: position.lineNumber,
-        startColumn: 1,
-        endLineNumber: position.lineNumber,
-        endColumn: position.column,
-      })
-      const m = /([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z0-9_]*)$/.exec(lineUpToCursor)
-      if (!m) return { suggestions: [] }
-      const [, dbName, prefix] = m
-      const hit = completionTables.filter((t) => t.dbName.toLowerCase() === dbName.toLowerCase())
-      if (hit.length === 0) return { suggestions: [] }
-      const word = model.getWordUntilPosition(position)
-      const range = {
-        startLineNumber: position.lineNumber,
-        endLineNumber: position.lineNumber,
-        startColumn: word.startColumn,
-        endColumn: word.endColumn,
-      }
-      return {
-        suggestions: hit
-          .filter((t) => t.tableName.toLowerCase().startsWith(prefix.toLowerCase()))
-          .slice(0, 50)
-          .map((t) => ({
-            label: t.tableName,
-            kind: monaco.languages.CompletionItemKind.Field,
-            insertText: t.tableName,
-            detail: [t.kind, t.format].filter(Boolean).join(' · '),
-            range,
-            command: tagCommandId
-              ? { id: tagCommandId, title: 'tailrace.addDsTag', arguments: [position.lineNumber] }
-              : undefined,
-          })),
-      }
-    },
+const DS_TAG = '-- @tag:ds\n'
+
+/**
+ * Insert the picked table name and, when the line above lacks it, `-- @tag:ds`.
+ * Two dispatches = two undo steps (monaco pushUndoStop parity): first undo
+ * removes the tag line, second removes the inserted table name.
+ */
+function applyTable(view: EditorView, completion: Completion, from: number, to: number): void {
+  const doc = view.state.doc
+  const line = doc.lineAt(from)
+  const prev = line.number > 1 ? doc.line(line.number - 1).text : ''
+  const tagged = /^\s*--\s*@tag/.test(prev)
+  view.dispatch({
+    changes: { from, to, insert: completion.label },
+    selection: { anchor: from + completion.label.length },
+    userEvent: 'input.complete',
+    annotations: pickedCompletion.of(completion),
+  })
+  if (tagged) return
+  view.dispatch({
+    changes: { from: line.from, insert: DS_TAG },
+    selection: { anchor: line.from + DS_TAG.length + (from - line.from) + completion.label.length },
+    userEvent: 'input.complete',
   })
 }
 
-function insertTagAbove(lineNumber: number): void {
-  const model = activeModel
-  const editor = activeEditor
-  if (!model || !editor || lineNumber < 1 || lineNumber > model.getLineCount()) return
-  const prev = lineNumber > 1 ? model.getLineContent(lineNumber - 1) : ''
-  if (/^\s*--\s*@tag/.test(prev)) return // already tagged
-  editor.pushUndoStop()
-  editor.executeEdits('tailrace-tag', [
-    { range: new monaco.Range(lineNumber, 1, lineNumber, 1), text: '-- @tag:ds\n', forceMoveMarkers: true },
-  ])
-  editor.pushUndoStop()
+/**
+ * `{ db: { self, children: { table: { self, children: [] } } } }` — the
+ * `children: []` slot is where column names go once the console's
+ * list-tables DTO exposes the columnsJson T14's infer-schema already
+ * persists (console api/datasources.rs TableObjectItem lacks the field),
+ * enabling `db.table.` column completion with no further editor code.
+ */
+function buildSchema(tables: CompletionTable[]): SQLNamespace {
+  const dbs: Record<string, { self: Completion; children: Record<string, SQLNamespace> }> = {}
+  for (const t of tables) {
+    const db = (dbs[t.dbName] ??= { self: { label: t.dbName, type: 'namespace' }, children: {} })
+    db.children[t.tableName] = {
+      self: {
+        label: t.tableName,
+        type: 'type',
+        detail: [t.kind, t.format].filter(Boolean).join(' · '),
+        apply: applyTable,
+      },
+      children: [],
+    }
+  }
+  return dbs
 }
 
-// --- themes from design tokens ---
-function defineThemes(): void {
-  monaco.editor.defineTheme('tailrace-dark', {
-    base: 'vs-dark',
-    inherit: true,
-    rules: [
-      { token: 'comment', foreground: '5d6b7a', fontStyle: 'italic' },
-      { token: 'keyword', foreground: '818CF8' },
-      { token: 'string', foreground: '34D399' },
-      { token: 'number', foreground: 'FBBF24' },
-    ],
-    colors: {
-      'editor.background': neutral.dark['bg-card'],
-      'editorGutter.background': neutral.dark['bg-card'],
-      'editor.lineHighlightBackground': neutral.dark['bg-pop'],
-      'editorLineNumber.foreground': neutral.dark['text-3'],
-      'editorCursor.foreground': semantic.dark.successColor,
-    },
-  })
-  monaco.editor.defineTheme('tailrace-light', {
-    base: 'vs',
-    inherit: true,
-    rules: [
-      { token: 'comment', foreground: '98A4B3', fontStyle: 'italic' },
-      { token: 'keyword', foreground: '6366F1' },
-      { token: 'string', foreground: '10B981' },
-      { token: 'number', foreground: 'F59E0B' },
-    ],
-    colors: {
-      'editor.background': neutral.light['bg-card'],
-      'editorGutter.background': neutral.light['bg-card'],
-      'editor.lineHighlightBackground': '#F4F6F9',
-      'editorLineNumber.foreground': neutral.light['text-3'],
-      'editorCursor.foreground': semantic.light.successColor,
-    },
-  })
-}
+// --- T22 delta alignment: case-insensitive `db.` walk + keyword gating ---
+// lang-sql's schema source looks members up by exact key, so `SHOP.` (db
+// registered as `shop`) completes nothing, and its keyword source fires in
+// member context too (`db.e` mixes SELECT/ELSE… in). Keep the library source
+// for what it does better (FROM-alias awareness, top-level db names) and add:
+// a text-driven member source that walks the chain case-insensitively, plus a
+// keyword source that stays silent inside a dotted chain.
 
-let editor: monaco.editor.IStandaloneCodeEditor | null = null
-let applying = false
-let layoutRo: ResizeObserver | null = null
+/** A trailing dotted member chain: `shop.` / `shop.orders.` + partial word. */
+const MEMBER_CHAIN = /((?:[A-Za-z_][A-Za-z0-9_]*\.)+)(\w*)$/
 
-// T9: this component is an async chunk — its CSS (monaco base styles
-// included) can apply AFTER the JS has run. An editor created against the
-// unstyled DOM ends up half-built and pinned at a garbage width
-// (automaticLayout observes the editor node itself, whose inline width never
-// changes, so it never recovers). Gate creation on monaco's stylesheet being
-// live; ResizeObserver (not rAF polling) so a background-tab mount can't wedge.
-function whenLaidOut(el: HTMLElement): Promise<void> {
-  return new Promise((resolve) => {
-    const done = () => resolve()
-    if (el.clientWidth >= 50) return done()
-    const ro = new ResizeObserver(() => {
-      if (el.clientWidth >= 50) {
-        ro.disconnect()
-        done()
-      }
+function memberCompletion(tables: CompletionTable[]): CompletionSource {
+  // lowercased-key node tree mirroring buildSchema's shape; table nodes carry
+  // an empty `children` map — the column slot T14's infer-schema output fills
+  // once the console list DTO exposes it (see buildSchema comment)
+  interface MemberNode {
+    completion: Completion
+    children: Map<string, MemberNode>
+  }
+  const root = new Map<string, MemberNode>()
+  for (const t of tables) {
+    const dbKey = t.dbName.toLowerCase()
+    let db = root.get(dbKey)
+    if (!db) root.set(dbKey, (db = { completion: { label: t.dbName, type: 'namespace' }, children: new Map() }))
+    db.children.set(t.tableName.toLowerCase(), {
+      completion: {
+        label: t.tableName,
+        type: 'type',
+        detail: [t.kind, t.format].filter(Boolean).join(' · '),
+        apply: applyTable,
+      },
+      children: new Map(),
     })
-    ro.observe(el)
-    setTimeout(() => {
-      ro.disconnect()
-      done() // safety net: never block editor creation on layout quirks
-    }, 3000)
+  }
+  return (ctx: CompletionContext): CompletionResult | null => {
+    const chain = MEMBER_CHAIN.exec(ctx.state.sliceDoc(0, ctx.pos))
+    if (!chain) return null
+    let node = { children: root } as MemberNode // sentinel: walks db→table→column
+    for (const seg of chain[1].slice(0, -1).split('.')) {
+      const next = node.children.get(seg.toLowerCase())
+      if (!next) return null // unknown member → offer nothing (monaco parity)
+      node = next
+    }
+    return {
+      from: ctx.pos - chain[2].length,
+      options: [...node.children.values()].map((n) => n.completion),
+      validFor: /^\w*$/,
+    }
+  }
+}
+
+/** lang-sql keywords — upper-cased, but never inside a `db.` member chain. */
+function keywordCompletion(): CompletionSource {
+  const keywords = keywordCompletionSource(StandardSQL, true)
+  return (ctx: CompletionContext) =>
+    MEMBER_CHAIN.test(ctx.state.sliceDoc(0, ctx.pos)) ? null : keywords(ctx)
+}
+
+function sqlSupport(tables: CompletionTable[]): Extension {
+  // same two language-data entries sql() would register (schema + keywords),
+  // with the keyword source gated, plus the case-insensitive member source
+  return new LanguageSupport(StandardSQL.language, [
+    StandardSQL.language.data.of({
+      autocomplete: schemaCompletionSource({ dialect: StandardSQL, schema: buildSchema(tables) }),
+    }),
+    StandardSQL.language.data.of({ autocomplete: memberCompletion(tables) }),
+    StandardSQL.language.data.of({ autocomplete: keywordCompletion() }),
+  ])
+}
+
+// --- theme from design tokens ---
+function makeTheme(mode: ThemeMode): Extension {
+  const n = neutral[mode]
+  const dark = mode === 'dark'
+  const activeLine = dark ? n['bg-pop'] : '#F4F6F9'
+  return [
+    EditorView.theme(
+      {
+        '&': { height: '100%', backgroundColor: n['bg-card'], color: n['text-1'], fontSize: '13px' },
+        '&.cm-focused': { outline: 'none' },
+        '.cm-scroller': { overflow: 'auto', fontFamily: fontMono, lineHeight: '20px' },
+        '.cm-content': { padding: '8px 0' },
+        '.cm-gutters': { backgroundColor: n['bg-card'], color: n['text-3'], border: 'none' },
+        '.cm-activeLine': { backgroundColor: activeLine },
+        '.cm-activeLineGutter': { backgroundColor: activeLine },
+        '.cm-cursor, .cm-dropCursor': { borderLeftColor: semantic[mode].successColor },
+        '.cm-tooltip': { backgroundColor: n['bg-pop'], color: n['text-1'], border: `1px solid ${n.border}` },
+        '.cm-tooltip.cm-tooltip-autocomplete > ul > li[aria-selected]': {
+          backgroundColor: dark ? n.border : '#E8ECF2',
+          color: n['text-1'],
+        },
+        '.cm-completionDetail': { color: n['text-3'] },
+      },
+      { dark },
+    ),
+    syntaxHighlighting(
+      HighlightStyle.define([
+        { tag: tags.comment, color: dark ? '#5d6b7a' : '#98A4B3', fontStyle: 'italic' },
+        { tag: tags.keyword, color: dark ? '#818CF8' : '#6366F1' },
+        { tag: tags.string, color: dark ? '#34D399' : '#10B981' },
+        { tag: tags.number, color: dark ? '#FBBF24' : '#F59E0B' },
+      ]),
+    ),
+  ]
+}
+
+const langCompartment = new Compartment()
+const themeCompartment = new Compartment()
+
+let view: EditorView | null = null
+let applying = false
+
+function toCmDiagnostics(state: EditorState, ds: Diagnostic[]): CmDiagnostic[] {
+  return ds.map((d) => {
+    const line = state.doc.line(Math.min(Math.max(1, d.line), state.doc.lines))
+    // monaco version marked columns 1..12 — mirror that span, clamped to the line
+    return { from: line.from, to: Math.min(line.from + 11, line.to), severity: 'error', message: d.message }
   })
 }
 
-function whenMonacoCssReady(): Promise<void> {
-  return new Promise((resolve) => {
-    const ok = () =>
-      Array.from(document.styleSheets).some((s) => {
-        try {
-          return Array.from(s.cssRules).some((r) => r.cssText.includes('.monaco-editor'))
-        } catch {
-          return false // cross-origin sheet: unreadable
-        }
-      })
-    if (ok()) return resolve()
-    let n = 0
-    const iv = setInterval(() => {
-      if (ok() || ++n > 250) {
-        clearInterval(iv)
-        resolve()
-      }
-    }, 20)
-  })
+function applyMarkers(): void {
+  if (!view) return
+  view.dispatch(setDiagnostics(view.state, toCmDiagnostics(view.state, props.diagnostics)))
 }
 
-onMounted(async () => {
+onMounted(() => {
   if (!hostEl.value) return
-  await Promise.all([whenLaidOut(hostEl.value), whenMonacoCssReady()])
-  defineThemes()
-  registerProvider()
-  editor = monaco.editor.create(hostEl.value, {
-    value: props.modelValue,
-    language: 'sql',
-    theme: theme.mode === 'dark' ? 'tailrace-dark' : 'tailrace-light',
-    fontFamily: fontMono,
-    fontSize: 13,
-    lineHeight: 20,
-    minimap: { enabled: false },
-    automaticLayout: true,
-    scrollBeyondLastLine: false,
-    tabSize: 2,
-    padding: { top: 8, bottom: 8 },
-    fixedOverflowWidgets: true,
-    renderWhitespace: 'selection',
-  })
-  activeEditor = editor
-  activeModel = editor.getModel()
-  tagCommandId = editor.addCommand(0, (...args: unknown[]) => {
-    const line = args[0]
-    if (typeof line === 'number') insertTagAbove(line)
-  })
-  editor.onDidChangeModelContent(() => {
-    if (applying) return
-    emit('update:modelValue', editor!.getValue())
+  view = new EditorView({
+    parent: hostEl.value,
+    state: EditorState.create({
+      doc: props.modelValue,
+      extensions: [
+        basicSetup,
+        langCompartment.of(sqlSupport(props.tables)),
+        themeCompartment.of(makeTheme(theme.mode)),
+        EditorState.tabSize.of(2),
+        indentUnit.of('  '),
+        EditorView.updateListener.of((u) => {
+          if (u.docChanged && !applying) emit('update:modelValue', u.state.doc.toString())
+        }),
+      ],
+    }),
   })
   applyMarkers()
-  // T9: belt-and-braces — force a re-measure whenever the host resizes, so a
-  // late-applying stylesheet (or any container change) can't pin the editor
-  // at a stale width.
-  layoutRo = new ResizeObserver(() => editor?.layout())
-  layoutRo.observe(hostEl.value)
 })
 
 // external value → editor (guard the echo)
 watch(
   () => props.modelValue,
   (v) => {
-    if (!editor || editor.getValue() === v) return
+    if (!view) return
+    const current = view.state.doc.toString()
+    if (current === v) return
     applying = true
-    editor.setValue(v)
+    view.dispatch({ changes: { from: 0, to: current.length, insert: v } })
     applying = false
   },
 )
 
 watch(
   () => props.tables,
-  (t) => {
-    completionTables = t
-  },
-  { immediate: true, deep: true },
+  (t) => view?.dispatch({ effects: langCompartment.reconfigure(sqlSupport(t)) }),
+  { deep: true },
 )
 
-function applyMarkers(): void {
-  if (!activeModel) return
-  monaco.editor.setModelMarkers(
-    activeModel,
-    'tailrace-sql',
-    props.diagnostics.map((d) => ({
-      severity: monaco.MarkerSeverity.Error,
-      message: d.message,
-      startLineNumber: Math.max(1, d.line),
-      endLineNumber: Math.max(1, d.line),
-      startColumn: 1,
-      endColumn: 12,
-    })),
-  )
-}
 watch(() => props.diagnostics, applyMarkers, { deep: true })
 
 watch(
   () => theme.mode,
-  (mode) => monaco.editor.setTheme(mode === 'dark' ? 'tailrace-dark' : 'tailrace-light'),
+  (mode) => view?.dispatch({ effects: themeCompartment.reconfigure(makeTheme(mode)) }),
 )
 
 onBeforeUnmount(() => {
-  layoutRo?.disconnect()
-  layoutRo = null
-  editor?.dispose()
-  editor = null
-  activeEditor = null
-  activeModel = null
+  view?.destroy()
+  view = null
 })
 </script>
 
 <template>
   <div class="sql-monaco" :style="{ height: `${props.height}px` }">
     <div ref="hostEl" class="editor-host" />
-    <div v-if="props.modelValue === '' && props.placeholder" class="placeholder" @click="editor?.focus()">
+    <div v-if="props.modelValue === '' && props.placeholder" class="placeholder" @click="view?.focus()">
       <pre>{{ props.placeholder }}</pre>
     </div>
   </div>

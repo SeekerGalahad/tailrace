@@ -1,19 +1,11 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
-// Design doc §8.1: monaco worker chunking + /api proxy to the console binary.
+// Design doc §8.1: editor chunking + /api proxy to the console binary.
+// T17 PoC: CodeMirror 6 needs no web worker, no CSS alias and no icon font —
+// the monaco-specific resolve.alias / worker.format entries are gone.
 export default defineConfig({
   plugins: [vue()],
-  resolve: {
-    alias: {
-      // monaco's exports map ("./*.js" → "./esm/vs/*.js") has no CSS entry —
-      // resolve the codicon font stylesheet (suggest-widget icons) directly.
-      // URL.pathname keeps this dependency-free (no @types/node in the web pkg).
-      'monaco-editor/base/browser/ui/codicons/codicon/codicon.css': decodeURIComponent(
-        new URL('./node_modules/monaco-editor/esm/vs/base/browser/ui/codicons/codicon/codicon.css', import.meta.url).pathname,
-      ),
-    },
-  },
   server: {
     proxy: {
       '/api': {
@@ -22,10 +14,6 @@ export default defineConfig({
       },
     },
   },
-  worker: {
-    // monaco editor workers as ES modules
-    format: 'es',
-  },
   build: {
     rollupOptions: {
       output: {
@@ -33,12 +21,16 @@ export default defineConfig({
         // advancedChunks.groups is the native equivalent.
         advancedChunks: {
           groups: [
-            // T9: minShareCount=2 — with SqlMonaco loaded via defineAsyncComponent
-            // exactly one chunk imports monaco, so the group extracts nothing and
-            // monaco stays inside that async chunk. Without it (minShareCount=1)
-            // the group chunk swallowed the shared preload helper, forcing the
-            // entry to statically import the 4.4MB monaco chunk (login-page hit).
-            { name: 'monaco', test: /node_modules[\\/]monaco-editor/, minShareCount: 2 },
+            // T9 rationale kept: minShareCount=2 — with SqlMonaco loaded via
+            // defineAsyncComponent exactly one chunk imports the editor, so the
+            // group extracts nothing and CM6 stays inside that async chunk
+            // (minShareCount=1 would swallow the shared preload helper and drag
+            // the editor into the entry — the login-page hit T9 fixed).
+            {
+              name: 'codemirror',
+              test: /node_modules[\\/](codemirror|@codemirror|@lezer|style-mod|w3c-keyname|crelt|@marijn)[\\/]/,
+              minShareCount: 2,
+            },
           ],
         },
       },
