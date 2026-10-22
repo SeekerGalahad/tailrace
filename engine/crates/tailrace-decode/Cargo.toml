@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 description = "Decoder trait plus ogg/json/csv/parquet decoders writing directly into Arrow columns"
+keywords = ["decoder", "json", "csv", "parquet", "ogg"]
+categories = ["encoding", "parser-implementations"]
 
 [dependencies]
 anyhow = "1"

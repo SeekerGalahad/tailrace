@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Console-to-node HTTP layer: shared reqwest client factories, typed /v1 node endpoint wrapper and datasource connectivity probes"
+keywords = ["proxy", "reqwest", "http", "probe", "datasource"]
+categories = ["web-programming::http-client"]
 
 [dependencies]
 reqwest = { workspace = true }

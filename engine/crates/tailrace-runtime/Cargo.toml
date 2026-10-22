@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 description = "Micro-batch pipeline executor: per-statement threads, ledger-backed at-least-once commits, serve-mode pipeline registry"
+keywords = ["runtime", "executor", "micro-batch", "pipeline", "etl"]
+categories = ["database", "concurrency"]
 
 [features]
 # Connector wiring: the default registry registers whatever is compiled in.

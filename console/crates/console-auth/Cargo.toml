@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Authentication plane of the tailrace console: argon2id login with brute-force lockout, opaque session tokens and the node bootstrap/token channel"
+keywords = ["authentication", "argon2", "session", "token", "middleware"]
+categories = ["authentication", "web-programming::http-server"]
 
 [dependencies]
 axum = { workspace = true }

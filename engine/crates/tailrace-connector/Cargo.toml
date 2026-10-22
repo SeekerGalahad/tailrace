@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 description = "Source/Sink connector traits plus the explicit ConnectorRegistry"
+keywords = ["connector", "source", "sink", "registry", "etl"]
+categories = ["database"]
 
 [dependencies]
 anyhow = "1"

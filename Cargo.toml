@@ -39,6 +39,12 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.95"
+# Shared publish metadata (T26): inherited by every member manifest via
+# `<key>.workspace = true`. The two user-facing binaries additionally carry
+# their own `readme` pointing at the workspace README.
+repository = "https://github.com/SeekerGalahad/tailrace"
+homepage = "https://github.com/SeekerGalahad/tailrace"
+documentation = "https://github.com/SeekerGalahad/tailrace/tree/main/docs"
 
 [profile.release]
 lto = "thin"

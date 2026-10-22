@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "SQLite metadata store for the tailrace console: single WAL file, versioned migrations, argon2 password hashing and AES-GCM secret sealing"
+keywords = ["sqlite", "rusqlite", "migration", "argon2", "store"]
+categories = ["database"]
 
 [dependencies]
 rusqlite = { workspace = true }

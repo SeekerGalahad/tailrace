@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 description = "SQL frontend: ${ds:} reference extraction, FlinkDialect parsing, statement lowering and validation"
+keywords = ["sql", "parser", "dialect", "flink", "frontend"]
+categories = ["parser-implementations", "database"]
 
 [dependencies]
 anyhow = "1"

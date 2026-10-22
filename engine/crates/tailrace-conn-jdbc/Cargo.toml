@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 description = "JDBC-style batch source: MySQL/PostgreSQL keyset incremental polling (cursor = Cursor::JdbcKey)"
+keywords = ["jdbc", "mysql", "postgresql", "source", "keyset"]
+categories = ["database"]
 
 [dependencies]
 anyhow = "1"

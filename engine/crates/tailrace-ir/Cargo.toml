@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 description = "Plan IR: datafusion-proto serialized LogicalPlan statements plus the Cursor/SourceChunk contract"
+keywords = ["ir", "datafusion", "logical-plan", "cursor", "arrow"]
+categories = ["database"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

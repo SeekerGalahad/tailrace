@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 description = "axum REST: /healthz, /v1/compile, /v1/pipelines (+plan/stats/logs/offsets/actions) and the node heartbeat against the console"
+keywords = ["axum", "rest", "api", "pipeline", "heartbeat"]
+categories = ["web-programming::http-server", "database"]
 
 [dependencies]
 anyhow = "1"

@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 description = "Doris sink: BE-direct stream load with idempotent labels, bounded retries, group commit and sequence columns"
+keywords = ["doris", "starrocks", "stream-load", "olap", "sink"]
+categories = ["database"]
 
 [features]
 # StarRocks speaks the same Stream Load protocol: enabling this registers the

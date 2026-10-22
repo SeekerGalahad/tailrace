@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+# Workspace-internal test suite — never published (T26 ④).
+publish = false
 description = "In-process /v1 protocol contract tests + deterministic executor main-loop tests (file→file, zero external deps)"
 
 [dependencies]

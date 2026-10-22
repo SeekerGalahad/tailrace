@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 description = "File connector: tailing source (jsonl/csv text + parquet batch) and jsonl/parquet writers"
+keywords = ["file", "jsonl", "csv", "parquet", "tailing"]
+categories = ["database", "filesystem"]
 
 [dependencies]
 anyhow = "1"

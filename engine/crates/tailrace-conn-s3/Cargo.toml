@@ -4,5 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "S3 connector placeholder: crate name reserved for the parked S3 route — no source or sink is registered yet"
+keywords = ["s3", "object-storage", "connector", "placeholder"]
+categories = ["network-programming"]
 
 [dependencies]

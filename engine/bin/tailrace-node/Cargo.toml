@@ -4,7 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 description = "tailrace single-binary node entry: CLI (run / serve / compile) with feature-wired connectors"
+readme = "../../../README.md"
+keywords = ["etl", "data-pipeline", "streaming", "kafka", "doris"]
+categories = ["command-line-utilities", "database"]
 
 [features]
 # Connector wiring: default registers kafka/file/doris; mqtt/jdbc/s3 stay

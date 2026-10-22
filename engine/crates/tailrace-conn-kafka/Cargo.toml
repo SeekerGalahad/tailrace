@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 description = "Kafka connector: BaseConsumer source (assign-only resume, partition discovery) and idempotent BaseProducer sink"
+keywords = ["kafka", "rdkafka", "source", "sink", "consumer"]
+categories = ["database", "network-programming"]
 
 [dependencies]
 anyhow = "1"

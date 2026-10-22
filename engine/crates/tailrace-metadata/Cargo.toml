@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 description = "Metadata clients for console discover / infer-schema: Kafka topic listing + tail sampling (rdkafka), Doris FE / MySQL SHOW-DESC over the MySQL wire protocol, PostgreSQL catalog (sqlx subcrates)"
+keywords = ["metadata", "kafka", "doris", "schema", "discovery"]
+categories = ["database"]
 
 [dependencies]
 anyhow = "1"

@@ -4,5 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "MQTT connector placeholder: crate name reserved for the parked MQTT route — no source or sink is registered yet"
+keywords = ["mqtt", "connector", "placeholder"]
+categories = ["network-programming"]
 
 [dependencies]

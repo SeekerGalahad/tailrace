@@ -103,6 +103,45 @@ impl<'de> serde::Deserialize<'de> for LedgerEntry {
 /// optional statement totals.
 pub type LoadedCursor = Option<(Cursor, Option<String>, Option<StatementTotals>)>;
 
+/// Cursor ledger: save=commit after successful write; load=restore at
+/// startup. The commit-only-after-write-success ordering is what makes the
+/// engine at-least-once: a crash before `save` replays the same batch.
+///
+/// # Example
+///
+/// ```
+/// # use std::collections::BTreeMap;
+/// # use tailrace_ir::Cursor;
+/// # use tailrace_state::{FileOffsetStore, OffsetStore, StatementTotals};
+/// let dir = std::env::temp_dir().join(format!("tailrace-offsetstore-doc-{}", std::process::id()));
+/// let mut store = FileOffsetStore::new(&dir)?;
+///
+/// // 1) Pull a batch, write it, THEN save — a crash before save replays the
+/// //    same cursor (at-least-once).
+/// let cursor = Cursor::Kafka {
+///     topic: "t".into(),
+///     group: "g".into(),
+///     offsets: BTreeMap::from([(0, 41)]),
+/// };
+/// store.save(
+///     7,
+///     0,
+///     &cursor,
+///     Some("p7-flush-1"),
+///     Some(StatementTotals { consumed: 10, flushed: 10, flushes: 1 }),
+/// )?;
+///
+/// // 2) Restart path: load restores cursor + the last flush's idempotency key.
+/// let (cur, ack, totals) = store.load(7, 0)?.expect("committed statement");
+/// assert_eq!(cur, cursor);
+/// assert_eq!(ack.as_deref(), Some("p7-flush-1"));
+/// assert_eq!(totals.unwrap().flushed, 10);
+///
+/// // 3) A statement that never committed has no cursor.
+/// assert!(store.load(7, 1)?.is_none());
+/// # std::fs::remove_dir_all(&dir)?;
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 pub trait OffsetStore: Send {
     fn save(
         &mut self,

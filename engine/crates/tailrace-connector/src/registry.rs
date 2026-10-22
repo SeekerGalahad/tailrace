@@ -20,6 +20,80 @@ pub type SinkFactory =
 /// Kind-keyed connector registry. Keys are canonical kinds ("kafka"/"file"/
 /// "doris"/"starrocks"/…); legacy aliases ("topic", "doris_table") are
 /// normalized by the catalog before lookup.
+///
+/// # Example
+///
+/// ```
+/// # use std::time::Duration;
+/// # use datafusion::arrow::record_batch::RecordBatch;
+/// # use tailrace_catalog::{ReliabilityOptions, StatementSpec, TableObject};
+/// # use tailrace_connector::{ConnectorRegistry, Cursor, Sink, SinkAck, Source, SourceChunk};
+/// # struct NoopSource;
+/// # impl Source for NoopSource {
+/// #     fn open(&mut self, _: &Cursor) -> anyhow::Result<()> {
+/// #         Ok(())
+/// #     }
+/// #     fn poll(&mut self, _: usize, _: Duration) -> anyhow::Result<Vec<SourceChunk>> {
+/// #         Ok(vec![])
+/// #     }
+/// #     fn cursor(&self) -> Cursor {
+/// #         Cursor::None
+/// #     }
+/// # }
+/// # struct NoopSink;
+/// # impl Sink for NoopSink {
+/// #     fn write(&mut self, _: Vec<RecordBatch>) -> anyhow::Result<()> {
+/// #         Ok(())
+/// #     }
+/// #     fn flush(&mut self) -> anyhow::Result<SinkAck> {
+/// #         Ok(SinkAck { rows: 0, kind: "noop", idempotency_key: String::new() })
+/// #     }
+/// # }
+/// # fn make_source(
+/// #     _o: &TableObject,
+/// #     _s: &StatementSpec,
+/// #     _r: Option<&ReliabilityOptions>,
+/// # ) -> anyhow::Result<Box<dyn Source>> {
+/// #     Ok(Box::new(NoopSource))
+/// # }
+/// # fn make_sink(
+/// #     _o: &TableObject,
+/// #     _r: Option<&ReliabilityOptions>,
+/// # ) -> anyhow::Result<Box<dyn Sink>> {
+/// #     Ok(Box::new(NoopSink))
+/// # }
+/// let mut reg = ConnectorRegistry::new();
+/// reg.register_source("kafka", make_source);
+/// reg.register_sink("kafka", make_sink);
+///
+/// let mut obj = TableObject {
+///     datasource: "ds".into(),
+///     name: "t".into(),
+///     kind: "kafka".into(),
+///     format: None,
+///     columns: vec![],
+///     bootstrap: None,
+///     stream_load_url: None,
+///     auth_env: None,
+///     label_prefix: None,
+///     sequence_column: None,
+/// };
+/// let spec = StatementSpec {
+///     source: "ds.t".into(),
+///     group: "tr.p1.s0".into(),
+///     sink: "ds.t".into(),
+///     pushdown: vec![],
+///     select_sql: "SELECT * FROM src".into(),
+///     start_offset: None,
+/// };
+/// assert!(reg.build_source(&obj, &spec, None).is_ok());
+/// assert!(reg.build_sink(&obj, None).is_ok());
+///
+/// // An unregistered kind fails loudly: this binary was built without that
+/// // connector feature.
+/// obj.kind = "jdbc".into();
+/// assert!(reg.build_sink(&obj, None).is_err());
+/// ```
 #[derive(Default, Clone)]
 pub struct ConnectorRegistry {
     sources: HashMap<String, SourceFactory>,
