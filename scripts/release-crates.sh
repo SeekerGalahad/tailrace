@@ -179,7 +179,9 @@ fi
 registry_max_version() {
   local api
   api="$(curl -sf -A "tailrace-release-script (T27)" "https://crates.io/api/v1/crates/$1" 2>/dev/null || true)"
-  printf '%s' "$api" | grep -o '"max_version": *"[^"]*"' | head -1 | sed -E 's/.*"max_version": *"([^"]*)".*/\1/'
+  # grep exits 1 on no match (crate not yet published); with set -e inside $()
+  # that would silently kill the caller — always succeed with possibly-empty output.
+  printf '%s' "$api" | grep -o '"max_version": *"[^"]*"' | head -1 | sed -E 's/.*"max_version": *"([^"]*)".*/\1/' || true
 }
 
 for level in "${LEVELS[@]}"; do
@@ -194,10 +196,15 @@ for level in "${LEVELS[@]}"; do
       fi
     fi
 
+    # tailrace-console only: the tree is legitimately "dirty" with the dist/
+    # that materialize_console_dist just wrote (cargo's dirty check counts even
+    # gitignored files); every other package keeps the strict clean-tree rule.
+    dirty_flag=""
+    [ "$pkg" = "tailrace-console" ] && dirty_flag="--allow-dirty"
     # Per-package dry-run gate; retry ONLY on registry propagation lag.
     ok=0
     for try in $(seq 1 "$MAX_TRIES"); do
-      if out="$(cargo publish --dry-run --registry "$REGISTRY" -p "$pkg" 2>&1)"; then
+      if out="$(cargo publish --dry-run --registry "$REGISTRY" $dirty_flag -p "$pkg" 2>&1)"; then
         ok=1
         break
       fi
@@ -215,7 +222,7 @@ for level in "${LEVELS[@]}"; do
     fi
     log "DRY $pkg OK"
 
-    if out="$(cargo publish --registry "$REGISTRY" -p "$pkg" 2>&1)"; then
+    if out="$(cargo publish --registry "$REGISTRY" $dirty_flag -p "$pkg" 2>&1)"; then
       log "PUB $pkg OK ($VERSION)"
     else
       log "PUB $pkg FAIL — wave stopped; re-run with --resume after diagnosis"
