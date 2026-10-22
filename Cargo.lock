@@ -883,7 +883,7 @@ dependencies = [
 
 [[package]]
 name = "console-auth"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -897,7 +897,7 @@ dependencies = [
 
 [[package]]
 name = "console-proxy"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "reqwest",
  "serde_json",
@@ -906,7 +906,7 @@ dependencies = [
 
 [[package]]
 name = "console-store"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4761,7 +4761,7 @@ dependencies = [
 
 [[package]]
 name = "tailrace-api"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -4778,7 +4778,7 @@ dependencies = [
 
 [[package]]
 name = "tailrace-catalog"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "reqwest",
@@ -4790,7 +4790,7 @@ dependencies = [
 
 [[package]]
 name = "tailrace-conn-doris"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4804,7 +4804,7 @@ dependencies = [
 
 [[package]]
 name = "tailrace-conn-file"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "criterion",
@@ -4816,7 +4816,7 @@ dependencies = [
 
 [[package]]
 name = "tailrace-conn-jdbc"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "datafusion",
@@ -4838,7 +4838,7 @@ dependencies = [
 
 [[package]]
 name = "tailrace-conn-kafka"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "datafusion",
@@ -4853,15 +4853,15 @@ dependencies = [
 
 [[package]]
 name = "tailrace-conn-mqtt"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "tailrace-conn-s3"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "tailrace-connector"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "datafusion",
@@ -4871,7 +4871,7 @@ dependencies = [
 
 [[package]]
 name = "tailrace-console"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -4898,7 +4898,7 @@ dependencies = [
 
 [[package]]
 name = "tailrace-decode"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4911,7 +4911,7 @@ dependencies = [
 
 [[package]]
 name = "tailrace-ir"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4925,7 +4925,7 @@ dependencies = [
 
 [[package]]
 name = "tailrace-metadata"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "rdkafka",
@@ -4941,7 +4941,7 @@ dependencies = [
 
 [[package]]
 name = "tailrace-node"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "openssl",
@@ -4972,7 +4972,7 @@ dependencies = [
 
 [[package]]
 name = "tailrace-parser"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "datafusion",
@@ -4982,7 +4982,7 @@ dependencies = [
 
 [[package]]
 name = "tailrace-runtime"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5006,7 +5006,7 @@ dependencies = [
 
 [[package]]
 name = "tailrace-state"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -5017,7 +5017,7 @@ dependencies = [
 
 [[package]]
 name = "tailrace-transform"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "criterion",
@@ -5080,7 +5080,7 @@ dependencies = [
 
 [[package]]
 name = "tests-contract"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

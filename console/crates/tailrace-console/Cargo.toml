@@ -9,6 +9,13 @@ homepage.workspace = true
 documentation.workspace = true
 description = "Management console: single-binary axum server embedding the web SPA, REST API, Swagger UI and node registration/heartbeat endpoints"
 readme = "../../../README.md"
+# T27 self-contained packaging: rust-embed embeds the crate-local `dist/`
+# (SPA build materialized by build.rs from web/dist, or the packaged copy).
+# `dist/` is gitignored; the explicit include list overrides the ignore file
+# so the published crate carries the SPA (cargo install must build without
+# the repository). Keep the list complete — it REPLACES the default file set
+# (Cargo.toml / Cargo.lock / README.md are always-included extras).
+include = ["/src/**", "/tests/**", "/build.rs", "/dist/**"]
 keywords = ["console", "axum", "spa", "admin", "management"]
 categories = ["web-programming::http-server", "command-line-utilities"]
 

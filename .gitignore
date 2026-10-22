@@ -19,3 +19,8 @@ data/
 
 # IDE
 .idea/
+
+# tailrace-console: crate-local SPA copy materialized at build/package time
+# (rust-embed folder target; real content synced from web/dist by build.rs / release script)
+console/crates/tailrace-console/dist/
+scripts/release-log-*.txt

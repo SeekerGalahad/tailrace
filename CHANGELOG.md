@@ -5,20 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.0.0] - 2026-10-22
 
 ### Added
 
+- StarRocks sink (roadmap T12): shares the Doris Stream Load path inside
+  `tailrace-conn-doris` with a verified difference matrix (URL/port,
+  `read_json_by_line` carrier, label idempotency, buffer-flush thresholds);
+  `docker compose --profile starrocks` local stack (allin1 via feproxy);
+  file→starrocks e2e including restart label-idempotency (replay with the
+  same label dedups, table row count does not grow).
 - JDBC batch source connector (`tailrace-conn-jdbc`, roadmap T13): MySQL /
   PostgreSQL keyset incremental polling — each poll runs
   `SELECT * FROM t [WHERE cursor > ?] ORDER BY cursor LIMIT n` and emits one
   JSON object per row (`kind=jdbc` pairs with `format=json`); the cursor
   (`Cursor::JdbcKey`) commits at flush points only (at-least-once). Driver:
   sqlx 0.9 subcrates, no TLS feature. Connector docs: `docs/connectors/jdbc.md`.
+- discover / infer-schema (roadmap T14): the console's 501 placeholders are
+  real — Kafka topic listing and tail sampling (rdkafka metadata), Doris /
+  MySQL `SHOW`/`DESC` over the 9030 text protocol, PostgreSQL
+  `information_schema`; datasource types gain the mysql/postgresql family
+  and `jdbc`→`JDBC_KEY` cursor semantics; web datasources flow wired.
+- Dynamic Kafka partition discovery (roadmap T15, option b): new partitions
+  join the poll set without a pipeline restart (measured discovery latency
+  26.8–31.2 s, three stable runs); fingerprint regression tests were written
+  first. Split-parallelization was NOT implemented — the card's retreat gate
+  fired (byte-level equivalence could not be constructed honestly); deferred
+  to the v1.x agenda with the narrow latest+subscribe window.
 - Opt-in jemalloc allocator for `tailrace-node` (roadmap T20): `jemalloc`
   feature (default OFF) via tikv-jemallocator; the heartbeat `resources`
   payload gains `peakRssBytes` (Linux `/proc/self/status` VmHWM). A/B
   numbers and caveats: `docs/BENCHMARKS.md` §六.
+- i18n wire channel (roadmap T30): console error codes collapsed to
+  single-point constants, and error responses carry an optional
+  `message_key` field (wire-compatible: omitted by default, current response
+  bytes unchanged) — groundwork for dictionary-based localization.
 
 ### Changed
 
@@ -27,9 +48,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parity = roadmap T12), mqtt/s3 are placeholders; the scripted smoke check
   is quoted per caliber — 25 assertions (default, dependency-free) / 44
   with `--full` (Kafka→Doris via docker compose).
-- Editor evaluation (roadmap T17, PoC branch `poc/codemirror6`, not merged):
-  CodeMirror6 measures 883.22→140.45 kB gzip on the editor async chunk
-  (−84.1%, T9-anchored); production migration scheduled as roadmap T22 (R4).
+- SQL editor migrated from monaco to CodeMirror6 (roadmap T22, landing the
+  T17 verdict): editor async chunk gzip 883.22 kB → 138,962 B (T9-anchored
+  single caliber, ≤300 kB gate), SQL keyword completion and FROM-alias
+  awareness added, completion+`-- @tag:ds` insert split into two undo steps;
+  the monaco dependency is removed from `web/package.json` and the T9
+  late-CSS/layout-collapse patch class is gone.
+- Connector feature trimming is real (roadmap T16): with
+  `--no-default-features --features connector-file,connector-doris` the
+  node actually drops kafka/rdkafka from its link graph — slim binary
+  −9.4% (55,788,080 B vs 61,571,936 B default); `smoke.sh --slim`
+  file→doris e2e green (30/30); CI gains a hard slim-features gate.
+- Live-gated tests report as `ignored` instead of silently passing
+  (roadmap T25, T18 ⑦b): `#[ignore = "live: …"]` + CI
+  `--include-ignored` — skip counts are now visible in the honest ledger.
+- OpenAPI components and `docs/protocol/console-api.md` synced with
+  discover/infer-schema (roadmap T24); the StarRocks e2e is archived as
+  the re-runnable `scripts/e2e/starrocks.sh`.
+- Release surface (roadmaps T26/T27): all 21 published crates carry
+  complete metadata (description/repository/keywords/categories) and ship
+  in lockstep at 1.0.0; `tailrace-console` packages self-contained — the
+  SPA build is embedded in the crate tarball (crate-local `dist/` via
+  rust-embed), so `cargo install tailrace-console` builds without the
+  repository.
 - MSRV raised from 1.85 to 1.95: `rusqlite_migration` 2.6 (the locked
   version) declares `rust-version = 1.95`, so the previous claim was
   unenforceable. The `msrv` CI job now actually compiles the workspace on
@@ -54,9 +95,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     re-match the same row every poll).
   - Pipeline validation diagnostics now name the JDBC/JDBC_TABLE mix-up:
     `jdbc` is the MySQL/PostgreSQL source kind, `jdbc_table` is the Doris
-    sink alias (a source declared `jdbc_table` resolves to doris and gets a
-    pointed hint instead of a bare "got doris"); the sink diagnostic list
+    sink alias (a source declared `jdbc_table` resolves to doris and gets
+    a pointed hint instead of a bare "got doris"); the sink diagnostic list
     now includes starrocks, which the whitelist already accepted.
+- Contract-test suite built as a single package no longer ran against an
+  empty connector registry (R3-W3 review finding): `tests/contract` pins
+  `tailrace-runtime` `features=["connector-file"]` explicitly, so
+  `cargo test -p tests-contract` exercises file→file as documented instead
+  of failing executor determinism 3/3.
 
 ## [0.1.0] - 2026-10-13
 
@@ -81,5 +127,6 @@ web UI.
   `checksums.txt`, and community health files (CONTRIBUTING, SECURITY,
   CODE_OF_CONDUCT, issue/PR templates).
 
-[Unreleased]: https://github.com/SeekerGalahad/tailrace/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/SeekerGalahad/tailrace/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/SeekerGalahad/tailrace/compare/v0.1.0...v1.0.0
 [0.1.0]: https://github.com/SeekerGalahad/tailrace/releases/tag/v0.1.0

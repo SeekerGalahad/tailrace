@@ -1,8 +1,7 @@
-//! Embedded SPA (§3.1/A2): rust-embed serves `web/dist`; unknown non-API
+//! Embedded SPA (§3.1/A2): rust-embed serves the crate-local `dist/`
+//! (materialized by build.rs from the repository `web/dist` build, or the
+//! packaged copy in a published crate — see build.rs); unknown non-API
 //! paths fall back to index.html (client-side routing).
-//!
-//! Folder is three levels up from this crate: tailrace/web/dist (the naive
-//! "../../web/dist" from the crate resolves one level short).
 
 use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -11,7 +10,7 @@ use rust_embed::RustEmbed;
 use console_auth::ApiError;
 
 #[derive(RustEmbed)]
-#[folder = "$CARGO_MANIFEST_DIR/../../../web/dist"]
+#[folder = "$CARGO_MANIFEST_DIR/dist"]
 struct Assets;
 
 const INDEX: &str = "index.html";
