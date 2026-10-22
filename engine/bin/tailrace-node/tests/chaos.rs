@@ -608,6 +608,7 @@ fn main_flow(d: &Deps) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[ignore = "live: TAILRACE_TESTCONTAINERS=1 (ephemeral Kafka+Doris) or --ignored against the docker-compose dev stack (seeded tailrace.chaos.src + FE on 8030)"]
 #[test]
 fn chaos_kill9_restart_idempotent() -> anyhow::Result<()> {
     // Mode ① (opt-in, CI chaos job): ephemeral Kafka+Doris via

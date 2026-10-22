@@ -606,6 +606,7 @@ mod tests {
         Ok(())
     }
 
+    #[ignore = "live: TAILRACE_TESTCONTAINERS=1 (ephemeral Kafka) or --ignored against the docker-compose dev stack (seeded tailrace.discover.test topic)"]
     #[test]
     fn kafka_source_live() -> anyhow::Result<()> {
         // Mode ① (opt-in, CI chaos job): ephemeral Kafka via testcontainers
@@ -892,8 +893,9 @@ mod tests {
     /// fixed host port (advertised.listeners must name a routable address —
     /// the testcontainers-modules apache module's 0.0.0.0 machinery trips the
     /// JVM wrapper's validation). The test **creates and alters topics**, so
-    /// it must not run against a shared dev broker — default mode skips (the
-    /// non-mutating liveness stays in kafka_source_live).
+    /// it must not run against a shared dev broker — default mode is
+    /// `#[ignore]`d (the non-mutating liveness stays in kafka_source_live).
+    #[ignore = "live: TAILRACE_TESTCONTAINERS=1 only (creates/alters topics — never a shared broker); CI chaos job runs it via --include-ignored kafka_source"]
     #[test]
     fn kafka_source_discovers_new_partitions_without_reopen() -> anyhow::Result<()> {
         if std::env::var("TAILRACE_TESTCONTAINERS").ok().as_deref() != Some("1") {

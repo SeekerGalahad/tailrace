@@ -2,7 +2,10 @@
 //!
 //! Gating: `TAILRACE_TESTCONTAINERS=1` boots ephemeral mysql:8.0 /
 //! postgres:15 (tags pinned to the locally preheated images — no pull);
-//! without the flag the tests skip (conn-kafka's live-gate convention).
+//! the tests are `#[ignore = "live: …"]` so the default skip shows as an
+//! ignored count (T25 honest ledger); `--include-ignored` runs execute
+//! them, and without the flag the in-body gate still skips (conn-kafka's
+//! live-gate convention).
 //! Assertions per the task card: restart continuation neither loses nor
 //! duplicates rows (keyset cursor), cumulative totals stay monotonic, and
 //! each dialect performs at least one real read+write round trip through
@@ -104,6 +107,7 @@ fn decode_all(raws: &[Vec<u8>], schema: Arc<Schema>) -> (usize, Option<Vec<u8>>)
     (appended, bad)
 }
 
+#[ignore = "live: TAILRACE_TESTCONTAINERS=1 (ephemeral mysql:8.0) or CI chaos job with --include-ignored"]
 #[test]
 fn mysql_keyset_cursor_restart_no_loss_no_dup() -> anyhow::Result<()> {
     if !gated() {
@@ -286,6 +290,7 @@ fn mysql_keyset_cursor_restart_no_loss_no_dup() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[ignore = "live: TAILRACE_TESTCONTAINERS=1 (ephemeral postgres:15) or CI chaos job with --include-ignored"]
 #[test]
 fn postgres_keyset_cursor_int_and_timestamptz() -> anyhow::Result<()> {
     if !gated() {

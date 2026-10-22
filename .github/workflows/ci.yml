@@ -122,12 +122,15 @@ jobs:
       # and the image entrypoint launders that into a silent container
       # exit(0) (runners ship a default 4096MB swapfile on /mnt — T11 F11)
       - run: sudo swapoff -a
-      - run: cargo test --locked -p tailrace-node --test chaos -- --nocapture
-      - run: cargo test --locked -p tailrace-conn-kafka kafka_source_live -- --nocapture
+      - run: cargo test --locked -p tailrace-node --test chaos -- --nocapture --include-ignored
+      # `kafka_source` prefix matches BOTH live tests (kafka_source_live and
+      # kafka_source_discovers_new_partitions_without_reopen) — the old
+      # `kafka_source_live` filter never ran the discovery test (T25 trap)
+      - run: cargo test --locked -p tailrace-conn-kafka kafka_source -- --nocapture --include-ignored
       # T13 JDBC batch source against real mysql:8.0 / postgres:15 (the
-      # `rust` job runs the same tests ungated, where they print [skip] and
-      # count as passed — only this job gives real-database coverage)
-      - run: cargo test --locked -p tailrace-conn-jdbc --test jdbc_sources -- --nocapture
+      # `rust` job's workspace run counts these as ignored — only this job
+      # gives real-database coverage)
+      - run: cargo test --locked -p tailrace-conn-jdbc --test jdbc_sources -- --nocapture --include-ignored
 
   smoke:                                           # 端到端冒烟：起 console+node，跑通 healthz/注册/心跳
     needs: [rust, web]
