@@ -27,6 +27,12 @@ pub struct ErrorResponse {
 pub struct ErrorBody {
     pub code: String,
     pub message: String,
+    /// Reserved dictionary key for i18n message lookup (roadmap §九 T30):
+    /// unset today, so it is absent from the wire (`skip_serializing_if`)
+    /// and default responses serialize exactly as before; v1.x may populate
+    /// it alongside `message`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_key: Option<String>,
 }
 
 /// SQLite `datetime('now')` ("YYYY-MM-DD HH:MM:SS", UTC) → ISO-8601 Z, the
@@ -75,4 +81,46 @@ pub fn not_implemented(what: &str, doc_ref: &str) -> ApiError {
         "NOT_IMPLEMENTED",
         format!("{what} 尚未实现（{doc_ref}）；本端点按计划推迟到后续阶段交付"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ErrorBody, ErrorResponse};
+
+    /// Wire-compat (T30): the reserved `message_key` channel must stay
+    /// invisible in today's error shape — a default body serializes to the
+    /// exact §4.0 envelope with no extra key.
+    #[test]
+    fn error_body_default_has_no_message_key() {
+        let body = ErrorResponse {
+            error: ErrorBody {
+                code: "UNAUTHENTICATED".to_string(),
+                message: "未登录或会话已过期".to_string(),
+                message_key: None,
+            },
+        };
+        let json = serde_json::to_string(&body).expect("serialize ErrorResponse");
+        assert!(
+            !json.contains("message_key"),
+            "message_key leaked into default wire shape: {json}"
+        );
+        assert_eq!(
+            json,
+            r#"{"error":{"code":"UNAUTHENTICATED","message":"未登录或会话已过期"}}"#
+        );
+    }
+
+    /// The reservation itself is functional: a populated key serializes.
+    #[test]
+    fn error_body_message_key_serializes_when_set() {
+        let body = ErrorBody {
+            code: "NOT_FOUND".to_string(),
+            message: "资源不存在".to_string(),
+            message_key: Some("err.not_found".to_string()),
+        };
+        assert_eq!(
+            serde_json::to_string(&body).expect("serialize ErrorBody"),
+            r#"{"code":"NOT_FOUND","message":"资源不存在","message_key":"err.not_found"}"#
+        );
+    }
 }
