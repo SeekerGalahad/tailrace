@@ -191,7 +191,7 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 
 **R3 亮点特性（~3-4 周）**（2026-10-20 已立项为任务卡，见 §九 T12-T21）：StarRocks sink 完整化（现仅注册别名，共享 Stream Load 协议）；JDBC 批源（MySQL/PostgreSQL，cursor_semantics 登记轮询位点；验收=新增连接器零改动 runtime/api/parser 本体）；discover / infer-schema 落地（替换 501 占位，Kafka/Doris 元数据客户端）；分区并行方案 b（split 化+动态分区发现，动工前先写部分分区推进的指纹回归测试）；feature 裁剪验证（`--no-default-features --features connector-file,connector-doris` 跑通 file→doris）；选做：SSH 部署链八步、jemalloc（RSS 指标先就位）、parser/decode fuzz 起步。**R3 末升格评审**：deltalake sink / DataFusion 升级 / 事务接口 / group commit / 本地两步 WAL 五项，默认结论=排 v1.x，纪要落 docs/dev/。
 
-**R4 1.0 发布（~1.5-2 周）**：~~开工第一动作=crates.io 注册占位~~（**已完成 2026-10-21**：`tailrace`/`tailrace-node`/`tailrace-console` 三名各以 0.0.0 占位发布注册并经 API 核验，风险 R1 关闭；R4 发包以真实现版本号覆盖即可）；T22 CodeMirror6 转产落地（§九，T17 裁决）；README 双语定稿（徽章矩阵+三命令 quickstart+连接器矩阵+FAQ）；mdBook 文档站骨架（协议/连接器/架构；设计文档以脱敏干净版重新入仓）；crate 元数据补齐 + doc-test；crates.io 发包（`tailrace-node` + `tailrace-console` 两 bin + `tailrace-connector` trait 契约面）；tag v1.0.0 → release（9 资产）；基准报告入 README；i18n 最小动作（错误码字典化接口预留，中文单轨明示）。MQTT 源 / S3 / CDC 的路线裁决并入 T18 评审（设计 §7.4 P2 序 #3/#4 未排卡）。
+**R4 1.0 发布（~1.5-2 周）**：~~开工第一动作=crates.io 注册占位~~（**已完成 2026-10-21**：`tailrace`/`tailrace-node`/`tailrace-console` 三名各以 0.0.0 占位发布注册并经 API 核验，风险 R1 关闭；R4 发包以真实现版本号覆盖即可）。**2026-10-22 已立项为任务卡（§九 T25-T31；T22 承接自 R3 不重写）**：T25 ⑦b live-gate 整改（W0 前置小卡，T18 ⑦b 裁决落地）；T26 crate 发布元数据补齐+doc-test 起步；T27 crates.io 全树发包（拓扑序 21 包、lockstep 1.0.0、全树 dry-run 门槛、publish 不可逆独占波）；T28 README 双语定稿（徽章矩阵/FAQ/北极星措辞按 T18 §九档位口径/基准外显携跨机器不可比注记）；T29 mdBook 文档站骨架（docs 8 篇为骨架基础；dev 内部档不入站，实际入站 5 篇=architecture.zh.md/engine-v1/console-api/jdbc/BENCHMARKS+前言，roadmap 以链接入开发指针）；T30 i18n 错误码字典化接口预留（message_key wire 兼容+中文单轨明示）；T31 v1.0.0 终验（tag→release 9 资产+checksums+全新机器三命令 quickstart+基准报告收口）。波次编排见 §十 R4-W1~W4；收口标准见 §十一 R4 段。MQTT / S3 / CDC 路线已由 T18 裁决关闭（⑥不升格带 12 个月触发器、⑦a 排 v1.x，纪要存档）。T19/T21 维持「待用户点名」现状，不并入本轮。
 
 ## 八、开放问题（随轮裁决）
 
@@ -327,7 +327,62 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 >
 > **low 一条仅登记未修（BENCHMARKS §6.3 已记，与 latest+subscribe 窄窗同批）**：分区发现单向（只增不减）——30s 差异对比只处理新分区（conn-kafka lib.rs:222-251），分区消失后 offsets 陈旧项永不清理，TPL 重建（lib.rs:260-263）与 `cursor()` 携带死分区项；现实触发面窄（Kafka `--alter` 不能减分区），收缩侧剔除+topic 重建回归测试与窄窗修复同批留待（窄窗已排 v1.x、届时并入 split 化同张热路径卡，T18 纪要 :131）。
 
-## 十、R3 波次编排（文件域冲突分析，动工前按最终文件域复核）
+### R4 任务卡（1.0 发布轮，T25-T31 共 7 张，2026-10-22 立项；T22 已于 2026-10-21 落章上文、引用不重写）
+
+> 立项依据：§七 R4 段 + 2026-10-22 勘察实录（现状锚点均为一手核实：cargo tree/dry-run 实跑、manifest 逐个 grep、ci.yml/README/release.yml/docs 树实读；T18 纪要 ⑦b 与 §九）。
+> 总量评估：T25-T31 共 ~7.5 业余人日 + T22 承接 ~2 人日（§八.4 统一口径）≈ 9.5 人日，合 R4 ~1.5-2 周档。
+> 红线（全轮生效）：§五既有红线沿用（状态账本/emit/SSE/smoke 骨架；**禁改 tag/动 v0.1.0**）；**cargo publish 不可逆——独占波（R4-W2）集中执行，发包前必过全树 dry-run 与查名**；版本 lockstep 单文件 bump（根 Cargo.toml 为唯一改动点）。
+
+#### T25 ⑦b live-gate 整改（~0.5 人日）〔R4-W0 前置小卡；T18 ⑦b 裁决〕
+
+- **现状**：T18 ⑦b 裁决采纳 R3-W1 评审 low#7 建议——`return Ok` 计 passed 改 `#[ignore]`+CI `--include-ignored`（纪要 docs/dev/R3-升格评审-2026-10-21.md ⑦b 与 :120 五测清单）。五处逐一核实（勘察实测行号）：`engine/crates/tailrace-conn-jdbc/tests/jdbc_sources.rs:111`、`:293` 两处 `return Ok(());`；`engine/crates/tailrace-conn-kafka/src/lib.rs:667`（TcpStream 9092 探测）、`:674`（topic 未播种跳过）、`:904`（纪要 :903 漂移 +1，分区发现测试 `kafka_source_discovers_new_partitions_without_reopen`@fn:898）；`engine/bin/tailrace-node/tests/chaos.rs:625`（chaos_kill9_restart_idempotent@fn:612）。CI 配套：`.github/workflows/ci.yml` chaos job 三条命令均无 `--include-ignored`（:125 chaos 全文件 / :126 kafka 过滤 / :130 jdbc 全文件）。**整改陷阱（勘察实测）**：:126 过滤词 `kafka_source_live` 不匹配 :904 的 discovery 测试名——只加 `--include-ignored` 不放过滤词，该测在 CI 永不被真跑；过滤词放宽为公共前缀 `kafka_source` 可两测兼收。
+- **方案**：5 处 live-gate 块改 `#[ignore = "live: …"]` 属性（ignore 消息注明启用方式，`[skip]` 探测文案保留）；ci.yml chaos job 三条命令追加 `--include-ignored`，:126 过滤词放宽为 `kafka_source`；工作区级 :29 `cargo test --workspace --locked` 不动（ignored 默认跳过，跳过语义从「计 passed」变「ignored 计数可见」——诚实账本）。
+- **验收**：`cargo test --locked -p tailrace-conn-jdbc --test jdbc_sources` 输出含 `2 ignored`（原静默 passed 转可见计数）；`cargo test --locked -p tailrace-conn-kafka` 含 `2 ignored`；`cargo test --locked -p tailrace-node --test chaos` 含 `1 ignored`；`cargo test --workspace --locked` 总数守恒（passed+ignored 之和不变，基线 R3-W3 176 passed/2 ignored → 预期 171/7）；push 后 `gh run watch` 绿且 chaos job 日志含 5 测真执行。
+- **文件域**：engine/crates/tailrace-conn-jdbc/tests/jdbc_sources.rs、engine/crates/tailrace-conn-kafka/src/lib.rs（live-gate 测试块）、engine/bin/tailrace-node/tests/chaos.rs、.github/workflows/ci.yml。
+
+#### T26 crate 发布元数据补齐 + doc-test 起步（~1.5 人日）
+
+- **现状**：`[workspace.package]` 仅 version/edition/license/rust-version 四键（Cargo.toml:37-41，实读）——repository/homepage/documentation/readme/keywords/categories 于 22 个 manifest 全 0 命中（勘察 grep 实测；license 是唯一就位的发布元数据）；description 缺 6 个：engine 侧 tailrace-conn-mqtt/tailrace-conn-s3 + console 全员 4 个（tailrace-console/console-store/console-auth/console-proxy），已有 16/22；`tests/contract` manifest 无 `publish = false`（实读——name=tests-contract 会误入发包面）；doc-test 全空跑：21 crate `///` 示例围栏 0 个（`//!` 亦 0；文档注释本身 1652+424 行存在），`cargo test --doc -p tailrace-ir`/`-p console-store` 实跑 0 passed 0 failed——「过」但为空跑。
+- **方案**：① 共享键 repository/homepage/documentation 入 `[workspace.package]`，成员 manifest 以 `.workspace = true` 继承（两个 bin crate 的 readme 单独指）；② 6 个缺 description crate 补一句话描述（与 crate 功能面对齐）；③ keywords/categories 逐 crate 定制（crates.io 官方 category slug，以 `cargo publish` 校验为准）；④ `tests/contract/Cargo.toml` 加 `publish = false`；⑤ doc-test 最小面 3 个对外 API crate：tailrace-connector（Source/Sink trait+ConnectorRegistry）、tailrace-ir（Cursor/SourceChunk）、tailrace-state（OffsetStore commit 语义），示例合计 ≤10 个，令 `cargo test --doc --workspace` 非零（勘察建议口径）。
+- **验收**：`cargo publish --dry-run --registry crates-io -p tailrace-ir 2>&1 | grep -c 'no documentation, homepage or repository'` = 0（叶 crate 无 metadata warning；conn-mqtt/conn-s3 同验）；`cargo metadata --no-deps` 21 个发布成员均有 description/repository；`cargo test --doc --workspace --locked` 非 0 passed；L0（fmt/clippy/deny）绿。
+- **文件域**：根 Cargo.toml（workspace.package 键）、22 个成员 Cargo.toml（继承行+description/keywords/categories+publish=false）、tailrace-connector/tailrace-ir/tailrace-state 的 src 文档示例（不动逻辑）。
+
+#### T27 crates.io 全树发包（~1.5 人日）〔依赖 T26〕〔publish 不可逆，独占波〕
+
+- **现状**：crates.io 侧 tailrace-* 19 个 lib 名从未发布（勘察 dry-run 查无 tailrace-catalog 佐证）；`tailrace`/`tailrace-node`/`tailrace-console` 三名 0.0.0 占位已注册（§七，2026-10-21）。内部依赖 path+version 双声明 19 条（Cargo.toml:132-162 实读：[workspace.dependencies] 内部包区 16 tailrace-* 含 conn-s3@:138 + 3 console-*；sqlx 等外部项散布其间）——打包时按注册表解析，依赖未发布则叶 crate dry-run 必失败（实测 `-p tailrace-connector` → error: no matching package named 'tailrace-catalog'；对照零内部依赖的 `-p tailrace-ir` dry-run 全通过）——**必须按拓扑序先发依赖**。发布拓扑（勘察 cargo tree 闭包核实）：L0 ir/decode/transform/conn-mqtt/conn-s3/metadata/console-store/console-proxy → L1 state(ir)/catalog(ir)/parser(catalog)/auth(store) → L2 connector(ir,catalog) → L3 conn-kafka/conn-file/conn-doris/conn-jdbc → L4 runtime → L5 api → L6 node/console；tests-contract 排除后实发 **21 包**。版本事实：单源 workspace version=0.1.0，lockstep bump 改根 Cargo.toml 单文件（[workspace.package].version + workspace.dependencies 19 条内部 version 串）；git tag v0.1.0 已存在且禁改（§五纪律 3）；CHANGELOG.md:5 声明 SemVer。**前置风险（勘察未覆盖，第一动作核查）**：release.yml:55-56 构建 web bundle 是 rust-embed 前置——`tailrace-console` 发包产物必须自包含可构建（embed 资产随包或 build.rs 降级方案），否则 `cargo install` 必失败；不可行则 console bin 走 release tarball 单渠道并如实登记本卡。
+- **方案**：① 查名：21 包名逐一 crates.io API 核验未被抢注（勘察明示未查）——命中抢注即停波上报裁决；② rust-embed 自包含核查（上述风险项）定 console 发包形态；③ lockstep bump **1.0.0**（R4 定名 1.0，与 tag v1.0.0/CHANGELOG 对齐；单文件改动+Cargo.lock 再生）；CHANGELOG Unreleased → [1.0.0] 段定稿；④ `scripts/release-crates.sh`：内置拓扑序，逐包 `cargo publish --dry-run` 绿→实发→`--list` 输出包清单（供收口循环）；同级多包发完等注册表传播（下一级 dry-run 失败即重试窗口）；⑤ 发后 API 核验 21×1.0.0。registry token 由发布机环境提供（严禁入库）。占位名 `tailrace` 维持 0.0.0 不动（无对应 crate）。
+- **验收**：`for c in $(bash scripts/release-crates.sh --list); do curl -sf https://crates.io/api/v1/crates/$c | grep -o '"max_version": *"1\.0\.0"'; done | wc -l` = **21**；发包日志留档（每包 dry-run→publish 双行）；`cargo install tailrace-node --version 1.0.0 --locked` 从注册表装出可执行二进制（console 视 ② 核查结论同验或登记 tarball 单渠道）；L0+L1 绿。
+- **文件域**：根 Cargo.toml（version bump）、Cargo.lock、CHANGELOG.md、scripts/release-crates.sh（新）。
+
+#### T28 README 双语定稿（~1.5 人日）〔基准外显；北极星措辞按 T18 §九〕
+
+- **现状**：README.md 62 行 / README.zh-CN.md 58 行（wc 实测），Status 段已是 R3 complete→R4 underway（README.md:7-14）；Quickstart 三命令在位（:20-35：build.sh→console→node serve，25/44 断言口径 :38-40）；连接器矩阵为 T23 勘正后现状（:42-52：jdbc ✅ / starrocks kind-gated 语义 / mqtt、s3 占位）。缺口（勘察 grep 实测，本轮复核一致：双 README `[!`/shields.io 均 0 命中）：**徽章矩阵全无**（CI/crates.io/license/MSRV 四徽章位全空）、**FAQ 章节无**、design/architecture.zh.md 与 CHANGELOG.md（85 行 Unreleased）均未链。北极星措辞债：现行「Doris/StarRocks 写入语义完整」（roadmap.md:9）在 v1.0 时点不诚实——T18 §九裁决按档位表述：「label 幂等档已交付（+重启幂等 e2e），事务接口/group commit 为 1.0 后演进档」。基准外显数据源（BENCHMARKS.md 608 行勘察实读）：§三宏基准表（:91-93，file→file 全链 21739 rows/s@debug+机读行）与 §六 M4 机数字（kafka(P=6)→file 中位 27861 rows/s、T16 裁剪档二进制 −9.4%、T15 分区发现 26.8s/30.7s（subscribe/assign，BENCHMARKS :363；T15 提交过程三跑口径 26.8-31.2s 见本文件 T15 结果行——README 摘录唯一源=BENCHMARKS 终稿））；§二 criterion 微基准偏内部不外显；**跨机器不可比注记（§六表前注）必须随数字携带**。
+- **方案**：① 徽章四枚双语同步（GitHub Actions CI、crates.io 版本、License Apache-2.0、MSRV 1.95）；② FAQ 章新增（≥5 问：与 Flink/SeaTunnel CDC 类之别、为何无 JVM/单二进制、StarRocks 与 Doris 通道关系、mqtt/s3 何时有（引 T18 裁决触发器）、平台/MSRV 矩阵）；③ 北极星/卖点措辞按 T18 §九档位口径改写（「label 幂等已交付+重启幂等 e2e；事务接口/group commit 见 roadmap v1.x 议程」）；④ 基准外显段：§三+§六摘录+跨机器不可比注记随行+链接 BENCHMARKS 全文；⑤ 链接补齐：CHANGELOG/design/architecture.zh.md/docs 站（T29 产物）；⑥ i18n 中文单轨明示一句（T30 呼应）；⑦ zh 侧与 EN 互为镜像（既有惯例，尾行互链保留）。
+- **验收**：`grep -cE '\[!\[' README.md` ≥4 且 `grep -cE '\[!\[' README.zh-CN.md` ≥4；`grep -ci '^## .*faq' README.md README.zh-CN.md` 各 ≥1；`grep -c 'architecture.zh.md' README.md` ≥1 且 CHANGELOG 链接存在；EN 侧无 "complete/full write semantics" 全谱系措辞（`grep -ci 'write semantics' README.md` 仅命中档位句）+ zh 侧 `grep -c '写入语义完整' README.zh-CN.md` = 0；基准段 `grep -c '27861' README.md` =1 且 `grep -c '跨机器' README.zh-CN.md` ≥1（注记随行）。
+- **文件域**：README.md、README.zh-CN.md。
+
+#### T29 mdBook 文档站骨架（~1 人日）
+
+- **现状**：docs/ 全量 8 篇 2300 行（wc 实测，本轮复核一致）：BENCHMARKS.md 608、design/architecture.zh.md **541（`## ` 章 13 个、mermaid 块 8 个——对表勘正：§七原口径 12 章，实测 13）**、dev/roadmap.md 354、dev/T11 248、protocol/engine-v1.md 229、dev/R3 评审 134、connectors/jdbc.md 124、protocol/console-api.md 62；全仓无 book.toml/SUMMARY.md（勘察 0 命中）。§七 R4 段「设计文档以脱敏干净版重新入仓」已由现状基线图文版 architecture.zh.md 兑现（公仓 @fbad97f 镜像），可直接作骨架章。
+- **方案**：mdBook 骨架（book.toml + docs/book/src/SUMMARY.md）：前言（项目一句话+链接 README quickstart）→ 架构（`{{#include}}` design/architecture.zh.md）→ 协议（protocol/engine-v1.md + console-api.md）→ 连接器（connectors/jdbc.md + 矩阵章占位）→ 基准（BENCHMARKS 摘要章+全文链接）→ 开发指针（roadmap/CHANGELOG 链接，不全文入站）；dev/ 评审纪要与 T11 事故档不入站（内部档）；中文单轨明示（book title/语言标注）；构建档默认本地 `mdbook build` + CI artifacts（免 gh-pages 部署面；升 gh-pages 留卡内裁决注记）。
+- **验收**：`mdbook build` 零错误退出且 `test -f docs/book/book/html/index.html`（或构建输出目录）；SUMMARY 展开 ≥6 章节页且 `grep -c 'architecture' docs/book/src/SUMMARY.md` ≥1、include 生效（产物 HTML 含架构章正文文本抽样）；mermaid 块以源码块或预渲染占位呈现不丢内容；CI（如立 job）绿或本地构建档登记入卡结果。
+- **文件域**：book.toml（新）、docs/book/（新，SUMMARY+前言/占位章）、.github/workflows/ci.yml（仅当立 docs job）。
+
+#### T30 i18n 错误码字典化接口预留（~0.5 人日）〔§七 R4 段 i18n 最小动作〕
+
+- **现状**：console 错误码面已集中两处——`ErrorResponse/ErrorBody{code:String,message:String}`（console/crates/tailrace-console/src/api/mod.rs:22-29）与 `ApiError{status,code,message,refs}`（console/crates/console-auth/src/error.rs:11-16），后者 5 个构造帮助方法硬编码 **6 个规范码**（UNAUTHENTICATED/INVALID_ARGUMENT/NOT_FOUND/INTERNAL/IN_USE/BAD_NODE_TOKEN）——码面单点在 error.rs，枚举化只差 String→常量；中文文案散布 api/*.rs+spa.rs 约 67 行（43 处 format! 带中文，勘察 grep）；engine 侧 tailrace-api 无错误码（11 处 ad-hoc `json!({"error":…})`）——**不在本卡，登记 v1.x**。
+- **方案**：最小动作=接口预留、文案不动：① 6 码收敛为常量/枚举单点（error.rs），构造方法签名与现值不变；② `ErrorBody` 加 `message_key: Option<String>`（serde `skip_serializing_if = "Option::is_none"`——wire 兼容，默认响应零变化），为字典化查表预留通道；③ 中文单轨现状一句入 README（文案句由 T28 承接）；文案字典化本体（67 行收敛 key 查表）与 engine 侧 code 字段补齐留 v1.x 议程（卡内登记）。
+- **验收**：`cargo test -p console-auth -p tailrace-console --locked` 全绿含新增 wire 兼容断言（现网形态响应序列化后无 `message_key` 键）；`grep -c '"UNAUTHENTICATED"' console/crates/console-auth/src/error.rs` 收敛为常量定义单点（构造方法引用常量名而非字面量）；L0 绿。
+- **文件域**：console/crates/console-auth/src/error.rs、console/crates/tailrace-console/src/api/mod.rs（+对应测试）。
+
+#### T31 v1.0.0 终验：tag→release + checksums + 基准报告收口（~1 人日）〔门槛=T22/T25-T30 全 ✅〕
+
+- **现状**：git tag 仅 v0.1.0（实跑 `git tag -l`），禁改禁动；release.yml 已自动化全链（实读）：tag v* → preflight（clippy --locked -D warnings）→ 4 目标矩阵（linux x64/arm64 cross + macos x64/arm64）→ package.sh 每 target 2 tarball（console+node）共 8 → aggregate `shasum -a 256` 出 checksums.txt → GitHub Release 共 **9 资产**（v0.1.0 基线 9/9，release.yml:76-96）；基准报告入 README 为 §七 R4 清单项（外显面 T28 已定，BENCHMARKS 608 行就绪）。
+- **方案**：① 全卡收口后 `git tag v1.0.0 && git push origin v1.0.0` 触发 release.yml；② 资产核验 9/9（8 tarball+checksums.txt）+ checksums 覆盖核对（下载抽验 `shasum -a 256 -c`）；③ README 基准段终验（与 BENCHMARKS 终稿数字一致、注记在位）；④ **全新机器三命令 quickstart 实测**：干净环境（rustup+Node 22+pnpm，无 target/无 pnpm store）按 README Quickstart 逐字执行三命令（build.sh→console→node serve）全成功；`cargo install` 档按 T27 ② 核查结论同验或登记；⑤ 收官报告 `docs/dev/v1.0-release-<date>.md`（发包 21 包/资产 9/基准摘要/全新机器实测记录/v1.x 遗留议程指针）；⑥ 本文件 §七 R4 段与各卡状态收口。
+- **验收**：`gh release view v1.0.0 --json assets --jq '.assets | length'` = **9** 且资产名单含 checksums.txt + 8 tarball（4 目标×2 bin）；§十一 R4 收口标准全绿（含 crates.io 21×1.0.0 复核）；quickstart 实测记录入收官报告；收官报告存在 `test -s docs/dev/v1.0-release-*.md`。
+- **文件域**：docs/dev/v1.0-release-<date>.md（新）、docs/dev/roadmap.md（状态收口）、README.md/README.zh-CN.md（仅终验勘误，如需）。
+
+## 十、R3/R4 波次编排（文件域冲突分析，动工前按最终文件域复核）
 
 | 波 | 任务（并行 ‖） | 冲突分析 | 波门禁 |
 |---|---|---|---|
@@ -338,8 +393,12 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 | R3-W5 | T19 SSH 部署链〔选做〕 | console 域 | L0+L1+push+CI 绿 |
 | R3-W6 | T21 fuzz 起步〔选做〕 | fuzz/ 新目录 | 语料跑绿 |
 | R3-W7 | T18 升格评审 + 终验：全量 L0-L4 + BENCHMARKS 终稿 + 收官报告 | — | 全绿收官 |
+| **R4-W1** | W0：T25 ⑦b live-gate 整改（串行先行）→ T22 CM6 转产 ‖ T26 元数据+doc-test ‖ T30 i18n 接口预留 | 四域零交集（T25=engine 三测试文件+ci.yml；T22=web/；T26=22 manifest+connector/ir/state 文档示例；T30=console-auth+console api）；T25 先行定 CI 计数口径（ignored 可见化），后续波门禁测试账本诚实；T22 依赖 T14 SQLNamespace 已就绪（R3 交付） | W0：L0+L1+push+CI 绿（chaos job 含 `--include-ignored` 真跑）；余波：L0+L1+push+CI 绿 |
+| **R4-W2** | T27 crates.io 全树发包〔依赖 T26〕 | **publish 不可逆→发包独占波**：集中执行留审计（逐包 dry-run→publish 双行日志）；动根 Cargo.toml（lockstep bump）与 T26 同文件故不同波；README/文档本波不动（T28 徽章需已发布版本号，排 W3） | L0+L1+查名 21 包+console rust-embed 自包含核查+全树 dry-run→实发→API 核验 21×1.0.0+`cargo install` 抽验+push+CI 绿 |
+| **R4-W3** | T28 README 双语定稿 ‖ T29 mdBook 骨架 | 文件域零交集（README\*/CHANGELOG 链接 vs book.toml+docs/book/ 新增）；软依赖互链（README↔文档站 URL）以最终路径占位、波门禁一并验；T29 只读引用 docs/ 既有 8 篇不改动 | L0（clippy+deny；fmt 对 md 不生效）+`mdbook build` 绿+README/zh 双语 grep 验收+push+CI 绿 |
+| **R4-W4** | T31 v1.0.0 终验：tag→release+checksums+基准报告收口 | 门槛=T22/T25-T30 全 ✅；tag/release 不可逆动作独占波（release.yml 自动化 9 资产） | §十一 R4 收口标准全绿收官（含 21×1.0.0 复核+资产 9/9+全新机器三命令 quickstart） |
 
-## 十一、R3 收口标准（全轮验收）
+## 十一、R3/R4 收口标准（分轮验收：R3 全量基线 + R4 增量段）
 
 ```bash
 cd ~/IdeaProjects/tailrace
@@ -351,4 +410,27 @@ docker compose up -d && ./scripts/smoke.sh --full && docker compose down -v   # 
 CARGO_PROFILE_DEV_DEBUG=0 cargo build --locked --no-default-features --features connector-file,connector-doris   # T16 裁剪档
 git push origin main && gh run watch <最新>                          # CI 七 job 绿
 test -s docs/dev/R3-升格评审-*.md                                   # T18 纪要存在
+```
+
+### R4 收口标准（1.0 发布轮验收，叠加于 R3 全量基线之上）
+
+```bash
+cd ~/GLMProjects/tailrace
+cargo fmt --all --check && CARGO_PROFILE_DEV_DEBUG=0 cargo clippy --workspace --all-targets --locked -- -D warnings
+CARGO_PROFILE_DEV_DEBUG=0 cargo test --workspace --locked          # 0 failed；ignored 计数可见（T25 后 5 测转 ignored，总数守恒）
+cargo test --doc --workspace --locked                              # 非 0 passed（T26 doc-test 起步，现状为 0 空跑）
+cargo deny check advisories bans licenses sources                  # 四门 ok
+bash scripts/bench/macro.sh --rows 100000 --report /tmp/r4-final.md # 吞吐行存在（vs R3 账本同机对比，跨机器不可比注记随行）
+docker compose up -d && ./scripts/smoke.sh --full && docker compose down -v   # 全链绿（OrbStack）
+# —— 发包与 release（R4 增量）——
+for c in $(bash scripts/release-crates.sh --list); do curl -sf https://crates.io/api/v1/crates/$c | grep -o '"max_version": *"1\.0\.0"'; done | wc -l   # = 21（cargo publish 全树验证）
+cargo install tailrace-node --version 1.0.0 --locked               # 注册表可装（console 按 T27 核查结论同验或登记 tarball 单渠道）
+gh release view v1.0.0 --json assets --jq '.assets | length'       # = 9（8 tarball + checksums.txt，release 资产 9/9）
+mdbook build                                                        # 文档站构建绿（T29）
+grep -cE '\[!\[' README.md README.zh-CN.md                          # 各 ≥4（徽章矩阵）
+# 全新机器三命令 quickstart 口径：干净环境（rustup+Node 22+pnpm，无缓存）按 README Quickstart 逐字执行
+#   ./scripts/build.sh → ./target/release/tailrace-console … → ./target/release/tailrace-node serve …
+# 三命令全成功；实测记录入 docs/dev/v1.0-release-<date>.md（T31 收官报告）
+git push origin main && gh run watch <最新>                          # CI job 全绿（现役 8 job 口径，README.md:13；以 watch 实测为准）
+test -s docs/dev/v1.0-release-*.md                                  # T31 收官报告存在
 ```
