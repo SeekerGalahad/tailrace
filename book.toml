@@ -1,0 +1,19 @@
+# Tailrace mdBook 文档站（roadmap §九 T29 骨架）
+#
+# 中文单轨：language = "zh-CN"，正文全中文；英文入口 = 仓库 README.md。
+# 验收 = 本地 `mdbook build`（仓库根执行）零错误，产物 docs/book/book/html/index.html。
+# 构建产物目录不入库；CI docs job 未立，升 gh-pages 部署留卡内裁决注记
+# （见 docs/dev/roadmap.md §九 T29）。
+# 版本注记：本骨架以 mdbook v0.5.4 落地——0.5.x 将渲染器产物直接写进 build-dir，
+# 故 build-dir 定为 docs/book/book/html 以对齐卡内验收路径；mdbook 0.4.x 会再嵌
+# 一层渲染器子目录（html/html/），以其构建时以「或构建输出目录」口径验收。
+
+[book]
+title = "Tailrace 文档（中文单轨）"
+authors = ["tailrace contributors"]
+language = "zh-CN"
+src = "docs/book/src"
+
+[build]
+build-dir = "docs/book/book/html"
+create-missing = false

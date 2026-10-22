@@ -24,3 +24,6 @@ data/
 # (rust-embed folder target; real content synced from web/dist by build.rs / release script)
 console/crates/tailrace-console/dist/
 scripts/release-log-*.txt
+
+# mdBook 文档站构建产物（T29；源在 docs/book/src，构建命令：仓库根 `mdbook build`）
+docs/book/book/
