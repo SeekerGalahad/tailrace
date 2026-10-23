@@ -308,6 +308,58 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 - **文件域**：scripts/e2e/、docs/connectors/jdbc.md、docs/protocol/console-api.md、console/crates/tailrace-console/src/openapi.rs。
 > 结果：4881c39 T24 按门禁指令提交为 4881c39（main，父 3b71f94 线性），staging 严格限 4 条文件域路径（scripts/e2e/starrocks.sh 新建可执行、docs/connectors/jdbc.md、docs/protocol/console-api.md、console/crates/tailrace-console/src/openapi.rs），+370/−9。提交主题与指令逐字一致，body 完整承载四项交付（① e2e 归档脚本含 TAILRACE_SR_* 覆盖/--wait/GRANT INSERT,SELECT ON ALL TABLES/三档断言/[skip] live-gate/T12 证据链；② jdbc.md §七 T14 后现状与剩余缺口；③ openapi 四 DTO+$ref 全文档走查测试；④ console-api.md discover/infer-schema 真实现契约）与验证数字。工作树干净，未 push。
 
+
+### 以下 R5 任务卡（2026-10-23 立项，四裁决点按草案推荐案：T33 纳入/T35 纳入/T37 挂起/T38 随轮发；锚点移植时抽查核稳）
+
+### T32 Doris/StarRocks sink 宏基准（~2 人日）〔T18 ④T1；无触发争议〕
+
+- **现状**（今日锚点）：`scripts/bench/macro.sh` 仅 file→file 单管道（:2 自述注释；:110/:147 datasource/pipeline 经 console API 建法；:188 吞吐口径行）；`docs/BENCHMARKS.md` 全部 Doris 提及为 e2e 行数守恒（:330-331）、容器内存峰值（:332）、体积/裁剪（:358/:361）——**无任何 Doris sink 吞吐行**（T18 共同事实 4 复核一致）。
+- **方案**：① `macro.sh --sink doris`：L3 compose 起 Doris（环境配方=`AGENTS-环境契约与工作纪律.md` §3；磁盘 <5G 红线先查）→ 建 doris datasource（stream_load_url 完整性由 T11 回归断言口径钉住）+ 目标表 DDL → file→doris 单管道吞吐（N/(t1−t0)，对齐 :188 口径，走 label 幂等路径）；② **多管道并发档**：P=4 管道 × 小批（flushRows≈500）——group commit 收益区探针（T18 ④ 判据 T3 的数据面）；③ StarRocks 可选档：allin1 profile（T12 先例）可达则跑，不可达打印 skip 行降级登记（对齐 `scripts/e2e/starrocks.sh` live-gate 惯例）；④ 数据入 BENCHMARKS §六新小节，跨机器不可比注记随行。
+- **验收**：`bash scripts/bench/macro.sh --sink doris --rows 100000 --report /tmp/r5-doris.md` 出吞吐行；并发档 ≥1 组吞吐/耗时行；BENCHMARKS 新小节含口径注记；栈 teardown 无残留（`docker ps` 空）。
+- **回退门**：Doris 栈本机不可起（磁盘/健康检查）→ 如实登记跳过不造数据，卡降级为「file→file 对照+Doris e2e 复用数字」并在 T36 纪要注明裁决输入缺口；并发档受 console API 并发建管道限制 → 降 P=2 并登记。
+- **文件域**：scripts/bench/macro.sh、docs/BENCHMARKS.md、（仅注记级）docker-compose.yml。
+- 产出 = T36 谱系裁决的门槛输入（③④共同）。
+
+### T33 DataFusion 48→55.2.0 升级（~4-6 人日）〔引擎串行独占波；裁决点1〕
+
+- **现状**（今日锚点）：根 Cargo.toml:63-64 `datafusion = "48.0.1"` / `datafusion-proto = "48.0.1"`；engine 侧 DF 触面 **12 文件**（今日 grep 实测清单：transform/runtime/ir{lib,placeholder}/connector{sink.rs,registry.rs}/catalog/parser/decode/conn-doris/conn-file/conn-kafka 各 src/lib.rs）；契约 golden 两测（tailrace-ir/tests/golden_layer_a.json、golden_layer_b.txt，字节稳定断言）；DF48 两条已登记限制（BENCHMARKS §4.4 memory pool 部分算子不强制 :193-196、output_batches 指标面窄 :184-187）——升级后须复核是否仍成立。**MSRV 前提已核实（§一新事实）：55.2.0 rust_version=1.94.0 ≤ 1.95，ADR-001 兼容。**
+- **方案**：① 直跳 55.2.0（不停中间版本），datafusion-proto 同步；② **动工前先列 DF 49-55 breaking-changes 核实清单**（DataFrame/SessionContext API、arrow 55→59 数组/位图/ffi 面、sqlparser 升级）落卡内再动代码；③ 契约 golden 重生成**显式登记归因表**（每条字节 diff 归因：proto 版本字段/默认值漂移 vs 语义漂移；**禁止手编 golden 凑绿**）；④ L4 全量前后对比**同机同日**（微基准 identity/filter/groupby vs §4.4 基线 30.6M/9.0M/8.1M；宏基准 file→file vs §六基线带）；⑤ DF48 两条限制在 55 上的复核结论入 BENCHMARKS；⑥ deny 四门（arrow 系新版本 advisories/licenses）。
+- **验收**：L0+L1 workspace 全绿（ignored 计数口径沿用 T25 后账本）；golden 归因表存在且逐条有结论；BENCHMARKS 新「DF 升级前后」小节（微基准三项+宏基准+注记）；`smoke.sh --full` 绿（L3）；裁剪档 `--no-default-features --features connector-file,connector-doris` check 绿。
+- **回退门（写死）**：宏基准回吐 >10% 且无法归因修复 → 版本回 48.0.1、回退报告留档、②续挂（触发器重等 RUSTSEC）；deny 出现不可豁免 license 冲突 → 同回退。
+- **文件域**：根 Cargo.toml、Cargo.lock、engine 12 触面文件、tests/contract（golden 重生成）、docs/BENCHMARKS.md。
+- **立项说明**：T18 ② 的触发器 T-b 原文=「①delatlake 升格→②为其前置波」；本草案以「①为 R6 意向」预支该前置（反向驱动），另两条理由：MSRV 已核实无阻塞；v1.0 刚发、下游零依赖历史包袱，是 7 个大版本跨度的最廉窗口。裁决点1 若否决 → W1 波移除，①解锁路径续挂。
+
+### T34 i18n 承诺债清偿（~1.5 人日）〔T30 登记 v1.x 项兑现〕
+
+- **现状**（今日锚点）：engine `tailrace-api` 11 处 ad-hoc `"error"` JSON（今日 grep=11，与 T30 登记一致）；console 中文 `format!` 直写 44 处（今日 grep=44，T30 登记 43，漂移 +1）；`message_key` wire 通道与 6 规范码常量单点已由 T30 交付（console-auth/error.rs + api/mod.rs）。
+- **方案**：① engine api 11 处错误响应补 `code` 字段（additive wire 变更）——动工前核实 console 侧 node client 的反序列化容错（Value 直取/非 deny_unknown_fields 则兼容），加 wire 兼容断言测试钉住；② console 44 处文案收敛 message_key 查表（zh 单轨字典模块，en 留空轨——T30 通道兑现；audit 日志类文案可豁免，**豁免边界写死在卡内**）；③ 字典完整性测试（扫描无漏网直写）。
+- **验收**：engine api 11 处全带 code 且 wire 兼容断言绿；console 直写中文降至豁免边界内并登记豁免清单；`cargo test -p tailrace-api -p tailrace-console --locked` 绿；L0 绿。
+- **文件域**：engine/crates/tailrace-api、console/crates/tailrace-console/src/api/*、console 新字典模块、（如牵连）console node client 反序列化点。
+
+### T35 SSH 部署链八步（~3 人日）〔T19 承接；裁决点2〕
+
+- **现状**（今日锚点）：`console/crates/tailrace-console/src/api/nodes_admin.rs:749` 起 §4.4 八步 501 标记区（:757 utoipa 501 responses 登记、:760 `not_implemented`）；设计 §4.4 八步链（上传/解压/停旧/替二进制/启新/健康/回滚/版本核对）定案未实现；web 侧入口空挂。
+- **方案**：① SSH 客户端选型先过 `cargo deny check licenses`（倾向 russh 纯 Rust；openssh 包装需系统依赖不取）；② console 编排八步状态机，每步审计事件入台账（复用 audit 面）；③ **失败回滚路径=验收重心**（任一步失败→回滚旧二进制→健康确认）；④ 本地 docker 目标机集成测试（容器当远端节点、tailrace-node 真进程、含中途失败触发回滚用例）；⑤ web 部署动线接线；⑥ `docs/protocol/console-api.md` 路径契约同步（501 行清除）。
+- **验收**：501 → 真实现；docker 目标机 e2e 含回滚用例绿；`cargo test -p tailrace-console --locked` 绿；web typecheck+build 绿；`grep -c '501' docs/protocol/console-api.md` 对应段落归零。
+- **文件域**：console/crates/tailrace-console/src/api/nodes_admin.rs、web/src/pages/nodes/、console tests/、根 Cargo.toml+Cargo.lock（新依赖）、docs/protocol/console-api.md。
+- **依赖**：排 T33 后串行（同动根 Cargo.toml/Cargo.lock；R3-W2「T23 先行」同因先例）。
+
+### T36 R5 末谱系裁决卡（~1 人日）〔T18 ③④⑤ 合并裁决的正式召开〕
+
+- **方案**：输入 = T32 Doris 基线（单管道+并发档）+ T33 后链路基线；按 T18 预设判据逐项检验——④ T2（瓶颈在 FE 事务/BE compaction 队列而非网络/CPU）/T3（≥4 管道×<1000 行批收益）；③⑤ 二选一（2PC 服务端裁决 vs WAL 客户端裁决，不同时做）；产出纪要 `docs/dev/R5-谱系裁决-<date>.md`（T18 模式复用：结论+依据+续挂触发器）；升格项转 R6 任务卡草案。
+- **验收**：纪要存在且 ③④⑤ 各有结论；升格项有卡草案要点，未触发项触发器续挂明示。
+- **文件域**：docs/dev/。
+
+### T37（选做）parser/decode fuzz 起步（~2 人日）〔T21 承接；裁决点3，推荐挂起〕
+
+按 T21 卡原案：fuzz/ 独立 workspace 两目标（parser SQL 文法、decode JSON/CSV/OGG 毒输入）、种子=T4/T11 毒数据语料、首轮语料 30 分钟零 panic、deny licenses 无新增问题。R5-W2 若提前收口可作加餐，不占关键路径。
+
+### T38 v1.1.0 收口（~1.5 人日）〔裁决点4；推荐随轮发〕
+
+- **方案**：CHANGELOG `[1.1.0]` 入账（R5 各卡——**R5 执行纪律：各卡不动 CHANGELOG，统一本卡入账**，避免并行波冲突）→ lockstep bump 1.1.0（T27 配方：根 Cargo.toml 单文件+Cargo.lock 再生）→ `scripts/release-crates.sh --publish` 发 21 包（拓扑序/dry-run 门槛/断点续发已固化；1.0.0 已发包不可重发，bump 前确认 main 已含全部 R5 卡）→ `git tag v1.1.0` → release.yml 9 资产 → 收官报告 `docs/dev/v1.1-release-<date>.md`。
+- **验收**：crates.io API 21×1.1.0；`cargo install tailrace-node --version 1.1.0 --locked` 实装；`gh release view v1.1.0` 资产 9/9；收官报告存在。
+- **文件域**：根 Cargo.toml、Cargo.lock、CHANGELOG.md、docs/dev/。
+
 ### R3-W1 评审登记（2026-10-21）
 
 > **medium 三条已修（各一提交）**：① `tailrace-runtime/src/registry.rs` `Cursor::JdbcKey` 指纹常量 13 → fold key+value（JDBC 位点推进对 NO_PROGRESS 可见，3 次瞬时断库不再误判毒数据；488efcc）；② `tailrace-conn-jdbc` keyset `WHERE col > ? LIMIT n` 无 tie-breaker → 连接探针经目录视图强制游标列自身唯一（PK / 单列 UNIQUE，非唯一即 fail-fast；13d1c2b）；③ CI chaos job 追加 `jdbc_sources` 真库步（此前 CI 对 JDBC 真库覆盖为 0；19bb80b）。注：① 按评审建议触碰了 runtime 本体 1 处——属既有判据缺陷修复而非连接器引入，单独提交可审计。
@@ -412,6 +464,10 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 | **R4-W2** | T27 crates.io 全树发包〔依赖 T26〕 | **publish 不可逆→发包独占波**：集中执行留审计（逐包 dry-run→publish 双行日志）；动根 Cargo.toml（lockstep bump）与 T26 同文件故不同波；README/文档本波不动（T28 徽章需已发布版本号，排 W3） | L0+L1+查名 21 包+console rust-embed 自包含核查+全树 dry-run→实发→API 核验 21×1.0.0+`cargo install` 抽验+push+CI 绿 |
 | **R4-W3** | T28 README 双语定稿 ‖ T29 mdBook 骨架 | 文件域零交集（README\*/CHANGELOG 链接 vs book.toml+docs/book/ 新增）；软依赖互链（README↔文档站 URL）以最终路径占位、波门禁一并验；T29 只读引用 docs/ 既有 8 篇不改动 | L0（clippy+deny；fmt 对 md 不生效）+`mdbook build` 绿+README/zh 双语 grep 验收+push+CI 绿 |
 | **R4-W4** | T31 v1.0.0 终验：tag→release+checksums+基准报告收口 | 门槛=T22/T25-T30 全 ✅；tag/release 不可逆动作独占波（release.yml 自动化 9 资产） | §十一 R4 收口标准全绿收官（含 21×1.0.0 复核+资产 9/9+全新机器三命令 quickstart） |
+| **R5-W0** | T32 Doris 宏基准 ‖ T34 i18n 债清偿 | T32=scripts/bench+BENCHMARKS；T34=engine api+console；零交集（单树串行执行） | L0+L1（受影响 -p）+push+CI 绿 |
+| **R5-W1** | T33 DF 48→55.2.0 升级 | 引擎全树串行独占波（12 触面文件+golden+lock） | L0+L1 全量+L3 smoke --full+L4 前后对比+push+CI 绿 |
+| **R5-W2** | T35 SSH 部署链 ‖ T36 谱系裁决卡 | T35 串行于 T33 后（同动 lock）；T36=纯 docs | T35：L0+L1+docker e2e+push+CI；T36：纪要落档 |
+| **R5-W3** | T38 v1.1.0 收口（门槛=T32-T36 全 ✅） | publish/tag 不可逆→独占波 | §十一 R5 收口全绿（21×1.1.0+资产 9/9+收官报告） |
 
 ## 十一、R3/R4 收口标准（分轮验收：R3 全量基线 + R4 增量段）
 
@@ -449,3 +505,18 @@ grep -cE '\[!\[' README.md README.zh-CN.md                          # 各 ≥4�
 git push origin main && gh run watch <最新>                          # CI job 全绿（现役 8 job 口径，README.md:13；以 watch 实测为准）
 test -s docs/dev/v1.0-release-*.md                                  # T31 收官报告存在
 ```
+
+## 十二、R5 收口标准（叠加于 R4 基线之上，2026-10-23 立项）
+
+```bash
+cd ~/GLMProjects/tailrace
+cargo fmt --all --check && CARGO_PROFILE_DEV_DEBUG=0 cargo clippy --workspace --all-targets --locked -- -D warnings
+CARGO_PROFILE_DEV_DEBUG=0 cargo test --workspace --locked          # 0 failed，ignored 计数沿用 T25 后账本
+cargo deny check advisories bans licenses sources                  # 四门 ok（DF/arrow 新版本重点）
+bash scripts/bench/macro.sh --rows 100000 --report /tmp/r5-final.md                 # file→file vs T33 前后同机对比在档
+bash scripts/bench/macro.sh --sink doris --rows 100000 --report /tmp/r5-doris.md    # Doris 吞吐行存在（T32）
+test -s docs/dev/R5-谱系裁决-*.md                                   # T36 纪要存在
+# T38（随轮发）：21×1.1.0 API 复核 + v1.1.0 release 9 资产 + 收官报告
+```
+
+R5 增补纪律：各卡不动 CHANGELOG（T38 统一入账）；禁改 tag 扩围至 v1.0.0。
