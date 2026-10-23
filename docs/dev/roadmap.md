@@ -311,13 +311,14 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 
 ### 以下 R5 任务卡（2026-10-23 立项，四裁决点按草案推荐案：T33 纳入/T35 纳入/T37 挂起/T38 随轮发；锚点移植时抽查核稳）
 
-### T32 Doris/StarRocks sink 宏基准（~2 人日）〔T18 ④T1；无触发争议〕
+### T32 Doris/StarRocks sink 宏基准（~2 人日）〔T18 ④T1；无触发争议〕 ✅
 
 - **现状**（今日锚点）：`scripts/bench/macro.sh` 仅 file→file 单管道（:2 自述注释；:110/:147 datasource/pipeline 经 console API 建法；:188 吞吐口径行）；`docs/BENCHMARKS.md` 全部 Doris 提及为 e2e 行数守恒（:330-331）、容器内存峰值（:332）、体积/裁剪（:358/:361）——**无任何 Doris sink 吞吐行**（T18 共同事实 4 复核一致）。
 - **方案**：① `macro.sh --sink doris`：L3 compose 起 Doris（环境配方=`AGENTS-环境契约与工作纪律.md` §3；磁盘 <5G 红线先查）→ 建 doris datasource（stream_load_url 完整性由 T11 回归断言口径钉住）+ 目标表 DDL → file→doris 单管道吞吐（N/(t1−t0)，对齐 :188 口径，走 label 幂等路径）；② **多管道并发档**：P=4 管道 × 小批（flushRows≈500）——group commit 收益区探针（T18 ④ 判据 T3 的数据面）；③ StarRocks 可选档：allin1 profile（T12 先例）可达则跑，不可达打印 skip 行降级登记（对齐 `scripts/e2e/starrocks.sh` live-gate 惯例）；④ 数据入 BENCHMARKS §六新小节，跨机器不可比注记随行。
 - **验收**：`bash scripts/bench/macro.sh --sink doris --rows 100000 --report /tmp/r5-doris.md` 出吞吐行；并发档 ≥1 组吞吐/耗时行；BENCHMARKS 新小节含口径注记；栈 teardown 无残留（`docker ps` 空）。
 - **回退门**：Doris 栈本机不可起（磁盘/健康检查）→ 如实登记跳过不造数据，卡降级为「file→file 对照+Doris e2e 复用数字」并在 T36 纪要注明裁决输入缺口；并发档受 console API 并发建管道限制 → 降 P=2 并登记。
 - **文件域**：scripts/bench/macro.sh、docs/BENCHMARKS.md、（仅注记级）docker-compose.yml。
+> 结果：cb825f6 六档数字全落（M4 同机同日/debug/100k/行数守恒全过）：file→file 锚点 33568；doris 单管大批 33852（+0.8% 持平=大批 sink 零开销）；单管小批 500 行 11017（200 次同步往返封顶 -67%）；P=4 真小批 26781（2.43x 单管小批、-21% vs 大批——**T18 ④T3 数据面：并发有相对收益无绝对追平，缺口即 group commit 目标区**）；P=4 poll 地板批 97752（瓶颈在单管道非 sink）；starrocks 8750（口径不同源量级参考）。macro.sh 205→583 行（--sink doris|starrocks + --pipes/--flush-rows/--poll-rows）；BENCHMARKS §6.4+总表五行+脚注6；环境复原全过（compose 零残留/mdop doris 回滚/swap 回挂）；开发中实证修 3 个脚本缺陷（deploy 漏 token/bash3.2 set-u/孤儿 node）。T36 谱系裁决门槛输入（④T3）齐备。
 - 产出 = T36 谱系裁决的门槛输入（③④共同）。
 
 ### T33 DataFusion 48→55.2.0 升级（~4-6 人日）〔引擎串行独占波；裁决点1〕
@@ -329,12 +330,13 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 - **文件域**：根 Cargo.toml、Cargo.lock、engine 12 触面文件、tests/contract（golden 重生成）、docs/BENCHMARKS.md。
 - **立项说明**：T18 ② 的触发器 T-b 原文=「①delatlake 升格→②为其前置波」；本草案以「①为 R6 意向」预支该前置（反向驱动），另两条理由：MSRV 已核实无阻塞；v1.0 刚发、下游零依赖历史包袱，是 7 个大版本跨度的最廉窗口。裁决点1 若否决 → W1 波移除，①解锁路径续挂。
 
-### T34 i18n 承诺债清偿（~1.5 人日）〔T30 登记 v1.x 项兑现〕
+### T34 i18n 承诺债清偿（~1.5 人日）〔T30 登记 v1.x 项兑现〕 ✅
 
 - **现状**（今日锚点）：engine `tailrace-api` 11 处 ad-hoc `"error"` JSON（今日 grep=11，与 T30 登记一致）；console 中文 `format!` 直写 44 处（今日 grep=44，T30 登记 43，漂移 +1）；`message_key` wire 通道与 6 规范码常量单点已由 T30 交付（console-auth/error.rs + api/mod.rs）。
 - **方案**：① engine api 11 处错误响应补 `code` 字段（additive wire 变更）——动工前核实 console 侧 node client 的反序列化容错（Value 直取/非 deny_unknown_fields 则兼容），加 wire 兼容断言测试钉住；② console 44 处文案收敛 message_key 查表（zh 单轨字典模块，en 留空轨——T30 通道兑现；audit 日志类文案可豁免，**豁免边界写死在卡内**）；③ 字典完整性测试（扫描无漏网直写）。
 - **验收**：engine api 11 处全带 code 且 wire 兼容断言绿；console 直写中文降至豁免边界内并登记豁免清单；`cargo test -p tailrace-api -p tailrace-console --locked` 绿；L0 绿。
 - **文件域**：engine/crates/tailrace-api、console/crates/tailrace-console/src/api/*、console 新字典模块、（如牵连）console node client 反序列化点。
+> 结果：3cf738b+ffb1d55 engine api 10 处错误响应补 code（8 规范码常量；11 处口径中 1 处系数据字段如实区分）+wire 兼容双锁（4 端点真起服断言 legacy 形态+console-proxy Value 容错钉住）+信封键集机器门（评审修升格）；console 44 处中文 format! 收敛 message_key 查表（zh 单轨字典 36 key/50 调用点，渲染字节一致）+38 处 §4.0 信封携 message_key 上 wire+完整性测试钉住 format! 类；字面量类 18 处 ApiError 残留机器钉住登记（评审修：豁免②如实列分布+扫描扩展）；review low 三笔（37/51 计数勘正留 T38、负测试树内固化、BENCHMARKS send_once 措辞）随评审修或登记。
 
 ### T35 SSH 部署链八步（~3 人日）〔T19 承接；裁决点2〕
 
