@@ -34,8 +34,9 @@ import type { Diagnostic } from '../../api/pipelines'
  * SqlMonaco (design doc §6.5.2) — CodeMirror 6 kernel (T22, T17 PoC base).
  *
  * - SQL language + `库名.` table-object completion (detail shows
- *   kind · format); applying a completion auto-inserts `-- @tag:ds` above
- *   the current line when missing (publish-gate requirement) as its own
+ *   kind · format) + `库名.表名.` column completion from the registered
+ *   columns (T39 ⑤); applying a table completion auto-inserts `-- @tag:ds`
+ *   above the current line when missing (publish-gate requirement) as its own
  *   undo step. Keyword completion comes with lang-sql.
  * - compile diagnostics → lint diagnostics (wavy underlines)
  * - theme follows ThemeStore (colors from tokens, never hardcoded)
@@ -46,8 +47,14 @@ const props = withDefaults(
     modelValue: string
     /** Compile diagnostics to mirror as editor markers. */
     diagnostics?: Diagnostic[]
-    /** Completion source: registered table objects. */
-    tables?: Array<{ dbName: string; tableName: string; kind: string; format: string | null }>
+    /** Completion source: registered table objects (+ their `[name, type]` columns, T39 ⑤). */
+    tables?: Array<{
+      dbName: string
+      tableName: string
+      kind: string
+      format: string | null
+      columns?: [string, string][]
+    }>
     height?: number
     placeholder?: string
   }>(),
@@ -65,6 +72,13 @@ interface CompletionTable {
   tableName: string
   kind: string
   format: string | null
+  /** registered columns (console list-tables `columnsJson`); absent/empty = no column completion */
+  columns?: [string, string][]
+}
+
+/** Column completions for a table (`db.table.` member slot): label = column, detail = type. */
+function columnCompletions(t: CompletionTable): Completion[] {
+  return (t.columns ?? []).map(([name, type]) => ({ label: name, type: 'property', detail: type }))
 }
 
 const DS_TAG = '-- @tag:ds\n'
@@ -94,11 +108,10 @@ function applyTable(view: EditorView, completion: Completion, from: number, to: 
 }
 
 /**
- * `{ db: { self, children: { table: { self, children: [] } } } }` — the
- * `children: []` slot is where column names go once the console's
- * list-tables DTO exposes the columnsJson T14's infer-schema already
- * persists (console api/datasources.rs TableObjectItem lacks the field),
- * enabling `db.table.` column completion with no further editor code.
+ * `{ db: { self, children: { table: { self, children: [column…] } } } }` —
+ * the `children` slot carries the table's registered columns (console
+ * list-tables `columnsJson`, T39 ⑤ — the DTO hop T22 found missing), so
+ * `db.table.` column completion works with zero further editor code.
  */
 function buildSchema(tables: CompletionTable[]): SQLNamespace {
   const dbs: Record<string, { self: Completion; children: Record<string, SQLNamespace> }> = {}
@@ -111,7 +124,7 @@ function buildSchema(tables: CompletionTable[]): SQLNamespace {
         detail: [t.kind, t.format].filter(Boolean).join(' · '),
         apply: applyTable,
       },
-      children: [],
+      children: columnCompletions(t),
     }
   }
   return dbs
@@ -130,8 +143,8 @@ const MEMBER_CHAIN = /((?:[A-Za-z_][A-Za-z0-9_]*\.)+)(\w*)$/
 
 function memberCompletion(tables: CompletionTable[]): CompletionSource {
   // lowercased-key node tree mirroring buildSchema's shape; table nodes carry
-  // an empty `children` map — the column slot T14's infer-schema output fills
-  // once the console list DTO exposes it (see buildSchema comment)
+  // their registered columns as leaf children (T39 ⑤), so the chain walk
+  // below serves `db.table.<col>` the same case-insensitive way as `db.<table>`
   interface MemberNode {
     completion: Completion
     children: Map<string, MemberNode>
@@ -148,7 +161,9 @@ function memberCompletion(tables: CompletionTable[]): CompletionSource {
         detail: [t.kind, t.format].filter(Boolean).join(' · '),
         apply: applyTable,
       },
-      children: new Map(),
+      children: new Map(
+        columnCompletions(t).map((c): [string, MemberNode] => [c.label.toLowerCase(), { completion: c, children: new Map() }]),
+      ),
     })
   }
   return (ctx: CompletionContext): CompletionResult | null => {

@@ -57,7 +57,7 @@ fn registry() -> Vec<DatasourceType> {
         },
         DatasourceType {
             ty: "doris".into(),
-            label: "Doris / StarRocks".into(),
+            label: "Doris".into(),
             family: "jdbc".into(),
             credential_label: Some("数据库账号".into()),
             fields: vec![
@@ -74,6 +74,42 @@ fn registry() -> Vec<DatasourceType> {
                     input_type: "text".into(),
                     required: true,
                     placeholder: Some("http://be-1:8040".into()),
+                },
+                TypeField {
+                    name: "fenodes".into(),
+                    label: "FE 节点列表".into(),
+                    input_type: "text".into(),
+                    required: false,
+                    placeholder: None,
+                },
+            ],
+        },
+        // starrocks (T39 ⑥ ← T32 caveat): its own registry member so a
+        // StarRocks target can be registered through the console instead of
+        // the `node run` bypass the T32 bench used. connJson reuses the doris
+        // shape verbatim (jdbcUrl FE 9030 / streamLoadUrl / fenodes) — the
+        // probe, discover (MySQL-protocol FE) and the sink URL composition
+        // in pipelines.rs are shared; the engine picks the StarRocks Stream
+        // Load flavor off the table-object kind (see `table_kind_for`).
+        DatasourceType {
+            ty: "starrocks".into(),
+            label: "StarRocks".into(),
+            family: "jdbc".into(),
+            credential_label: Some("数据库账号".into()),
+            fields: vec![
+                TypeField {
+                    name: "jdbcUrl".into(),
+                    label: "JDBC URL（FE）".into(),
+                    input_type: "text".into(),
+                    required: true,
+                    placeholder: None,
+                },
+                TypeField {
+                    name: "streamLoadUrl".into(),
+                    label: "Stream Load URL（FE/BE）".into(),
+                    input_type: "text".into(),
+                    required: true,
+                    placeholder: Some("http://fe-1:8030".into()),
                 },
                 TypeField {
                     name: "fenodes".into(),
@@ -135,6 +171,7 @@ fn registry_type(ty: &str) -> Option<&'static str> {
     match ty {
         "kafka" => Some("kafka"),
         "doris" => Some("doris"),
+        "starrocks" => Some("starrocks"),
         "file" => Some("file"),
         "mysql" => Some("mysql"),
         "postgresql" => Some("postgresql"),
@@ -146,7 +183,7 @@ fn registry_type(ty: &str) -> Option<&'static str> {
 fn required_conn_keys(ty: &str) -> &'static [&'static str] {
     match ty {
         "kafka" => &["bootstrap"],
-        "doris" => &["jdbcUrl", "streamLoadUrl"],
+        "doris" | "starrocks" => &["jdbcUrl", "streamLoadUrl"],
         "file" => &["path"],
         "mysql" | "postgresql" => &["jdbcUrl"],
         _ => &[],
@@ -157,9 +194,14 @@ fn required_conn_keys(ty: &str) -> &'static [&'static str] {
 /// `cursor_semantics` derivation keys off this: kafka → KAFKA_OFFSET, file →
 /// FILE_POINTER, jdbc → JDBC_KEY, else NONE). The mysql/postgresql types
 /// both register `jdbc` objects — the conn-jdbc kind (IR `Cursor::JdbcKey`).
+/// doris and starrocks stay DISTINCT kinds (T39 ⑥): the conn-doris factory
+/// selects the StarRocks Stream Load flavor (no `read_json_by_line` /
+/// `sequence_column`, FE redirect following — the T12 difference matrix) off
+/// `kind == "starrocks"`, so folding starrocks into "doris" here would make
+/// the engine send Doris-only headers to a StarRocks FE. Both kinds derive
+/// cursor NONE (sink-side).
 fn table_kind_for(ds_type: &str) -> &str {
     match ds_type {
-        "doris" | "starrocks" => "doris",
         "mysql" | "postgresql" => "jdbc",
         other => other,
     }
@@ -253,6 +295,11 @@ pub struct TableRegistered {
     pub id: i64,
 }
 
+/// List-tables row. `columns_json` (wire `columnsJson`) carries the
+/// `[name, type]` pairs registered manually or via T14 infer-schema, `null`
+/// when the table was registered without columns — it feeds the web editor's
+/// `db.table.` column completion (T39 ⑤: the console hop the T22 chain was
+/// missing; additive wire change).
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TableObjectItem {
@@ -264,6 +311,7 @@ pub struct TableObjectItem {
     pub format: Option<String>,
     pub cursor_semantics: String,
     pub source: String,
+    pub columns_json: Option<Vec<(String, String)>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -938,7 +986,9 @@ fn conn_spec(
             }),
             None => Err(ApiError::bad_request("connJson 缺少 bootstrap").into_response()),
         },
-        "doris" | "mysql" => {
+        // doris/starrocks FEs both speak the MySQL protocol on the jdbcUrl
+        // port (9030): discover/infer-schema share the mysql metadata client
+        "doris" | "starrocks" | "mysql" => {
             let url = str_field("jdbcUrl")
                 .ok_or_else(|| ApiError::bad_request("connJson 缺少 jdbcUrl").into_response())?;
             let (host, port, database) = jdbc_endpoint(url).ok_or_else(|| {
@@ -1219,21 +1269,36 @@ pub async fn list_tables(
         .get("kind")
         .map(String::as_str)
         .filter(|v| !v.is_empty());
-    let items = match state.store().list_table_objects(datasource_id, kind) {
+    let store = state.store();
+    let items = match store.list_table_objects(datasource_id, kind) {
         Ok(v) => v,
         Err(e) => return ApiError::internal(&e).into_response(),
     };
     let items: Vec<TableObjectItem> = items
         .into_iter()
-        .map(|t| TableObjectItem {
-            id: t.id,
-            datasource_id: t.datasource_id,
-            db_name: t.db_name,
-            table_name: t.table_name,
-            kind: t.kind,
-            format: t.format,
-            cursor_semantics: t.cursor_semantics,
-            source: t.source,
+        .map(|t| {
+            // columns ride the existing per-id accessor (the same one the
+            // pipeline assembly in pipelines.rs reads): the store's list row
+            // model carries no columns_json, and the table-object catalog is
+            // small enough that a per-row lookup on the in-process SQLite
+            // handle beats widening the shared row model for one DTO (T39 ⑤).
+            let columns_json = store
+                .table_object_columns_json(t.id)
+                .ok()
+                .flatten()
+                .flatten()
+                .and_then(|s| serde_json::from_str::<Vec<(String, String)>>(&s).ok());
+            TableObjectItem {
+                id: t.id,
+                datasource_id: t.datasource_id,
+                db_name: t.db_name,
+                table_name: t.table_name,
+                kind: t.kind,
+                format: t.format,
+                cursor_semantics: t.cursor_semantics,
+                source: t.source,
+                columns_json,
+            }
         })
         .collect();
     Json(TableListResponse {

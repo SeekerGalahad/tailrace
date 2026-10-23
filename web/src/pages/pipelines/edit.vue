@@ -177,7 +177,14 @@ const dsOptions = computed(() =>
 const templateOptions = computed(() => templates.value.map((t) => ({ label: t.label || t.name, value: t.name })))
 
 const completionTables = computed(() =>
-  tables.value.map((t) => ({ dbName: t.dbName, tableName: t.tableName, kind: String(t.kind), format: t.format })),
+  tables.value.map((t) => ({
+    dbName: t.dbName,
+    tableName: t.tableName,
+    kind: String(t.kind),
+    format: t.format,
+    // T39 ⑤: registered columns feed `db.table.` completion (null → none)
+    columns: t.columnsJson ?? [],
+  })),
 )
 
 // --- mapping validation (complete rows + unique db, lowercase-normalized) ---

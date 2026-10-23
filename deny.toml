@@ -26,11 +26,11 @@ wildcards = "deny"
 
 [advisories]
 version = 2
-# zip 8.6.0 (build-dep of utoipa-swagger-ui 10.0.1, the latest release) was
-# yanked upstream after 2026-10-13 with no compatible replacement (^8.6 has no
-# other version; zip jumped to 9.x). Downgrade to deny once utoipa-swagger-ui
-# ships a release off the yanked zip.
-yanked = "warn"
+# Re-tightened 2026-10-23 (roadmap §九 T39 ⑦ / §八.1 closed): the only yanked
+# crate in the graph was zip 8.6.0, a build-dep of utoipa-swagger-ui 10.0.1
+# (^8.6, no other 8.x). utoipa-swagger-ui 10.0.2 (2026-10-20) moved to zip
+# ^9.0, so the lock now resolves zip 9.0.5 and nothing yanked remains.
+yanked = "deny"
 ignore = [
     # RUSTSEC-2024-0436: paste 1.0.15 is unmaintained; no safe upgrade exists.
     # Transitive via datafusion-common 48.0.1 (workspace pins datafusion 48,
@@ -38,18 +38,7 @@ ignore = [
     # drops paste (upgrade plan §2.2 eng H1 / §3.2; Arroyo/RisingWave do the
     # same for this advisory).
     "RUSTSEC-2024-0436",
-    # RUSTSEC-2026-0367/0368/0369: three zip extraction vulnerabilities
-    # (SUID/SGID bits preserved on extract, symlink-target escape, permissions
-    # applied through symlinks), each fixed only in zip >=9.0.0. zip reaches
-    # the graph solely as a BUILD dependency of utoipa-swagger-ui 10.0.1
-    # (latest release 2026-09-23, requires zip ^8.6): its build script
-    # extracts the crate's own vendored swagger-ui dist, never an
-    # attacker-controlled archive, and zip is not linked into the shipped
-    # binaries — none of the exploit paths apply. No 8.x backport exists and
-    # ^8.6 cannot resolve to 9.x, so there is no upgrade path until
-    # utoipa-swagger-ui ships a release on zip 9; drop these ignores then
-    # (roadmap §八.1).
-    "RUSTSEC-2026-0367",
-    "RUSTSEC-2026-0368",
-    "RUSTSEC-2026-0369",
+    # (The three zip <9 extraction advisories that were ignored here while
+    # utoipa-swagger-ui pinned zip ^8.6 were dropped 2026-10-23 with the
+    # 10.0.2 → zip 9.0.5 upgrade — see roadmap §八.1.)
 ]

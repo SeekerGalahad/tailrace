@@ -126,6 +126,8 @@ export interface TableObject {
   format: string | null
   cursorSemantics: string
   source: string
+  /** `[name, type]` pairs as registered; `null` when registered without columns (T39 ⑤). */
+  columnsJson: [string, string][] | null
 }
 
 export interface TableObjectList {

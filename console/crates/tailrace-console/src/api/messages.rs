@@ -9,6 +9,12 @@
 //! 模板占位 `{0}`..`{9}`，由 [`t`] 位置插值；渲染结果与收敛前的直写输出
 //! 逐字节一致（既有测试与前端提示不漂移）。
 //!
+//! 规模口径（T39 ③ 勘正，2026-10-23 实测）：字典 **36 key**（[`tests::KEY_LIST`]
+//! 与 `template` 同步，长度由 [`tests::templates_use_only_positional_placeholders`]
+//! 钉住）/ **50 调用点**（`grep -rn 'messages::' src/ --include='*.rs'`
+//! 排除本模块）。T34 首提交 3cf738b 的「37 key/51 调用点」为双 off-by-one
+//! 误记，ffb1d55 勘正、本次落为模块事实。
+//!
 //! 信封：`{"error":{code,message,message_key[,refs]}}`——与 console-auth
 //! `ApiError::into_response` 的 §4.0 形态逐字节同形（多出 message_key 一键，
 //! additive；由模块测试钉死字节）。走本模块的响应不再经过 ApiError。
@@ -78,7 +84,7 @@ fn template(key: &str) -> Option<&'static str> {
         "err.datasource.not_found" => "数据源 #{0} 不存在",
         "err.datasource.unknown_type" => "未知数据源类型 {0}",
         "err.datasource.unknown_type_registry" => {
-            "未知数据源类型 {0}（注册表：kafka/doris/file/mysql/postgresql）"
+            "未知数据源类型 {0}（注册表：kafka/doris/starrocks/file/mysql/postgresql）"
         }
         "err.datasource.missing_required_fields" => "connJson 缺少必填字段: {0}",
         "err.datasource.in_use" => "数据源仍被引用（管道 {0} 个，表对象 {1} 个）",
@@ -191,10 +197,13 @@ mod tests {
     }
 
     /// 字典自洽：模板只含 {数字} 占位，且插值后无残留花括号。
+    /// 另钉字典规模 = 36 key（模块文档「规模口径」的机器锚点，T39 ③）：
+    /// 加 key 时同步改此数与 KEY_LIST。
     #[test]
     fn templates_use_only_positional_placeholders() {
         let keys: Vec<&str> = KEY_LIST.to_vec();
         assert!(!keys.is_empty());
+        assert_eq!(keys.len(), 36, "字典规模漂移：同步模块文档「规模口径」");
         for key in keys {
             let tpl = template(key).expect("listed key resolves");
             let mut rest = tpl;

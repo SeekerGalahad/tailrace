@@ -361,6 +361,7 @@ decode→transform→write 之后），行数边界过界判断只能以整 poll
 | T16 | file→doris e2e（裁剪档 node，`smoke.sh --slim`） | —（默认档 `smoke.sh` 25/25 回归） | **30/30**，11.9 s；行数守恒 12==12 | 见 §6.2 | 2026-10-21 |
 | T15 | macro-partitions 吞吐（kafka(P=6)→file **debug 档**，4 轮）⁵ | **M4 首档：中位 27861 rows/s**（23918 / 27678 / 28043 / 28474） | —（本卡热路径零改动，无 A/B 档） | **vs §4.5 的 24658 属跨机器（Intel i7→M4），不可比**；本组=该 bench 在 M4 的首个档位 | 2026-10-21 |
 | T15 | 动态分区发现延迟（testcontainers 真 kafka，topic 2→4 分区不重开） | subscribe 模式 **26.8 s** | assign 模式 **30.7 s** | 均在口径界内（≤~35 s = 30 s 差异对比 + fetch_metadata ≤5 s，见 §6.3） | 2026-10-21 |
+| T22 | web 编辑器异步 chunk **gzip 体积**（`dist/assets/SqlMonaco-*.js`，`vite build` 后 `gzip -c \| wc -c`）⁷ | monaco 档 **883.22 kB**（T9 单口径锚点） | CodeMirror6 档 **138,962 B**（raw 431,013 B） | **−84.3%**；≤300 kB 门槛过；编辑器 CSS 278 B gzip、编辑器相关资产合计 139,240 B；monaco worker/ttf/外部 CSS 整类归零 | 2026-10-21 |
 | T32 | macro 吞吐（file→**doris** 单管道·默认批，debug）⁶ | **33852 rows/s** | 同日 file→file 锚点 33568 | +0.8%（噪声界内持平）——大批下 doris sink 零可测开销（见 §6.4） | 2026-10-23 |
 | T32 | 同上·小批探针（flushRows 500+pollRows 500，单管道） | **11017 rows/s**（200 次同步 stream load） | —（vs 大批 −67%） | 小批区无 group commit 的同步往返封顶 ≈45ms/次 | 2026-10-23 |
 | T32 | 同上·P=4 并发小批（T18 ④T3 判据数据面）⁶ | **26781 rows/s**（50 flush/管） | 单管小批 11017 | **2.43×**（HTTP 往返重叠），仍 −21% vs 单管大批——收益缺口=group commit 目标区 | 2026-10-23 |
@@ -373,6 +374,7 @@ decode→transform→write 之后），行数边界过界判断只能以整 poll
 > ⁴ T16 体积口径：**release 档**（`[profile.release]` lto="thin" / codegen-units=1 / strip=true），宿主 target aarch64-apple-darwin（命令不带 `--target`，产物 `target/release/`），`--locked`（Cargo.lock 零变动）；字节数 `stat -f %z`、sha256 `shasum -a 256`，sha256 为前 8 位。「改造前」两行 = `4881c39` 干净树；「改造后」两行 = `4881c39` + T16 工作树（根 Cargo.toml / engine/bin/tailrace-node/Cargo.toml / scripts/smoke.sh / .github/workflows/ci.yml）。方法与结论见 §6.2。
 > ⁵ T15 吞吐口径：`TAILRACE_KAFKA_PORT=19092 bash scripts/bench/macro-partitions.sh --rows 100000 --partitions 6`（compose kafka 移位 19092——本机 9092 被常驻 kafka-local 占用；EXTERNAL 通告随端口走，口径不变）。4 有效轮 + 1 轮播种失败重试（console-producer 端 99850≠100000，基础设施毛刺非引擎行为，弃用重跑）；每轮断言播种量==N 与 sink 行数==N（不丢行）。脚注 ¹ 的量化噪声（±17%）同样适用；同组内极差 ±9% 在噪声界内。
 > ⁶ T32 吞吐口径：`bash scripts/bench/macro.sh --sink doris [--pipes P] [--flush-rows R] [--poll-rows R] --rows 100000`——console 档口径同脚注 ¹ 的 macro.sh（t0=deploy 200，P=4 档=首条 deploy 200；t1=stats 0.5s 轮询至全部管道 flushed≥目标），单轮单档（非多轮中位）；starrocks 行为 node 直跑口径（t0=run-start 日志、t1=FE COUNT ~1s 轮询）与 console 档不同源。栈=docker-compose doris-fe/be 2.1.7 单 BE（BUCKETS 1）；行数守恒全档过（FE COUNT==100000）。环境配方（swapoff/max_map_count/停 mdop doris 腾内存）与逐档注记见 §6.4。
+> ⁷ T22 体积口径（T39 ② 补登记——T22 时文件域=web/，BENCHMARKS 未随行，数字取自 T22 落地提交 f90e6a2 说明）：编辑器异步 chunk = `web/dist/assets/SqlMonaco-*.js`（CodeMirror6 档；monaco 档为 T9 记录的编辑器 chunk 同名口径），体积为 `gzip -c | wc -c` 字节、构建产物确定性输出——**与表内吞吐行不同，不涉机器性能，跨机可比**；「编辑器相关资产合计 1,078→140.70 kB」的 PoC 复合口径已弃用（T23 评审 low#6，统一锚 T9 单口径 883.22 kB）。2026-10-23 T39 ⑤ 在本树复测：列补全接线（columnsJson 上 DTO+编辑器 children 槽填充）后 raw 431,182 B / gzip 139,007 B（+45 B，门槛仍过）。
 
 ### §6.1 T20 jemalloc + 峰值 RSS 指标（2026-10-20，同机同日交错复测）
 

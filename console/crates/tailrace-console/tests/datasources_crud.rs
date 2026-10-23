@@ -28,23 +28,34 @@ async fn datasource_types_registry_shape() {
     let (s, b) = req(&app, "GET", "/api/datasource-types", None).await;
     assert_eq!(s, StatusCode::OK);
     let types = b["types"].as_array().unwrap();
-    // T14 + low#4: kafka/doris/file + the jdbc family (mysql/postgresql)
-    assert_eq!(types.len(), 5, "{b}");
+    // T14 + low#4: kafka/doris/file + the jdbc family (mysql/postgresql);
+    // T39 ⑥: starrocks is its own member (doris connJson shape)
+    assert_eq!(types.len(), 6, "{b}");
     assert_eq!(types[0]["type"], "kafka");
     assert_eq!(types[0]["fields"][0]["name"], "bootstrap");
     assert_eq!(types[0]["fields"][0]["required"], true);
     assert_eq!(types[1]["type"], "doris");
     assert_eq!(types[1]["credentialLabel"], "数据库账号");
     assert_eq!(types[1]["fields"].as_array().unwrap().len(), 3);
-    assert_eq!(types[2]["type"], "file");
-    assert_eq!(types[3]["type"], "mysql");
-    assert_eq!(types[3]["family"], "jdbc");
-    assert_eq!(types[3]["credentialLabel"], "数据库账号");
-    assert_eq!(types[3]["fields"][0]["name"], "jdbcUrl");
-    assert_eq!(types[3]["fields"][0]["required"], true);
-    assert_eq!(types[4]["type"], "postgresql");
+    // starrocks (T39 ⑥): same 3-field doris connJson shape, own label
+    assert_eq!(types[2]["type"], "starrocks");
+    assert_eq!(types[2]["label"], "StarRocks");
+    assert_eq!(types[2]["family"], "jdbc");
+    assert_eq!(types[2]["credentialLabel"], "数据库账号");
+    assert_eq!(types[2]["fields"].as_array().unwrap().len(), 3);
+    assert_eq!(types[2]["fields"][0]["name"], "jdbcUrl");
+    assert_eq!(types[2]["fields"][0]["required"], true);
+    assert_eq!(types[2]["fields"][1]["name"], "streamLoadUrl");
+    assert_eq!(types[2]["fields"][1]["required"], true);
+    assert_eq!(types[3]["type"], "file");
+    assert_eq!(types[4]["type"], "mysql");
     assert_eq!(types[4]["family"], "jdbc");
+    assert_eq!(types[4]["credentialLabel"], "数据库账号");
     assert_eq!(types[4]["fields"][0]["name"], "jdbcUrl");
+    assert_eq!(types[4]["fields"][0]["required"], true);
+    assert_eq!(types[5]["type"], "postgresql");
+    assert_eq!(types[5]["family"], "jdbc");
+    assert_eq!(types[5]["fields"][0]["name"], "jdbcUrl");
 }
 
 #[tokio::test]
@@ -556,4 +567,179 @@ async fn discover_and_infer_schema_error_paths() {
     assert_eq!(s, StatusCode::OK, "{b}");
     assert_eq!(b["hasPassword"], true, "{b}");
     assert!(b.get("password").is_none(), "{b}");
+}
+
+/// T39 ⑤ (closes the T22 caveat): the list-tables DTO carries the registered
+/// `columnsJson` — the console hop the web editor's `db.table.` column
+/// completion needed (SqlMonaco.vue builds its column slot from it). The
+/// value round-trips exactly as registered; a table registered without
+/// columns reports `null` (not `[]`), and the key is always present.
+#[tokio::test]
+async fn table_list_carries_columns_json() {
+    let app = app().await;
+    let (s, b) = req(
+        &app,
+        "POST",
+        "/api/datasources",
+        Some(json!({"name": "edge-kafka", "type": "kafka", "connJson": {"bootstrap": "127.0.0.1:19092"}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let id = b["id"].as_i64().unwrap();
+
+    let cols = json!([["id", "int64"], ["payload", "utf8"], ["ts", "timestamp"]]);
+    let (s, b) = req(
+        &app,
+        "POST",
+        &format!("/api/datasources/{id}/tables"),
+        Some(
+            json!({"dbName": "shop", "tableName": "orders", "format": "json", "columnsJson": cols}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (s, b) = req(
+        &app,
+        "POST",
+        &format!("/api/datasources/{id}/tables"),
+        Some(json!({"dbName": "shop", "tableName": "events", "format": "json"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+
+    let (s, b) = req(
+        &app,
+        "GET",
+        &format!("/api/datasources/tables?datasourceId={id}"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["total"], 2, "{b}");
+    let items = b["items"].as_array().unwrap();
+    let orders = items
+        .iter()
+        .find(|t| t["tableName"] == "orders")
+        .expect("orders row");
+    assert_eq!(
+        orders["columnsJson"], cols,
+        "columns round-trip verbatim: {b}"
+    );
+    let events = items
+        .iter()
+        .find(|t| t["tableName"] == "events")
+        .expect("events row");
+    assert!(
+        events.get("columnsJson").is_some(),
+        "key always present (null, never absent): {b}"
+    );
+    assert!(
+        events["columnsJson"].is_null(),
+        "no columns registered → null: {b}"
+    );
+    // the pre-existing DTO fields are untouched (additive wire change)
+    assert_eq!(orders["kind"], "kafka");
+    assert_eq!(orders["cursorSemantics"], "KAFKA_OFFSET");
+    assert_eq!(orders["source"], "manual");
+}
+
+/// T39 ⑥ (closes the T32 caveat): `starrocks` is a first-class datasource
+/// type through the console — doris connJson shape (jdbcUrl + streamLoadUrl
+/// required), its own table-object kind `starrocks` (the conn-doris sink picks
+/// the StarRocks Stream Load flavor off that kind — folding it into doris would
+/// ship Doris-only headers), and sink-side cursor semantics NONE.
+#[tokio::test]
+async fn starrocks_type_registered_through_console() {
+    let app = app_with_cipher(console_store::CredentialCipher::ephemeral()).await;
+
+    // type passes the registry gate; the doris-shaped key precheck applies
+    let (s, b) = req(
+        &app,
+        "POST",
+        "/api/datasources",
+        Some(json!({"name": "sr", "type": "starrocks", "connJson": {"jdbcUrl": "jdbc:mysql://127.0.0.1:9030/ods"}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert_eq!(b["error"]["code"], "INVALID_ARGUMENT", "{b}");
+    assert!(
+        b["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("streamLoadUrl"),
+        "{b}"
+    );
+
+    let (s, b) = req(
+        &app,
+        "POST",
+        "/api/datasources",
+        Some(json!({
+            "name": "lake-starrocks", "type": "starrocks",
+            "connJson": {"jdbcUrl": "jdbc:mysql://127.0.0.1:9030/ods", "streamLoadUrl": "http://127.0.0.1:8030"},
+            "username": "root", "password": "pw"
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let id = b["id"].as_i64().unwrap();
+    let (s, b) = req(&app, "GET", &format!("/api/datasources/{id}"), None).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["type"], "starrocks", "{b}");
+    assert_eq!(b["hasPassword"], true, "{b}");
+
+    // table objects: kind stays starrocks (NOT doris), cursor NONE
+    let (s, b) = req(
+        &app,
+        "POST",
+        &format!("/api/datasources/{id}/tables"),
+        Some(json!({"dbName": "ods", "tableName": "orders", "format": null, "columnsJson": [["id", "int64"]]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (s, b) = req(
+        &app,
+        "GET",
+        &format!("/api/datasources/tables?datasourceId={id}"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["total"], 1, "{b}");
+    assert_eq!(b["items"][0]["kind"], "starrocks", "{b}");
+    assert_eq!(b["items"][0]["cursorSemantics"], "NONE", "{b}");
+    // and the kind filter resolves it under its own name, not under doris
+    let (_, b) = req(
+        &app,
+        "GET",
+        &format!("/api/datasources/tables?datasourceId={id}&kind=starrocks"),
+        None,
+    )
+    .await;
+    assert_eq!(b["total"], 1, "{b}");
+    let (_, b) = req(
+        &app,
+        "GET",
+        &format!("/api/datasources/tables?datasourceId={id}&kind=doris"),
+        None,
+    )
+    .await;
+    assert_eq!(b["total"], 0, "{b}");
+
+    // the unknown-type message now names starrocks in the registry list
+    let (s, b) = req(
+        &app,
+        "POST",
+        "/api/datasources",
+        Some(json!({"name": "x", "type": "clickhouse", "connJson": {}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert!(
+        b["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("starrocks"),
+        "{b}"
+    );
 }

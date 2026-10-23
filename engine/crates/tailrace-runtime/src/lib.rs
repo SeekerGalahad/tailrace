@@ -678,7 +678,7 @@ fn run_statement_serve(
     let mut pause_ok = false; // only a successful pause allows keepalive polls (otherwise poll = real consumption, dropped)
     let resume = state
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner()) // poisoned ≠ corrupt — recover, don't cascade a sibling thread's panic (T39 ④; rationale at run_statement)
         .load(pipeline_id, st.statement_index)?
         .map(|(c, _, _)| c)
         .unwrap_or(Cursor::None);
@@ -772,7 +772,7 @@ fn run_statement_serve(
                 st.obs_flush(ack.rows);
                 st.pending_rows = 0;
                 st.last_flush = Instant::now();
-                state.lock().unwrap().save(
+                state.lock().unwrap_or_else(|e| e.into_inner()).save(
                     pipeline_id,
                     st.statement_index,
                     &st.source.cursor(),
@@ -876,7 +876,7 @@ fn run_statement_serve(
             }
             st.pending_rows = 0;
             st.last_flush = Instant::now();
-            state.lock().unwrap().save(
+            state.lock().unwrap_or_else(|e| e.into_inner()).save(
                 pipeline_id,
                 st.statement_index,
                 &st.source.cursor(),
@@ -909,7 +909,7 @@ fn run_statement_serve(
             );
         }
     }
-    state.lock().unwrap().save(
+    state.lock().unwrap_or_else(|e| e.into_inner()).save(
         pipeline_id,
         st.statement_index,
         &st.source.cursor(),
@@ -921,6 +921,14 @@ fn run_statement_serve(
 
 /// Standalone statement thread body: micro-batch loop until the deadline
 /// (including final flush + cursor commit).
+///
+/// Offset-store locking (here and in `run_statement_serve`, roadmap §九 T39
+/// ④): every `state.lock()` recovers a poisoned `Mutex` with
+/// `unwrap_or_else(|e| e.into_inner())` — registry.rs parity. Poisoning only
+/// means some sibling statement thread panicked while holding the lock; the
+/// store itself (whole-row save/load) stays consistent, so the guard is
+/// recovered and this statement keeps committing instead of cascading the
+/// sibling's panic through every flush/commit site.
 fn run_statement(
     mut st: StatementRuntime,
     pipeline_id: u64,
@@ -933,7 +941,7 @@ fn run_statement(
     let mut bad_event_emitted = false; // first-bad visibility (engine H2)
     let resume = state
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .load(pipeline_id, st.statement_index)?
         .map(|(c, _, _)| c)
         .unwrap_or(Cursor::None);
@@ -963,7 +971,7 @@ fn run_statement(
                 st.obs_flush(ack.rows);
                 st.pending_rows = 0;
                 st.last_flush = Instant::now();
-                state.lock().unwrap().save(
+                state.lock().unwrap_or_else(|e| e.into_inner()).save(
                     pipeline_id,
                     st.statement_index,
                     &st.source.cursor(),
@@ -1061,7 +1069,7 @@ fn run_statement(
             }
             st.pending_rows = 0;
             st.last_flush = Instant::now();
-            state.lock().unwrap().save(
+            state.lock().unwrap_or_else(|e| e.into_inner()).save(
                 pipeline_id,
                 st.statement_index,
                 &st.source.cursor(),
@@ -1093,7 +1101,7 @@ fn run_statement(
             );
         }
     }
-    state.lock().unwrap().save(
+    state.lock().unwrap_or_else(|e| e.into_inner()).save(
         pipeline_id,
         st.statement_index,
         &st.source.cursor(),

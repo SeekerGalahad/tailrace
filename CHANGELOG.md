@@ -5,6 +5,59 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+_Scope: changes since v1.0.0 — roadmap cards T32 / T34 (R5-W0) and T39
+(R5-W0.5). The R4 cards T22 / T25 / T26 / T30 shipped inside 1.0.0 (entries
+below, not repeated here) and had no post-1.0.0 follow-ups._
+
+### Added
+
+- Doris / StarRocks sink macro benchmark (roadmap T32): `scripts/bench/macro.sh`
+  gains `--sink doris|starrocks` plus `--pipes` / `--flush-rows` /
+  `--poll-rows`; `docs/BENCHMARKS.md` §6.4 records the six-row ledger on the
+  M4 machine (file→doris single pipe, default batch 33852 rows/s vs the
+  same-day file→file anchor 33568 — large-batch sink overhead is not
+  measurable; small batch 500 rows 11017; P=4 small batch 26781 = 2.43× the
+  single small-batch pipe yet −21% vs large batch — the group-commit target
+  zone; P=4 poll-floor batch 97752; starrocks via `node run` 8750, a
+  different-caliber reference). These numbers are the T36 lineage-decision
+  input (T18 ④T3).
+- `starrocks` is a first-class console datasource type (roadmap T39 ⑥,
+  closing the T32 caveat): registry member with the doris connJson shape
+  (`jdbcUrl` + `streamLoadUrl` required, `fenodes` optional), probe /
+  discover / infer-schema shared with doris over the MySQL-protocol FE port,
+  and its own table-object kind `starrocks` (cursor semantics `NONE`) — the
+  engine's conn-doris factory selects the StarRocks Stream Load flavor off
+  that kind, so StarRocks targets no longer need the `node run` bypass.
+- `GET /api/datasources/tables` items carry `columnsJson` (roadmap T39 ⑤,
+  closing the T22 caveat): the `[name, type]` pairs registered manually or
+  via infer-schema, `null` when a table was registered without columns.
+  Additive wire change; the web SQL editor's `db.table.` column completion
+  (CodeMirror6 schema + member sources) is fed from it end-to-end.
+
+### Changed
+
+- i18n promise paid (roadmap T34, the T30 channel): engine `tailrace-api`
+  error responses carry a `code` field at 10 formerly ad-hoc sites (8
+  canonical code constants; the 11th grep hit was a data field and is left
+  as such) — additive, the legacy `{ok:false,error}` shape is pinned by
+  wire-compat tests and an envelope key-set gate; console user-facing
+  format strings (44 sites) collapsed into the zh single-track dictionary
+  `api/messages.rs` (36 keys / 50 call sites, byte-identical rendering)
+  with `message_key` on 38 §4.0 envelopes, completeness enforced by a
+  source scan; the 34 `ApiError` literal sites outside that caliber are
+  registered as the exempted remainder and machine-pinned.
+- Runtime offset-store locking: every `state.lock()` in `tailrace-runtime`
+  (serve loop + standalone statement bodies, 8 sites) now recovers a
+  poisoned `Mutex` with `unwrap_or_else(|e| e.into_inner())` — registry
+  parity — instead of cascading a sibling statement thread's panic into
+  the cursor commit path (roadmap T39 ④).
+- Supply chain: `utoipa-swagger-ui` 10.0.1 → 10.0.2, whose build-dep `zip`
+  moves from the yanked 8.6.0 to 9.0.5; the RUSTSEC-2026-0367/0368/0369
+  advisory ignores are dropped from `deny.toml` and `yanked = "deny"` is
+  restored (roadmap T39 ⑦, §八.1 closed).
+
 ## [1.0.0] - 2026-10-22
 
 ### Added

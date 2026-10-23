@@ -184,4 +184,34 @@ mod tests {
         walk(&doc, &schemas, &mut dangling);
         assert!(dangling.is_empty(), "dangling $refs: {dangling:?}");
     }
+
+    /// T39 ⑤: the list-tables DTO (`TableObjectItem.columns_json`) exposes
+    /// `columnsJson` in the published contract (camelCase on the wire,
+    /// nullable), so the swagger document and the web client type agree on
+    /// the column-completion hop.
+    #[test]
+    fn table_object_item_exposes_columns_json() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("openapi serializes");
+        let props = doc
+            .pointer("/components/schemas/TableObjectItem/properties")
+            .and_then(|v| v.as_object())
+            .expect("TableObjectItem.properties");
+        assert!(
+            props.contains_key("columnsJson"),
+            "TableObjectItem must publish columnsJson, got keys: {:?}",
+            props.keys().collect::<Vec<_>>()
+        );
+        // the pre-existing fields are still there (additive change)
+        for k in [
+            "id",
+            "datasourceId",
+            "dbName",
+            "tableName",
+            "kind",
+            "cursorSemantics",
+            "source",
+        ] {
+            assert!(props.contains_key(k), "missing {k}");
+        }
+    }
 }
