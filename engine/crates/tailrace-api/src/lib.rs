@@ -613,7 +613,9 @@ mod tests {
         // A second additive key turns this test red instead of passing
         // silently.
         let assert_envelope_keys = |v: &serde_json::Value| {
-            let obj = v.as_object().unwrap_or_else(|| panic!("not an object: {v}"));
+            let obj = v
+                .as_object()
+                .unwrap_or_else(|| panic!("not an object: {v}"));
             for required in ["ok", "code", "error"] {
                 assert!(obj.contains_key(required), "missing `{required}`: {v}");
             }

@@ -307,10 +307,7 @@ mod tests {
                     "制品落盘失败: {e}",
                 ],
             ),
-            (
-                "auth.rs",
-                &["缺少用户名或密码", "用户名或密码错误"],
-            ),
+            ("auth.rs", &["缺少用户名或密码", "用户名或密码错误"]),
             (
                 "datasources.rs",
                 &[
@@ -360,9 +357,7 @@ mod tests {
             let mut want: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
             want.sort();
             if found != want {
-                offenders.push(format!(
-                    "{file}: found {found:#?}\n{file}: want  {want:#?}"
-                ));
+                offenders.push(format!("{file}: found {found:#?}\n{file}: want  {want:#?}"));
             }
         }
         // 未登记文件必须零残留（新文件带 ApiError 中文字面量进域即红）。
