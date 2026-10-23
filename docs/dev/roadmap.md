@@ -444,6 +444,13 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 - **文件域**：docs/dev/v1.0-release-<date>.md（新）、docs/dev/roadmap.md（状态收口）、README.md/README.zh-CN.md（仅终验勘误，如需）。
 > 结果：2026-10-23 v1.0.0 正式发布——tag bd8f301→release.yml 四目标全绿 9/9 资产；checksums 抽验双 OK（首轮失败=下载侧网络截断，镜像复验排除）；全新环境三命令 quickstart 实测全过（build.sh 双二进制/console 首启 healthz 200+token/node 自注册 m2m 通）；crates.io 21×1.0.0+无尘 cargo install 实装（R4-W2）；终验全文 docs/dev/v1.0-release-2026-10-23.md。R4 全轮收官（T22/T25-T31 ✅；选做 T19/T21 待点名；v1.x 议程=T18 纪要+R5 草案）。
 
+### T39 集中尾债清偿（~2 人日）〔R5-W0.5 波，2026-10-23 立项——R5-W1 高风险波前的全面清账〕
+
+- **现状**（2026-10-23 全仓横扫，含 roadmap 三轮评审登记+§八+各波 caveat）：① CHANGELOG 1.0.0 后无 Unreleased 段（T25/T22/T26/T30/T32/T34 六卡未入账——R5 纪律留 T38 统一，但 T38 只做版本号转正，条目本体先立）；② T22 编辑器 gzip 138,962B 未入 BENCHMARKS（文件域=web/ 时域外）；③ R5-W0 评审 low#1 36 key/50 调用点双 off-by-one 勘正；④ 引擎主循环 `state.lock().unwrap()` 三处（runtime lib.rs:775/:879/:912）——registry 侧已 `unwrap_or_else(into_inner)` 防御而主循环未（对称化，Mutex 中毒即 panic 的防御）；⑤ console TableObjectItem（datasources.rs:258）不回 columnsJson——列补全全链路缺 console 一跳（T22 caveat 登记、SqlMonaco.vue:99 注释已预留消费端）；⑥ starrocks datasource 类型在 console 注册表缺（T32 caveat——bench 走 node run 绕行，同口径对照需类型登记）；⑦ zip §八#1 触发器检查：utoipa-swagger-ui 10.0.2（2026-10-20）是否解 zip ^8.6 锁——是则升+回收 deny ignore，否则续挂注记；⑧ OTLP 默认开启裁决（§八#2）——v1.0 已发，按使用反馈决定（本轮只登记不裁）。
+- **方案**：① CHANGELOG Unreleased 段立起（六卡条目，Keep a Changelog 风格，T38 届时改版本号即可）；② BENCHMARKS §六增 CM6 行（138,962B gzip 编辑器 chunk，T22 提交说明数字，口径注记）；③ T34 结果行/messages.rs 模块文档 36 key/50 调用点勘正；④ runtime 三处 `unwrap()` → `unwrap_or_else(|e| e.into_inner())`（registry 同款防御，加一行注释说明理由——Mutex 中毒=持锁线程 panic，锁内状态仍一致可继续）；⑤ TableObjectItem 加 `columns_json` 字段+list 端点回传+openapi DTO 更新+web 端消费核验（SqlMonaco 列补全链通——加一条 e2e 或集成测试断言 DTO 携带列）；⑥ console datasource-types 注册表加 starrocks（starrocks_sink 侧 connJson 复用 doris 格式）+`table_kind_for`+`cursor_semantics` 派生+集成测试；⑦ 查 utoipa-swagger-ui 10.0.2 的 zip 依赖（crates.io API 或本地 `cargo update -p`）——9.x 可达则升+deny.toml 回收三条 ignore+§八#1 关闭注记；⑧ §八#2 OTLP 加一行 v1.0 后观察注记（不裁）。
+- **验收**：`grep -q '^## \[Unreleased\]' CHANGELOG.md` 且含 T25/T22/T26/T30/T32/T34 六卡关键词；`grep -c '138,962\|138962' docs/BENCHMARKS.md` ≥1；runtime lib.rs `grep -c 'state.lock().unwrap()'` =0（三处全防御化）；TableObjectItem 含 columns_json 且 web SqlMonaco 补全链 e2e 断言（或集成测试）绿；`grep -q starrocks console/crates/tailrace-console/src/api/datasources.rs`（注册表行）；⑦ 的结果（升级或续挂）写入卡内结果行；L0+L1 全绿。
+- **文件域**：CHANGELOG.md、docs/BENCHMARKS.md、docs/dev/roadmap.md（③勘正）、engine/crates/tailrace-runtime/src/lib.rs（④）、console/crates/tailrace-console/src/api/datasources.rs+openapi.rs（⑤⑥）、web/src/（⑤消费核验）、Cargo.toml+Cargo.lock+deny.toml（⑦若升）、tests/（⑤⑥新测试）。
+
 ### R4-W1 评审登记（2026-10-22）
 
 > 本波无独立评审档（docs/dev/ 现存仅 R3 升格评审纪要与 T11 事故档）；发现均随卡实测得来，登记如下：
