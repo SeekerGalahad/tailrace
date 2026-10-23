@@ -382,12 +382,13 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 - **文件域**：console/crates/console-auth/src/error.rs、console/crates/tailrace-console/src/api/mod.rs（+对应测试）。
 > 结果：31fea8a T30 已按波门禁指令提交为 31fea8a（main，父 bf2848f 线性，非 amend）。staging 严格限文件域 2 文件（console-auth/src/error.rs +35、tailrace-console/src/api/mod.rs +48，共 +76/−7），无外来变更混入。提交主题与指令逐字一致（feat: T30 i18n 接口预留——错误码单点收敛+message_key wire 兼容通道），body 记录：6 规范码常量单点收敛（构造签名/现值不变）、message_key wire 兼容通道（默认响应 byte 级不变）、wire 兼容断言×2、cargo test -p console-auth -p tailrace-console --locked 全绿与 L0 三件绿（上一轮实测）、域外不动项（4 处 IN_USE 调用点/67 行中文文案/engine 侧留 v1.x，README 归 T28）。未 push（留波门禁）。工作树干净。
 
-#### T31 v1.0.0 终验：tag→release + checksums + 基准报告收口（~1 人日）〔门槛=T22/T25-T30 全 ✅〕
+#### T31 v1.0.0 终验：tag→release + checksums + 基准报告收口（~1 人日）〔门槛=T22/T25-T30 全 ✅〕 ✅
 
 - **现状**：git tag 仅 v0.1.0（实跑 `git tag -l`），禁改禁动；release.yml 已自动化全链（实读）：tag v* → preflight（clippy --locked -D warnings）→ 4 目标矩阵（linux x64/arm64 cross + macos x64/arm64）→ package.sh 每 target 2 tarball（console+node）共 8 → aggregate `shasum -a 256` 出 checksums.txt → GitHub Release 共 **9 资产**（v0.1.0 基线 9/9，release.yml:76-96）；基准报告入 README 为 §七 R4 清单项（外显面 T28 已定，BENCHMARKS 608 行就绪）。
 - **方案**：① 全卡收口后 `git tag v1.0.0 && git push origin v1.0.0` 触发 release.yml；② 资产核验 9/9（8 tarball+checksums.txt）+ checksums 覆盖核对（下载抽验 `shasum -a 256 -c`）；③ README 基准段终验（与 BENCHMARKS 终稿数字一致、注记在位）；④ **全新机器三命令 quickstart 实测**：干净环境（rustup+Node 22+pnpm，无 target/无 pnpm store）按 README Quickstart 逐字执行三命令（build.sh→console→node serve）全成功；`cargo install` 档按 T27 ② 核查结论同验或登记；⑤ 收官报告 `docs/dev/v1.0-release-<date>.md`（发包 21 包/资产 9/基准摘要/全新机器实测记录/v1.x 遗留议程指针）；⑥ 本文件 §七 R4 段与各卡状态收口。
 - **验收**：`gh release view v1.0.0 --json assets --jq '.assets | length'` = **9** 且资产名单含 checksums.txt + 8 tarball（4 目标×2 bin）；§十一 R4 收口标准全绿（含 crates.io 21×1.0.0 复核）；quickstart 实测记录入收官报告；收官报告存在 `test -s docs/dev/v1.0-release-*.md`。
 - **文件域**：docs/dev/v1.0-release-<date>.md（新）、docs/dev/roadmap.md（状态收口）、README.md/README.zh-CN.md（仅终验勘误，如需）。
+> 结果：2026-10-23 v1.0.0 正式发布——tag bd8f301→release.yml 四目标全绿 9/9 资产；checksums 抽验双 OK（首轮失败=下载侧网络截断，镜像复验排除）；全新环境三命令 quickstart 实测全过（build.sh 双二进制/console 首启 healthz 200+token/node 自注册 m2m 通）；crates.io 21×1.0.0+无尘 cargo install 实装（R4-W2）；终验全文 docs/dev/v1.0-release-2026-10-23.md。R4 全轮收官（T22/T25-T31 ✅；选做 T19/T21 待点名；v1.x 议程=T18 纪要+R5 草案）。
 
 ### R4-W1 评审登记（2026-10-22）
 
