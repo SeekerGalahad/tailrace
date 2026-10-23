@@ -56,7 +56,21 @@ below, not repeated here) and had no post-1.0.0 follow-ups._
 - Supply chain: `utoipa-swagger-ui` 10.0.1 → 10.0.2, whose build-dep `zip`
   moves from the yanked 8.6.0 to 9.0.5; the RUSTSEC-2026-0367/0368/0369
   advisory ignores are dropped from `deny.toml` and `yanked = "deny"` is
-  restored (roadmap T39 ⑦, §八.1 closed).
+  restored (roadmap T39 ⑦, §八.1 closed). The same lock update had also
+  silently re-resolved four windows-only `windows-sys` edges (errno /
+  rustix / tempfile / winapi-util) 0.61.2 → 0.52.0 — no impact off
+  Windows targets; the T39 review fix re-pins them to 0.61.2, the
+  pre-T39 state (`ring` keeps its pre-existing 0.52.0 edge).
+
+### Security
+
+- Two advisories the T39 gate record had claimed green (roadmap T39
+  review fix): `ctutils` 0.4.3 → 0.4.4 (RUSTSEC-2026-0385,
+  non-constant-time mask generation — the crate rides the console
+  password-hashing path via argon2 → blake2) and `tokio` 1.53.2 → 1.53.3
+  (RUSTSEC-2026-0386, unsound `AsyncFd` I/O safety); `cargo deny check
+  advisories bans licenses sources` is green again (cargo-deny 0.20.2,
+  advisory-db 84d943a).
 
 ## [1.0.0] - 2026-10-22
 

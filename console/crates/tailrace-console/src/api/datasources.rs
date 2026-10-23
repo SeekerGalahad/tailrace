@@ -1274,7 +1274,7 @@ pub async fn list_tables(
         Ok(v) => v,
         Err(e) => return ApiError::internal(&e).into_response(),
     };
-    let items: Vec<TableObjectItem> = items
+    let items: Vec<TableObjectItem> = match items
         .into_iter()
         .map(|t| {
             // columns ride the existing per-id accessor (the same one the
@@ -1282,13 +1282,14 @@ pub async fn list_tables(
             // model carries no columns_json, and the table-object catalog is
             // small enough that a per-row lookup on the in-process SQLite
             // handle beats widening the shared row model for one DTO (T39 ⑤).
+            // Store errors propagate to 500 like list_table_objects above;
+            // only an unparseable blob degrades to null (build_plan_table
+            // semantics, pipelines.rs).
             let columns_json = store
-                .table_object_columns_json(t.id)
-                .ok()
-                .flatten()
+                .table_object_columns_json(t.id)?
                 .flatten()
                 .and_then(|s| serde_json::from_str::<Vec<(String, String)>>(&s).ok());
-            TableObjectItem {
+            Ok(TableObjectItem {
                 id: t.id,
                 datasource_id: t.datasource_id,
                 db_name: t.db_name,
@@ -1298,9 +1299,13 @@ pub async fn list_tables(
                 cursor_semantics: t.cursor_semantics,
                 source: t.source,
                 columns_json,
-            }
+            })
         })
-        .collect();
+        .collect::<anyhow::Result<Vec<_>>>()
+    {
+        Ok(v) => v,
+        Err(e) => return ApiError::internal(&e).into_response(),
+    };
     Json(TableListResponse {
         total: items.len() as i64,
         items,
