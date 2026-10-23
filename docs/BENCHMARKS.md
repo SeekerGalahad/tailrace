@@ -361,12 +361,18 @@ decode→transform→write 之后），行数边界过界判断只能以整 poll
 | T16 | file→doris e2e（裁剪档 node，`smoke.sh --slim`） | —（默认档 `smoke.sh` 25/25 回归） | **30/30**，11.9 s；行数守恒 12==12 | 见 §6.2 | 2026-10-21 |
 | T15 | macro-partitions 吞吐（kafka(P=6)→file **debug 档**，4 轮）⁵ | **M4 首档：中位 27861 rows/s**（23918 / 27678 / 28043 / 28474） | —（本卡热路径零改动，无 A/B 档） | **vs §4.5 的 24658 属跨机器（Intel i7→M4），不可比**；本组=该 bench 在 M4 的首个档位 | 2026-10-21 |
 | T15 | 动态分区发现延迟（testcontainers 真 kafka，topic 2→4 分区不重开） | subscribe 模式 **26.8 s** | assign 模式 **30.7 s** | 均在口径界内（≤~35 s = 30 s 差异对比 + fetch_metadata ≤5 s，见 §6.3） | 2026-10-21 |
+| T32 | macro 吞吐（file→**doris** 单管道·默认批，debug）⁶ | **33852 rows/s** | 同日 file→file 锚点 33568 | +0.8%（噪声界内持平）——大批下 doris sink 零可测开销（见 §6.4） | 2026-10-23 |
+| T32 | 同上·小批探针（flushRows 500+pollRows 500，单管道） | **11017 rows/s**（200 次同步 stream load） | —（vs 大批 −67%） | 小批区无 group commit 的同步往返封顶 ≈45ms/次 | 2026-10-23 |
+| T32 | 同上·P=4 并发小批（T18 ④T3 判据数据面）⁶ | **26781 rows/s**（50 flush/管） | 单管小批 11017 | **2.43×**（HTTP 往返重叠），仍 −21% vs 单管大批——收益缺口=group commit 目标区 | 2026-10-23 |
+| T32 | 同上·P=4 并发·poll 地板批（名义 flush500，实际批 ≈6250）⁶ | **97752 rows/s**（4 flush/管） | 单管大批 33852 | **2.89×**——4 管道并行化全链；console 并发 4 管道无限制（未触发降 P=2 回退门） | 2026-10-23 |
+| T32 | file→**starrocks**（node 直跑档，口径不同源）⁶ | **8750 rows/s** | — | allin1 单容器量级参考，不与 console 档直接比（见 §6.4 口径注记） | 2026-10-23 |
 
 > ¹ 吞吐口径脚注（R3-W1 评审 low#5 补注）：**debug 档**（`CARGO_PROFILE_DEV_DEBUG=0`，非 release）、单轮全链仅 ~3s、macro.sh stats 轮询步进 0.5s → **量化误差 ±17%**（§6.1 结论段自认）——本口径对 <~17% 的 allocator 效应**无检出力**，「持平」仅指差值未超出该噪声界；allocator 吞吐结论以 release 档长跑补测后为准。
 > ² 体积口径脚注（low#5）：两个体积数字来自**基准二进制**（sha256 前缀 `1f7270c7…`/`55066ae4…`，§6.1 方法段），构建树 = **caa842e + T20 提交前工作树**（= 9a9f8a2 落章前的树；其后 488efcc/13d1c2b（engine 改动）、19bb80b（CI）均未包含）——**非任何已提交树的可复现产物**。2026-10-21 复查：本机现存 `target/debug/tailrace-node`（264,705,488 B，`nm` 计 `_rjem_` 符号 0 个）属其后另一树的重建产物，与表中默认档数字不可互推。
 > ³ 碎片行（low#5）：T20 卡方案列有「碎片」对比项，实测未做（无 jemalloc-ctl stats 面，§6.1 结论段「未测」）——此行为显式占位，防「表里没有＝测过没事」的误读；补测需 `tikv-jemalloc-ctl` stats feature + release 长跑。
 > ⁴ T16 体积口径：**release 档**（`[profile.release]` lto="thin" / codegen-units=1 / strip=true），宿主 target aarch64-apple-darwin（命令不带 `--target`，产物 `target/release/`），`--locked`（Cargo.lock 零变动）；字节数 `stat -f %z`、sha256 `shasum -a 256`，sha256 为前 8 位。「改造前」两行 = `4881c39` 干净树；「改造后」两行 = `4881c39` + T16 工作树（根 Cargo.toml / engine/bin/tailrace-node/Cargo.toml / scripts/smoke.sh / .github/workflows/ci.yml）。方法与结论见 §6.2。
 > ⁵ T15 吞吐口径：`TAILRACE_KAFKA_PORT=19092 bash scripts/bench/macro-partitions.sh --rows 100000 --partitions 6`（compose kafka 移位 19092——本机 9092 被常驻 kafka-local 占用；EXTERNAL 通告随端口走，口径不变）。4 有效轮 + 1 轮播种失败重试（console-producer 端 99850≠100000，基础设施毛刺非引擎行为，弃用重跑）；每轮断言播种量==N 与 sink 行数==N（不丢行）。脚注 ¹ 的量化噪声（±17%）同样适用；同组内极差 ±9% 在噪声界内。
+> ⁶ T32 吞吐口径：`bash scripts/bench/macro.sh --sink doris [--pipes P] [--flush-rows R] [--poll-rows R] --rows 100000`——console 档口径同脚注 ¹ 的 macro.sh（t0=deploy 200，P=4 档=首条 deploy 200；t1=stats 0.5s 轮询至全部管道 flushed≥目标），单轮单档（非多轮中位）；starrocks 行为 node 直跑口径（t0=run-start 日志、t1=FE COUNT ~1s 轮询）与 console 档不同源。栈=docker-compose doris-fe/be 2.1.7 单 BE（BUCKETS 1）；行数守恒全档过（FE COUNT==100000）。环境配方（swapoff/max_map_count/停 mdop doris 腾内存）与逐档注记见 §6.4。
 
 ### §6.1 T20 jemalloc + 峰值 RSS 指标（2026-10-20，同机同日交错复测）
 
@@ -606,3 +612,71 @@ T5 顺带口径的比值（24658/29394 ≈ 0.84）一致。
 → `TAILRACE_KAFKA_PORT=19092 bash scripts/bench/macro-partitions.sh --rows
 100000 --partitions 6`；发现延迟：`TAILRACE_TESTCONTAINERS=1 cargo test -p
 tailrace-conn-kafka kafka_source_discovers -- --nocapture`。
+
+### §6.4 T32 Doris/StarRocks sink 宏基准（2026-10-23，M4 同机同日）
+
+> 首批 Doris sink 吞吐档（T18 共同事实 4 的数据面补全）。全部 debug 档
+> （`CARGO_PROFILE_DEV_DEBUG=0`）、行形态同 §三宏基准（JSON 4 列 ≈95B）、
+> rows=100000、compose doris-fe/be **2.1.7 单 BE**（BUCKETS 1 /
+> replication_num=1）——与多 BE 生产集群不可比；跨机器不可比注记同 §六头部
+> （§一 Intel 机的 R2 数字与下表互不可比）。量化噪声：console 档 t1 以 0.5s
+> 步进轮询 stats，~3s 窗口的档位噪声 ±17%（脚注¹同款）；小批档窗口 3.7-9.1s
+> 噪收窄。吞吐行原始报告：/tmp/r5-{doris,doris-p4,doris-p4-small,
+> doris-p1-small,starrocks,file-100k}.md。
+
+| 档 | 配置 | rows | elapsed_s | throughput | flushes |
+|---|---|---|---|---|---|
+| file→file（同日锚点） | 单管道，默认攒批 | 100000 | 2.979 | **33568 rows/s** | — |
+| file→doris 单管道 | 默认攒批（flushRows 10000/pollRows 8000/checkpointMs 2000→flush_interval 2s） | 100000 | 2.954 | **33852 rows/s** | 7 |
+| file→doris 单管道·小批 | flushRows 500 + pollRows 500 | 100000 | 9.077 | **11017 rows/s** | 200 |
+| file→doris P=4 并发·小批 | 4 管道 ×25000 行（独立源文件→同一表），flushRows 500 + pollRows 500 | 100000 | 3.734 | **26781 rows/s** | 50/管 |
+| file→doris P=4 并发·poll 地板批 | 名义 flushRows 500、pollRows 8000（批粒度被 poll 托底 ≈6250） | 100000 | 1.023 | **97752 rows/s** | 4/管 |
+| file→starrocks（node 直跑档） | `tailrace-node run` 直跑，默认攒批（10000/10s/8MB） | 100000 | 11.428 | **8750 rows/s** | — |
+
+**口径注记（随行）**：
+
+- console 档（前五行）：口径同 §三——t0=deploy 返回 200（P=4 档=首条 deploy
+  200），t1=全部管道 stats flushed≥各自目标，吞吐=N/(t1−t0)；sink 侧以 FE
+  `COUNT(*)` 复核（六档全部 100000==100000 行数守恒）。
+- **doris sink 零可测开销（大批下）**：单管大批 33852 vs 同日 file→file 33568
+  （+0.8%，噪声界内持平）——10k 批 stream load 不在热路径上。与 T20 的 33670
+  基线（2026-10-20，跨日）亦一致。
+- **小批区（group commit 目标区）无 group commit 的基线**：引擎 DorisSink 不发
+  Doris `group_commit` header（`conn-doris` `send_once` 仅 label+Expect，
+  engine/crates/tailrace-conn-doris/src/lib.rs:361）——本组是「小批×无 group
+  commit」基线。单管小批 11017（200 次同步 stream load ≈45ms/次往返封顶，
+  −67% vs 大批）；P=4 小批 26781（=单管小批的 2.43×，HTTP 往返部分重叠），
+  **仍 −21% vs 单管大批 33852**。T18 ④T3 判据（≥4 管道×<1000 行批收益）的
+  数据面结论：并发有相对收益、无绝对追平——收益缺口即 Doris group commit
+  （或引擎侧攒批合并）的目标区，T36 谱系裁决输入。
+- **P=4 poll 地板批 97752**：4 管道并发把 decode/transform/sink 全链并行化
+  （2.89× 单管大批）——宏基准瓶颈在单管道吞吐而非 doris sink；亦证明单机
+  BE 2.1.7 可吸收 4 路并发 stream load 无退潮。**并发档未降级**：console API
+  4 管道并发建+部署无限制（回退门「降 P=2」未触发）。注：批粒度地板=pollRows
+  （pending 每 poll +poll_rows 行）——探小批必须同压 pollRows，本卡首跑实证
+  （flushes=4×~6250 而非 50×500）。
+- **starrocks 档口径不同源**：console 尚无 starrocks datasource 类型
+  （`datasources.rs` `registry_type` 白名单不含），走 `tailrace-node run`
+  直跑（`scripts/e2e/starrocks.sh` 同路径）：t0=「pipeline run started
+  (standalone)」日志时间戳（排除进程启动/装配），t1=FE COUNT 轮询（~1s 步进，
+  ±9% 量化）；攒批=引擎默认（10000 行/10s/8MB，toml 无 tuning 面）。allin1
+  单容器（FE+BE+nginx feproxy 拦 307，引擎 307 跟随路径不经此档）——仅作
+  sink 差异量级参考，不与 console 档直接比。
+- **环境配方（共享宿主机，操作者级——脚本不代做）**：磁盘 ≥5G 查 `df -h`；
+  be-2.1.7 拒启于活动 swap → zram 0 用量时 `docker run --rm --privileged
+  alpine swapoff -a`；`vm.max_map_count=2000000`；VM 8G → 临时 `docker stop
+  doris-2.1 doris-be`（mdop 常驻栈）腾 ~1.9G，完事回 `docker start` + `swapon
+  -a`。正典=researchEverything/AGENTS-环境契约与工作纪律.md §3。本档不涉
+  kafka（`up -d --wait doris-fe doris-be`），`TAILRACE_KAFKA_PORT` 无关。
+
+**复现**（栈复用：脚本成功后保留栈不自动拆，重跑免健康等待；收尾
+`docker compose down -v` + 回挂 mdop 栈/swap）：
+
+```bash
+bash scripts/bench/macro.sh --rows 100000                            # file→file 锚点
+bash scripts/bench/macro.sh --sink doris --rows 100000 --report /tmp/r5-doris.md          # 单管大批
+bash scripts/bench/macro.sh --sink doris --rows 100000 --flush-rows 500 --poll-rows 500   # 单管小批
+bash scripts/bench/macro.sh --sink doris --rows 100000 --pipes 4 --flush-rows 500 --poll-rows 500   # P=4 真小批
+bash scripts/bench/macro.sh --sink doris --rows 100000 --pipes 4 --flush-rows 500         # P=4 poll 地板批
+bash scripts/bench/macro.sh --sink starrocks --rows 100000 --report /tmp/r5-starrocks.md  # node 直跑档
+```
