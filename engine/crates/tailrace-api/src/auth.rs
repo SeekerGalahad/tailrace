@@ -263,6 +263,7 @@ pub async fn require_node_token(
         axum::http::StatusCode::UNAUTHORIZED,
         axum::Json(serde_json::json!({
             "ok": false,
+            "code": crate::error_code::UNAUTHENTICATED,
             "error": "unauthorized: /v1 requires the node token (Authorization: Bearer <node token> or X-Node-Token)",
         })),
     )

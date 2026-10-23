@@ -159,15 +159,22 @@ pub async fn upload(
                         Err(e) => {
                             let _ = tokio::fs::remove_file(staged.as_ref().expect("staged exists"))
                                 .await;
-                            return ApiError::bad_request(format!("multipart 读取失败: {e}"))
-                                .into_response();
+                            return super::messages::bad_request(
+                                "err.artifact.multipart_read_failed",
+                                &[&e.to_string()],
+                            )
+                            .into_response();
                         }
                     }
                 }
             }
             other => {
                 let Ok(text) = field.text().await else {
-                    return ApiError::bad_request(format!("字段 {other} 读取失败")).into_response();
+                    return super::messages::bad_request(
+                        "err.artifact.field_read_failed",
+                        &[other],
+                    )
+                    .into_response();
                 };
                 match other {
                     "name" => name = Some(text),
@@ -217,10 +224,11 @@ pub async fn upload(
         console_store::ArtifactInsert::Created(id) => id,
         console_store::ArtifactInsert::Duplicate => {
             let _ = tokio::fs::remove_file(&staged_path).await;
-            return ApiError::new(
+            return super::messages::respond(
                 axum::http::StatusCode::CONFLICT,
                 "CONFLICT",
-                format!("制品 {name} {version} 已存在"),
+                "err.artifact.duplicate",
+                &[&name, &version],
             )
             .into_response();
         }
@@ -276,22 +284,21 @@ pub async fn remove(
 ) -> Response {
     let store = state.store();
     let Some(a) = store.artifact(id).ok().flatten() else {
-        return ApiError::not_found(format!("制品 #{id} 不存在")).into_response();
+        return super::messages::not_found("err.artifact.not_found", &[&id.to_string()])
+            .into_response();
     };
     let nodes = store.nodes_referencing_artifact(id).unwrap_or_default();
     if !nodes.is_empty() {
-        return ApiError::new(
+        return super::messages::respond_with_refs(
             axum::http::StatusCode::CONFLICT,
             "IN_USE",
-            format!("制品被节点引用: {nodes:?}"),
-        )
-        .with_refs(
+            "err.artifact.in_use",
+            &[&format!("{nodes:?}")],
             json!({"nodes": nodes})
                 .as_object()
                 .cloned()
                 .unwrap_or_default(),
-        )
-        .into_response();
+        );
     }
     if let Err(e) = store.delete_artifact(id) {
         return ApiError::internal(&e).into_response();

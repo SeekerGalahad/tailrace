@@ -92,7 +92,10 @@ pub async fn register(
 ) -> Response {
     let body: RegisterBody = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(e) => return ApiError::bad_request(format!("非法注册请求: {e}")).into_response(),
+        Err(e) => {
+            return super::messages::bad_request("err.node.bad_register_body", &[&e.to_string()])
+                .into_response()
+        }
     };
     let token = console_auth::generate_token(console_auth::BOOTSTRAP_TOKEN_PREFIX);
     let token_hash = console_auth::token_hash(&token);
@@ -143,7 +146,10 @@ pub async fn heartbeat(
 ) -> Response {
     let body: HeartbeatBody = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(e) => return ApiError::bad_request(format!("非法心跳请求: {e}")).into_response(),
+        Err(e) => {
+            return super::messages::bad_request("err.node.bad_heartbeat_body", &[&e.to_string()])
+                .into_response()
+        }
     };
     let store = state.store();
     let node_key = principal.node_key.clone();

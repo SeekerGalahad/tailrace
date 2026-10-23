@@ -181,12 +181,9 @@ fn parse_capacity(raw: Option<&str>) -> NodeCapacity {
 }
 
 fn load_node(state: &AppState, id: i64) -> Result<console_store::Node, Response> {
-    state
-        .store()
-        .node(id)
-        .ok()
-        .flatten()
-        .ok_or_else(|| ApiError::not_found(format!("节点 #{id} 不存在")).into_response())
+    state.store().node(id).ok().flatten().ok_or_else(|| {
+        super::messages::not_found("err.node.not_found", &[&id.to_string()]).into_response()
+    })
 }
 
 // ---------------- handlers ----------------
@@ -372,7 +369,9 @@ pub async fn register_manual(
 ) -> Response {
     let body: ManualRegisterBody = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(e) => return ApiError::bad_request(format!("非法请求体: {e}")).into_response(),
+        Err(e) => {
+            return super::messages::bad_request("err.bad_body", &[&e.to_string()]).into_response()
+        }
     };
     if body.name.trim().is_empty() || body.host.trim().is_empty() {
         return ApiError::bad_request("缺少 name / host").into_response();
@@ -383,10 +382,11 @@ pub async fn register_manual(
     match endpoint.healthz_ok(state.node_client()).await {
         Ok(true) => {}
         Ok(false) => {
-            return ApiError::new(
+            return super::messages::respond(
                 axum::http::StatusCode::BAD_GATEWAY,
                 "ENGINE_UNREACHABLE",
-                format!("节点探活失败：{api_url}/healthz 未返回 200"),
+                "err.node.probe_failed",
+                &[&api_url],
             )
             .into_response()
         }
@@ -513,18 +513,16 @@ pub async fn remove(
     };
     let assigned = state.store().pipelines_assigned_to(id).unwrap_or_default();
     if !assigned.is_empty() {
-        return ApiError::new(
+        return super::messages::respond_with_refs(
             axum::http::StatusCode::CONFLICT,
             "IN_USE",
-            format!("节点仍被管道指派: {assigned:?}"),
-        )
-        .with_refs(
+            "err.node.in_use",
+            &[&format!("{assigned:?}")],
             json!({"pipelines": assigned})
                 .as_object()
                 .cloned()
                 .unwrap_or_default(),
-        )
-        .into_response();
+        );
     }
     if let Err(e) = state.store().delete_node_cascade(id, &node.node_key) {
         return ApiError::internal(&e).into_response();
@@ -635,7 +633,8 @@ pub async fn metrics(
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     if load_node(&state, id).is_err() {
-        return ApiError::not_found(format!("节点 #{id} 不存在")).into_response();
+        return super::messages::not_found("err.node.not_found", &[&id.to_string()])
+            .into_response();
     }
     let hours = params
         .get("hours")
@@ -720,7 +719,8 @@ pub async fn deploy_log(
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     if load_node(&state, id).is_err() {
-        return ApiError::not_found(format!("节点 #{id} 不存在")).into_response();
+        return super::messages::not_found("err.node.not_found", &[&id.to_string()])
+            .into_response();
     }
     let limit = params
         .get("limit")

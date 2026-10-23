@@ -398,8 +398,9 @@ fn to_item(
 }
 
 fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, Response> {
-    serde_json::from_slice(body)
-        .map_err(|e| ApiError::bad_request(format!("非法请求体: {e}")).into_response())
+    serde_json::from_slice(body).map_err(|e| {
+        super::messages::bad_request("err.bad_body", &[&e.to_string()]).into_response()
+    })
 }
 
 /// Validate name/type/connJson shape; returns the canonical conn_json string.
@@ -408,11 +409,10 @@ fn validate_upsert(body: &DatasourceUpsertBody) -> Result<String, Response> {
         return Err(ApiError::bad_request("缺少数据源名称").into_response());
     }
     let Some(ty) = registry_type(&body.ty) else {
-        return Err(ApiError::bad_request(format!(
-            "未知数据源类型 {}（注册表：kafka/doris/file/mysql/postgresql）",
-            body.ty
-        ))
-        .into_response());
+        return Err(super::messages::bad_request(
+            "err.datasource.unknown_type_registry",
+            &[&body.ty],
+        ));
     };
     let conn = body.conn_json.clone().unwrap_or(Value::Null);
     if !conn.is_object() {
@@ -430,11 +430,10 @@ fn validate_upsert(body: &DatasourceUpsertBody) -> Result<String, Response> {
         .copied()
         .collect();
     if !missing.is_empty() {
-        return Err(ApiError::bad_request(format!(
-            "connJson 缺少必填字段: {}",
-            missing.join(", ")
-        ))
-        .into_response());
+        return Err(super::messages::bad_request(
+            "err.datasource.missing_required_fields",
+            &[&missing.join(", ")],
+        ));
     }
     serde_json::to_string(&conn).map_err(|e| ApiError::internal(&e.into()).into_response())
 }
@@ -589,7 +588,8 @@ fn conflict_or_internal(e: &anyhow::Error, conflict_message: &str) -> Response {
 pub async fn detail(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     let store = state.store();
     let Some(ds) = store.datasource(id).ok().flatten() else {
-        return ApiError::not_found(format!("数据源 #{id} 不存在")).into_response();
+        return super::messages::not_found("err.datasource.not_found", &[&id.to_string()])
+            .into_response();
     };
     let has_password = store.credential(id).map(|c| c.is_some()).unwrap_or(false);
     let table_count = store.table_count(id).unwrap_or(0);
@@ -670,7 +670,8 @@ pub async fn update(
         )
         .into_response(),
         Ok(DatasourceUpdate::NotFound) => {
-            ApiError::not_found(format!("数据源 #{id} 不存在")).into_response()
+            super::messages::not_found("err.datasource.not_found", &[&id.to_string()])
+                .into_response()
         }
         Err(e) => ApiError::internal(&e).into_response(),
     }
@@ -696,7 +697,8 @@ pub async fn remove(
 ) -> Response {
     let store = state.store();
     let Some(ds) = store.datasource(id).ok().flatten() else {
-        return ApiError::not_found(format!("数据源 #{id} 不存在")).into_response();
+        return super::messages::not_found("err.datasource.not_found", &[&id.to_string()])
+            .into_response();
     };
     let pipelines = store
         .pipelines_referencing_datasource(id)
@@ -710,17 +712,13 @@ pub async fn remove(
         if tables > 0 {
             refs.insert("tables".into(), json!(tables));
         }
-        return ApiError::new(
+        return super::messages::respond_with_refs(
             axum::http::StatusCode::CONFLICT,
             "IN_USE",
-            format!(
-                "数据源仍被引用（管道 {} 个，表对象 {} 个）",
-                pipelines.len(),
-                tables
-            ),
-        )
-        .with_refs(refs)
-        .into_response();
+            "err.datasource.in_use",
+            &[&pipelines.len().to_string(), &tables.to_string()],
+            refs,
+        );
     }
     if let Err(e) = store.delete_datasource(id) {
         return ApiError::internal(&e).into_response();
@@ -772,7 +770,8 @@ pub async fn test_by_id(
 ) -> Response {
     let store = state.store();
     let Some(ds) = store.datasource(id).ok().flatten() else {
-        return ApiError::not_found(format!("数据源 #{id} 不存在")).into_response();
+        return super::messages::not_found("err.datasource.not_found", &[&id.to_string()])
+            .into_response();
     };
     let conn: Value = serde_json::from_str(&ds.conn_json).unwrap_or(Value::Null);
     let result = run_probe(&ds.ds_type, &conn).await;
@@ -793,7 +792,7 @@ async fn run_probe(ty: &str, conn_json: &Value) -> (bool, Response) {
     if registry_type(ty).is_none() {
         return (
             false,
-            ApiError::bad_request(format!("未知数据源类型 {ty}")).into_response(),
+            super::messages::bad_request("err.datasource.unknown_type", &[ty]).into_response(),
         );
     }
     let r = match ty {
@@ -847,7 +846,7 @@ async fn probe_jdbc_url(conn_json: &Value) -> ProbeOutcome {
     let Some((host, port, _db)) = jdbc_endpoint(url) else {
         return ProbeOutcome {
             ok: false,
-            message: format!("jdbcUrl 无法解析（需 host:port）: {url}"),
+            message: super::messages::t("err.datasource.jdbc_url_unparsable", &[url]),
             latency_ms: started.elapsed().as_millis() as u64,
         };
     };
@@ -860,13 +859,13 @@ async fn probe_jdbc_url(conn_json: &Value) -> ProbeOutcome {
     {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(e)) => Err(format!("{addr}: {e}")),
-        Err(_) => Err(format!("{addr}: 超时 (>3s)")),
+        Err(_) => Err(super::messages::t("probe.jdbc.timeout", &[&addr])),
     };
     ProbeOutcome {
         ok: outcome.is_ok(),
         message: match outcome {
-            Ok(()) => format!("jdbc server 可达（{addr}）"),
-            Err(msg) => format!("jdbc server 不可达: {msg}"),
+            Ok(()) => super::messages::t("probe.jdbc.reachable", &[&addr]),
+            Err(msg) => super::messages::t("probe.jdbc.unreachable", &[&msg]),
         },
         latency_ms: started.elapsed().as_millis() as u64,
     }
@@ -943,10 +942,7 @@ fn conn_spec(
             let url = str_field("jdbcUrl")
                 .ok_or_else(|| ApiError::bad_request("connJson 缺少 jdbcUrl").into_response())?;
             let (host, port, database) = jdbc_endpoint(url).ok_or_else(|| {
-                ApiError::bad_request(format!(
-                    "jdbcUrl 无法解析（需 jdbc:mysql://host:port/db）: {url}"
-                ))
-                .into_response()
+                super::messages::bad_request("err.datasource.jdbc_mysql_unparsable", &[url])
             })?;
             Ok(tailrace_metadata::ConnSpec::MySql {
                 host,
@@ -966,10 +962,7 @@ fn conn_spec(
             let url = str_field("jdbcUrl")
                 .ok_or_else(|| ApiError::bad_request("connJson 缺少 jdbcUrl").into_response())?;
             let (host, port, database) = jdbc_endpoint(url).ok_or_else(|| {
-                ApiError::bad_request(format!(
-                    "jdbcUrl 无法解析（需 jdbc:postgresql://host:port/db）: {url}"
-                ))
-                .into_response()
+                super::messages::bad_request("err.datasource.jdbc_pg_unparsable", &[url])
             })?;
             Ok(tailrace_metadata::ConnSpec::Postgres {
                 host,
@@ -989,7 +982,9 @@ fn conn_spec(
             "文件数据源不支持发现（路径下的文件请直接登记表对象）",
         )
         .into_response()),
-        other => Err(ApiError::bad_request(format!("未知数据源类型 {other}")).into_response()),
+        other => Err(
+            super::messages::bad_request("err.datasource.unknown_type", &[other]).into_response(),
+        ),
     }
 }
 
@@ -1031,7 +1026,8 @@ pub async fn discover(State(state): State<AppState>, Path(id): Path<i64>, body: 
     };
     let store = state.store();
     let Some(ds) = store.datasource(id).ok().flatten() else {
-        return ApiError::not_found(format!("数据源 #{id} 不存在")).into_response();
+        return super::messages::not_found("err.datasource.not_found", &[&id.to_string()])
+            .into_response();
     };
     if let Some(assets) = cache_get(id, ds.generation, &ds.conn_json) {
         return Json(DiscoverResponse {
@@ -1098,7 +1094,8 @@ pub async fn infer_schema(
     }
     let store = state.store();
     let Some(ds) = store.datasource(id).ok().flatten() else {
-        return ApiError::not_found(format!("数据源 #{id} 不存在")).into_response();
+        return super::messages::not_found("err.datasource.not_found", &[&id.to_string()])
+            .into_response();
     };
     let spec = match conn_spec(&state, &ds) {
         Ok(s) => s,
@@ -1110,10 +1107,10 @@ pub async fn infer_schema(
         match body.format.as_deref() {
             Some("ogg") | Some("json") | Some("jsonl") | None => {}
             Some(other) => {
-                return ApiError::bad_request(format!(
-                    "kafka 样本推断不支持格式 {other:?}（ogg/json/jsonl；csv/parquet 请手工登记列）"
-                ))
-                .into_response()
+                return super::messages::bad_request(
+                    "err.datasource.kafka_format_unsupported",
+                    &[&format!("{other:?}")],
+                )
             }
         }
     }
@@ -1167,7 +1164,8 @@ pub async fn register_table(
     }
     let store = state.store();
     let Some(ds) = store.datasource(id).ok().flatten() else {
-        return ApiError::not_found(format!("数据源 #{id} 不存在")).into_response();
+        return super::messages::not_found("err.datasource.not_found", &[&id.to_string()])
+            .into_response();
     };
     // kind derives from the datasource type (kafka ds → kafka table …,
     // mysql/postgresql ds → jdbc objects — see table_kind_for)
@@ -1265,22 +1263,21 @@ pub async fn remove_table(
 ) -> Response {
     let store = state.store();
     let Some(t) = store.table_object(id).ok().flatten() else {
-        return ApiError::not_found(format!("表对象 #{id} 不存在")).into_response();
+        return super::messages::not_found("err.table_object.not_found", &[&id.to_string()])
+            .into_response();
     };
     let pipelines = store.pipelines_referencing_table(&t).unwrap_or_default();
     if !pipelines.is_empty() {
-        return ApiError::new(
+        return super::messages::respond_with_refs(
             axum::http::StatusCode::CONFLICT,
             "IN_USE",
-            format!("表对象被已发布管道引用: {pipelines:?}"),
-        )
-        .with_refs(
+            "err.table_object.in_use",
+            &[&format!("{pipelines:?}")],
             serde_json::json!({"pipelines": pipelines})
                 .as_object()
                 .cloned()
                 .unwrap_or_default(),
-        )
-        .into_response();
+        );
     }
     if let Err(e) = store.delete_table_object(id) {
         return ApiError::internal(&e).into_response();

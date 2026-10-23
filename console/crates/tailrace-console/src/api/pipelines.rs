@@ -163,8 +163,9 @@ pub struct TemplatesResponse {
 // ---------------- shared plumbing ----------------
 
 fn parse_json_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, Response> {
-    serde_json::from_slice(body)
-        .map_err(|e| ApiError::bad_request(format!("非法请求体: {e}")).into_response())
+    serde_json::from_slice(body).map_err(|e| {
+        super::messages::bad_request("err.bad_body", &[&e.to_string()]).into_response()
+    })
 }
 
 fn load_pipeline(state: &AppState, id: i64) -> Result<console_store::PipelineFull, Response> {
@@ -173,7 +174,9 @@ fn load_pipeline(state: &AppState, id: i64) -> Result<console_store::PipelineFul
         .pipeline_full(id)
         .ok()
         .flatten()
-        .ok_or_else(|| ApiError::not_found(format!("管道 #{id} 不存在")).into_response())
+        .ok_or_else(|| {
+            super::messages::not_found("err.pipeline.not_found", &[&id.to_string()]).into_response()
+        })
 }
 
 /// Normalize the dsMapping values to integers ("3" and 3 both accepted).
@@ -420,7 +423,8 @@ pub async fn update(
         Err(r) => return r,
     };
     if load_pipeline(&state, id).is_err() {
-        return ApiError::not_found(format!("管道 #{id} 不存在")).into_response();
+        return super::messages::not_found("err.pipeline.not_found", &[&id.to_string()])
+            .into_response();
     }
     let config = body
         .config
@@ -592,11 +596,9 @@ pub async fn publish(
             {
                 gate.push(CompileDiag {
                     line: idx as i64 + 1,
-                    message: format!(
-                        "语句 {} 的{}表对象未登记: {}（先在数据源页登记库表）",
-                        idx + 1,
-                        role_ref.1,
-                        role_ref.0
+                    message: super::messages::t(
+                        "err.pipeline.statement_table_missing",
+                        &[&(idx + 1).to_string(), role_ref.1, role_ref.0],
                     ),
                 });
             }
@@ -778,7 +780,10 @@ async fn push_plan(
                 statements: Vec::new(),
                 diagnostics: vec![CompileDiag {
                     line: 1,
-                    message: format!("表对象未登记（先在数据源页登记）: {}", missing.join(", ")),
+                    message: super::messages::t(
+                        "err.pipeline.table_objects_missing",
+                        &[&missing.join(", ")],
+                    ),
                 }],
             }),
         )
@@ -791,10 +796,11 @@ async fn push_plan(
         Err(r) => return r,
     };
     let Some(api_url) = node.api_url.clone() else {
-        return ApiError::new(
+        return super::messages::respond(
             axum::http::StatusCode::CONFLICT,
             "NO_ELIGIBLE_NODE",
-            format!("节点 {} 未上报 api_url（等待首次心跳）", node.name),
+            "err.pipeline.node_no_api_url",
+            &[&node.name],
         )
         .into_response();
     };
@@ -844,10 +850,11 @@ async fn push_plan(
                 .map(str::to_string)
                 .unwrap_or_else(|| verdict.to_string());
             let _ = store.set_pipeline_deploy_failed(id, &error);
-            ApiError::new(
+            super::messages::respond(
                 axum::http::StatusCode::BAD_GATEWAY,
                 "ENGINE_REJECTED",
-                format!("引擎装配失败: {error}"),
+                "err.pipeline.engine_assembly_failed",
+                &[&error],
             )
             .into_response()
         }
@@ -988,11 +995,16 @@ async fn proxy_action(state: &AppState, id: i64, action: &str) -> Result<Value, 
             return Ok(json!({"pipelineId": id, "status": "PUBLISHED"}));
         }
         return Err(
-            ApiError::bad_request(format!("管道 #{id} 未部署（无指派节点）")).into_response(),
+            super::messages::bad_request("err.pipeline.undeployed", &[&id.to_string()])
+                .into_response(),
         );
     };
     let node = store.node(node_id).ok().flatten().ok_or_else(|| {
-        ApiError::not_found(format!("指派节点 #{node_id} 不存在")).into_response()
+        super::messages::not_found(
+            "err.pipeline.assigned_node_missing",
+            &[&node_id.to_string()],
+        )
+        .into_response()
     })?;
     let Some(api_url) = node.api_url else {
         return Err(ApiError::new(
@@ -1158,13 +1170,22 @@ async fn proxy_get(state: &AppState, id: i64, resource: &str) -> Response {
     let Some(node_id) = full.base.assigned_node else {
         return Json(json!({
             "ok": false,
-            "error": format!("pipeline #{id} 未部署（无指派节点）"),
+            "error": super::messages::t(
+                "err.pipeline.undeployed_plain",
+                &[&id.to_string()],
+            ),
         }))
         .into_response();
     };
     let node = match state.store().node(node_id).ok().flatten() {
         Some(n) => n,
-        None => return ApiError::not_found(format!("指派节点 #{node_id} 不存在")).into_response(),
+        None => {
+            return super::messages::not_found(
+                "err.pipeline.assigned_node_missing",
+                &[&node_id.to_string()],
+            )
+            .into_response()
+        }
     };
     let Some(api_url) = node.api_url else {
         return ApiError::new(
@@ -1349,7 +1370,8 @@ pub async fn metrics_trend(
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     if load_pipeline(&state, id).is_err() {
-        return ApiError::not_found(format!("管道 #{id} 不存在")).into_response();
+        return super::messages::not_found("err.pipeline.not_found", &[&id.to_string()])
+            .into_response();
     }
     let hours = params
         .get("hours")

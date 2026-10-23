@@ -8,12 +8,13 @@ pub mod artifacts;
 pub mod auth;
 pub mod datasources;
 pub mod health;
+pub mod messages;
 pub mod nodes;
 pub mod nodes_admin;
 pub mod pipelines;
 
 use axum::http::HeaderMap;
-use console_auth::{ApiError, AuthContext};
+use console_auth::AuthContext;
 use console_store::{AuditEntry, Store};
 use utoipa::ToSchema;
 
@@ -74,12 +75,14 @@ pub fn audit(
 }
 
 /// 501 for endpoints whose machinery ships in a later stage (§4.4 SSH deploy
-/// chain and friends) — explicit TODO marker, not a silent stub.
-pub fn not_implemented(what: &str, doc_ref: &str) -> ApiError {
-    ApiError::new(
+/// chain and friends) — explicit TODO marker, not a silent stub. Returns the
+/// §4.0 envelope directly (messages module: zh dictionary + message_key).
+pub fn not_implemented(what: &str, doc_ref: &str) -> axum::response::Response {
+    messages::respond(
         axum::http::StatusCode::NOT_IMPLEMENTED,
         "NOT_IMPLEMENTED",
-        format!("{what} 尚未实现（{doc_ref}）；本端点按计划推迟到后续阶段交付"),
+        "err.not_implemented",
+        &[what, doc_ref],
     )
 }
 

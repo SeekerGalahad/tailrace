@@ -8,6 +8,32 @@
 pub mod auth;
 pub mod heartbeat;
 
+/// Canonical `code` strings for the engine's `/v1` error JSON envelopes
+/// (roadmap §九 T34): an *additive* wire field — the legacy `ok`/`error`
+/// shape is untouched, and the console's only consumption path
+/// (`console_proxy::NodeEndpoint::send_json`) deserializes into a
+/// schemaless `serde_json::Value`, so the addition is invisible to it.
+/// Values align with the console §4.0 canonical set where they overlap
+/// (UNAUTHENTICATED / INVALID_ARGUMENT / NOT_FOUND / INTERNAL).
+pub mod error_code {
+    /// 401 — missing/invalid node token (auth middleware).
+    pub const UNAUTHENTICATED: &str = "UNAUTHENTICATED";
+    /// 400 — request body is not valid JSON.
+    pub const INVALID_ARGUMENT: &str = "INVALID_ARGUMENT";
+    /// compile/plan SQL compilation returned a hard error.
+    pub const SQL_COMPILE_FAILED: &str = "SQL_COMPILE_FAILED";
+    /// plan push rejected with SQL diagnostics (payload `diagnostics`).
+    pub const SQL_DIAGNOSTICS: &str = "SQL_DIAGNOSTICS";
+    /// plan push compiled but assembly/start failed.
+    pub const PIPELINE_START_FAILED: &str = "PIPELINE_START_FAILED";
+    /// plan push used the retired specJson compatibility path.
+    pub const SPEC_JSON_RETIRED: &str = "SPEC_JSON_RETIRED";
+    /// pipeline id not registered (undeployed/stopped).
+    pub const NOT_FOUND: &str = "NOT_FOUND";
+    /// offsets ledger read failure.
+    pub const INTERNAL: &str = "INTERNAL";
+}
+
 use std::sync::{Arc, RwLock};
 
 /// Node runtime snapshot (written by the node process at pipeline start).
@@ -112,10 +138,10 @@ pub fn start_server(
                                             "statements": c.statements,
                                             "diagnostics": diags,
                                         }),
-                                        Err(e) => serde_json::json!({ "ok": false, "error": format!("{e:#}") }),
+                                        Err(e) => serde_json::json!({ "ok": false, "code": error_code::SQL_COMPILE_FAILED, "error": format!("{e:#}") }),
                                     }
                                 }
-                                Err(e) => serde_json::json!({ "ok": false, "error": format!("{e}") }),
+                                Err(e) => serde_json::json!({ "ok": false, "code": error_code::INVALID_ARGUMENT, "error": format!("{e}") }),
                             };
                             let _ = &st2;
                             axum::Json(resp)
@@ -229,23 +255,24 @@ pub fn start_server(
                                                         drop(snap);
                                                         serde_json::json!({ "ok": true, "pipelineId": id, "statements": n, "mode": "sql-compiled+serve-executing" })
                                                     }
-                                                    Err(e) => serde_json::json!({ "ok": false, "error": format!("pipeline assembly/start failed: {e:#}") })
+                                                    Err(e) => serde_json::json!({ "ok": false, "code": error_code::PIPELINE_START_FAILED, "error": format!("pipeline assembly/start failed: {e:#}") })
                                                 }
                                             }
                                             Ok((_, diags)) => serde_json::json!({
                                                 "ok": false,
+                                                "code": error_code::SQL_DIAGNOSTICS,
                                                 "error": "SQL compile diagnostics",
                                                 "diagnostics": diags,
                                             }),
-                                            Err(e) => serde_json::json!({ "ok": false, "error": format!("SQL compile failed: {e:#}") }),
+                                            Err(e) => serde_json::json!({ "ok": false, "code": error_code::SQL_COMPILE_FAILED, "error": format!("SQL compile failed: {e:#}") }),
                                         }
                                     } else {
                                         // ② retired legacy path: old specJson
                                         // pipelines must re-publish SQL-first
-                                        serde_json::json!({ "ok": false, "error": "the specJson compatibility path is retired — re-publish SQL-first (pipeline page edit + publish)" })
+                                        serde_json::json!({ "ok": false, "code": error_code::SPEC_JSON_RETIRED, "error": "the specJson compatibility path is retired — re-publish SQL-first (pipeline page edit + publish)" })
                                     }
                                 }
-                                Err(e) => serde_json::json!({ "ok": false, "error": format!("{e}") }),
+                                Err(e) => serde_json::json!({ "ok": false, "code": error_code::INVALID_ARGUMENT, "error": format!("{e}") }),
                             };
                             axum::Json(resp)
                         }
@@ -268,6 +295,7 @@ pub fn start_server(
                                     })),
                                     None => axum::Json(serde_json::json!({
                                         "ok": false,
+                                        "code": error_code::NOT_FOUND,
                                         "error": format!("pipeline #{id} not registered (undeployed/stopped) — logs may still be queryable via /logs"),
                                     })),
                                 }
@@ -313,6 +341,7 @@ pub fn start_server(
                                     Ok(v) => axum::Json(v),
                                     Err(e) => axum::Json(serde_json::json!({
                                         "ok": false,
+                                        "code": error_code::INTERNAL,
                                         "error": format!("{e:#}"),
                                     })),
                                 }
@@ -544,6 +573,101 @@ mod tests {
             reqwest::StatusCode::OK,
             "x-node-token accepted"
         );
+        Ok(())
+    }
+
+    /// T34 wire lock: every /v1 error envelope carries the additive `code`
+    /// field alongside the *untouched* legacy `ok`/`error` shape (the
+    /// console's only consumption path — `console_proxy` `send_json` —
+    /// deserializes into a schemaless `serde_json::Value`, so the addition
+    /// is invisible to it). No external dependency — always runs.
+    #[test]
+    fn error_envelopes_carry_code_legacy_shape_intact() -> anyhow::Result<()> {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let p = l.local_addr()?.port();
+            drop(l);
+            p
+        };
+        let addr = format!("127.0.0.1:{port}");
+        let state = StateHandle::new();
+        let reg = std::sync::Arc::new(tailrace_runtime::registry::PipelineRegistry::new(
+            &std::env::temp_dir().join(format!("tailrace-test-code-{}", std::process::id())),
+        ));
+        let _h = start_server(
+            &addr,
+            state,
+            reg,
+            auth::NodeApiToken::new("tr_b_unit_token"),
+        )?;
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let c = reqwest::blocking::Client::new();
+        // The console-side read pattern: parse the body as a schemaless
+        // Value (exactly what console_proxy send_json does) and read fields.
+        let get_json = |resp: reqwest::blocking::Response| -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::from_str(&resp.text()?)?)
+        };
+
+        // ① 401 without a token → UNAUTHENTICATED (+ legacy fields intact)
+        let v = get_json(c.get(format!("http://{addr}/v1/pipelines")).send()?)?;
+        assert_eq!(
+            v.get("code").and_then(|x| x.as_str()),
+            Some("UNAUTHENTICATED"),
+            "{v}"
+        );
+        assert_eq!(
+            v.get("ok").and_then(|x| x.as_bool()),
+            Some(false),
+            "legacy ok field intact: {v}"
+        );
+        assert!(
+            v.get("error").and_then(|x| x.as_str()).is_some(),
+            "legacy error field intact: {v}"
+        );
+
+        // ② compile with a non-JSON body → INVALID_ARGUMENT
+        let v = get_json(
+            c.post(format!("http://{addr}/v1/compile"))
+                .header("Authorization", "Bearer tr_b_unit_token")
+                .body("not json at all")
+                .send()?,
+        )?;
+        assert_eq!(
+            v.get("code").and_then(|x| x.as_str()),
+            Some("INVALID_ARGUMENT"),
+            "{v}"
+        );
+        assert_eq!(v.get("ok").and_then(|x| x.as_bool()), Some(false), "{v}");
+        assert!(v.get("error").is_some(), "{v}");
+
+        // ③ plan push on the retired specJson path → SPEC_JSON_RETIRED
+        let v = get_json(
+            c.put(format!("http://{addr}/v1/pipelines/99/plan"))
+                .header("X-Node-Token", "tr_b_unit_token")
+                .json(&serde_json::json!({"pipelineId": 99, "specJson": []}))
+                .send()?,
+        )?;
+        assert_eq!(
+            v.get("code").and_then(|x| x.as_str()),
+            Some("SPEC_JSON_RETIRED"),
+            "{v}"
+        );
+        assert_eq!(v.get("ok").and_then(|x| x.as_bool()), Some(false), "{v}");
+        assert!(v.get("error").is_some(), "{v}");
+
+        // ④ stats for an unregistered pipeline → NOT_FOUND
+        let v = get_json(
+            c.get(format!("http://{addr}/v1/pipelines/99/stats"))
+                .header("X-Node-Token", "tr_b_unit_token")
+                .send()?,
+        )?;
+        assert_eq!(
+            v.get("code").and_then(|x| x.as_str()),
+            Some("NOT_FOUND"),
+            "{v}"
+        );
+        assert_eq!(v.get("ok").and_then(|x| x.as_bool()), Some(false), "{v}");
+        assert!(v.get("error").is_some(), "{v}");
         Ok(())
     }
 }

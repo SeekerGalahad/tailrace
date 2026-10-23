@@ -63,7 +63,10 @@ pub struct MeResponse {
 pub async fn login(State(state): State<AppState>, body: Bytes) -> Response {
     let req: LoginRequest = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(e) => return ApiError::bad_request(format!("非法登录请求: {e}")).into_response(),
+        Err(e) => {
+            return super::messages::bad_request("err.auth.bad_login_request", &[&e.to_string()])
+                .into_response()
+        }
     };
     if req.username.trim().is_empty() || req.password.is_empty() {
         return ApiError::bad_request("缺少用户名或密码").into_response();
@@ -95,10 +98,11 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> Response {
             "用户名或密码错误",
         )
         .into_response(),
-        Err(LoginError::Locked { retry_in_secs }) => ApiError::new(
+        Err(LoginError::Locked { retry_in_secs }) => super::messages::respond(
             StatusCode::UNAUTHORIZED,
             "ACCOUNT_LOCKED",
-            format!("尝试过于频繁，请 {retry_in_secs} 秒后再试"),
+            "err.auth.locked",
+            &[&retry_in_secs.to_string()],
         )
         .into_response(),
     }
