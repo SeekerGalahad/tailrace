@@ -607,6 +607,25 @@ mod tests {
         let get_json = |resp: reqwest::blocking::Response| -> anyhow::Result<serde_json::Value> {
             Ok(serde_json::from_str(&resp.text()?)?)
         };
+        // Key-set gate (R5 review): "additive `code` only" is not just
+        // "code exists" — the envelope key set must converge on the legacy
+        // three (+ `diagnostics`, which only the SQL-compile path uses).
+        // A second additive key turns this test red instead of passing
+        // silently.
+        let assert_envelope_keys = |v: &serde_json::Value| {
+            let obj = v.as_object().unwrap_or_else(|| panic!("not an object: {v}"));
+            for required in ["ok", "code", "error"] {
+                assert!(obj.contains_key(required), "missing `{required}`: {v}");
+            }
+            let extra: Vec<&String> = obj
+                .keys()
+                .filter(|k| !matches!(k.as_str(), "ok" | "code" | "error" | "diagnostics"))
+                .collect();
+            assert!(
+                extra.is_empty(),
+                "envelope keys beyond legacy+code(+diagnostics): {extra:?} in {v}"
+            );
+        };
 
         // ① 401 without a token → UNAUTHENTICATED (+ legacy fields intact)
         let v = get_json(c.get(format!("http://{addr}/v1/pipelines")).send()?)?;
@@ -624,6 +643,7 @@ mod tests {
             v.get("error").and_then(|x| x.as_str()).is_some(),
             "legacy error field intact: {v}"
         );
+        assert_envelope_keys(&v);
 
         // ② compile with a non-JSON body → INVALID_ARGUMENT
         let v = get_json(
@@ -639,6 +659,7 @@ mod tests {
         );
         assert_eq!(v.get("ok").and_then(|x| x.as_bool()), Some(false), "{v}");
         assert!(v.get("error").is_some(), "{v}");
+        assert_envelope_keys(&v);
 
         // ③ plan push on the retired specJson path → SPEC_JSON_RETIRED
         let v = get_json(
@@ -654,6 +675,7 @@ mod tests {
         );
         assert_eq!(v.get("ok").and_then(|x| x.as_bool()), Some(false), "{v}");
         assert!(v.get("error").is_some(), "{v}");
+        assert_envelope_keys(&v);
 
         // ④ stats for an unregistered pipeline → NOT_FOUND
         let v = get_json(
@@ -668,6 +690,7 @@ mod tests {
         );
         assert_eq!(v.get("ok").and_then(|x| x.as_bool()), Some(false), "{v}");
         assert!(v.get("error").is_some(), "{v}");
+        assert_envelope_keys(&v);
         Ok(())
     }
 }

@@ -1,8 +1,11 @@
 //! zh 单轨文案字典 + §4.0 信封构造（roadmap §九 T34：T30 登记的 v1.x 项兑现）。
 //!
-//! console API 的用户可见文案收敛为 message_key 查表——zh 是唯一轨道
-//! （en 留空轨：key 已经以 `message_key` 随 wire 携带（本模块的信封构造，
-//! T30 通道兑现），未来翻译轨按 key 展开即可，本模块不再加第二张表）。
+//! console API 的**格式化直写类**用户可见文案收敛为 message_key 查表——
+//! zh 是唯一轨道（en 留空轨：key 已经以 `message_key` 随 wire 携带
+//! （本模块的信封构造，T30 通道兑现），未来翻译轨按 key 展开即可，本
+//! 模块不再加第二张表）。走 ApiError 通道的中文字面量文案**不在本次
+//! 收敛范围**（豁免②：残留清单如实登记并由测试机器钉住，翻译轨到时
+//! 按清单二次展开）。
 //! 模板占位 `{0}`..`{9}`，由 [`t`] 位置插值；渲染结果与收敛前的直写输出
 //! 逐字节一致（既有测试与前端提示不漂移）。
 //!
@@ -13,8 +16,13 @@
 //! 豁免边界（不进字典的中文文案类，T34 卡内登记）：
 //! ① audit 台账文案——`AuditEntry{action,entity_type,entity_id,detail_json}`
 //!    均为机器 JSON（name/version/sha256/引用数组），无中文文案；
-//! ② 非格式化直写的字面量文案（console-auth 5 个构造器字面量等）——44 处
-//!    锚点只覆盖格式化直写类；
+//! ② ApiError 通道的中文字面量错误响应（非格式化直写，44 处锚点不覆盖）
+//!    ——api/ 域内残留 34 站点：datasources 11 / artifacts 10 / pipelines 7 /
+//!    nodes_admin 3 / auth 2 / nodes 1（bad_request/not_found 单字面量 19、
+//!    internal+anyhow! 格式化 4、new 三参字面量 11；console-auth crate 内
+//!    5 个构造器字面量在域外另计）——均无 message_key，是 T34 收敛度的
+//!    如实口径；清单由 [`tests::api_error_chinese_literals_match_pinned_registry`]
+//!    按文件×文案多重集机器钉住，新增/删改站点即红；
 //! ③ 数据源注册表 UI 元数据标签（label/credential_label）；
 //! ④ main.rs 启动横幅 eprintln（stderr，非 API 面）；
 //! ⑤ spa.rs/openapi.rs 的说明性文案；
@@ -24,7 +32,9 @@
 //!    完整性扫描按路径豁免并在此登记）。
 //! 完整性由 [`tests::no_chinese_format_direct_writes_outside_dictionary`]
 //! 钉住：src/ 内（字典模块与 compile.rs 之外）格式化直写 + 中文的行必须
-//! 为零。
+//! 为零。豁免②的 ApiError 字面量残留另由
+//! [`tests::api_error_chinese_literals_match_pinned_registry`] 清单制钉住
+//! （豁免可查、不可悄悄扩大）。
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -269,41 +279,244 @@ mod tests {
         );
     }
 
+    /// 豁免②机器钉住（R5 评审修复）：ApiError 通道的中文字面量错误响应
+    /// 不在 T34 收敛范围（锚点类只覆盖格式化直写），但残留清单必须可被
+    /// 机器钉住——api/ 内每个 ApiError 调用切片的中文字面量多重集必须与
+    /// 下方登记逐一相等（未登记文件必须为零）。新增/删改任何字面量站点
+    /// （含换行写法）都会红，豁免不会被悄悄扩大；收敛某站点进字典时，
+    /// 改站点并同步删本表对应条目。
+    #[test]
+    fn api_error_chinese_literals_match_pinned_registry() {
+        let api_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api");
+        // 登记口径 = 站点文案多重集（同文案两站点登记两次）；分布见模块
+        // 文档豁免②：34 站点 = 19 bad_request/not_found 单字面量
+        // + 4 internal+anyhow! + 11 new 三参。
+        let pinned: &[(&str, &[&str])] = &[
+            (
+                "artifacts.rs",
+                &[
+                    "multipart 缺少 file 字段的文件名",
+                    "制品必须是 .tar.gz 包",
+                    "创建制品目录失败: {e}",
+                    "暂存文件创建失败: {e}",
+                    "制品超过 512MB 上限",
+                    "写入暂存失败: {e}",
+                    "multipart 缺少 file 字段",
+                    "缺少 version 字段",
+                    "name 仅允许 [A-Za-z0-9._-]",
+                    "制品落盘失败: {e}",
+                ],
+            ),
+            (
+                "auth.rs",
+                &["缺少用户名或密码", "用户名或密码错误"],
+            ),
+            (
+                "datasources.rs",
+                &[
+                    "缺少数据源名称",
+                    "connJson 必须是对象",
+                    "缺少 generation（CAS 乐观锁必填）",
+                    "generation 不匹配，数据源已被其他人修改",
+                    "数据源名称已被占用",
+                    "connJson 缺少 bootstrap",
+                    "connJson 缺少 jdbcUrl",
+                    "connJson 缺少 jdbcUrl",
+                    "文件数据源不支持发现（路径下的文件请直接登记表对象）",
+                    "缺少 dbName / tableName",
+                    "缺少 dbName / tableName",
+                ],
+            ),
+            ("nodes.rs", &["节点不存在"]),
+            (
+                "nodes_admin.rs",
+                &[
+                    "缺少 name / host",
+                    "节点名称或 node_key 已存在",
+                    "节点未上报 api_url（等待首次心跳）",
+                ],
+            ),
+            (
+                "pipelines.rs",
+                &[
+                    "缺少管道名称",
+                    "管道名称已存在",
+                    "管道名称已存在",
+                    "管道尚未发布（无 spec 快照），先执行发布",
+                    "没有可指派的在线节点（需心跳 90s 内在线且已上报 api_url）",
+                    "节点未上报 api_url",
+                    "节点未上报 api_url",
+                ],
+            ),
+        ];
+        let mut offenders: Vec<String> = Vec::new();
+        for (file, expected) in pinned {
+            let text = std::fs::read_to_string(api_dir.join(file)).expect("read api source");
+            let mut found: Vec<String> = api_error_call_spans(&text)
+                .iter()
+                .flat_map(|span| cjk_string_literals(&text[span.clone()]))
+                .collect();
+            found.sort();
+            let mut want: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+            want.sort();
+            if found != want {
+                offenders.push(format!(
+                    "{file}: found {found:#?}\n{file}: want  {want:#?}"
+                ));
+            }
+        }
+        // 未登记文件必须零残留（新文件带 ApiError 中文字面量进域即红）。
+        let registered: Vec<&str> = pinned.iter().map(|(f, _)| *f).collect();
+        for entry in std::fs::read_dir(&api_dir).expect("read api dir") {
+            let path = entry.expect("entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if registered.contains(&name.as_str()) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read api source");
+            let hits: Vec<String> = api_error_call_spans(&text)
+                .iter()
+                .flat_map(|span| cjk_string_literals(&text[span.clone()]))
+                .collect();
+            if !hits.is_empty() {
+                offenders.push(format!("{name}: 未登记的 ApiError 中文字面量 {hits:#?}"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "豁免②清单漂移（收敛站点进字典时同步更新本表）:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// 多行感知负测试入树（R5 评审修复：把开发期瞬态实证固化为可回归
+    /// 证据）——`format!(` 与中文字面量分行写的直写必须被
+    /// [`format_call_spans`] 取到完整切片且 [`contains_cjk`] 命中；
+    /// 英文单行调用保持阴性。
+    #[test]
+    fn format_call_spans_is_multiline_aware() {
+        let sample = concat!(
+            "let a = 1;\n",
+            "let s = format!(\n",
+            "    \"中文 {0}\",\n",
+            "    a\n",
+            ");\n",
+            "let t = format!(\"english only {}\", a);\n",
+        );
+        let spans = format_call_spans(sample);
+        assert_eq!(spans.len(), 2, "两个 format! 调用都要找到");
+        let multiline = &sample[spans[0].clone()];
+        assert!(multiline.contains('\n'), "切片跨行");
+        assert!(multiline.contains("中文 {0}"), "切片覆盖次行中文字面量");
+        assert!(contains_cjk(multiline), "多行直写被判中");
+        let single = &sample[spans[1].clone()];
+        assert!(!contains_cjk(single), "英文单行保持阴性");
+    }
+
     /// 每个格式化宏调用的字符区间（起于 `format!(`，止于配对闭括号）。
     fn format_call_spans(text: &str) -> Vec<std::ops::Range<usize>> {
-        let bytes = text.as_bytes();
         let mut spans = Vec::new();
         let mut i = 0;
         while let Some(rel) = text[i..].find("format!(") {
             let start = i + rel;
-            let mut depth = 0usize;
-            let mut j = start + "format!".len();
-            let mut in_str = false;
-            let mut escaped = false;
-            while j < bytes.len() {
-                let c = bytes[j] as char;
-                if escaped {
-                    escaped = false;
-                } else if c == '\\' {
-                    escaped = true;
-                } else if c == '"' {
-                    in_str = !in_str;
-                } else if !in_str {
-                    if c == '(' {
-                        depth += 1;
-                    } else if c == ')' {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
+            match balanced_paren_end(text, start + "format!".len()) {
+                Some(end) => {
+                    spans.push(start..end);
+                    i = end;
+                }
+                None => break,
+            }
+        }
+        spans
+    }
+
+    /// 每个 ApiError 调用的字符区间（`ApiError::ctor(` 起至配对闭括号，
+    /// 与 [`format_call_spans`] 同一字符串感知匹配——多行调用同样取全）。
+    fn api_error_call_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+        let mut spans = Vec::new();
+        let mut i = 0;
+        while let Some(rel) = text[i..].find("ApiError::") {
+            let start = i + rel;
+            let mut j = start + "ApiError::".len();
+            let bytes = text.as_bytes();
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'(' {
+                if let Some(end) = balanced_paren_end(text, j) {
+                    spans.push(start..end);
+                    i = end;
+                    continue;
+                }
+            }
+            i = start + "ApiError::".len();
+        }
+        spans
+    }
+
+    /// 从 `(` 下标起返回配对闭括号后一位（引号内的括号不计数；字节扫描
+    /// 对 UTF-8 安全——多字节续字节不与 ASCII 冲突）。
+    fn balanced_paren_end(text: &str, open: usize) -> Option<usize> {
+        let bytes = text.as_bytes();
+        let mut depth = 0usize;
+        let mut in_str = false;
+        let mut escaped = false;
+        let mut j = open;
+        while j < bytes.len() {
+            let c = bytes[j] as char;
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = !in_str;
+            } else if !in_str {
+                if c == '(' {
+                    depth += 1;
+                } else if c == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(j + 1);
                     }
+                }
+            }
+            j += 1;
+        }
+        None
+    }
+
+    /// 调用切片内的中文字符串字面量（豁免②清单的登记单位，保留重复——
+    /// 同文案两站点登记两次）。
+    fn cjk_string_literals(call: &str) -> Vec<String> {
+        let bytes = call.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != b'"' {
+                i += 1;
+                continue;
+            }
+            let mut j = i + 1;
+            while j < bytes.len() {
+                if bytes[j] == b'\\' {
+                    j += 2;
+                    continue;
+                }
+                if bytes[j] == b'"' {
+                    break;
                 }
                 j += 1;
             }
-            spans.push(start..(j + 1).min(bytes.len()));
+            let lit = &call[i + 1..j.min(call.len())];
+            if contains_cjk(lit) {
+                out.push(lit.to_string());
+            }
             i = j + 1;
         }
-        spans
+        out
     }
 
     /// CJK 判定：汉字 + CJK 标点/全角符号（文案必然落在这些区段）。

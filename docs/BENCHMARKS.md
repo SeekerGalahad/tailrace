@@ -642,7 +642,9 @@ tailrace-conn-kafka kafka_source_discovers -- --nocapture`。
   （+0.8%，噪声界内持平）——10k 批 stream load 不在热路径上。与 T20 的 33670
   基线（2026-10-20，跨日）亦一致。
 - **小批区（group commit 目标区）无 group commit 的基线**：引擎 DorisSink 不发
-  Doris `group_commit` header（`conn-doris` `send_once` 仅 label+Expect，
+  Doris `group_commit` header（`conn-doris` `send_once` 常规头
+  Authorization/label/format/Expect，Doris 档另加 read_json_by_line/
+  sequence_column——均无 group_commit，
   engine/crates/tailrace-conn-doris/src/lib.rs:361）——本组是「小批×无 group
   commit」基线。单管小批 11017（200 次同步 stream load ≈45ms/次往返封顶，
   −67% vs 大批）；P=4 小批 26781（=单管小批的 2.43×，HTTP 往返部分重叠），
