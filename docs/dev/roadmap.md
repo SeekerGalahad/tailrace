@@ -340,19 +340,21 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 - **文件域**：engine/crates/tailrace-api、console/crates/tailrace-console/src/api/*、console 新字典模块、（如牵连）console node client 反序列化点。
 > 结果：3cf738b+ffb1d55 engine api 10 处错误响应补 code（8 规范码常量；11 处口径中 1 处系数据字段如实区分）+wire 兼容双锁（4 端点真起服断言 legacy 形态+console-proxy Value 容错钉住）+信封键集机器门（评审修升格）；console 44 处中文 format! 收敛 message_key 查表（zh 单轨字典 **36 key/50 调用点**，渲染字节一致）+38 处 §4.0 信封携 message_key 上 wire+完整性测试钉住 format! 类；字面量类 ApiError 残留 **34 站点**机器钉住登记（评审稿 18 为行扫口径、ffb1d55 多行扫实测 34——datasources 11/artifacts 10/pipelines 7/nodes_admin 3/auth 2/nodes 1；评审修：豁免②如实列分布+扫描扩展）；review low 三笔（37/51 计数勘正、负测试树内固化、BENCHMARKS send_once 措辞）随评审修或登记。〔**2026-10-23 T39 ③ 勘正落定**：3cf738b 提交说明的「37 key/51 调用点」为双 off-by-one 误记（实测：`template` 匹配臂/KEY_LIST 均 36 项；`grep -rn 'messages::' src/ --include='*.rs'` 排除本模块 =50），已落为 messages.rs 模块文档「规模口径」段 + `templates_use_only_positional_placeholders` 内 `KEY_LIST.len()==36` 机器钉 + CHANGELOG Unreleased T34 条目（36 keys / 50 call sites）；不可改写的提交说明为唯一残留，T38 入账直接引用本行即可。〕
 
-### T35 SSH 部署链八步（~3 人日）〔T19 承接；裁决点2〕
+### T35 SSH 部署链八步（~3 人日）〔T19 承接；裁决点2〕 ✅
 
 - **现状**（今日锚点）：`console/crates/tailrace-console/src/api/nodes_admin.rs:749` 起 §4.4 八步 501 标记区（:757 utoipa 501 responses 登记、:760 `not_implemented`）；设计 §4.4 八步链（上传/解压/停旧/替二进制/启新/健康/回滚/版本核对）定案未实现；web 侧入口空挂。
 - **方案**：① SSH 客户端选型先过 `cargo deny check licenses`（倾向 russh 纯 Rust；openssh 包装需系统依赖不取）；② console 编排八步状态机，每步审计事件入台账（复用 audit 面）；③ **失败回滚路径=验收重心**（任一步失败→回滚旧二进制→健康确认）；④ 本地 docker 目标机集成测试（容器当远端节点、tailrace-node 真进程、含中途失败触发回滚用例）；⑤ web 部署动线接线；⑥ `docs/protocol/console-api.md` 路径契约同步（501 行清除）。
 - **验收**：501 → 真实现；docker 目标机 e2e 含回滚用例绿；`cargo test -p tailrace-console --locked` 绿；web typecheck+build 绿；`grep -c '501' docs/protocol/console-api.md` 对应段落归零。
 - **文件域**：console/crates/tailrace-console/src/api/nodes_admin.rs、web/src/pages/nodes/、console tests/、根 Cargo.toml+Cargo.lock（新依赖）、docs/protocol/console-api.md。
 - **依赖**：排 T33 后串行（同动根 Cargo.toml/Cargo.lock；R3-W2「T23 先行」同因先例）。
+> 结果：9b21854（main，父 b82c77d 线性）八步链全落地——提交说明仅单行，结构与数字取自树内证据（本行由 T38 prep 落档）：①选型兑现——russh 纯 Rust SSH 传输（根 Cargo.toml workspace dep，default-features=false+ring+flate2，aws-lc-sys C 工具链与 deny 许可面被排除）；②`console/src/deploy.rs` 新增 1104 行八步状态机（PENDING→PREFLIGHT→UPLOAD→UNPACK→CONFIGURE→START→HEALTH_WAIT→REGISTER→REGISTERED；hosts[] 批量建行 register_mode=deployed+per-node token / nodeId 重部署；每步审计落 deploy-log）；③回滚路径在位——任一步失败→prev→current 恢复+旧进程重启+健康确认+deploy_status=FAILED+artifact_id 不动，首部署无 prev 则移除损坏链接；④tests/nodes_deploy_unit.rs（状态机单测 292 行）+tests/nodes_deploy_docker_e2e.rs（docker 目标机 e2e 507 行，live-gate `#[ignore]` 形态）；⑤web nodes 页接线（index.vue）；⑥console-api.md:34-35 两行 ✅（deploy 501 清除；余 501=migrate/ticket，域外）。nodes_admin.rs 另交付 action 面（start/stop/restart/rollback/uninstall 同步+upgrade 异步八步；非 SSH 托管 400/SSH 失败 502 SSH_FAILED）；store nodes.rs/models.rs 部署状态字段；messages.rs 字典键补齐。**验收复跑（T38 prep 会话，1.1.0 bump 树）**：`cargo test -p tailrace-console --locked` 全绿——nodes_deploy_unit **4 passed/0 failed**、nodes_deploy_docker_e2e **1 ignored**（live-gate；docker 实跑未在本会话复现，T35 会话是否真跑无登记可考——提交无 body）。web typecheck+build 未在本会话复跑（无登记可考）；Cargo.lock 随 russh 依赖边 +938 行（该波串行于 T33 后，同动 lock 先例兑现）。
 
-### T36 R5 末谱系裁决卡（~1 人日）〔T18 ③④⑤ 合并裁决的正式召开〕
+### T36 R5 末谱系裁决卡（~1 人日）〔T18 ③④⑤ 合并裁决的正式召开〕 ✅
 
 - **方案**：输入 = T32 Doris 基线（单管道+并发档）+ T33 后链路基线；按 T18 预设判据逐项检验——④ T2（瓶颈在 FE 事务/BE compaction 队列而非网络/CPU）/T3（≥4 管道×<1000 行批收益）；③⑤ 二选一（2PC 服务端裁决 vs WAL 客户端裁决，不同时做）；产出纪要 `docs/dev/R5-谱系裁决-<date>.md`（T18 模式复用：结论+依据+续挂触发器）；升格项转 R6 任务卡草案。
 - **验收**：纪要存在且 ③④⑤ 各有结论；升格项有卡草案要点，未触发项触发器续挂明示。
 - **文件域**：docs/dev/。
+> 结果：d43fbdc 纪要落档 `docs/dev/R5-lineage-judge-20261025.md`（179 行，T36 唯一产出物；本行由 T38 prep 落档）：④ group commit **维持排 v1.x/R6**——④T1 已满足存档（T32 §6.4 六档）；④T2 半成立（瓶颈归因成立：小批域 45.4ms/次 FE 事务往返完全记账、大批 +0.8% 持平排除网络/CPU；「默认档不达标」被同数据否定——默认 10k 行档恰是持平档）；④T3 机制面成立（P=4×500 行=单管小批 2.43× 但 −21% vs 大批）需求面未触发（外部信号复测 stars/forks/issues 全零）→ 触发器改写为 ④-T2'（真实小批多管道场景+实际损害，默认档不再是必要条件）+T3'（外部信号，续挂）；③⑤ **双双维持排 v1.x**，谱系卡预定分支=③ 2PC（代价封闭性：只动 sink 协议面 vs WAL 对全管道 flush 持久写翻倍、fsync 主导链路必回吐；损害模型对位：label 幂等已收敛重放、2PC 补 abort/孤儿事务对账），唯一翻转条件写死（损害落在无幂等键 sink file/kafka→改 ⑤ WAL）；① deltalake 硬耦合已松（T33 后 arrow 59.3.1 ≥ ^59，仍需求门控）。裁决输入缺口如实登记：§6.4 Doris 档系 DF48 树测得、DF55 未复测（T33 L3 smoke「待跑」随行）。移交 T38/波门禁：T33 L3 状态对齐+纪要文件名与 §十二收口 glob（`R5-谱系裁决-*.md`）不一致待裁决。
 
 ### T37（选做）parser/decode fuzz 起步（~2 人日）〔T21 承接；裁决点3，推荐挂起〕
 

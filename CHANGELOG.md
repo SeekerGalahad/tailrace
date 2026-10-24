@@ -5,11 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.0] - 2026-10-25
 
-_Scope: changes since v1.0.0 — roadmap cards T32 / T34 (R5-W0) and T39
-(R5-W0.5). The R4 cards T22 / T25 / T26 / T30 shipped inside 1.0.0 (entries
-below, not repeated here) and had no post-1.0.0 follow-ups._
+_Scope: changes since v1.0.0 — roadmap cards T32 / T34 (R5-W0), T39
+(R5-W0.5), T33 (R5-W1) and T35 (R5-W2). T36 (R5 lineage judge) is a
+docs-only decision record (docs/dev/R5-lineage-judge-20261025.md — group
+commit / 2PC / WAL all stay on the v1.x/R6 agenda with rewritten triggers);
+no user-facing change, hence no entry below. The R4 cards T22 / T25 / T26 /
+T30 shipped inside 1.0.0 (entries below, not repeated here) and had no
+post-1.0.0 follow-ups._
 
 ### Added
 
@@ -35,6 +39,25 @@ below, not repeated here) and had no post-1.0.0 follow-ups._
   via infer-schema, `null` when a table was registered without columns.
   Additive wire change; the web SQL editor's `db.table.` column completion
   (CodeMirror6 schema + member sources) is fed from it end-to-end.
+- SSH deploy chain, the design §4.4 eight-step flow (roadmap T35, carried
+  from T19): `POST /api/nodes/deploy` drives
+  PENDING→PREFLIGHT→UPLOAD→UNPACK→CONFIGURE→START→HEALTH_WAIT→REGISTER→
+  REGISTERED over russh (pure-Rust transport, ring backend, public-key
+  authentication only — the console's `TAILRACE_SSH_KEY` /
+  `TAILRACE_SSH_KEY_PASSPHRASE` env, credentials never ride the request
+  body). Two trigger modes: `hosts[]` batch onboarding (the control plane
+  pre-creates the node row with register_mode=deployed and a per-node
+  token) or `nodeId` re-deploy of an SSH-managed node. Per-step progress
+  lands in `GET /api/nodes/{id}/deploy-log` (a failure appends a ROLLBACK
+  line); any step failure rolls back — prev→current symlink restore, old
+  binary restart, health re-check, deploy_status=FAILED, artifact_id
+  untouched; REGISTER additionally verifies engine_version matches the
+  artifact. Node actions `start/stop/restart/rollback/uninstall` execute
+  synchronously and `upgrade` walks the full chain asynchronously; the 501
+  placeholders in the console admin API are gone (non-SSH-managed nodes
+  get 400, SSH-side failures 502 SSH_FAILED). Web nodes page wired;
+  in-tree tests cover the state machine (unit) plus a docker target-host
+  e2e including the mid-chain-failure → rollback case.
 
 ### Changed
 
@@ -48,6 +71,26 @@ below, not repeated here) and had no post-1.0.0 follow-ups._
   with `message_key` on 38 §4.0 envelopes, completeness enforced by a
   source scan; the 34 `ApiError` literal sites outside that caliber are
   registered as the exempted remainder and machine-pinned.
+- DataFusion 48.0.1 → 55.2.0 (roadmap T33): seven-major direct jump with
+  `datafusion-proto` in lockstep — arrow/parquet 59.3.1, sqlparser 0.62.0,
+  prost 0.14.4; MSRV unchanged (55.2.0 declares rust-version 1.94 ≤ the
+  workspace's 1.95). Six code adaptations across the 12 engine touch-point
+  files (extension-codec TaskContext signatures, `TableProvider::as_any`
+  removal, `TableReference` relocating to `datafusion::common`, a
+  sqlparser-0.62 `ObjectNamePart::Function` rejection arm). Contract
+  goldens are byte-identical across the jump (proto-plan b64 and execution
+  pretty snapshots; per-diff attribution in docs/dev/
+  t33-golden-attribution.md); the two behavioral drifts are attributed —
+  metric rendering `8000` → `8.00 K` (human_readable_count display layer,
+  tests accept both forms) and the `output_batches` metric unlocked via
+  BaselineMetrics (the DF48 §4.4 limitation is lifted, memory-pool
+  partial-enforcement persists). Supply-chain side effects: paste /
+  lzma-sys / xz2 / thrift leave the dependency graph (pure-Rust
+  libbz2-rs-sys / liblzma replace the C bindings), bzip2-1.0.6 joins the
+  deny license allowlist, and the RUSTSEC-2024-0436 (paste unmaintained)
+  ignore retires with the crate. M4 macro benchmark file→file: 41528
+  rows/s (first DF55 sample, same machine different day vs the DF48 anchor
+  33568 = +23.7% — recorded as no-regression, not a confirmed gain).
 - Runtime offset-store locking: every `state.lock()` in `tailrace-runtime`
   (serve loop + standalone statement bodies, 8 sites) now recovers a
   poisoned `Mutex` with `unwrap_or_else(|e| e.into_inner())` — registry
@@ -194,6 +237,7 @@ web UI.
   `checksums.txt`, and community health files (CONTRIBUTING, SECURITY,
   CODE_OF_CONDUCT, issue/PR templates).
 
-[Unreleased]: https://github.com/SeekerGalahad/tailrace/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/SeekerGalahad/tailrace/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/SeekerGalahad/tailrace/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/SeekerGalahad/tailrace/compare/v0.1.0...v1.0.0
 [0.1.0]: https://github.com/SeekerGalahad/tailrace/releases/tag/v0.1.0
