@@ -221,6 +221,12 @@ fn ident_name(name: &ObjectName) -> Option<String> {
     }
     match first {
         datafusion::sql::sqlparser::ast::ObjectNamePart::Identifier(i) => Some(i.value.clone()),
+        // T33 (sqlparser 0.55→0.62): new dialect-specific variant (function
+        // call in object-name position, ast/mod.rs:423). A ${ds:} placeholder
+        // is a plain single-part identifier by construction — the function
+        // form falls through to the same "not a reference placeholder" None
+        // the multi-part case already yields.
+        datafusion::sql::sqlparser::ast::ObjectNamePart::Function(_) => None,
     }
 }
 

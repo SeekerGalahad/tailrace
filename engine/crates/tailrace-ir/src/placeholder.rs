@@ -12,6 +12,12 @@ use datafusion::catalog::{Session, TableProvider};
 use datafusion::datasource::provider_as_source;
 use datafusion::error::Result;
 use datafusion::execution::context::SessionContext;
+// T33 (DF 55): the logical extension codec now receives a &TaskContext
+// instead of a &SessionContext (DF51 #17601, verified on 55.2.0
+// proto/src/logical_plan/mod.rs:141-156). The task_context module is gone —
+// TaskContext is a facade re-export (datafusion-execution lib.rs:54, glob
+// re-exported by execution/mod.rs).
+use datafusion::execution::TaskContext;
 use datafusion::logical_expr::logical_plan::Extension;
 use datafusion::logical_expr::{Expr, TableType};
 use datafusion::physical_plan::ExecutionPlan;
@@ -32,9 +38,9 @@ impl SrcPlaceholderTable {
 
 #[async_trait::async_trait]
 impl TableProvider for SrcPlaceholderTable {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
+    // T33 (DF 55): `as_any` is no longer a trait method — TableProvider now
+    // takes `Any` as a supertrait (datafusion-session table.rs:52), so the
+    // impl method is simply dropped.
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -74,7 +80,7 @@ impl LogicalExtensionCodec for IrCodec {
         &self,
         buf: &[u8],
         inputs: &[datafusion::logical_expr::LogicalPlan],
-        ctx: &SessionContext,
+        ctx: &TaskContext,
     ) -> Result<Extension> {
         DefaultLogicalExtensionCodec {}.try_decode(buf, inputs, ctx)
     }
@@ -84,9 +90,9 @@ impl LogicalExtensionCodec for IrCodec {
     fn try_decode_table_provider(
         &self,
         buf: &[u8],
-        table_ref: &datafusion::sql::TableReference,
+        table_ref: &datafusion::common::TableReference,
         schema: SchemaRef,
-        ctx: &SessionContext,
+        ctx: &TaskContext,
     ) -> Result<Arc<dyn TableProvider>> {
         if table_ref.table() == "src" {
             return Ok(Arc::new(SrcPlaceholderTable::new(schema)));
@@ -95,7 +101,7 @@ impl LogicalExtensionCodec for IrCodec {
     }
     fn try_encode_table_provider(
         &self,
-        table_ref: &datafusion::sql::TableReference,
+        table_ref: &datafusion::common::TableReference,
         node: Arc<dyn TableProvider>,
         buf: &mut Vec<u8>,
     ) -> Result<()> {

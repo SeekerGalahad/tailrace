@@ -107,8 +107,13 @@ fn b64_to_plan_unchecked(b64: &str) -> anyhow::Result<LogicalPlan> {
         .build()?;
     let plan: LogicalPlan = rt.block_on(async {
         let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        // T33 (DF 55): logical_plan_from_bytes_with_extension_codec takes the
+        // task context (bytes/mod.rs:164 on 55.2.0) — SessionContext::task_ctx
+        // still hands it out.
         let p = datafusion_proto::bytes::logical_plan_from_bytes_with_extension_codec(
-            &bytes, &ctx, &IrCodec,
+            &bytes,
+            &ctx.task_ctx(),
+            &IrCodec,
         )?;
         Ok::<_, anyhow::Error>(p)
     })?;

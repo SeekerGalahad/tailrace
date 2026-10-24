@@ -60,8 +60,11 @@ strip = true
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time", "sync"] }
 rdkafka = { version = "0.39", features = ["cmake-build", "tokio", "curl-static"] }
 openssl = { version = "0.10", features = ["vendored"] }
-datafusion = "48.0.1"
-datafusion-proto = "48.0.1"
+# T33: DataFusion 48.0.1 → 55.2.0 direct jump (7 majors; engine serial wave.
+# datafusion-proto moves in lockstep. Dependency face at 55.2.0: arrow 59.2.0 /
+# sqlparser 0.62.0 / prost 0.14.1; MSRV 1.94.0 ≤ workspace rust-version 1.95.)
+datafusion = "55.2.0"
+datafusion-proto = "55.2.0"
 bytes = "1"
 simd-json = "0.15.1"
 # T4 CSV decoder: RFC4180 record grammar (already in-tree via arrow-csv —

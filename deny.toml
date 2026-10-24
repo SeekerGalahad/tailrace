@@ -18,6 +18,12 @@ allow = [
     # option-ext 0.2.0 (MPL-2.0) via rust-embed -> dirs-sys; weak copyleft,
     # commonly allowlisted in Apache-2.0 projects (upgrade plan §2.2 eng H1).
     "MPL-2.0",
+    # T33 (DF 55): libbz2-rs-sys 0.2.5 — the pure-Rust bzip2 that replaces
+    # the C libbz2/xz2 stack in DF 55's async-compression dependency face
+    # (bzip2 0.6.1 -> compression-codecs). bzip2-1.0.6 is the standard
+    # permissive bzip2/libbzip2 license (BSD-style redistribution terms,
+    # SPDX-listed) — same family as the BSD-2/3 entries above.
+    "bzip2-1.0.6",
 ]
 
 [bans]
@@ -32,12 +38,12 @@ version = 2
 # ^9.0, so the lock now resolves zip 9.0.5 and nothing yanked remains.
 yanked = "deny"
 ignore = [
-    # RUSTSEC-2024-0436: paste 1.0.15 is unmaintained; no safe upgrade exists.
-    # Transitive via datafusion-common 48.0.1 (workspace pins datafusion 48,
-    # engine version table is not bumped ad hoc). Revisit when datafusion
-    # drops paste (upgrade plan §2.2 eng H1 / §3.2; Arroyo/RisingWave do the
-    # same for this advisory).
-    "RUSTSEC-2024-0436",
+    # (T33, DF 48→55): the RUSTSEC-2024-0436 ignore (paste 1.0.15
+    # unmaintained, transitive via datafusion-common 48) was dropped with the
+    # DataFusion 55.2.0 upgrade — DF 55 no longer depends on paste, the crate
+    # left the lockfile (cargo update output: "Removing paste v1.0.15"), and
+    # cargo-deny confirmed "advisory was not encountered" while the ignore
+    # was still listed.
     # (The three zip <9 extraction advisories that were ignored here while
     # utoipa-swagger-ui pinned zip ^8.6 were dropped 2026-10-23 with the
     # 10.0.2 → zip 9.0.5 upgrade — see roadmap §八.1.)

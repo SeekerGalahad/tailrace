@@ -355,12 +355,16 @@ mod tests {
 
     /// T7 acceptance: first batch 1 row + later large batch — the later
     /// micro-batch's executed batch count drops, evidenced on the DataFusion
-    /// EXPLAIN ANALYZE run of the same plan. Note: DataFusion 48 emits the
-    /// `output_batches` metric only from join/coalesce/unnest operators
-    /// (datafusion-physical-plan source) — aggregate/projection plans do not
-    /// carry it, so the executed batch count is taken at the plan output
-    /// (collect), while the explain table pins the other execution facts
-    /// (operators ran, all 8000 rows flowed) for both scenarios.
+    /// EXPLAIN ANALYZE run of the same plan. T33 (DF 55): `output_batches`
+    /// is now a standard BaselineMetrics metric (RecordOutput auto-records
+    /// it on every operator) and shows up on aggregate/projection plans —
+    /// the DF 48 limitation (only join/coalesce/unnest emitted it) is
+    /// lifted. The executed batch count for the drop comparison is still
+    /// taken at the plan output (collect); the explain table pins the other
+    /// execution facts (operators ran, all 8000 rows flowed, output_batches
+    /// present) for both scenarios. Count metrics render human-readable on
+    /// 55 (datafusion-common display/human_readable.rs: `8000` → `8.00 K`);
+    /// both renderings are accepted below.
     #[test]
     fn explain_metrics_batch_count_drops() -> anyhow::Result<()> {
         let agg_sql = "SELECT seq, COUNT(*) AS n FROM src GROUP BY seq";
@@ -375,8 +379,23 @@ mod tests {
                 // later 8000-row micro-batch: explain run + executed output
                 let table = transform_cached_explain(agg_sql, two_col_batch(8000), &opts)?;
                 assert!(
-                    table.contains("AggregateExec") && table.contains("output_rows=8000"),
-                    "explain metrics must show the aggregate executed with all rows:\n{table}"
+                    table.contains("AggregateExec"),
+                    "explain metrics must show the aggregate ran:\n{table}"
+                );
+                // all 8000 rows flowed through the aggregate (DF 48 rendered
+                // the count raw, DF 55 renders it human-readable)
+                let all_rows =
+                    table.contains("output_rows=8000") || table.contains("output_rows=8.00 K");
+                assert!(
+                    all_rows,
+                    "explain metrics must show all 8000 rows flowed:\n{table}"
+                );
+                // T33 (DF 55): output_batches is now emitted by
+                // aggregate/projection operators too (BaselineMetrics) — the
+                // metric-face unlock this test documents.
+                assert!(
+                    table.contains("output_batches="),
+                    "DF 55 must expose output_batches on aggregate plans:\n{table}"
                 );
                 let out = transform_cached(agg_sql, two_col_batch(8000), &opts)?;
                 anyhow::Ok(out.len())
