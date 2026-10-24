@@ -185,6 +185,10 @@ passed，契约 7/7）：
   记录（datafusion-physical-plan 源码确认），聚合/投影计划不产出该指标，故执行批数取
   计划输出 collect 计数，EXPLAIN ANALYZE 表断言其真实展示项（AggregateExec 执行、
   output_rows=8000）——偏差在测试注释与本节注明，不按卡面字样造假。
+  〔**DF55 已解除**（T33，2026-10-24）：`output_batches` 入 BaselineMetrics 标准指标
+  （datafusion-physical-expr-common `src/metrics/baseline.rs`，RecordOutput 自动记录），
+  AggregateExec/ProjectionExec 均自带 `output_batches=1`；测试注记已按此改写并加
+  `output_batches=` 存在性断言钉住。归因见 docs/dev/t33-golden-attribution.md §三 B-2。〕
 - `batch_size_fixed_from_options_not_first_batch`：同场景，固定 8000 → 输出 1 批 vs
   旧定格（模拟 batch_size=1）→ 8000 批。
 - `t7_exec_plan_wiring`（runtime 接线）：声明 schema 的 `build_exec_plan` 计划 +
@@ -193,7 +197,10 @@ passed，契约 7/7）：
 - `memory_pool_wired_with_configured_cap`：pool 装配断言
   （`memory_pool.memory_limit() == Finite(cap)`）。**如实登记**：DF 官方注明 pool
   "not yet respected in all cases"；实测 64 KiB 池下 8000 组 hash agg 照常完成（不
-  强制拒绝），pool 是装配正确的护栏而非硬限制。
+  强制拒绝），pool 是装配正确的护栏而非硬限制。〔**DF55 维持**（T33，2026-10-24）：
+  datafusion-execution 55.2.0 `src/runtime_env.rs:429` 注记 "does not yet respect this
+  limit in all cases" 逐字仍在，`with_memory_limit` 行为面同构——本条限制在 55 上原样
+  成立。复核见 docs/dev/t33-golden-attribution.md §八。〕
 - 过程修复：契约套件（v1_file_pipeline_lifecycle / v1_bad_rows_dlq）抓到
   `build_exec_plan` 在节点 serve 部署 handler（异步上下文）内嵌套建 runtime → panic；
   已改为专用线程建 runtime（一次性部署成本）。
@@ -367,6 +374,8 @@ decode→transform→write 之后），行数边界过界判断只能以整 poll
 | T32 | 同上·P=4 并发小批（T18 ④T3 判据数据面）⁶ | **26781 rows/s**（50 flush/管） | 单管小批 11017 | **2.43×**（HTTP 往返重叠），仍 −21% vs 单管大批——收益缺口=group commit 目标区 | 2026-10-23 |
 | T32 | 同上·P=4 并发·poll 地板批（名义 flush500，实际批 ≈6250）⁶ | **97752 rows/s**（4 flush/管） | 单管大批 33852 | **2.89×**——4 管道并行化全链；console 并发 4 管道无限制（未触发降 P=2 回退门） | 2026-10-23 |
 | T32 | file→**starrocks**（node 直跑档，口径不同源）⁶ | **8750 rows/s** | — | allin1 单容器量级参考，不与 console 档直接比（见 §6.4 口径注记） | 2026-10-23 |
+| T33 | macro 吞吐（file→file debug，DataFusion 48.0.1→**55.2.0**）⁸ | DF48 同机锚点 **33568 rows/s**（§6.4，2026-10-23） | DF55 **41528 rows/s**（2.408 s） | **+23.7%**（同机**不同日**，非同日 A/B；单轮 debug 档不登记为确定增益）；回退门「宏基准回吐 >10%」**未触发** | 2026-10-24 |
+| T33 | transform 微基准三项（criterion release，8000 行/批，DF 55.2.0）⁸ | —（**本机无 DF48 微基准档**：target/criterion 本次首跑） | **M4 DF55 首档**：identity **237.38 M** / filter **65.89 M** / groupby **53.47 M** rows/s | **vs §4.4 的 30.647 M/8.958 M/8.072 M 属跨机器（Intel i7→M4），不可比**；本组=该 bench 在 M4 的首个档位，三项「前后差」无法给出（见 §6.5） | 2026-10-24 |
 
 > ¹ 吞吐口径脚注（R3-W1 评审 low#5 补注）：**debug 档**（`CARGO_PROFILE_DEV_DEBUG=0`，非 release）、单轮全链仅 ~3s、macro.sh stats 轮询步进 0.5s → **量化误差 ±17%**（§6.1 结论段自认）——本口径对 <~17% 的 allocator 效应**无检出力**，「持平」仅指差值未超出该噪声界；allocator 吞吐结论以 release 档长跑补测后为准。
 > ² 体积口径脚注（low#5）：两个体积数字来自**基准二进制**（sha256 前缀 `1f7270c7…`/`55066ae4…`，§6.1 方法段），构建树 = **caa842e + T20 提交前工作树**（= 9a9f8a2 落章前的树；其后 488efcc/13d1c2b（engine 改动）、19bb80b（CI）均未包含）——**非任何已提交树的可复现产物**。2026-10-21 复查：本机现存 `target/debug/tailrace-node`（264,705,488 B，`nm` 计 `_rjem_` 符号 0 个）属其后另一树的重建产物，与表中默认档数字不可互推。
@@ -375,6 +384,7 @@ decode→transform→write 之后），行数边界过界判断只能以整 poll
 > ⁵ T15 吞吐口径：`TAILRACE_KAFKA_PORT=19092 bash scripts/bench/macro-partitions.sh --rows 100000 --partitions 6`（compose kafka 移位 19092——本机 9092 被常驻 kafka-local 占用；EXTERNAL 通告随端口走，口径不变）。4 有效轮 + 1 轮播种失败重试（console-producer 端 99850≠100000，基础设施毛刺非引擎行为，弃用重跑）；每轮断言播种量==N 与 sink 行数==N（不丢行）。脚注 ¹ 的量化噪声（±17%）同样适用；同组内极差 ±9% 在噪声界内。
 > ⁶ T32 吞吐口径：`bash scripts/bench/macro.sh --sink doris [--pipes P] [--flush-rows R] [--poll-rows R] --rows 100000`——console 档口径同脚注 ¹ 的 macro.sh（t0=deploy 200，P=4 档=首条 deploy 200；t1=stats 0.5s 轮询至全部管道 flushed≥目标），单轮单档（非多轮中位）；starrocks 行为 node 直跑口径（t0=run-start 日志、t1=FE COUNT ~1s 轮询）与 console 档不同源。栈=docker-compose doris-fe/be 2.1.7 单 BE（BUCKETS 1）；行数守恒全档过（FE COUNT==100000）。环境配方（swapoff/max_map_count/停 mdop doris 腾内存）与逐档注记见 §6.4。
 > ⁷ T22 体积口径（T39 ② 补登记——T22 时文件域=web/，BENCHMARKS 未随行，数字取自 T22 落地提交 f90e6a2 说明）：编辑器异步 chunk = `web/dist/assets/SqlMonaco-*.js`（CodeMirror6 档；monaco 档为 T9 记录的编辑器 chunk 同名口径），体积为 `gzip -c | wc -c` 字节、构建产物确定性输出——**与表内吞吐行不同，不涉机器性能，跨机可比**；「编辑器相关资产合计 1,078→140.70 kB」的 PoC 复合口径已弃用（T23 评审 low#6，统一锚 T9 单口径 883.22 kB）。2026-10-23 T39 ⑤ 在本树复测：列补全接线（columnsJson 上 DTO+编辑器 children 槽填充）后 raw 431,182 B / gzip 139,007 B（+45 B，门槛仍过）。
+> ⁸ T33 口径（2026-10-24，R5-W1 波门禁实跑；原始输出 /tmp/r5w1-t33-bench.log、/tmp/t33-macro.md）：代码树=bfbaeb3 的 DF 55.2.0 迁移树（bench 于 11:53 跑在提交前的同树上；macro.sh 报告标签 `git@c2c30e8` 系脚本 `rev-parse HEAD` 取当时 HEAD，bfbaeb3 12:00 才提交——**实跑二进制为 DF55**：`target/debug/tailrace-node` 11:43 构建，`strings` 含 `datafusion-55.2.0` 路径 7 处 / `datafusion-48.0.1` 0 处）。宏基准：`bash scripts/bench/macro.sh --rows 100000 --report /tmp/t33-macro.md`，debug 档、口径同脚注¹（±17% 量化噪声），行数守恒 100000==100000；DF48 对照取 §6.4 同机锚点 33568（2026-10-23），**非同日**——同 bench 的 DF48 跨日漂移 T20 33670（10-20，3 轮中位）↔ T32 33568（10-23）仅 0.3%，+23.7% 远在其外，回退门判定不受「不同日」影响；但单轮单档不登记为 DF55 的确定增益（release 档/多轮中位补测后方可谈增益量）。微基准：`cargo bench -p tailrace-transform`（criterion，release 继承，8000 行/批同 §2.2），区间为 criterion 吞吐 95% 置信区间；**本机从未跑过 DF48 微基准**（target/criterion 本次首跑：base==new 同 mtime、无 change/），§4.4 基线 30.647 M/8.958 M/8.072 M 采自 §一 Intel 机（2026-10-17），按 §六头部口径跨机器不可比——故登记为「M4 首档」而非前后对比；同机 DF48 对照若需补测 = `git worktree add <dir> c2c30e8` 后在该树 `cargo bench -p tailrace-transform`（留后续，非本卡回退门输入——回退门只定义在宏基准上）。
 
 ### §6.1 T20 jemalloc + 峰值 RSS 指标（2026-10-20，同机同日交错复测）
 
@@ -683,4 +693,56 @@ bash scripts/bench/macro.sh --sink doris --rows 100000 --flush-rows 500 --poll-r
 bash scripts/bench/macro.sh --sink doris --rows 100000 --pipes 4 --flush-rows 500 --poll-rows 500   # P=4 真小批
 bash scripts/bench/macro.sh --sink doris --rows 100000 --pipes 4 --flush-rows 500         # P=4 poll 地板批
 bash scripts/bench/macro.sh --sink starrocks --rows 100000 --report /tmp/r5-starrocks.md  # node 直跑档
+```
+
+### §6.5 T33 DataFusion 48.0.1→55.2.0 升级基准（2026-10-24，M4；**DF55 首档**，非同日前后对比）
+
+> R5-W1 引擎独占波（roadmap T33）④/⑤ 步的数据落档。升级本体=bfbaeb3（datafusion/
+> datafusion-proto 48.0.1→55.2.0 直跳，arrow 59.3.1 / sqlparser 0.62.0 / prost 0.14.4），
+> 评审修 03bf261（纯登记）。**口径声明**：卡面要求「同机同日前后对比」，实际可得的是
+> ——宏基准同机**不同日**（DF48 侧=§6.4 的 2026-10-23 锚点）、微基准**仅 DF55 单侧**
+> （本机无 DF48 微基准档）——故本小节按「M4 首档」登记（T15 §六 :362 同款处置），
+> 不冒称前后对比；跨机器不可比注记同 §六头部。原始输出：/tmp/r5w1-t33-bench.log、
+> /tmp/t33-macro.md（脚注⁸ 含 git 标签勘正）。
+
+| 档 | 口径 | DF48（同机对照） | DF55（本次） | 变化 / 结论 |
+|---|---|---|---|---|
+| 宏基准 file→file | debug，rows=100000，单管道默认攒批（macro.sh 脚注¹口径） | **33568 rows/s**（2.979 s；§6.4 锚点，2026-10-23） | **41528 rows/s**（2.408 s；sink 行数 100000 ✓） | **+23.7%**，同机不同日；**回退门（宏基准回吐 >10%）未触发** |
+| 微基准 transform/identity_select_star | criterion release，8000 行/批（§2.2 口径） | —（本机无档） | **237.38 M rows/s**（33.701 µs/批；CI 236.67–237.92 M） | M4 DF55 首档；vs §4.4 Intel 基线 30.647 M **跨机不可比** |
+| 微基准 transform/filter_project | 同上 | —（本机无档） | **65.89 M rows/s**（121.41 µs/批；CI 65.786–65.984 M） | M4 DF55 首档；vs §4.4 Intel 基线 8.958 M 跨机不可比 |
+| 微基准 transform/groupby_aggregate | 同上 | —（本机无档） | **53.47 M rows/s**（149.62 µs/批；CI 53.214–53.701 M） | M4 DF55 首档；vs §4.4 Intel 基线 8.072 M 跨机不可比 |
+
+**口径注记（随行）**：
+
+- **回退门判定**：卡面回退门=「宏基准回吐 >10% 且无法归因修复 → 版本回 48.0.1」。
+  DF55 宏基准 41528 vs 同机 DF48 锚点 33568 为 **+23.7%**（非回吐）；「不同日」的
+  影响以同 bench 的 DF48 跨日漂移为界——T20 33670（10-20，3 轮中位）↔ T32 33568
+  （10-23）仅 0.3%，+23.7% 远在其外，判定稳健。本小节**不**把 +23.7% 登记为 DF55
+  的确定增益：单轮单档（脚注¹ ±17% 量化噪声）且为 debug 档，仅作「无回归」的证据；
+  release 档/多轮中位补测后方可谈增益量。
+- **微基准为何无前后差**：target/criterion 在本机为首跑（base==new 同 mtime、无
+  change/ 目录），即 M4 上从未留下 DF48 的 transform 微基准档；§4.4 :110-112 的
+  30.647 M/8.958 M/8.072 M 采自 §一 Intel i7-9750H（2026-10-17），7.75×/7.36×/6.62×
+  的比值是机器差而非 DF 差，**禁止当作升级收益引用**。补测路径（非本卡回退门输入）：
+  `git worktree add <dir> c2c30e8` 后在该树 `cargo bench -p tailrace-transform` 得同机
+  DF48 档，再与本表 DF55 行按 criterion 口径对比。
+- **DF48 两条已登记限制在 55 上的复核**（T33 卡 ⑤，结论已回写 §4.4 对应行旁注）：
+  E1 memory pool「部分算子不强制」**维持**（datafusion-execution 55.2.0
+  `src/runtime_env.rs:429` 注记逐字仍在）；E2 `output_batches`「仅 join/coalesce/unnest
+  记录」**已解除**（BaselineMetrics 标准化，全算子自带 output_batches，测试加存在性
+  断言）。逐条归因见 docs/dev/t33-golden-attribution.md §八 / §三 B-2。
+- **契约 golden**：layer_a（proto 字节）/ layer_b（执行 pretty）在 DF55 下
+  `UPDATE_GOLDEN=1` 重生成后与 DF48 fixture **零字节 diff**，C3 `rewrite_query`
+  select_sql 48↔55 逐字节一致（零 diff 面 3）；行为面漂移 2 条（metrics 计数展示
+  `8000`→`8.00 K` 等价、output_batches 解锁）逐条归因，无手编 golden——归因表
+  docs/dev/t33-golden-attribution.md。
+- **本小节不覆盖**：L3 `smoke.sh --full`（Doris 栈窗口按 §6.4 环境配方人工执行，
+  R5-W1 波门禁登记「待跑」，T33 卡因此未收口）；DF55 的行数守恒/e2e 以 L1 契约套件
+  （190 passed / 0 failed / 7 ignored，58 二进制）与宏基准 sink 行数 100000==100000 为限。
+
+**复现**：
+
+```bash
+cargo bench -p tailrace-transform                                            # 微基准三项（DF55 树）
+bash scripts/bench/macro.sh --rows 100000 --report /tmp/t33-macro.md          # 宏基准 file→file（debug）
 ```
