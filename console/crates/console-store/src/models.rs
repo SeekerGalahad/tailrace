@@ -158,6 +158,20 @@ pub struct NodeMetricPoint {
     pub tx_bps: Option<f64>,
 }
 
+/// Insert payload of [`Store::insert_deployed_node`] (§4.4 hosts[] batch).
+#[derive(Debug)]
+pub struct NewDeployedNode<'a> {
+    pub node_key: &'a str,
+    pub name: &'a str,
+    pub host: &'a str,
+    pub ssh_port: i64,
+    pub ssh_user: &'a str,
+    pub engine_port: i64,
+    pub install_dir: &'a str,
+    /// sha256 digest of the per-node token (plaintext never stored).
+    pub bootstrap_token: &'a str,
+}
+
 /// A `deploy_log` row (§4.4 deploy-log endpoint).
 #[derive(Debug, Clone)]
 pub struct DeployLogRow {

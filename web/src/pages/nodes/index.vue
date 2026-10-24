@@ -14,10 +14,11 @@ import MetricChart from '../../components/MetricChart.vue'
 import { useAutoRefresh } from '../../components/useAutoRefresh'
 
 /**
- * Engine-node page (design doc §6.4, this segment's scope: list / detail
- * drawer / manual registration / heartbeat status / action buttons — the
- * artifact card, deploy wizard and orchestration overlay land in a later
- * segment; upgrades still pick their artifact from the registry).
+ * Engine-node page (design doc §6.4: list / detail drawer / manual
+ * registration / heartbeat status / action buttons; T35 wires the deploy
+ * line — batch hosts[] deploy wizard, redeploy/upgrade artifact pickers and
+ * the process actions all ride the §4.4 SSH eight-step chain; progress is
+ * the deploy-log drawer).
  */
 
 const message = useMessage()
@@ -315,6 +316,54 @@ async function submitRedeploy(): Promise<void> {
   await doDeploy()
 }
 
+// --- batch deploy wizard (§4.4 hosts[] mode — one new SSH-managed node per line) ---
+const deployModal = ref(false)
+const deployHostsText = ref('')
+const deployArtifactId = ref<number | null>(null)
+const deploySubmitting = ref(false)
+
+function openDeployModal(): void {
+  deployHostsText.value = ''
+  deployArtifactId.value = null
+  deployModal.value = true
+  if (artifacts.value.length === 0) void loadArtifacts()
+}
+
+/** Each line: "host[,name]" — name defaults to the host; ssh/engine/install
+ * fields ride the console defaults (root/22/18100//opt/tailrace/engine). */
+function parseHosts(): { host: string; name: string; sshUser: string; sshPort: number; enginePort: number; installDir: string }[] {
+  return deployHostsText.value
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && !l.startsWith('#'))
+    .map((l) => {
+      const [host, name] = l.split(/[\s,]+/)
+      return { host, name: name || host, sshUser: 'root', sshPort: 22, enginePort: 18100, installDir: '/opt/tailrace/engine' }
+    })
+}
+
+async function submitBatchDeploy(): Promise<void> {
+  const hosts = parseHosts()
+  const artifactId = deployArtifactId.value
+  if (hosts.length === 0 || artifactId == null) return
+  deploySubmitting.value = true
+  try {
+    const res = await nodesApi.deploy({ hosts, artifactId })
+    deployModal.value = false
+    message.success(`已受理 ${res.deploys.length} 台主机的八步部署，进度见各节点日志抽屉`)
+    void fetchList()
+    const first = res.deploys[0]
+    if (first) {
+      const row = { id: first.nodeId } as NodeListItem
+      openLogDrawer(row)
+    }
+  } catch {
+    /* toast already shown by http layer */
+  } finally {
+    deploySubmitting.value = false
+  }
+}
+
 // --- manual registration (§6.4 flow 7) ---
 const manualModal = ref(false)
 const manualFormRef = ref<FormInst | null>(null)
@@ -541,6 +590,10 @@ const eventColumns: DataTableColumns<NodeEvent> = [
           <template #icon><RefreshOutline /></template>
           刷新
         </NButton>
+        <NButton size="small" @click="openDeployModal">
+          <template #icon><AddOutline /></template>
+          批量部署
+        </NButton>
         <NButton size="small" @click="openManualModal">
           <template #icon><AddOutline /></template>
           手动注册
@@ -593,6 +646,40 @@ const eventColumns: DataTableColumns<NodeEvent> = [
         />
       </NCard>
     </template>
+
+    <!-- batch deploy wizard (§4.4 hosts[] — SSH eight-step chain) -->
+    <NModal v-model:show="deployModal" preset="card" title="批量部署新节点" class="modal-sm">
+      <NForm label-placement="left" label-width="90">
+        <NFormItem label="目标制品">
+          <NSelect v-model:value="deployArtifactId" :options="artifactOptions" placeholder="选择程序包" :loading="artifactsLoading" />
+        </NFormItem>
+        <NFormItem label="主机列表">
+          <NInput
+            v-model:value="deployHostsText"
+            type="textarea"
+            :rows="5"
+            placeholder="每行一台：host[,name]&#10;10.1.1.6, edge-06&#10;10.1.1.7"
+          />
+        </NFormItem>
+      </NForm>
+      <NAlert type="info" :bordered="false" class="form-alert">
+        console 经 SSH（root@host:22，部署私钥 TAILRACE_SSH_KEY）执行八步：上传/解压/停旧/换新/启动/健康/注册/版本核对；任一步失败自动回滚旧二进制。SSH 用户/端口/安装目录用控制台默认值。
+      </NAlert>
+      <template #footer>
+        <div class="modal-footer">
+          <NButton size="small" @click="deployModal = false">取消</NButton>
+          <NButton
+            size="small"
+            type="primary"
+            :loading="deploySubmitting"
+            :disabled="deployArtifactId == null || deployHostsText.trim().length === 0"
+            @click="submitBatchDeploy"
+          >
+            开始部署
+          </NButton>
+        </div>
+      </template>
+    </NModal>
 
     <!-- manual registration modal -->
     <NModal v-model:show="manualModal" preset="card" title="手动注册节点" class="modal-sm">

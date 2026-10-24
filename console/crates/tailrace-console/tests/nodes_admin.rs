@@ -1,6 +1,6 @@
 //! Node admin surface lifecycle (§4.3): manual registration behind the
 //! healthz probe → list/detail → pipelines-runtime proxy → events/metrics →
-//! revoke → guarded delete; 501 markers for the §4.4 SSH chain.
+//! revoke → guarded delete; §4.4 deploy/action real handlers (migrate 501).
 
 mod common;
 
@@ -113,27 +113,30 @@ async fn node_admin_lifecycle() {
     assert_eq!(s, StatusCode::OK, "{b}");
     assert_eq!(b["items"].as_array().unwrap().len(), 0);
 
-    // --- §4.4 SSH chain endpoints: honest 501s
+    // --- §4.4 SSH chain endpoints: deploy/action are real (T35), migrate stays 501
+    // deploy: unknown artifact -> 404 before any node is created
     let (s, b) = req(
         &app,
         "POST",
         "/api/nodes/deploy",
-        Some(json!({"hosts": [{"host": "10.1.1.6"}], "artifactId": 1})),
+        Some(json!({"hosts": [{"host": "10.1.1.6", "name": "edge-batch", "sshUser": "root"}], "artifactId": 999})),
     )
     .await;
-    assert_eq!(s, StatusCode::NOT_IMPLEMENTED, "{b}");
-    assert!(
-        b["error"]["message"].as_str().unwrap().contains("八步"),
-        "{b}"
-    );
-    let (s, _) = req(
+    assert_eq!(s, StatusCode::NOT_FOUND, "{b}");
+    // action on a manual node (no SSH identity) -> 400
+    let (s, b) = req(
         &app,
         "POST",
         &format!("/api/nodes/{id}/action"),
         Some(json!({"action": "stop"})),
     )
     .await;
-    assert_eq!(s, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert!(
+        b["error"]["message"].as_str().unwrap().contains("SSH 托管"),
+        "{b}"
+    );
+    // migrate remains the honest P2 501
     let (s, _) = req(
         &app,
         "POST",
@@ -146,7 +149,7 @@ async fn node_admin_lifecycle() {
     // --- revoke: 204; heartbeats with the old token now fail 401
     let (s, _) = req(&app, "POST", &format!("/api/nodes/{id}/revoke"), None).await;
     assert_eq!(s, StatusCode::NO_CONTENT);
-    // --- delete: warning branch (SSH chain absent) + cascade
+    // --- delete: manual node -> skip-with-warning branch (remote not SSH-managed) + cascade
     let (s, b) = req(&app, "DELETE", &format!("/api/nodes/{id}"), None).await;
     assert_eq!(s, StatusCode::OK, "{b}");
     assert_eq!(b["remoteCleaned"], false);

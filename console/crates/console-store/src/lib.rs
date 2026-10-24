@@ -27,9 +27,9 @@ use rusqlite_migration::{Migrations, M};
 pub use artifacts::ArtifactInsert;
 pub use datasources::DatasourceUpdate;
 pub use models::{
-    Artifact, AuditEntry, Datasource, DatasourceCredential, DeployLogRow, NewNodeEvent,
-    NewNodeMetrics, NewPipelineMetrics, Node, NodeEventRow, NodeMetricPoint, Pipeline,
-    PipelineTrendPoint, PipelineVersion, TableObject, User,
+    Artifact, AuditEntry, Datasource, DatasourceCredential, DeployLogRow, NewDeployedNode,
+    NewNodeEvent, NewNodeMetrics, NewPipelineMetrics, Node, NodeEventRow, NodeMetricPoint,
+    Pipeline, PipelineTrendPoint, PipelineVersion, TableObject, User,
 };
 pub use password::{hash_password, verify_password};
 pub use pipelines::{PipelineFull, PipelineWrite};

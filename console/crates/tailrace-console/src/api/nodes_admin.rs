@@ -1,7 +1,8 @@
 //! Engine-node admin endpoints (§4.3 管理端点): list/detail with the 90s
 //! OFFLINE judgement, manual registration behind a healthz probe, revocation,
 //! guarded delete, events / metrics feeds, the pipelines-runtime proxy, and
-//! the 501 markers for the §4.4 SSH deploy chain.
+//! the §4.4 SSH deploy chain (eight-step state machine + process actions;
+//! migrate stays a 501 — P2).
 
 use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
@@ -144,8 +145,11 @@ pub struct DeployLogResponse {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct DeployBody {
-    pub hosts: Option<Vec<Value>>,
+    /// Fresh batch: one node per entry (nodes are created by this call).
+    pub hosts: Option<Vec<DeployHost>>,
+    /// Redeploy an existing SSH-managed node.
     pub node_id: Option<i64>,
     pub artifact_id: Option<i64>,
     pub clean: Option<bool>,
@@ -488,9 +492,10 @@ pub async fn revoke(
     axum::http::StatusCode::NO_CONTENT.into_response()
 }
 
-/// `DELETE /api/nodes/{id}` — 409 while pipelines are assigned; the
-/// best-effort remote cleanup needs the §4.4 SSH chain (not in this stage),
-/// so it degrades to the documented skip-with-warning branch.
+/// `DELETE /api/nodes/{id}` — 409 while pipelines are assigned; the remote
+/// cleanup rides the §4.4 SSH chain: SSH-managed (deployed) nodes get a
+/// best-effort uninstall (stop + `rm -rf install_dir`) first, and an
+/// unreachable remote degrades to the documented skip-with-warning branch.
 #[utoipa::path(
     delete,
     path = "/api/nodes/{id}",
@@ -524,6 +529,49 @@ pub async fn remove(
                 .unwrap_or_default(),
         );
     }
+    // best-effort remote cleanup on SSH-managed nodes (§4.4 chain, T35)
+    let mut remote_cleaned = false;
+    let mut warning = None;
+    if ssh_managed(&node) {
+        let placeholder = console_store::Artifact {
+            id: 0,
+            name: String::new(),
+            version: String::new(),
+            filename: String::new(),
+            sha256: String::new(),
+            size_bytes: 0,
+            uploaded_by: String::new(),
+            created_at: String::new(),
+            ref_count: 0,
+        };
+        let spec = spec_from_node(
+            &node,
+            &placeholder,
+            None,
+            false,
+            false,
+            crate::deploy::ACTION_UNINSTALL,
+            operator_of(&ctx, &headers),
+        );
+        match crate::deploy::run_process_action(
+            &state,
+            &spec,
+            crate::deploy::ProcessAction::Uninstall,
+        )
+        .await
+        {
+            Ok(()) => remote_cleaned = true,
+            Err(e) => {
+                warning = Some(super::messages::t(
+                    "err.node.remote_cleanup_failed",
+                    &[&format!("{e:#}")],
+                ));
+            }
+        }
+    } else {
+        warning =
+            Some("节点非 SSH 托管（manual/self 注册），远端清理跳过；已仅清理控制面元数据".into());
+    }
     if let Err(e) = state.store().delete_node_cascade(id, &node.node_key) {
         return ApiError::internal(&e).into_response();
     }
@@ -536,10 +584,8 @@ pub async fn remove(
         None,
     );
     Json(NodeDeleteResponse {
-        remote_cleaned: false,
-        warning: Some(
-            "远端清理依赖 SSH 部署链（§4.4 八步状态机，本阶段未实现）；已按「跳过并警告」分支仅清理控制面元数据".into(),
-        ),
+        remote_cleaned,
+        warning,
     })
     .into_response()
 }
@@ -746,48 +792,391 @@ pub async fn deploy_log(
     .into_response()
 }
 
-// ---------------- §4.4 SSH deploy chain — 501 markers ----------------
+// ---------------- §4.4 SSH deploy chain (T35) ----------------
 
-/// `POST /api/nodes/deploy` — TODO(§4.4): the eight-step SSH deploy state
-/// machine (`PENDING→PREFLIGHT→UPLOAD→UNPACK→CONFIGURE→START→HEALTH_WAIT→REGISTER→REGISTERED`).
+/// One new-host entry of a batch deploy (`hosts[]` mode).
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DeployHost {
+    pub host: String,
+    pub name: String,
+    pub ssh_user: String,
+    pub ssh_port: Option<i64>,
+    pub engine_port: Option<i64>,
+    pub install_dir: Option<String>,
+}
+
+/// Per-node acceptance echo of `POST /api/nodes/deploy`.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DeployAccepted {
+    pub node_id: i64,
+    /// Initial machine state — the chain advances asynchronously
+    /// (watch `GET /api/nodes/{id}/deploy-log`).
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DeployResponse {
+    pub deploys: Vec<DeployAccepted>,
+}
+
+/// `202 {accepted:true}` echo of `POST /api/nodes/{id}/action`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ActionAccepted {
+    pub accepted: bool,
+}
+
+/// True when the node row carries enough SSH identity for the chain to own
+/// the remote process (`register_mode='deployed'` + host + install dir).
+fn ssh_managed(node: &console_store::Node) -> bool {
+    node.register_mode == "deployed" && node.host.as_deref().is_some_and(|h| !h.is_empty())
+}
+
+/// Build the chain spec from an existing node row (redeploy / upgrade /
+/// actions). Prefers the row's own ssh/install fields.
+fn spec_from_node(
+    node: &console_store::Node,
+    artifact: &console_store::Artifact,
+    fresh_token: Option<String>,
+    clean: bool,
+    wipe_state: bool,
+    action: &'static str,
+    operator: String,
+) -> crate::deploy::ChainSpec {
+    crate::deploy::ChainSpec {
+        node_id: node.id,
+        node_key: node.node_key.clone(),
+        name: node.name.clone(),
+        host: node.host.clone().unwrap_or_default(),
+        ssh_port: node.ssh_port.unwrap_or(22),
+        ssh_user: node.ssh_user.clone().unwrap_or_else(|| "root".into()),
+        engine_port: node.engine_port,
+        install_dir: node.install_dir.clone(),
+        artifact_id: artifact.id,
+        artifact_name: artifact.name.clone(),
+        artifact_version: artifact.version.clone(),
+        artifact_sha256: artifact.sha256.clone(),
+        fresh_token,
+        clean,
+        wipe_state,
+        action,
+        operator,
+    }
+}
+
+/// `POST /api/nodes/deploy` — the §4.4 eight-step SSH deploy state machine.
+/// Two modes: `hosts[]` (fresh batch — nodes are created with
+/// register_mode='deployed' + generated node_key/token) or `nodeId`
+/// (redeploy an existing SSH-managed node). The chain itself runs in a
+/// background task; every step (and the failure rollback path) lands in
+/// `deploy_log` and `node.deploy_status`.
 #[utoipa::path(
     post,
     path = "/api/nodes/deploy",
     request_body = DeployBody,
-    responses((status = 501, body = crate::api::ErrorResponse, description = "SSH deploy chain ships in a later stage"))
-)]
-pub async fn deploy(State(_state): State<AppState>, _body: axum::body::Bytes) -> Response {
-    not_implemented(
-        "批量部署（SSH 八步状态机）",
-        "SSH 八步：PENDING→PREFLIGHT→UPLOAD→UNPACK→CONFIGURE→START→HEALTH_WAIT→REGISTER→REGISTERED",
+    responses(
+        (status = 200, body = DeployResponse, description = "chain accepted per node (PENDING); progress via deploy-log"),
+        (status = 400, body = crate::api::ErrorResponse),
+        (status = 404, body = crate::api::ErrorResponse, description = "artifact / node not found"),
+        (status = 409, body = crate::api::ErrorResponse),
     )
-    .into_response()
+)]
+pub async fn deploy(
+    State(state): State<AppState>,
+    axum::Extension(ctx): axum::Extension<AuthContext>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let body: DeployBody = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return super::messages::bad_request("err.bad_body", &[&e.to_string()]).into_response()
+        }
+    };
+    let Some(artifact_id) = body.artifact_id else {
+        return ApiError::bad_request("缺少 artifactId（制品未指定）").into_response();
+    };
+    let artifact = match state.store().artifact(artifact_id) {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            return super::messages::not_found(
+                "err.node.artifact_not_found",
+                &[&artifact_id.to_string()],
+            )
+            .into_response();
+        }
+        Err(e) => return ApiError::internal(&e).into_response(),
+    };
+    let operator = operator_of(&ctx, &headers);
+    let clean = body.clean.unwrap_or(false);
+    let wipe_state = body.wipe_state.unwrap_or(false);
+
+    // Resolve targets → (node row, fresh token echo-or-None) pairs.
+    let mut targets: Vec<(console_store::Node, Option<String>)> = Vec::new();
+    if let Some(hosts) = &body.hosts {
+        if hosts.is_empty() {
+            return ApiError::bad_request("hosts 不能为空（或改用 nodeId 重新部署既有节点）")
+                .into_response();
+        }
+        if body.node_id.is_some() {
+            return ApiError::bad_request("hosts 与 nodeId 二选一").into_response();
+        }
+        for h in hosts {
+            if h.host.trim().is_empty() || h.name.trim().is_empty() {
+                return ApiError::bad_request("hosts[].host / hosts[].name 不能为空")
+                    .into_response();
+            }
+            let node_key = format!("sn-{}", hex16());
+            let token = console_auth::generate_token(console_auth::BOOTSTRAP_TOKEN_PREFIX);
+            let token_hash = console_auth::token_hash(&token);
+            let id = match state
+                .store()
+                .insert_deployed_node(&console_store::NewDeployedNode {
+                    node_key: &node_key,
+                    name: h.name.trim(),
+                    host: h.host.trim(),
+                    ssh_port: h.ssh_port.unwrap_or(22),
+                    ssh_user: h.ssh_user.trim(),
+                    engine_port: h.engine_port.unwrap_or(18100),
+                    install_dir: h.install_dir.as_deref().unwrap_or("/opt/tailrace/engine"),
+                    bootstrap_token: &token_hash,
+                }) {
+                Ok(id) => id,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("UNIQUE constraint failed") {
+                        return super::messages::respond(
+                            axum::http::StatusCode::CONFLICT,
+                            "CONFLICT",
+                            "err.node.deploy_name_taken",
+                            &[h.name.trim()],
+                        )
+                        .into_response();
+                    }
+                    return ApiError::internal(&e).into_response();
+                }
+            };
+            let node = match state.store().node(id) {
+                Ok(Some(n)) => n,
+                _ => {
+                    return ApiError::internal(&anyhow::anyhow!("deployed node row lost"))
+                        .into_response()
+                }
+            };
+            targets.push((node, Some(token)));
+        }
+    } else if let Some(node_id) = body.node_id {
+        let node = match load_node(&state, node_id) {
+            Ok(n) => n,
+            Err(r) => return r,
+        };
+        if !ssh_managed(&node) {
+            return ApiError::bad_request(
+                "节点非 SSH 托管（manual/self 注册无部署链身份），仅 deployed 节点可重新部署",
+            )
+            .into_response();
+        }
+        targets.push((node, None));
+    } else {
+        return ApiError::bad_request("缺少 hosts 或 nodeId").into_response();
+    }
+
+    // Audit once for the request; per-step rows live in deploy_log.
+    audit(
+        state.store(),
+        &operator,
+        "NODE_DEPLOY",
+        "node",
+        Some(
+            targets
+                .iter()
+                .map(|(n, _)| n.node_key.clone())
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        Some(
+            json!({
+                "artifactId": artifact.id, "artifactVersion": artifact.version,
+                "hosts": targets.len(),
+                "clean": clean, "wipeState": wipe_state
+            })
+            .to_string(),
+        ),
+    );
+
+    // Spawn the chain per node (sequential over the batch — one SSH lane,
+    // honest deploy_log ordering under the same operator).
+    let mut accepted = Vec::new();
+    let mut first = true;
+    for (node, token) in targets {
+        let spec = spec_from_node(
+            &node,
+            &artifact,
+            token,
+            clean,
+            wipe_state,
+            crate::deploy::ACTION_DEPLOY,
+            operator.clone(),
+        );
+        accepted.push(DeployAccepted {
+            node_id: spec.node_id,
+            status: "PENDING".into(),
+        });
+        let st = state.clone();
+        let run = async move {
+            let outcome = crate::deploy::run_deploy_chain(st, spec).await;
+            tracing::info!(outcome = ?outcome, "deploy chain finished");
+        };
+        if first {
+            first = false;
+            tokio::spawn(run);
+        } else {
+            // stagger batch starts so remote `releases/<v>` writes and
+            // health windows don't interleave on shared hosts
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            tokio::spawn(run);
+        }
+    }
+    Json(DeployResponse { deploys: accepted }).into_response()
 }
 
-/// `POST /api/nodes/{id}/action` — TODO(§4.4): process-level actions
-/// (start/stop/restart/upgrade/rollback/uninstall) ride the SSH chain with
-/// the pause-orchestration preamble.
+/// `POST /api/nodes/{id}/action` — process-level actions on an SSH-managed
+/// node. `start/stop/restart/rollback/uninstall` run synchronously over SSH
+/// (each phase into deploy_log); `upgrade` requires `artifactId` and rides
+/// the full eight-step chain in the background.
 #[utoipa::path(
     post,
     path = "/api/nodes/{id}/action",
     request_body = NodeActionBody,
     params(("id" = i64, Path)),
-    responses((status = 501, body = crate::api::ErrorResponse))
+    responses(
+        (status = 202, body = ActionAccepted),
+        (status = 400, body = crate::api::ErrorResponse),
+        (status = 404, body = crate::api::ErrorResponse),
+        (status = 502, body = crate::api::ErrorResponse, description = "SSH side failed"),
+    )
 )]
 pub async fn action(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    axum::Extension(ctx): axum::Extension<AuthContext>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<i64>,
-    _body: axum::body::Bytes,
+    body: axum::body::Bytes,
 ) -> Response {
-    let _ = id;
-    not_implemented(
-        "节点进程动作（start/stop/restart/upgrade/rollback/uninstall）",
-        "依赖 SSH 链与「逐条暂停→执行→自动恢复」编排",
-    )
-    .into_response()
+    let body: NodeActionBody = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return super::messages::bad_request("err.bad_body", &[&e.to_string()]).into_response()
+        }
+    };
+    let node = match load_node(&state, id) {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    if !ssh_managed(&node) {
+        return ApiError::bad_request(
+            "节点非 SSH 托管（manual/self 注册无部署链身份），进程动作不可用",
+        )
+        .into_response();
+    }
+    let operator = operator_of(&ctx, &headers);
+
+    // upgrade: full eight-step chain in the background (§4.4)
+    if body.action == "upgrade" {
+        let Some(artifact_id) = body.artifact_id else {
+            return ApiError::bad_request("upgrade 需要 artifactId").into_response();
+        };
+        let artifact = match state.store().artifact(artifact_id) {
+            Ok(Some(a)) => a,
+            Ok(None) => {
+                return super::messages::not_found(
+                    "err.node.artifact_not_found",
+                    &[&artifact_id.to_string()],
+                )
+                .into_response();
+            }
+            Err(e) => return ApiError::internal(&e).into_response(),
+        };
+        audit(
+            state.store(),
+            &operator,
+            "NODE_ACTION",
+            "node",
+            Some(node.node_key.clone()),
+            Some(json!({"action": "upgrade", "artifactId": artifact.id}).to_string()),
+        );
+        let spec = spec_from_node(
+            &node,
+            &artifact,
+            None,
+            true,
+            false,
+            crate::deploy::ACTION_UPGRADE,
+            operator,
+        );
+        let st = state.clone();
+        tokio::spawn(async move {
+            let outcome = crate::deploy::run_deploy_chain(st, spec).await;
+            tracing::info!(outcome = ?outcome, "upgrade chain finished");
+        });
+        return (
+            axum::http::StatusCode::ACCEPTED,
+            Json(ActionAccepted { accepted: true }),
+        )
+            .into_response();
+    }
+
+    let Some(process_action) = crate::deploy::ProcessAction::parse(&body.action) else {
+        return super::messages::bad_request("err.node.action_unknown", &[&body.action])
+            .into_response();
+    };
+    // actions operate on the *current* release; a placeholder artifact block
+    // keeps the spec self-contained (unused fields for sync actions)
+    let placeholder = console_store::Artifact {
+        id: node.artifact_id.unwrap_or(0),
+        name: String::new(),
+        version: String::new(),
+        filename: String::new(),
+        sha256: String::new(),
+        size_bytes: 0,
+        uploaded_by: String::new(),
+        created_at: String::new(),
+        ref_count: 0,
+    };
+    let spec = spec_from_node(
+        &node,
+        &placeholder,
+        None,
+        false,
+        false,
+        process_action.label(),
+        operator.clone(),
+    );
+    audit(
+        state.store(),
+        &operator,
+        "NODE_ACTION",
+        "node",
+        Some(node.node_key.clone()),
+        Some(json!({"action": body.action}).to_string()),
+    );
+    match crate::deploy::run_process_action(&state, &spec, process_action).await {
+        Ok(()) => (
+            axum::http::StatusCode::ACCEPTED,
+            Json(ActionAccepted { accepted: true }),
+        )
+            .into_response(),
+        Err(e) => ApiError::new(
+            axum::http::StatusCode::BAD_GATEWAY,
+            "SSH_FAILED",
+            format!("{e:#}"),
+        )
+        .into_response(),
+    }
 }
 
-/// `POST /api/nodes/{id}/migrate` — P2 deliverable (§4.4).
+/// `POST /api/nodes/{id}/migrate` — P2 deliverable (§4.4), still a 501.
 #[utoipa::path(
     post,
     path = "/api/nodes/{id}/migrate",
@@ -801,5 +1190,5 @@ pub async fn migrate(
     _body: axum::body::Bytes,
 ) -> Response {
     let _ = id;
-    not_implemented("节点迁移（三步编排）", "后续版本交付").into_response()
+    not_implemented("节点迁移（三步编排）", "P2 交付").into_response()
 }

@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 
-use super::models::{NewNodeEvent, NewNodeMetrics, NewPipelineMetrics, Node};
+use super::models::{NewDeployedNode, NewNodeEvent, NewNodeMetrics, NewPipelineMetrics, Node};
 use super::Store;
 
 const NODE_COLS: &str =
@@ -247,6 +247,87 @@ impl Store {
                 rusqlite::params![node_key, name, api_url, host, engine_port, bootstrap_token],
             )?;
             Ok(conn.last_insert_rowid())
+        })
+    }
+
+    /// Deploy-chain node creation (§4.4 POST /api/nodes/deploy hosts[] mode):
+    /// like [`Self::insert_manual_node`] but records the full SSH identity
+    /// (host/ssh_port/ssh_user/install_dir) and `register_mode='deployed'`;
+    /// `deploy_status='PENDING'` marks the eight-step machine in flight.
+    /// `bootstrap_token` is the sha256 digest of the per-node token the
+    /// chain passes to the engine via `--bootstrap-token`.
+    pub fn insert_deployed_node(&self, n: &NewDeployedNode<'_>) -> Result<i64> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO node (node_key, name, status, host, ssh_port, ssh_user, engine_port, \
+                 install_dir, register_mode, deploy_status, bootstrap_token) \
+                 VALUES (?1, ?2, 'REGISTERED', ?3, ?4, ?5, ?6, ?7, 'deployed', 'PENDING', ?8)",
+                rusqlite::params![
+                    n.node_key,
+                    n.name,
+                    n.host,
+                    n.ssh_port,
+                    n.ssh_user,
+                    n.engine_port,
+                    n.install_dir,
+                    n.bootstrap_token
+                ],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+    }
+
+    /// One `deploy_log` row (§4.4): every step of the eight-step machine (and
+    /// the ROLLBACK remediation) lands here. `output` is truncated to 4KB at
+    /// this boundary (DDL comment).
+    pub fn insert_deploy_log(
+        &self,
+        node_id: i64,
+        action: &str,
+        step: &str,
+        status: &str,
+        output: &str,
+        operator: Option<&str>,
+    ) -> Result<()> {
+        const MAX: usize = 4 * 1024;
+        let output = if output.len() > MAX {
+            let mut cut = MAX;
+            while cut > 0 && !output.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            &output[..cut]
+        } else {
+            output
+        };
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO deploy_log (node_id, action, step, status, output, operator) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![node_id, action, step, status, output, operator],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Advance `node.deploy_status` (eight-step machine states; terminal
+    /// REGISTERED / FAILED / UNINSTALLED per DDL).
+    pub fn set_node_deploy_status(&self, id: i64, deploy_status: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            Ok(conn.execute(
+                "UPDATE node SET deploy_status = ?1 WHERE id = ?2",
+                rusqlite::params![deploy_status, id],
+            )? > 0)
+        })
+    }
+
+    /// Pin `node.artifact_id` to the release a finished chain left current
+    /// (§4.4 version verification anchor).
+    pub fn set_node_artifact(&self, id: i64, artifact_id: i64) -> Result<bool> {
+        self.with_conn(|conn| {
+            Ok(conn.execute(
+                "UPDATE node SET artifact_id = ?1 WHERE id = ?2",
+                rusqlite::params![artifact_id, id],
+            )? > 0)
         })
     }
 

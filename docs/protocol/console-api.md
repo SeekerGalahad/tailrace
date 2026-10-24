@@ -11,7 +11,7 @@
 - **操作人**：请求头 `X-Operator` 可选覆盖（默认会话用户名），落审计。
 - **错误码语义**：400 INVALID_ARGUMENT / 401 UNAUTHENTICATED·BAD_NODE_TOKEN / 404 NOT_FOUND / 409 CONFLICT·IN_USE·GENERATION_CONFLICT / 413 PAYLOAD_TOO_LARGE / 501 NOT_IMPLEMENTED / 502 ENGINE_UNREACHABLE·ENGINE_REJECTED。
 - **时间戳**：ISO-8601 UTC（`2026-10-11T08:00:00Z`；存储层 SQLite `datetime('now')` 序列化时转换）。
-- **审计**：所有管理面变更操作写 `audit_log`（DATASOURCE_CREATE/UPDATE/DELETE/TEST、TABLE_CREATE/DELETE、NODE_MANUAL_REGISTER/REVOKE/DELETE、ARTIFACT_UPLOAD/DELETE、PIPELINE_CREATE/UPDATE/DELETE/PUBLISH/DEPLOY/RECOVER/ACTION；LOGIN/NODE_REGISTER 沿用 P0）。
+- **审计**：所有管理面变更操作写 `audit_log`（DATASOURCE_CREATE/UPDATE/DELETE/TEST、TABLE_CREATE/DELETE、NODE_MANUAL_REGISTER/REVOKE/DELETE/DEPLOY/ACTION、ARTIFACT_UPLOAD/DELETE、PIPELINE_CREATE/UPDATE/DELETE/PUBLISH/DEPLOY/RECOVER/ACTION；LOGIN/NODE_REGISTER 沿用 P0）。
 
 ## 二、端点清单（P1 实装状态）
 
@@ -27,12 +27,13 @@
 | ✅ | POST /api/datasources/{id}/discover（T14，2026-10-21；非 501——engine `tailrace-metadata` 内嵌转发：kafka 经 rdkafka fetch_metadata 列 topics（首点拆 db.table，带 partitions）；doris/mysql 走 9030 mysql **文本协议** SHOW DATABASES/SHOW TABLES；postgres 走 information_schema（扩展协议绑定参数）；回 `{"assets":[{dbName,tableName,kind,format:null,partitions?}]}`，kind 按 `table_kind_for` 派生（kafka→kafka、doris→doris、mysql/postgresql→jdbc）；成功缓存 30s（键=datasource id+generation+connJson 逐字节，失败不缓存以便改参即重探）；file 型/connJson 缺字段 400、数据源不存在 404、后端不可达 502） · POST /api/datasources/{id}/infer-schema（body `{dbName,tableName,format?,sampleRows?}`：kafka 尾采 sampleRows 条（默认 20 钳 1..=100）经 decode 链类型格推断列 + 给出 format 建议（ogg/json/jsonl，其它显式格式 400）；SQL 后端读 DDL 列型（DESC / information_schema.columns），format 恒 null；回 `{"columns":[[列名,arrow 型]…],"format":null|"ogg"|"json"}`——**不落库**，登记仍走 POST /tables；同档 400/404/502） |
 | ✅ | GET /api/nodes（90s 无心跳判 OFFLINE，只读计算） · GET /api/nodes/{id} |
 | ✅ | POST /api/nodes/manual（先探活 `GET http://host:port/healthz`，200 才登记；node_key 由控制面生成 `sn-<16hex>`，per-node token 响应一次性回显，库内仅存 sha256；探活失败 502） |
-| ✅ | POST /api/nodes/{id}/revoke（204） · DELETE /api/nodes/{id}（被 assigned 管道引用 409 IN_USE；远端清理按「跳过并警告」分支：`{"remoteCleaned":false,"warning":"…"}`） |
+| ✅ | POST /api/nodes/{id}/revoke（204） · DELETE /api/nodes/{id}（被 assigned 管道引用 409 IN_USE；T35 起 SSH 托管节点先 best-effort 远端卸载（停进程+清安装目录）再删行，失败降级「跳过并警告」：`{"remoteCleaned":bool,"warning":…}`） |
 | ✅ | GET /api/nodes/{id}/events?hours=168 · GET /api/nodes/events?hours&level |
 | ✅ | GET /api/nodes/{id}/metrics?hours=6（1 分钟桶，窗口钳 1..24h） |
 | ✅ | GET /api/nodes/{id}/pipelines-runtime（代理引擎 GET /v1/pipelines 原样透传；不可达 502） |
-| ✅ | GET /api/nodes/{id}/deploy-log?limit=100（升序；SSH 链落盘前恒空） |
-| ⛔ 501 | POST /api/nodes/deploy（SSH 八步状态机） · POST /api/nodes/{id}/action（进程级 start/stop/restart/upgrade/rollback/uninstall + 暂停编排） · POST /api/nodes/{id}/migrate（P2） |
+| ✅ | GET /api/nodes/{id}/deploy-log?limit=100（升序；§4.4 八步链逐步落盘：PREFLIGHT/UPLOAD/UNPACK/CONFIGURE/START/HEALTH_WAIT/REGISTER/REGISTERED，任一步失败附 ROLLBACK 行） |
+| ✅ | POST /api/nodes/deploy（T35，2026-10-24；SSH 八步状态机 PENDING→PREFLIGHT→UPLOAD→UNPACK→CONFIGURE→START→HEALTH_WAIT→REGISTER→REGISTERED，russh 纯 Rust 传输。两模式：`hosts[]` 批量新机（控制面建 node 行 register_mode=deployed+生成 node_key/per-node token）或 `nodeId` 重部署（仅 SSH 托管节点）；响应 `{deploys:[{nodeId,status:"PENDING"}]}` 后台推进，进度走 deploy-log。PREFLIGHT=SSH 连通+install dir 可写+prev 链接锚定；UPLOAD=制品流式上传+远端 sha256 核验；UNPACK=解包 releases/<version> 并定位 tailrace-node；CONFIGURE=prev 快照+停旧进程（SIGTERM→SIGKILL）+current 软链切换；START=nohup 拉新二进制（--control-plane/--node-key/--state-dir）；HEALTH_WAIT=/healthz 200 窗口；REGISTER=引擎自注册心跳+版本核对（engine_version==制品 version 不符即 FAIL）。**任一步失败→回滚**：prev→current 恢复+重启旧二进制+健康确认，deploy_status=FAILED、artifact_id 不动；首部署无 prev 则移除损坏链接留 FAILED。SSH 凭据=console 部署私钥 `TAILRACE_SSH_KEY`（口令 `TAILRACE_SSH_KEY_PASSPHRASE`），仅公钥认证、不收凭据于请求体；`TAILRACE_CONSOLE_ADVERTISE_URL` 指引擎回连地址、`TAILRACE_DEPLOY_HEALTH_TIMEOUT_SECS`（默认 90）调健康窗口） · POST /api/nodes/{id}/action（T35：start/stop/restart/rollback/uninstall 同步执行（stop=pidfile SIGTERM→SIGKILL；rollback=current⇄prev 对调+重启+健康确认）；upgrade 异步走完整八步链（需 artifactId）；非 SSH 托管节点 400、SSH 侧失败 502 SSH_FAILED） |
+| ⛔ 501 | POST /api/nodes/{id}/migrate（P2 三步编排，未在本阶段交付） |
 | ✅ | GET /api/artifacts · POST /api/artifacts（multipart：file(.tar.gz)+name([A-Za-z0-9._-]，默认 tailrace-node)+version；sha256 服务端算；name+version 重复 409；>512MB 413；落 `<data-dir>/artifacts/<name>-<version>.tar.gz`） · DELETE /api/artifacts/{id}（被节点引用 409） |
 | ✅ | GET /api/pipelines?page&pageSize · POST /api/pipelines · GET/PUT/DELETE /api/pipelines/{id}（detail 回 `config`（五段 PlanOptions 原文，null 段序列化为 null——编辑页据此原样回传，保存不清空高级配置）；非 DRAFT 保存→PENDING_CHANGES；RUNNING 删除先自动 stop，引擎不可达 502 阻断） |
 | ✅ | POST /api/pipelines/compile（console 内嵌 tailrace-parser 本地编译；`db.table`×dsMapping→`${ds:id.db.table}` 物化后编译；diagnostics 走 400 自带形态） |
@@ -57,6 +58,6 @@
 ## 四、未决 / 后续
 
 - ticket 端点（票据链，600s 单次票据）仍未交付——凭据加密静态半边已落地（见「关键语义裁决」3），票据链为 v1.x 结构性修复。
-- SSH 部署链八步 + 节点进程动作的「逐条暂停→执行→自动恢复」编排。
+- ~~SSH 部署链八步 + 节点进程动作~~（T35 已交付，见端点清单；「逐条暂停→执行→自动恢复」的管道级暂停编排仍留 v1.x——当前动作直接作用于进程，不自动暂停在跑管道）。
 - catalog 快照浏览 / 样本预览 / lag 告警规则 / SQL 片段助手（后续版本族；discover / infer-schema 已于 T14 交付）。jdbc 管道 console 端到端未通（plan 下推 bootstrap/sequence_column 两键，见 docs/connectors/jdbc.md §七）。
 - 90s OFFLINE 目前为读时计算；未做后台定时器回写。

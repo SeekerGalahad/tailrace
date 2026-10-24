@@ -14,10 +14,10 @@ use crate::api::nodes::{
     HeartbeatBody, HeartbeatResponse, NodeCreated, NodeEcho, RegisterBody, RegisterResponse,
 };
 use crate::api::nodes_admin::{
-    DeployBody, DeployLogItem, DeployLogResponse, EventsResponse, ManualRegisterBody,
-    ManualRegistered, MetricsResponse, MigrateBody, NodeActionBody, NodeCapacity,
-    NodeDeleteResponse, NodeDetail, NodeEventItem, NodeListItem, NodeMetricPointOut,
-    NodesListResponse, NodesSummary,
+    ActionAccepted, DeployAccepted, DeployBody, DeployHost, DeployLogItem, DeployLogResponse,
+    DeployResponse, EventsResponse, ManualRegisterBody, ManualRegistered, MetricsResponse,
+    MigrateBody, NodeActionBody, NodeCapacity, NodeDeleteResponse, NodeDetail, NodeEventItem,
+    NodeListItem, NodeMetricPointOut, NodesListResponse, NodesSummary,
 };
 use crate::api::pipelines::{
     CompileBody, CompileResponse, DeployBody as PipeDeployBody, PipelineConfig, PipelineCreated,
@@ -114,7 +114,8 @@ use crate::compile::{CompileDiag, StatementOut};
         NodesListResponse, NodeListItem, NodesSummary, NodeCapacity, NodeDetail,
         ManualRegisterBody, ManualRegistered, NodeDeleteResponse,
         EventsResponse, NodeEventItem, MetricsResponse, NodeMetricPointOut,
-        DeployLogResponse, DeployLogItem, DeployBody, NodeActionBody, MigrateBody,
+        DeployLogResponse, DeployLogItem, DeployBody, DeployHost, DeployResponse,
+        DeployAccepted, NodeActionBody, ActionAccepted, MigrateBody,
         // artifacts
         ArtifactsResponse, ArtifactItem, ArtifactUploaded,
         // pipelines

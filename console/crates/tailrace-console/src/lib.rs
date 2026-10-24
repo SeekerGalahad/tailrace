@@ -6,6 +6,7 @@
 
 pub mod api;
 pub mod compile;
+pub mod deploy;
 pub mod openapi;
 pub mod spa;
 pub mod state;

@@ -51,6 +51,9 @@ tailrace-catalog = { workspace = true }
 # (same pattern as the local compile parser; sqlx subcrates unify with
 # conn-jdbc through the workspace table).
 tailrace-metadata = { workspace = true }
+# T35 §4.4 SSH deploy chain: pure-Rust SSH transport (workspace table
+# carries the feature rationale — ring backend, no aws-lc).
+russh = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }

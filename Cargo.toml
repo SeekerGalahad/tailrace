@@ -77,6 +77,14 @@ axum = { version = "0.8", features = ["json"] }
 reqwest = { version = "0.13", default-features = false, features = ["http2", "blocking", "json"] }
 # console side (design doc §3.1 / §5.1 / A3 / A4)
 rusqlite = { version = "0.40", features = ["bundled"] }
+# T35 (SSH deploy chain, §4.4): pure-Rust SSH client — the openssh wrapped
+# client needs system libssh/openssh-cli and was ruled out on the card.
+# default-features = false drops the aws-lc-rs default backend (aws-lc-sys
+# = cmake C-toolchain burden + license atoms outside the deny allowlist —
+# same reasoning as the sqlx NO-tls note below); ring covers kex/cipher
+# for key-auth sessions against OpenSSH servers, flate2 keeps the
+# zlib@openssh.com compression offer available.
+russh = { version = "0.64", default-features = false, features = ["ring", "flate2"] }
 rusqlite_migration = "2.6"
 argon2 = { version = "0.6", features = ["rand_core"] }
 utoipa = "6"

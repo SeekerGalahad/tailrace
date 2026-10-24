@@ -9,10 +9,10 @@
 //! 模板占位 `{0}`..`{9}`，由 [`t`] 位置插值；渲染结果与收敛前的直写输出
 //! 逐字节一致（既有测试与前端提示不漂移）。
 //!
-//! 规模口径（T39 ③ 勘正，2026-10-23 实测）：字典 **36 key**（[`tests::KEY_LIST`]
+//! 规模口径（T39 ③ 勘正，2026-10-23 实测；T35 增补）：字典 **39 key**（[`tests::KEY_LIST`]
 //! 与 `template` 同步，长度由 [`tests::templates_use_only_positional_placeholders`]
-//! 钉住）/ **50 调用点**（`grep -rn 'messages::' src/ --include='*.rs'`
-//! 排除本模块）。T34 首提交 3cf738b 的「37 key/51 调用点」为双 off-by-one
+//! 钉住）/ **57 调用点**（`grep -rn 'messages::' src/ --include='*.rs'`
+//! 排除本模块；T35 部署链 +3 key/+7 站点）。T34 首提交 3cf738b 的「37 key/51 调用点」为双 off-by-one
 //! 误记，ffb1d55 勘正、本次落为模块事实。
 //!
 //! 信封：`{"error":{code,message,message_key[,refs]}}`——与 console-auth
@@ -36,6 +36,10 @@
 //! ⑦ `src/compile.rs`（44 锚点内含 1 处，但不在本卡文件域
 //!    `console/crates/tailrace-console/src/api/*` 内——域外不动，留后续卡；
 //!    完整性扫描按路径豁免并在此登记）。
+//! ⑧ `src/deploy.rs`（T35 §4.4 部署链，2026-10-24 登记）：deploy_log 的
+//!    output 行是落库运行遥测（嵌入远端命令原文，随步骤动态拼装），与
+//!    豁免①audit 台账同性质——非 §4.0 信封文案，不进字典；完整性扫描按
+//!    路径豁免（exempt 表），站点数无清单钉住（自由拼装的诊断行）。
 //! 完整性由 [`tests::no_chinese_format_direct_writes_outside_dictionary`]
 //! 钉住：src/ 内（字典模块与 compile.rs 之外）格式化直写 + 中文的行必须
 //! 为零。豁免②的 ApiError 字面量残留另由
@@ -68,6 +72,13 @@ fn template(key: &str) -> Option<&'static str> {
         "err.node.bad_heartbeat_body" => "非法心跳请求: {0}",
         "err.node.probe_failed" => "节点探活失败：{0}/healthz 未返回 200",
         "err.node.in_use" => "节点仍被管道指派: {0}",
+        "err.node.deploy_name_taken" => "节点名称已存在：{0}",
+        "err.node.action_unknown" => {
+            "未知动作 {0}（支持 start/stop/restart/upgrade/rollback/uninstall）"
+        }
+        "err.node.remote_cleanup_failed" => {
+            "远端清理失败（SSH 链不可达或命令失败）：{0}；已按「跳过并警告」分支仅清理控制面元数据"
+        }
         // ---- pipelines ----
         "err.pipeline.not_found" => "管道 #{0} 不存在",
         "err.pipeline.table_objects_missing" => "表对象未登记（先在数据源页登记）: {0}",
@@ -197,13 +208,13 @@ mod tests {
     }
 
     /// 字典自洽：模板只含 {数字} 占位，且插值后无残留花括号。
-    /// 另钉字典规模 = 36 key（模块文档「规模口径」的机器锚点，T39 ③）：
+    /// 另钉字典规模 = 39 key（模块文档「规模口径」的机器锚点，T39 ③；T35 +3）：
     /// 加 key 时同步改此数与 KEY_LIST。
     #[test]
     fn templates_use_only_positional_placeholders() {
         let keys: Vec<&str> = KEY_LIST.to_vec();
         assert!(!keys.is_empty());
-        assert_eq!(keys.len(), 36, "字典规模漂移：同步模块文档「规模口径」");
+        assert_eq!(keys.len(), 39, "字典规模漂移：同步模块文档「规模口径」");
         for key in keys {
             let tpl = template(key).expect("listed key resolves");
             let mut rest = tpl;
@@ -250,9 +261,13 @@ mod tests {
     #[test]
     fn no_chinese_format_direct_writes_outside_dictionary() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        // 豁免路径：字典模块本身（模板为字面量）与 compile.rs（锚点内
-        // 含 1 处但文件不在本卡文件域——域外不动项，卡内登记）
-        let exempt: &[&str] = &["api/messages.rs", "compile.rs"];
+        // 豁免路径：字典模块本身（模板为字面量）、compile.rs（锚点内
+        // 含 1 处但文件不在本卡文件域——域外不动项，卡内登记）与
+        // deploy.rs（T35 §4.4 部署链）：deploy_log 的 output 行是落库的
+        // 运行遥测（嵌入远端 df/tar/engine.log 原文，随步骤动态拼装），
+        // 与豁免①的 audit 台账同性质——机器可读操作记录，非 §4.0 信封
+        // 用户文案，不进字典（message_key 通道对日志行无意义）。
+        let exempt: &[&str] = &["api/messages.rs", "compile.rs", "deploy.rs"];
         let mut offenders: Vec<String> = Vec::new();
         let mut stack = vec![src.clone()];
         while let Some(dir) = stack.pop() {
@@ -337,9 +352,17 @@ mod tests {
             (
                 "nodes_admin.rs",
                 &[
+                    "hosts 不能为空（或改用 nodeId 重新部署既有节点）",
+                    "hosts 与 nodeId 二选一",
+                    "hosts[].host / hosts[].name 不能为空",
+                    "upgrade 需要 artifactId",
+                    "缺少 artifactId（制品未指定）",
+                    "缺少 hosts 或 nodeId",
                     "缺少 name / host",
                     "节点名称或 node_key 已存在",
                     "节点未上报 api_url（等待首次心跳）",
+                    "节点非 SSH 托管（manual/self 注册无部署链身份），仅 deployed 节点可重新部署",
+                    "节点非 SSH 托管（manual/self 注册无部署链身份），进程动作不可用",
                 ],
             ),
             (
@@ -546,6 +569,9 @@ mod tests {
         "err.node.bad_heartbeat_body",
         "err.node.probe_failed",
         "err.node.in_use",
+        "err.node.deploy_name_taken",
+        "err.node.action_unknown",
+        "err.node.remote_cleanup_failed",
         "err.pipeline.not_found",
         "err.pipeline.table_objects_missing",
         "err.pipeline.statement_table_missing",

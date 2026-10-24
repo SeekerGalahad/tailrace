@@ -31,6 +31,12 @@ fn usage() {
          \x20                             (otherwise generated and printed once at startup)\n\
          \x20 TAILRACE_MASTER_KEY       credential master key, 32B base64 (§5.3; otherwise\n\
          \x20                             <data-dir>/master.key is generated, 0600, first boot)\n\
+         \x20 TAILRACE_SSH_KEY          deploy private key (OpenSSH format) for the §4.4\n\
+         \x20                             SSH deploy chain; without it deploys fail at PREFLIGHT\n\
+         \x20 TAILRACE_SSH_KEY_PASSPHRASE  optional passphrase for TAILRACE_SSH_KEY\n\
+         \x20 TAILRACE_CONSOLE_ADVERTISE_URL  base URL engines use for --control-plane\n\
+         \x20                             (default http://127.0.0.1:8080)\n\
+         \x20 TAILRACE_DEPLOY_HEALTH_TIMEOUT_SECS  deploy health/register window (default 90)\n\
          \x20 RUST_LOG                   tracing filter (default info)"
     );
 }
