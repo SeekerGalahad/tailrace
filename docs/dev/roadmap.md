@@ -329,6 +329,7 @@ test -s docs/BENCHMARKS.md                                        # 含基线+4 
 - **回退门（写死）**：宏基准回吐 >10% 且无法归因修复 → 版本回 48.0.1、回退报告留档、②续挂（触发器重等 RUSTSEC）；deny 出现不可豁免 license 冲突 → 同回退。
 - **文件域**：根 Cargo.toml、Cargo.lock、engine 12 触面文件、tests/contract（golden 重生成）、docs/BENCHMARKS.md。
 - **立项说明**：T18 ② 的触发器 T-b 原文=「①delatlake 升格→②为其前置波」；本草案以「①为 R6 意向」预支该前置（反向驱动），另两条理由：MSRV 已核实无阻塞；v1.0 刚发、下游零依赖历史包袱，是 7 个大版本跨度的最廉窗口。裁决点1 若否决 → W1 波移除，①解锁路径续挂。
+> 结果：bfbaeb3 **部分交付，卡未收口**（提交标题「L4 前后对比」系波门禁口径的前置表述，L4 数字/BENCHMARKS 新小节/同机同日注记均未产出——下游读 git log 以本行为准，评审 high① 补登）：**已落 bfbaeb3**——①核实清单（/tmp/t33-changes.md）+②核心迁移（datafusion/datafusion-proto 48.0.1→55.2.0 直跳，12 触面 6 处代码适配 A1/A2+清单漏判 X1-X4）+③golden 归因（docs/dev/t33-golden-attribution.md：layer_a/layer_b 双层零字节 diff+行为面 2 条逐条归因）+⑥deny 四门（bzip2-1.0.6 入 allow、paste 豁免随出图退役）；**留波门禁**——④L4 前后对比（微基准 identity/filter/groupby vs §4.4 基线 30.647M/8.958M/8.072M rows/s〔:110-112〕+宏基准 file→file vs §六基线带；**同机同日注记**）+⑤BENCHMARKS 新「DF 升级前后」小节+§4.4 两行改写（E1 加 55 维持注记、E2 改「DF55 已解除：output_batches 入 BaselineMetrics 标准指标」回链归因表）+L3 `smoke.sh --full`+裁剪档 check+push。波门禁次序要求：**先跑 L4 同机同日前后对比再执行回退门判定**——宏基准回吐>10% 且无法归因修复 → 按卡面回退门走版本回 48.0.1+回退报告留档，**不得因迁移已合入 master 顶端而放宽门**；E1/E2 复核结论已在档（归因表 §八/§三 B-2）。bfbaeb3 会话门禁：fmt 0 diff / clippy -D warnings exit 0 / deny 四门 ok / L1 190 passed/0 failed/7 ignored（与 T39 基线 c59699e 一致）。〔本行 R5-W1 评审修补登 2026-10-24，随笔 low②③：归因表 B-2 处置理由勘正+§五 F 区口径勘误补录；提交 SHA 由波门禁补。〕
 
 ### T34 i18n 承诺债清偿（~1.5 人日）〔T30 登记 v1.x 项兑现〕 ✅
 

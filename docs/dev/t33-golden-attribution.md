@@ -77,7 +77,12 @@ DF 分析器 49-55 改动最少的面；`op: format!("{op:?}")` 的操作符字�
 - **处置**：测试注记按 E2 改写（DF48 限制已解除）；新增
   `output_batches=` 存在性断言把解锁钉进机器门。
 - **下游**：BENCHMARKS §4.4「output_batches 指标面窄（:184-187）」一行
-  已过时，**留待 T33 后续 L4/BENCHMARKS 步骤统一改写**（本步不越文件域）。
+  已过时，**留待 T33 后续 L4/BENCHMARKS 步骤统一改写**。〔勘正（R5-W1
+  评审 low②，2026-10-24）：原记「本步不越文件域」理由失准——
+  docs/BENCHMARKS.md 在 T33 文件域内（roadmap T33 文件域行），推迟实为
+  留 L4 步骤将 §4.4 两行与新小节一次改写的**分步安排**，非越域；改写
+  内容= E1 行加 55 维持注记、E2 行改「DF55 已解除：output_batches 入
+  BaselineMetrics 标准指标」并回链本表。〕
 
 ## 四、C3（sqlparser Display 漂移）实证：零漂移
 
@@ -108,6 +113,15 @@ integration test，跑完即删）对 `examples/pipeline.sql` 双语句取
 | X2 | `TableProvider::as_any` 成员方法移除（trait 改 `Any + Debug + Sync + Send` 超 trait，datafusion-session table.rs:52） | ❌ 清单漏（B 区误记"其余面不变"） | impl 删 `as_any` 方法（trait 不再有此成员） |
 | X3 | `TableReference` 从 `datafusion::sql` 迁走（datafusion-sql lib.rs 仅再导出 sqlparser） | ❌ 清单漏 | 两处改 `datafusion::common::TableReference`（datafusion::common = datafusion_common 全量再导出，lib.rs:798-800） |
 | X4 | sqlparser 0.62 `ObjectNamePart` 新增 `Function(_)` 变体（ast/mod.rs:423）致 parser 非穷尽匹配 | ❌ 清单漏（B 区只核了 Identifier 同形） | parser `ident_name` 加显式 `Function(_) => None` 臂（语义=既有多段拒绝：`${ds:}` 占位符只认单段纯标识符） |
+
+**F 区口径勘误（R5-W1 评审 low③ 补录，2026-10-24）**：清单 F 区称
+connector/sink.rs、registry.rs、catalog/lib.rs「仅 doc 注释/无代码引用」
+——实测 `engine/crates/tailrace-connector/src/sink.rs:1` 实有 1 处真实
+代码引用 `use datafusion::arrow::record_batch::RecordBatch;`（registry.rs
+:28 与 catalog/lib.rs:149 确仅 doc 注释）。该引用走 `datafusion::arrow`
+稳定再导出面，DF55 下保留、零适配（§七 workspace check 全绿含该文件）
+——清单「仅 doc 注释」口径失准，但「该触面零改动编译通过」的结论恰
+成立，登记在案。
 
 ## 六、依赖面与 deny 四门（C4 兑现）
 
