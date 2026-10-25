@@ -15,9 +15,11 @@ R3 complete (2026-10-22): engine data plane with kafka / file / jdbc sources
 (MySQL/PostgreSQL keyset), Doris + StarRocks Stream Load sinks and a file
 sink; datasource discovery & schema inference (`discover` / `infer-schema`);
 a full performance ledger (docs/BENCHMARKS.md) and an 8-job CI matrix.
-R4 (1.0 release) is on its final step: all 21 workspace crates are already
-published on crates.io at 1.0.0 (`cargo install tailrace-node --version
-1.0.0 --locked`); the v1.0.0 git tag / GitHub release follows (roadmap T31).
+R4 (1.0 release) shipped 2026-10-23: all 21 workspace crates on crates.io
+at 1.0.0 plus the v1.0.0 git tag / GitHub release. R5 (1.1) is on its
+final step: the tree is versioned 1.1.0 and ships to crates.io
+(`cargo install tailrace-node --version 1.1.0 --locked`); the v1.1.0
+git tag / GitHub release follows (roadmap T38).
 
 Sink delivery tiers, stated plainly (route review T18): **label idempotency
 is delivered** — including restart-idempotency e2e (replaying a batch under

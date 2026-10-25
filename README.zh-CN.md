@@ -12,9 +12,11 @@
 R3 收官（2026-10-22）：数据面连接器 kafka / file / jdbc（MySQL/PostgreSQL
 keyset 批源）为源，Doris + StarRocks Stream Load 与 file 为汇；数据源发现与
 模式推断（discover / infer-schema）已落地；性能账本（docs/BENCHMARKS.md）与
-8 job CI 矩阵齐备。R4（1.0 发布）收尾中：21 个 workspace crate 已全部在
-crates.io 发至 1.0.0（`cargo install tailrace-node --version 1.0.0 --locked`），
-v1.0.0 git tag / GitHub Release 为余下步骤（roadmap T31）。
+8 job CI 矩阵齐备。R4（1.0 发布）已于 2026-10-23 收官：21 个 workspace
+crate 在 crates.io 发至 1.0.0，v1.0.0 git tag / GitHub Release 在档。
+R5（1.1）收尾中：全树已锁版 1.1.0 并随发布门禁发往 crates.io
+（`cargo install tailrace-node --version 1.1.0 --locked`），
+v1.1.0 git tag / GitHub Release 为余下步骤（roadmap T38）。
 
 汇端交付档位如实表述（路线评审 T18）：**label 幂等档已交付**——含重启幂等
 e2e（同 label 重放去重，表行数不增长）；事务接口（exactly-once）与

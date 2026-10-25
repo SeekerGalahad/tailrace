@@ -53,9 +53,11 @@ post-1.0.0 follow-ups._
   binary restart, health re-check, deploy_status=FAILED, artifact_id
   untouched; REGISTER additionally verifies engine_version matches the
   artifact. Node actions `start/stop/restart/rollback/uninstall` execute
-  synchronously and `upgrade` walks the full chain asynchronously; the 501
-  placeholders in the console admin API are gone (non-SSH-managed nodes
-  get 400, SSH-side failures 502 SSH_FAILED). Web nodes page wired;
+  synchronously and `upgrade` walks the full chain asynchronously; the
+  deploy/action 501 placeholders in the console admin API are gone
+  (non-SSH-managed nodes get 400, SSH-side failures 502 SSH_FAILED;
+  `migrate` and `ticket` stay 501 — P2 deliverables, out of this card's
+  scope). Web nodes page wired;
   in-tree tests cover the state machine (unit) plus a docker target-host
   e2e including the mid-chain-failure → rollback case.
 
@@ -90,7 +92,11 @@ post-1.0.0 follow-ups._
   deny license allowlist, and the RUSTSEC-2024-0436 (paste unmaintained)
   ignore retires with the crate. M4 macro benchmark file→file: 41528
   rows/s (first DF55 sample, same machine different day vs the DF48 anchor
-  33568 = +23.7% — recorded as no-regression, not a confirmed gain).
+  33568 = +23.7% — recorded as no-regression, not a confirmed gain). The
+  Doris full-stack smoke (`smoke.sh --full`) was not re-run on the DF55
+  tree before this release (disk-gated window); engine coverage for the
+  jump is the L1 contract suite plus the macro row-count check
+  (docs/BENCHMARKS.md §6.5).
 - Runtime offset-store locking: every `state.lock()` in `tailrace-runtime`
   (serve loop + standalone statement bodies, 8 sites) now recovers a
   poisoned `Mutex` with `unwrap_or_else(|e| e.into_inner())` — registry
