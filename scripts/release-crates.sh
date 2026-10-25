@@ -55,7 +55,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 export CARGO_PROFILE_DEV_DEBUG=0
-VERSION="1.0.0"
+VERSION="1.1.0"
 REGISTRY="crates-io"
 MAX_TRIES=10
 RETRY_SLEEP=15
