@@ -31,7 +31,7 @@
 
 ### 1.2 代码质量摘要
 
-- **结构**：workspace 22 成员（Cargo.toml:8-33）= engine 16 lib crate + 1 bin `tailrace-node` + console 4 crate + `tests/contract`（`publish = false`，tests/contract/Cargo.toml:11）→ **21 包上 crates.io**，lockstep 1.1.0（Cargo.toml:38；architecture.zh.md:505 逐包复核 21×1.1.0）。21 包 description/keywords/categories 三键齐全（本会话逐 Cargo.toml grep，21/21）。
+- **结构**：workspace 22 成员（Cargo.toml:8-35）= engine 16 lib crate + 1 bin `tailrace-node` + console 4 crate + `tests/contract`（`publish = false`，tests/contract/Cargo.toml:11）→ **21 包上 crates.io**，lockstep 1.1.0（Cargo.toml:38；architecture.zh.md:505 逐包复核 21×1.1.0）。21 包 description/keywords/categories 三键齐全（本会话逐 Cargo.toml grep，21/21）。
 - **测试**：L1 全 workspace **194 passed / 0 failed / 8 ignored**，契约套件 **7/7**（architecture.zh.md:483，2026-10-26 落稿会话实跑——**本文未重跑**）；T33 时点为 190/0/7（roadmap.md:333）。live-gate 测试自 T25 起 `#[ignore]` + CI `--include-ignored` 真跑（ci.yml:125/129/133），跳过计数可见、不再静默计 passed。
 - **静态门与供应链**：fmt / clippy `-D warnings` / deny 四门全进 CI rust job（ci.yml:16）；msrv job 以 1.95 真实编译（ci.yml:35-44；ADR-001 roadmap.md:21-26）；slim-features job 用 `cargo tree` 防 rdkafka/openssl 栈泄漏回图（ci.yml:55）。
 - **内存安全**：`unsafe` 0 处（本会话 grep）；但**无 `#![forbid(unsafe_code)]`**（grep `unsafe_code` 0 命中）——现状是「实践为 0」而非「编译器保证为 0」。
@@ -41,7 +41,7 @@
 
 ### 1.3 社区就绪度摘要
 
-**已就位**：README 双语，4 枚徽章（README.md:3-6）、三命令 quickstart（:36-51）、FAQ 5 问（:85-122）；CONTRIBUTING.md 44 行写明四条本地门（:24-27）与 Conventional Commits（:34-36）；CODE_OF_CONDUCT.md 70 行；SECURITY.md 私密通报流程（:10-20）；issue 模板 bug/feature + `blank_issues_enabled: false`（config.yml:1）；PR 模板带四项检查清单（PULL_REQUEST_TEMPLATE.md:16-19）；CHANGELOG 遵循 Keep a Changelog（CHANGELOG.md:5-6），[1.1.0] 段逐卡入账（:8-122）；mdBook 8 章（docs/book/src/SUMMARY.md:3-10）。
+**已就位**：README 双语，4 枚徽章（README.md:3-6）、三命令 quickstart（:36-51）、FAQ 5 问（:85-122）；CONTRIBUTING.md 44 行写明四条本地门（:24-27）与 Conventional Commits（:34-36）；CODE_OF_CONDUCT.md 70 行；SECURITY.md 私密通报流程（:10-20）；issue 模板 bug/feature + `blank_issues_enabled: false`（config.yml:1）；PR 模板带四项检查清单（PULL_REQUEST_TEMPLATE.md:16-19）；CHANGELOG 遵循 Keep a Changelog（CHANGELOG.md:5-6），[1.1.0] 段逐卡入账（:8-122）；mdBook 9 章（docs/book/src/SUMMARY.md:3-11）。
 
 **滞后与缺口（均可低成本修）**：
 
@@ -227,7 +227,7 @@
 | 190 / 0 / 7 | 同上，T33 时点 | roadmap.md:333；BENCHMARKS.md:741 |
 | 1 passed / 49.13 s | T35 docker 目标机 e2e（含回滚场景） | roadmap.md:350 |
 | 1104 行 | console/src/deploy.rs | 本会话 `wc -l` |
-| 22 / 21 | workspace 成员 / crates.io 发包数 | Cargo.toml:8-33；tests/contract/Cargo.toml:11 |
+| 22 / 21 | workspace 成员 / crates.io 发包数 | Cargo.toml:8-35；tests/contract/Cargo.toml:11 |
 | 8 job | ci.yml | ci.yml:16/35/45/55/76/85/102/135 |
 | 9 资产 | GitHub Release v1.1.0 | 本会话 `gh release view v1.1.0`；architecture.zh.md:505 |
 | 0 / 0 / 0 / 0 | stars / forks / open_issues / watchers（2026-10-26） | 本会话 `gh api`；R5-lineage-judge-20261025.md:17-20（2026-10-25 同值） |

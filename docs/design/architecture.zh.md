@@ -2,7 +2,7 @@
 
 > 读者：新贡献者与评审者。本文档描述**已落地**的系统形态（v1.1.0 基线，tag `v1.1.0`，2026-10-25；工作树 HEAD `b19661b`），不是愿景稿。
 > 三条引用纪律：性能数字一律引 `docs/BENCHMARKS.md` 现值（带行号锚点）；任务状态一律引 `docs/dev/roadmap.md` ✅ 实况；代码锚点 `路径:行号` 可直接点开核对。
-> 定位：R4 计划中「设计文档以脱敏干净版重新入仓」（roadmap.md:194）的落点即本目录，并经 T29 入 mdBook 文档站（book.toml + docs/book/，SUMMARY 8 章，4 篇 `{{#include}}` 全文引入本档）；2026-10-11 内部设计档为本文档前身，差异见 §十一。
+> 定位：R4 计划中「设计文档以脱敏干净版重新入仓」（roadmap.md:194）的落点即本目录，并经 T29 入 mdBook 文档站（book.toml + docs/book/，SUMMARY 9 章，5 篇 `{{#include}}` 全文引入正典——本档与 docs/ASSESSMENT-AND-OUTLOOK.md 各占其一）；2026-10-11 内部设计档为本文档前身，差异见 §十一。
 
 ## 目录
 
@@ -71,8 +71,7 @@ flowchart TB
     SSHD["SSH 目标机（部署 LAN，releases/current/prev 布局）"]
   end
   PAGES -->|"/api 会话（cookie/Bearer）"| ROUTER
-  ROUTER --- AUTHC
-  AUTHC --- STOREC
+  ROUTER --- AUTHC --- STOREC
   ROUTER --- STOREC
   ROUTER -->|"register / heartbeat（m2m token）"| APIE
   PROXY -->|"/v1（Bearer/X-Node-Token 五级链）"| APIE
@@ -90,7 +89,7 @@ flowchart TB
   RT -.->|"otel feature 门控，默认关"| OTEL
 ```
 
-### 2.1 引擎 crate 全景（engine/crates/，15 个；行数为 2026-10-26 本档落稿会话实测）
+### 2.1 引擎 crate 全景（engine/crates/，16 个；行数为 2026-10-26 本档落稿会话实测）
 
 | crate | 职责 | 行数（含测试括注 src） |
 |---|---|---|
@@ -107,6 +106,7 @@ flowchart TB
 | tailrace-transform | DataFusion 55.2.0 执行层（thread_local session + 物化计划） | 559（src 467） |
 | tailrace-ir | PipelineIr / build_exec_plan / Cursor / SourceChunk | 482 |
 | tailrace-state | OffsetStore trait + FileOffsetStore（JSON 台账） | 480 |
+| tailrace-connector | Source/Sink trait + 显式 `ConnectorRegistry`（source.rs / sink.rs / registry.rs；各连接器 crate 以 `register()` 入表，无注册宏，§五） | 374 |
 | tailrace-conn-mqtt | **1 行占位**（T18⑥ 裁决：v1.x + 12 个月触发器） | 1 |
 | tailrace-conn-s3 | **1 行占位**（T18⑦a 裁决：v1.x） | 1 |
 
@@ -198,7 +198,7 @@ serve 主循环（runtime/src/lib.rs:666）共三处 flush 点，全部先 `sink
 | 三阈值触发 | lib.rs:856-885 | lib.rs:1049-1072 |
 | stop 终局 | lib.rs:894-918 | lib.rs:1086-1104 |
 
-**锁中毒防御（T39 ④，v1.1.0）**：runtime 全部 8 处 `state.lock()`（serve 三处 + standalone 三处 save、两函数入口 resume load 各一处）自 v1.1.0 起统一 `unwrap_or_else(|e| e.into_inner())`（lib.rs:925-926 文档注释 + 各调用点；注册表侧同款）——兄弟语句线程 panic 不再把毒锁级联进游标提交路径，锁内状态仍一致可继续。
+**锁中毒防御（T39 ④，v1.1.0）**：runtime 语句体内 8 处 `state.lock()`（serve/standalone 各 1 处入口 resume load + 3 处 flush 点 save；CHANGELOG.md:100-104 所记 8 处即此口径）+ assemble 期 load 1 处（lib.rs:521-523），共 9 处自 v1.1.0 起统一 `unwrap_or_else(|e| e.into_inner())`（lib.rs:925-926 文档注释 + 各调用点；注册表侧同款）——兄弟语句线程 panic 不再把毒锁级联进游标提交路径，锁内状态仍一致可继续。
 
 台账耐久性（tailrace-state/src/lib.rs:1-14）：tmp(pid)→sync_data→rename→父目录 fsync；损坏文件 `.corrupt` 隔离 + `.bak` 回退，仍不可读则 **fail closed**（拒绝带着未知位点继续）。
 
@@ -311,7 +311,7 @@ sequenceDiagram
 
 `console-store/migrations/00_init.sql` 单迁移：user(:3)、session(:12)、datasource(:20)、datasource_credential(:30)、table_object(:36)、node(:52)、artifact(:70)、deploy_log(:81)、node_event(:92)、pipeline(:104)、pipeline_version(:121)、pipeline_metrics(:133)、node_metrics(:139)、audit_log(:147)，另 5 索引。pragmas：WAL + busy_timeout + foreign_keys + synchronous=NORMAL（T8，事务化后 4 并发×500 事件批最差 31.7ms，roadmap.md:120）。node 的 OFFLINE 判定为 90s 读时计算，无后台回写（console-api.md:62）。T35 起节点表携部署链列：host/ssh_port/ssh_user、install_dir、**deploy_status**（八步链终态 REGISTERED|FAILED|UNINSTALLED）、**register_mode**（manual|deployed|self）（00_init.sql:58-64）；`deploy_log` 表即八步链逐步落盘面（§6.5）。
 
-**数据源类型注册表**（`GET /api/datasource-types`，datasources.rs:34-180 静态注册）：kafka / doris / **starrocks**（T39 ⑥：connJson 复用 doris 形态 jdbcUrl+streamLoadUrl 必填、fenodes 可选，FE MySQL 协议共用 probe/discover/infer-schema）/ file / mysql / postgresgresql；`table_kind_for` 派生表对象 kind（mysql/postgresql→jdbc；**doris 与 starrocks 各自独立 kind**——折叠会让引擎把 Doris 专属头发给 StarRocks FE，datasources.rs:195-206）；cursor_semantics 派生 kafka→KAFKA_OFFSET、file→FILE_POINTER、jdbc→JDBC_KEY、doris/starrocks→NONE。
+**数据源类型注册表**（`GET /api/datasource-types`，datasources.rs:34-180 静态注册）：kafka / doris / **starrocks**（T39 ⑥：connJson 复用 doris 形态 jdbcUrl+streamLoadUrl 必填、fenodes 可选，FE MySQL 协议共用 probe/discover/infer-schema）/ file / mysql / postgresql；`table_kind_for` 派生表对象 kind（mysql/postgresql→jdbc；**doris 与 starrocks 各自独立 kind**——折叠会让引擎把 Doris 专属头发给 StarRocks FE，datasources.rs:195-206）；cursor_semantics 派生 kafka→KAFKA_OFFSET、file→FILE_POINTER、jdbc→JDBC_KEY、doris/starrocks→NONE。
 
 ### 6.4 /v1 引擎协议（docs/protocol/engine-v1.md ↔ 代码一致）
 
@@ -500,7 +500,7 @@ smoke 三档步数：默认 25 / `--full` 44（+毒浸泡，SOAK 本地默认 60
 | chaos | :102 | testcontainers 真栈（Kafka+Doris+MySQL+PG）+ swapoff + vm.max_map_count；**三条命令均带 `--include-ignored`**（:125/:129/:133，T25）真跑 5 个 live-gate 测试——jdbc 真库、kafka 活性+分区发现、chaos kill-9；kafka 过滤词为公共前缀 `kafka_source`（T25 实证的过滤词陷阱）；**SSH 部署 e2e 未入此 job**（§6.5 后续项） |
 | smoke | :135 | build.sh + `--full` SOAK=180 |
 
-> 口径注记：roadmap §三写「六 job」（:42）、§十一写「七 job」（:352），均为 T16 增 slim-features 前的滞后口径；本文以 ci.yml 实况 8 为准（R4 收口标准亦按 8 job `gh run watch` 口径，roadmap.md:521）。
+> 口径注记：roadmap §三写「六 job」（:42）、§十一写「七 job」（:498），均为 T16 增 slim-features 前的滞后口径；本文以 ci.yml 实况 8 为准（R4 收口标准亦按 8 job `gh run watch` 口径，roadmap.md:521）。
 
 release（release.yml）：preflight（红提交不发，:16）→ build 4 目标矩阵（x86_64/aarch64-linux 走 cross；双 apple-darwin 原生，:35-38）→ aggregate **8 tarballs + 1 checksums.txt = 9 资产**（:76-96）。crates.io：**21 包全树 lockstep 发包**——T27 以 1.0.0 发（2026-10-23，拓扑序/dry-run 门槛/断点续发），T38 以 1.1.0 覆盖（2026-10-25；脚本 VERSION 硬编码缺陷致首轮 SKIP 全部、b19661b 修为读 Cargo.toml 后续发）；本档会话 API 逐包复核 **21×1.1.0**。GitHub Release：v1.0.0（2026-10-23）与 v1.1.0（2026-10-25）各 9 资产（本档会话 `gh release view` 复核 v1.1.0：8 tarball + checksums.txt）。
 
