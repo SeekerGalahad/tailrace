@@ -1,8 +1,8 @@
 # tailrace 架构设计（v1.1.0 基线版）
 
 > 读者：新贡献者与评审者。本文档描述**已落地**的系统形态（v1.1.0 基线，tag `v1.1.0`，2026-10-25；工作树 HEAD `b19661b`），不是愿景稿。
-> 三条引用纪律：性能数字一律引 `docs/BENCHMARKS.md` 现值（带行号锚点）；任务状态一律引 `docs/dev/roadmap.md` ✅ 实况；代码锚点 `路径:行号` 可直接点开核对。
-> 定位：R4 计划中「设计文档以脱敏干净版重新入仓」（roadmap.md:194）的落点即本目录，并经 T29 入 mdBook 文档站（book.toml + docs/book/，SUMMARY 9 章，5 篇 `{{#include}}` 全文引入正典——本档与 docs/ASSESSMENT-AND-OUTLOOK.md 各占其一）；2026-10-11 内部设计档为本文档前身，差异见 §十一。
+> 三条引用纪律：性能数字一律引 `docs/BENCHMARKS.md` 现值（带行号锚点）；任务状态一律引 `docs/ASSESSMENT-AND-OUTLOOK.md` ✅ 实况；代码锚点 `路径:行号` 可直接点开核对。
+> 定位：R4 计划中「设计文档以脱敏干净版重新入仓」（ASSESSMENT-AND-OUTLOOK.md §五）的落点即本目录，并经 T29 入 mdBook 文档站（book.toml + docs/book/，SUMMARY 9 章，5 篇 `{{#include}}` 全文引入正典——本档与 docs/ASSESSMENT-AND-OUTLOOK.md 各占其一）；2026-10-11 内部设计档为本文档前身，差异见 §十一。
 
 ## 目录
 
@@ -21,9 +21,9 @@
 
 ## 一、项目定位与北极星
 
-**v1.0：一条 SQL、两个二进制、零 JVM 的数据接入引擎，管理台内置，Doris/StarRocks 写入语义按档位交付（1.0=label 幂等档；事务接口 exactly-once 与 group commit 吞吐档=v1.x，触发条件见 T18 纪要）。**（roadmap.md:9，北极星原文）**v1.0.0（2026-10-23）与 v1.1.0（2026-10-25）均已发布**：crates.io 21 包 lockstep 发到 1.1.0（本档落稿会话 API 逐包复核 21/21）、GitHub Release 各 9 资产（8 tarball + checksums.txt）。
+**v1.0：一条 SQL、两个二进制、零 JVM 的数据接入引擎，管理台内置，Doris/StarRocks 写入语义按档位交付（1.0=label 幂等档；事务接口 exactly-once 与 group commit 吞吐档=v1.x，触发条件见 T18 纪要）。**（ASSESSMENT-AND-OUTLOOK.md §一，北极星原文）**v1.0.0（2026-10-23）与 v1.1.0（2026-10-25）均已发布**：crates.io 21 包 lockstep 发到 1.1.0（本档落稿会话 API 逐包复核 21/21）、GitHub Release 各 9 资产（8 tarball + checksums.txt）。
 
-三条差异化支柱（roadmap.md:13-15）：
+三条差异化支柱（ASSESSMENT-AND-OUTLOOK.md §一）：
 
 | 支柱 | 承诺 | v1.1.0 兑现 |
 |---|---|---|
@@ -31,7 +31,7 @@
 | SQL-first + DataFusion | 管道即一条 `INSERT INTO 库.表 SELECT …`，不学私有 DSL | parser→IR→transform 全链落地（§三），SQL 计划每语句物化一次（T7 内存治理）；DataFusion 已随 T33 升 **55.2.0**（七版本直跳，§9.3） |
 | Doris/StarRocks 深度工程化 | 写入语义谱系：label 幂等 → 事务接口 → group commit | label 幂等档已落地（同 label 重放 `FlushOutcome::Dedup`，conn-doris/src/lib.rs:198-205）；sink 吞吐基线已由 T32 补齐（§9.3）；事务接口/group commit 经 T36 谱系裁决**维持 v1.x/R6**（触发器改写，docs/dev/R5-lineage-judge-20261025.md） |
 
-两条红线（roadmap.md:17）：**不拼连接器数量；不做真正流式 join/水位线/状态后端。**
+两条红线（ASSESSMENT-AND-OUTLOOK.md §四）：**不拼连接器数量；不做真正流式 join/水位线/状态后端。**
 
 轮次结构（roadmap.md:19）：R2 性能与基准（T1-T11 全 ✅，:49-150）→ R3 亮点特性（必做 T12-T18 全 ✅ + 选做 T20 ✅，:209-279）→ R4 1.0 发布（**已收官，2026-10-23**）→ R5 1.1 发布（**已收官，2026-10-25**）。详见 §十一。
 
@@ -609,7 +609,7 @@ gantt
 ```mermaid
 flowchart LR
   ARCH["本文档<br/>docs/design/architecture.zh.md"]
-  ROAD["docs/dev/roadmap.md<br/>任务正典（状态 ✅ 实况）"]
+  ROAD["docs/ASSESSMENT-AND-OUTLOOK.md<br/>任务正典（状态 ✅ 实况）"]
   BENCH["docs/BENCHMARKS.md<br/>数字账本（唯一性能来源）"]
   PROTO["docs/protocol/engine-v1.md<br/>docs/protocol/console-api.md"]
   CONN["docs/connectors/jdbc.md"]

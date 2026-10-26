@@ -1,13 +1,13 @@
 # tailrace 现状评估与未来展望（v1.1.0 基线）
 
 > **基线**：tag `v1.1.0`（指向 `6cedcf7`，2026-10-25）；工作树 HEAD `b19661b`；评估日 2026-10-26。
-> **引用纪律**：性能数字只引 `docs/BENCHMARKS.md`；交付事实只引 `CHANGELOG.md` / `docs/dev/roadmap.md` / 两份裁决纪要；代码锚点一律 `路径:行号`。文中「本会话实测」均为 2026-10-26 在工作树实跑所得，命令随行写明；未重跑的数字一律注明来源与其测量日。
+> **引用纪律**：性能数字只引 `docs/BENCHMARKS.md`；交付事实只引 `CHANGELOG.md` / `CHANGELOG.md (delivery facts) / docs/BENCHMARKS.md (performance)` / 两份裁决纪要；代码锚点一律 `路径:行号`。文中「本会话实测」均为 2026-10-26 在工作树实跑所得，命令随行写明；未重跑的数字一律注明来源与其测量日。
 > **来源注记**：原计划作为本文输入的四份领域评估稿（`/tmp/assess-{code,community,competitive,depth}.md`）在落稿时**不存在于磁盘**。本文全部结论直接取自仓内正典文件与本会话实测，不转述任何二手结论。
 > **版本标签注记**：§五 的「v1.1.x / v1.2 / v2.x」是本文的分期框架；仓内正典（roadmap、T18/T36 纪要）使用的是「v1.x / R6 / 12 个月触发器」口径，映射关系在 §五 逐段标注。
 
 **一页纸结论**：
 
-- tailrace v1.1.0 是一个**工程纪律极严、技术语义完整、但尚无任何外部用户**的 Rust 数据接入引擎。北极星「一条 SQL、两个二进制、零 JVM、Doris/StarRocks label 幂等档」（roadmap.md:9）已按档位兑现。
+- tailrace v1.1.0 是一个**工程纪律极严、技术语义完整、但尚无任何外部用户**的 Rust 数据接入引擎。北极星「一条 SQL、两个二进制、零 JVM、Doris/StarRocks label 幂等档」（CHANGELOG.md:8 (v1.1.0 section)）已按档位兑现。
 - 总体健康分 **7/10**：工程质量 9、技术深度 8、诚实账本 8 拉高；公开面一致性 5、社区 2 拉低（§1.1）。
 - 真正的差异化只有三条且都有数据：SQL-first（DataFusion 55.2.0）、Doris/StarRocks 深度工程化、单二进制+内置管理台+一键 SSH 部署（§2.1）。
 - 随 1.1.0 带出门的最大技术缺口是 **DF55 树上的 L3 `smoke.sh --full` 未跑**（BENCHMARKS.md:739-741）；最大非技术缺口是公开面若干滞后（SECURITY.md:5「pre-1.0」、README「follows」、模板 `TODO` URL）。
@@ -23,7 +23,7 @@
 |---|---|---|
 | 工程纪律与质量门 | 9 | CI 8 job（ci.yml:16 rust / :35 msrv / :45 no-default-features / :55 slim-features / :76 macos / :85 web / :102 chaos / :135 smoke），最新 run `40191202705` @ b19661b **success**（本会话 `gh run list`）；全仓 `unsafe` **0 处**（本会话 `grep -rn '\bunsafe\b' engine console tests`）；`cargo fmt --all --check` **exit 0**、`cargo deny check advisories bans licenses sources` **四门 ok**（本会话实跑，cargo-deny 0.20.2）；`yanked = "deny"`（deny.toml:39） |
 | 技术深度 | 8 | at-least-once 游标 + flush 点整图提交（architecture.zh.md:176、:193-199）；NO_PROGRESS 写死 3 次不配置化（registry.rs:26-30）；台账 tmp→sync→rename→fsync 与 fail-closed（tailrace-state/src/lib.rs:1-14）；label 幂等 `FlushOutcome::{Success,Dedup}`（conn-doris/src/lib.rs:198-205）；DataFusion 55.2.0（Cargo.toml:66-67）；SSH 八步状态机 **1104 行**（deploy.rs:1-24；本会话 `wc -l`） |
-| 诚实账本与内部文档 | 8 | BENCHMARKS.md 748 行 / roadmap.md 538 行 / architecture.zh.md 635 行均带行号锚点；缺口逐条显式登记而非掩盖——L3 未跑（BENCHMARKS.md:739-741）、同机不同日（:377）、跨机不可比（:349-350） |
+| 诚实账本与内部文档 | 8 | BENCHMARKS.md 748 行 / CHANGELOG.md 133 行 / architecture.zh.md 635 行均带行号锚点；缺口逐条显式登记而非掩盖——L3 未跑（BENCHMARKS.md:739-741）、同机不同日（:377）、跨机不可比（:349-350） |
 | 公开面一致性 | 5 | SECURITY.md:5 仍写「pre-1.0 (`0.1.x`)」；README.md:19-22 仍写 v1.1.0 tag「follows」而 tag 已发；issue 模板安全链接 `github.com/TODO/tailrace`（.github/ISSUE_TEMPLATE/config.yml:4）；T38 验收项「收官报告存在」（roadmap.md:366）未兑现——docs/dev/ 仅有 `v1.0-release-2026-10-23.md` |
 | 社区与采用 | 2 | 本会话 `gh api repos/SeekerGalahad/tailrace`：stars **0** / forks **0** / open_issues **0** / watchers **0**；issues 全历史 **0**（与 T36 纪要 2026-10-25 复测一致，R5-lineage-judge-20261025.md:17-20）；UI/API 文案中文单轨（README.md:143） |
 
@@ -132,7 +132,7 @@
 1. **不拼连接器数量**——mqtt/s3 占位不注册（architecture.zh.md:266-267）；S3 栈会把 T16 的 −9.4% 轻量卖点吃回（R3-升格评审-2026-10-21.md:95）。
 2. **不做真正流式 join / 水位线 / 状态后端**——README FAQ 明示为 non-goals（README.md:90-91）；SQL 面仅支持 INSERT（tailrace-parser/src/lib.rs:53）。
 
-另两条实质性「不做」：exactly-once 不在 1.x 默认交付（北极星按档位交付，roadmap.md:9）；文案不做多语言（中文单轨，README.md:143）。
+另两条实质性「不做」：exactly-once 不在 1.x 默认交付（北极星按档位交付，CHANGELOG.md:8 (v1.1.0 section)）；文案不做多语言（中文单轨，README.md:143）。
 
 ### 4.2 延后项——T18 升格评审（2026-10-21）与 T36 谱系裁决（2026-10-25）
 
