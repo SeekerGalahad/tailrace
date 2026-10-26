@@ -7,4 +7,5 @@
 - [连接器：JDBC 批源](connectors-jdbc.md)
 - [连接器矩阵](connectors-matrix.md)
 - [性能基准摘要](benchmarks.md)
+- [现状评估与未来展望](assessment.md)
 - [开发指针](development.md)
