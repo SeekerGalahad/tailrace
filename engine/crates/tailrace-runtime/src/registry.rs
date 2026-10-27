@@ -330,6 +330,14 @@ impl PipelineRegistry {
             if let Some(v) = t.poll_slice_ms {
                 options.poll_slice = std::time::Duration::from_millis(v.clamp(10, 1_000));
             }
+            // T-D1 broadcast join caps (fail-fast at assembly; clamps are the
+            // plan-surface guardrails, defaults 500_000 rows / 64 MiB)
+            if let Some(v) = t.dim_max_rows {
+                options.dim_max_rows = (v.clamp(1, 10_000_000)) as usize;
+            }
+            if let Some(v) = t.dim_max_bytes {
+                options.dim_max_bytes = v.clamp(1024, 1 << 32);
+            }
         }
         let reliability = plan_options.as_ref().and_then(|o| o.reliability.clone());
         // recovery: self-healing policy (the poison-data criterion is not

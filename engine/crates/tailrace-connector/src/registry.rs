@@ -85,6 +85,7 @@ pub type SinkFactory =
 ///     pushdown: vec![],
 ///     select_sql: "SELECT * FROM src".into(),
 ///     start_offset: None,
+///     dims: Vec::new(),
 /// };
 /// assert!(reg.build_source(&obj, &spec, None).is_ok());
 /// assert!(reg.build_sink(&obj, None).is_ok());
@@ -162,6 +163,7 @@ mod tests {
             pushdown: vec![],
             select_sql: "SELECT * FROM src".into(),
             start_offset: None,
+            dims: Vec::new(),
         }
     }
 

@@ -7,9 +7,11 @@
 //! ② FlinkDialect multi-statement parsing (v1 narrows to an ANSI subset:
 //!    INSERT INTO sink SELECT … FROM source);
 //! ③ AST → statement set: FROM tables rewrite to `src` (the runtime's decoded
-//!    batch registration name), WHERE op_type constant predicates extract into
-//!    the decode-time pushdown whitelist, cursor groups follow the
-//!    `tr.p{pipeline}.s{idx}` convention;
+//!    batch registration name), JOIN dimension tables rewrite to their static
+//!    `dim_<alias>` MemTable names (T-D1 broadcast join — the dim object is
+//!    loaded FULL-TABLE over JDBC at assembly; NOT a streaming join), WHERE
+//!    op_type constant predicates extract into the decode-time pushdown
+//!    whitelist, cursor groups follow the `tr.p{pipeline}.s{idx}` convention;
 //! ④ Validator: catalog resolves references + source/sink direction checks.
 //! **The IR never carries credentials** — references are catalog anchors only.
 
@@ -17,7 +19,7 @@ use datafusion::sql::sqlparser::ast::{Expr, ObjectName, Query, SetExpr, Statemen
 use datafusion::sql::sqlparser::dialect::Dialect;
 use datafusion::sql::sqlparser::parser::Parser;
 
-use tailrace_catalog::{CatalogProvider, StatementSpec};
+use tailrace_catalog::{CatalogProvider, DimJoin, StatementSpec};
 
 /// FlinkDialect (v1: ANSI subset; the extension point for Flink-specific
 /// syntax differences).
@@ -89,7 +91,7 @@ pub fn compile_with_opts(
         let Some(query) = ins.source.as_deref() else {
             anyhow::bail!("statement #{}: INSERT missing SELECT source", idx);
         };
-        let (source_ref, select_sql, pushdown) = rewrite_query(query, &refs)
+        let (source_ref, select_sql, pushdown, dims) = rewrite_query(query, &refs)
             .map_err(|e| anyhow::anyhow!("statement #{} compile failed: {e}", idx))?;
         let group = match group_prefix.map(str::trim).filter(|p| !p.is_empty()) {
             Some(p) => format!("{p}.s{idx}"),
@@ -102,6 +104,7 @@ pub fn compile_with_opts(
             pushdown,
             select_sql,
             start_offset: start_offset.map(str::to_owned),
+            dims,
         });
     }
     if statements.is_empty() {
@@ -163,6 +166,26 @@ pub fn validate(catalog: &dyn CatalogProvider, compiled: &Compiled) -> Vec<Diagn
                 statement: Some(i),
                 message: format!("sink resolution failed: {e}"),
             }),
+        }
+        // T-D1: dim references resolve to kind=dim table objects (broadcast
+        // join side — full-table JDBC load at assembly, never a streaming
+        // source/sink kind)
+        for d in &st.dims {
+            match catalog.resolve(&d.reference) {
+                Ok(t) if t.kind == "dim" => {}
+                Ok(t) => out.push(Diagnostic {
+                    statement: Some(i),
+                    message: format!(
+                        "dim reference {} must be a kind=dim table object (got {}) — \
+                         dimension tables are JDBC-backed and loaded full-table for the broadcast join",
+                        d.reference, t.kind
+                    ),
+                }),
+                Err(e) => out.push(Diagnostic {
+                    statement: Some(i),
+                    message: format!("dim resolution failed: {e}"),
+                }),
+            }
         }
     }
     out
@@ -241,12 +264,13 @@ fn ref_of(
         .ok_or_else(|| anyhow::anyhow!("{ident} is not a ${{ds:}} placeholder"))
 }
 
-/// FROM table rewritten to src + pushdown extraction; returns (source_ref,
-/// select_sql, pushdown).
+/// FROM table rewritten to src + dim JOINs rewritten to their static
+/// `dim_<alias>` MemTable names; returns (source_ref, select_sql, pushdown,
+/// dims).
 fn rewrite_query(
     query: &Query,
     refs: &std::collections::BTreeMap<String, String>,
-) -> anyhow::Result<(String, String, Vec<String>)> {
+) -> anyhow::Result<(String, String, Vec<String>, Vec<DimJoin>)> {
     let mut q = query.clone();
     let select = match q.body.as_mut() {
         SetExpr::Select(s) => s,
@@ -262,6 +286,12 @@ fn rewrite_query(
     let source_ref = match factor {
         TableFactor::Table { name, .. } => {
             let r = ref_of(name, refs)?;
+            if let Some(rest) = r.strip_prefix("dim.") {
+                anyhow::bail!(
+                    "${{ds:dim.{rest}}} is a dimension reference — dim tables are JOIN-only \
+                     (the FROM source stays a streaming source: kafka/file/jdbc)"
+                );
+            }
             *name = ObjectName(vec![
                 datafusion::sql::sqlparser::ast::ObjectNamePart::Identifier("src".into()),
             ]);
@@ -269,12 +299,63 @@ fn rewrite_query(
         }
         other => anyhow::bail!("FROM must be a table reference ({:?})", other),
     };
+    // T-D1 broadcast join: every JOIN must be a ${ds:dim.datasource.table}
+    // reference; it is rewritten to the static dim_<alias> MemTable the
+    // runtime loads full-table over JDBC at assembly. v1 has no second
+    // streaming source — a non-dim JOIN reference is rejected here.
+    let mut dims: Vec<DimJoin> = Vec::new();
+    for (ji, join) in select.from[0].joins.iter_mut().enumerate() {
+        let TableFactor::Table { name, alias, .. } = &mut join.relation else {
+            anyhow::bail!(
+                "JOIN #{ji} must be a ${{ds:dim.datasource.table}} dimension table reference (got {:?})",
+                join.relation
+            );
+        };
+        let r = ref_of(name, refs).map_err(|e| {
+            anyhow::anyhow!("JOIN #{ji}: {e} — only ${{ds:dim.datasource.table}} dimension joins are supported in v1")
+        })?;
+        let reference = r.strip_prefix("dim.").ok_or_else(|| {
+            anyhow::anyhow!(
+                "JOIN #{ji}: ${{ds:{r}}} is not a dimension reference — v1 joins only \
+                 ${{ds:dim.datasource.table}} (a second streaming source is not supported)"
+            )
+        })?;
+        let (ds, tbl) = reference.split_once('.').ok_or_else(|| {
+            anyhow::anyhow!(
+                "JOIN #{ji}: dim reference must be ${{ds:dim.datasource.table}} (got ${{ds:dim.{reference}}})"
+            )
+        })?;
+        if ds.is_empty() || tbl.is_empty() || tbl.contains('.') {
+            anyhow::bail!(
+                "JOIN #{ji}: dim reference must be ${{ds:dim.datasource.table}} with exactly two non-empty parts (got ${{ds:dim.{reference}}})"
+            );
+        }
+        // registered MemTable name: dim_<alias> (alias defaults to the
+        // reference's table part when the SQL omits one)
+        let alias_name = alias
+            .as_ref()
+            .map(|a| a.name.value.clone())
+            .unwrap_or_else(|| tbl.to_string());
+        let dim_name = format!("dim_{alias_name}");
+        if dims.iter().any(|d| d.name == dim_name) {
+            anyhow::bail!(
+                "JOIN #{ji}: duplicate dimension alias {alias_name:?} — {dim_name} would be registered twice; give each dim join a distinct alias"
+            );
+        }
+        *name = ObjectName(vec![
+            datafusion::sql::sqlparser::ast::ObjectNamePart::Identifier(dim_name.as_str().into()),
+        ]);
+        dims.push(DimJoin {
+            reference: reference.to_string(),
+            name: dim_name,
+        });
+    }
     let pushdown = select
         .selection
         .as_ref()
         .map(extract_pushdown)
         .unwrap_or_default();
-    Ok((source_ref, format!("{}", q), pushdown))
+    Ok((source_ref, format!("{}", q), pushdown, dims))
 }
 
 /// op_type constant predicate extraction (IN ('I','U') / = 'X'; a table
@@ -442,6 +523,175 @@ mod tests {
         )
         .is_err();
         assert!(err, "multi-source rejected in v1");
+    }
+
+    /// T-D1 (blueprint D narrow path): `JOIN ${ds:dim.datasource.table}`
+    /// compiles into StatementSpec.dims + the rewritten `dim_<alias>` table
+    /// name inside select_sql; FROM stays `src`. Without an explicit alias the
+    /// reference's table part names the MemTable.
+    #[test]
+    fn dim_join_compiles_to_dims_and_dim_alias_table() -> anyhow::Result<()> {
+        let sql = "INSERT INTO ${ds:3.shop.orders_wide} \
+                   SELECT s.order_no, d.name FROM ${ds:12.default.orders_ogg} s \
+                   LEFT JOIN ${ds:dim.mysql.dim_user} d ON s.uid = d.id";
+        let (c, diags) = compile(sql, 42)?;
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(c.statements.len(), 1);
+        assert_eq!(c.statements[0].source, "12.default.orders_ogg");
+        assert_eq!(c.statements[0].sink, "3.shop.orders_wide");
+        assert_eq!(
+            c.statements[0].dims,
+            vec![tailrace_catalog::DimJoin {
+                reference: "mysql.dim_user".into(),
+                name: "dim_d".into(),
+            }],
+            "alias d → dim_d, reference = datasource.table after the dim. prefix"
+        );
+        let sel = &c.statements[0].select_sql;
+        assert!(sel.contains("FROM src"), "{sel}");
+        assert!(
+            sel.contains("LEFT JOIN dim_d d ON s.uid = d.id"),
+            "join rewritten to the static dim_d MemTable (alias preserved): {sel}"
+        );
+
+        // no alias: the reference's table part names the MemTable
+        let (c2, _) = compile(
+            "INSERT INTO ${ds:a.b} SELECT s.x, id FROM ${ds:c.d} s \
+             INNER JOIN ${ds:dim.e.f} ON s.x = id",
+            1,
+        )?;
+        assert_eq!(c2.statements[0].dims[0].name, "dim_f");
+        assert!(
+            c2.statements[0].select_sql.contains("INNER JOIN dim_f ON"),
+            "{}",
+            c2.statements[0].select_sql
+        );
+        Ok(())
+    }
+
+    /// T-D1 rejections: a second streaming source in JOIN position, dim in
+    /// FROM position, malformed dim references, and duplicate dim aliases.
+    #[test]
+    fn dim_join_rejects_non_dim_and_malformed_refs() {
+        let err = |sql: &str| match compile(sql, 1) {
+            Err(e) => e.to_string(),
+            Ok((_, d)) => panic!("must be rejected (diagnostics: {d:?})"),
+        };
+        // JOIN to a second streaming source: v1 is single-source
+        let e =
+            err("INSERT INTO ${ds:a.b} SELECT s.x FROM ${ds:c.d} s JOIN ${ds:e.f} g ON s.x = g.x");
+        assert!(
+            e.contains("not a dimension reference"),
+            "second streaming source in JOIN must be rejected: {e}"
+        );
+        // dim reference in FROM position (streaming side stays streaming)
+        let e = err("INSERT INTO ${ds:a.b} SELECT x FROM ${ds:dim.c.d}");
+        assert!(
+            e.contains("dimension reference") && e.contains("JOIN-only"),
+            "dim in FROM must be rejected: {e}"
+        );
+        // malformed: missing table part / extra parts
+        let e = err(
+            "INSERT INTO ${ds:a.b} SELECT s.x FROM ${ds:c.d} s JOIN ${ds:dim.onlyds} d ON s.x = d.x",
+        );
+        assert!(
+            e.contains("must be ${ds:dim.datasource.table}"),
+            "one-part dim ref rejected: {e}"
+        );
+        let e = err(
+            "INSERT INTO ${ds:a.b} SELECT s.x FROM ${ds:c.d} s JOIN ${ds:dim.e.f.g} d ON s.x = d.x",
+        );
+        assert!(
+            e.contains("exactly two non-empty parts"),
+            "three-part dim ref rejected: {e}"
+        );
+        // duplicate dim alias → duplicate MemTable registration
+        let e = err("INSERT INTO ${ds:a.b} SELECT s.x FROM ${ds:c.d} s \
+             JOIN ${ds:dim.e.f} d ON s.x = d.x JOIN ${ds:dim.g.h} d ON s.y = d.y");
+        assert!(
+            e.contains("duplicate dimension alias"),
+            "duplicate alias rejected: {e}"
+        );
+        // a derived table in JOIN position is not a dim reference
+        let e = err(
+            "INSERT INTO ${ds:a.b} SELECT s.x FROM ${ds:c.d} s JOIN (SELECT 1 AS x) t ON s.x = t.x",
+        );
+        assert!(
+            e.contains("dimension table reference"),
+            "derived table in JOIN rejected: {e}"
+        );
+    }
+
+    /// T-D1 validator: dim references must resolve to kind=dim table objects;
+    /// a wrong kind (e.g. the jdbc streaming source kind) gets a diagnostic
+    /// naming the broadcast-join contract.
+    #[test]
+    fn validator_checks_dim_refs_resolve_to_dim_kind() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("tailrace-par-dim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let f = dir.join("d.toml");
+        std::fs::write(
+            &f,
+            r#"
+[pipeline]
+id = 11
+name = "t"
+[[datasource]]
+name = "mysql"
+type = "mysql"
+bootstrap = "mysql://root@localhost/test"
+[[table]]
+datasource = "mysql"
+name = "dim_user"
+kind = "dim"
+columns = [["id","int64"],["name","utf8"]]
+sequence_column = "id"
+[[table]]
+datasource = "mysql"
+name = "plain_src"
+kind = "jdbc"
+columns = [["id","int64"]]
+[[table]]
+datasource = "mysql"
+name = "wide_out"
+kind = "file"
+columns = [["id","int64"],["name","utf8"]]
+"#,
+        )?;
+        let cat = tailrace_catalog::FileCatalog::load(&f)?;
+        // good: dim ref resolves to kind=dim
+        let (ok, _) = compile(
+            "INSERT INTO ${ds:mysql.wide_out} SELECT s.id, d.name FROM ${ds:mysql.plain_src} s \
+             LEFT JOIN ${ds:dim.mysql.dim_user} d ON s.id = d.id",
+            11,
+        )?;
+        assert!(validate(&cat, &ok).is_empty(), "kind=dim dim ref passes");
+        // bad: dim ref points at a kind=jdbc streaming source object
+        let (bad, _) = compile(
+            "INSERT INTO ${ds:mysql.wide_out} SELECT s.id, d.name FROM ${ds:mysql.plain_src} s \
+             LEFT JOIN ${ds:dim.mysql.plain_src} d ON s.id = d.id",
+            11,
+        )?;
+        let d = validate(&cat, &bad);
+        assert!(
+            d.iter()
+                .any(|x| x.message.contains("must be a kind=dim table object")),
+            "{d:?}"
+        );
+        // bad: dim ref does not resolve at all
+        let (bad, _) = compile(
+            "INSERT INTO ${ds:mysql.wide_out} SELECT s.id, d.name FROM ${ds:mysql.plain_src} s \
+             LEFT JOIN ${ds:dim.mysql.no_such} d ON s.id = d.id",
+            11,
+        )?;
+        let d = validate(&cat, &bad);
+        assert!(
+            d.iter()
+                .any(|x| x.message.contains("dim resolution failed")),
+            "{d:?}"
+        );
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     /// Regression lock: op_type predicates extract only under AND. A past bug

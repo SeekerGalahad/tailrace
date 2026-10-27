@@ -144,4 +144,11 @@ pub struct TuningOptions {
     pub flush_bytes: Option<u64>,
     pub poll_rows: Option<usize>,
     pub poll_slice_ms: Option<u64>,
+    /// Dimension table (T-D1 broadcast join) row cap per dim table. Default
+    /// 500_000; a dim load crossing the cap rejects the whole plan at
+    /// assembly (fail-fast, not OOM).
+    pub dim_max_rows: Option<u64>,
+    /// Dimension table (T-D1) memory cap per dim table in bytes (measured on
+    /// the decoded Arrow batch). Default 64 MiB; fail-fast at assembly.
+    pub dim_max_bytes: Option<u64>,
 }

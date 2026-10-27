@@ -122,8 +122,10 @@ pub fn stream_load_url_allowed(
 /// PostgreSQL batch SOURCE kind; "JDBC_TABLE" is a Doris SINK alias** (it
 /// folds to "doris" — a source declared `kind = jdbc_table` resolves to a
 /// doris object and trips the "source only supports kafka/file/jdbc (got
-/// doris)" diagnostic). Unknown kinds pass through lowercased (the registry
-/// reports "unsupported kind" at build time).
+/// doris)" diagnostic). **"DIM" is the dimension-table kind (T-D1)** — a
+/// JDBC-backed table loaded full-table at assembly for the broadcast join;
+/// never a streaming source/sink kind. Unknown kinds pass through
+/// lowercased (the registry reports "unsupported kind" at build time).
 pub fn normalize_kind(kind: &str) -> String {
     match kind.to_uppercase().as_str() {
         "TOPIC" | "KAFKA" => "kafka".into(),
@@ -134,6 +136,9 @@ pub fn normalize_kind(kind: &str) -> String {
         "DORIS_TABLE" | "JDBC_TABLE" | "DORIS" => "doris".into(),
         "STARROCKS" => "starrocks".into(),
         "JDBC" => "jdbc".into(),
+        // T-D1: dimension table (broadcast join side). Explicit arm for the
+        // doc anchor; the lowercase fallback would produce the same value.
+        "DIM" => "dim".into(),
         other => other.to_lowercase(),
     }
 }
@@ -145,7 +150,7 @@ pub struct StatementSpec {
     /// Source table object (datasource.name)
     pub source: String,
     /// Consumer group (cursor group convention `tr.p{pipeline}.s{n}`; with a
-    /// plan-configured groupPrefix it is `{prefix}.s{n}`)
+    /// plan-configured groupPrefix it is `{prefix}.s{statement index}`)
     pub group: String,
     /// Target table object
     pub sink: String,
@@ -158,6 +163,25 @@ pub struct StatementSpec {
     /// committed offset exists)
     #[serde(default)]
     pub start_offset: Option<String>,
+    /// Dimension table joins (T-D1 broadcast join, blueprint D narrow path):
+    /// one entry per `JOIN ${ds:dim.<datasource>.<table>} [AS] <alias>` in
+    /// select_sql. Each dim table is loaded FULL-TABLE over JDBC at assembly
+    /// (compile time) and registered as the static `dim_<alias>` MemTable —
+    /// a broadcast join, NOT a streaming join (no watermark, no state
+    /// backend; explicit row/memory caps fail the assembly).
+    #[serde(default)]
+    pub dims: Vec<DimJoin>,
+}
+
+/// One dimension-table join extracted by the SQL compiler (T-D1).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DimJoin {
+    /// Catalog reference of the dim table object (datasource.table; the
+    /// object must be `kind = "dim"`)
+    pub reference: String,
+    /// Table name the rewritten select_sql joins against (`dim_<alias>`;
+    /// alias defaults to the reference's table part when the SQL omits one)
+    pub name: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -208,6 +232,10 @@ pub struct TableSpec {
     pub auth_env: Option<String>,
     #[serde(default)]
     pub label_prefix: Option<String>,
+    /// JDBC cursor column (dim tables: the PRIMARY KEY / single-column
+    /// UNIQUE key, used as the full-table load pagination key)
+    #[serde(default)]
+    pub sequence_column: Option<String>,
 }
 
 /// Catalog backend trait (all backends the same shape — the golden-set parity
@@ -268,7 +296,7 @@ impl CatalogProvider for FileCatalog {
                 .clone()
                 .map(|p| format!("{p}-{}", self.spec.pipeline.id))
                 .clone(),
-            sequence_column: None,
+            sequence_column: tbl.sequence_column.clone(),
         })
     }
 
@@ -487,12 +515,17 @@ impl PlanCatalog {
 
     /// Missing table object metadata for referenced tables (pre-deploy
     /// preflight — a missing table rejects the whole plan, no half-assembled
-    /// pipeline starts).
+    /// pipeline starts). Dim references (T-D1) are part of the statement's
+    /// table-object needs — their metadata (kind=dim + bootstrap +
+    /// sequence_column) must ride with the plan too.
     pub fn missing_tables(&self) -> Vec<String> {
         let mut refs = std::collections::BTreeSet::new();
         for s in &self.statements {
             refs.insert(&s.source);
             refs.insert(&s.sink);
+            for d in &s.dims {
+                refs.insert(&d.reference);
+            }
         }
         refs.iter()
             .filter(|r| !self.tables.contains_key(r.as_str()))
@@ -606,11 +639,129 @@ select_sql = "SELECT * FROM src"
             "jdbc is the SOURCE kind — distinct from the JDBC_TABLE→doris sink alias"
         );
         assert_eq!(normalize_kind("starrocks"), "starrocks");
+        // T-D1: the dimension kind (broadcast join side)
+        assert_eq!(normalize_kind("DIM"), "dim");
+        assert_eq!(normalize_kind("dim"), "dim");
         assert_eq!(
             normalize_kind("mqtt"),
             "mqtt",
             "unknown kinds pass through lowercased"
         );
+    }
+
+    /// T-D1: a FileCatalog dim table declaration carries kind=dim +
+    /// sequence_column (the PK / unique column used as the full-table load
+    /// pagination key) through resolve(); a statement's dims ride the
+    /// StatementSpec (`dims` serde-defaults empty — old plan bodies and tomls
+    /// stay valid).
+    #[test]
+    fn file_catalog_dim_table_and_statement_dims() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("tailrace-cat-dim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let f = dir.join("dim.toml");
+        std::fs::write(
+            &f,
+            r#"
+[pipeline]
+id = 43
+name = "dim-demo"
+
+[[datasource]]
+name = "db"
+type = "mysql"
+bootstrap = "mysql://root@localhost/test"
+
+[[table]]
+datasource = "db"
+name = "users"
+kind = "dim"
+columns = [["id", "int64"], ["name", "utf8"]]
+sequence_column = "id"
+
+[[statement]]
+source = "k.orders"
+group = "tr.p43.s0"
+sink = "k.orders_wide"
+select_sql = "SELECT s.uid, d.name FROM src s LEFT JOIN dim_d d ON s.uid = d.id"
+
+[[statement.dims]]
+reference = "db.users"
+name = "dim_d"
+"#,
+        )?;
+        let cat = FileCatalog::load(&f)?;
+        let stmts = cat.statements()?;
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(
+            stmts[0].dims,
+            vec![DimJoin {
+                reference: "db.users".into(),
+                name: "dim_d".into()
+            }],
+            "toml-declared dims parse into StatementSpec.dims"
+        );
+        let dim = cat.resolve("db.users")?;
+        assert_eq!(dim.kind, "dim", "kind=dim normalizes to the dim key");
+        assert_eq!(
+            dim.bootstrap.as_deref(),
+            Some("mysql://root@localhost/test")
+        );
+        assert_eq!(dim.sequence_column.as_deref(), Some("id"));
+        assert_eq!(dim.columns.len(), 2);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// T-D1: the plan preflight (`missing_tables`) counts dim references — a
+    /// dim join whose table object metadata did not ride with the plan
+    /// rejects the whole plan up front (not at first assembly).
+    #[test]
+    fn plan_preflight_counts_dim_references() {
+        let stmt = StatementSpec {
+            source: "1.local.input".into(),
+            group: "tr.p7.s0".into(),
+            sink: "1.local.out".into(),
+            pushdown: vec![],
+            select_sql: "SELECT s.uid, d.name FROM src s LEFT JOIN dim_d d ON s.uid = d.id".into(),
+            start_offset: None,
+            dims: vec![DimJoin {
+                reference: "2.db.dim_user".into(),
+                name: "dim_d".into(),
+            }],
+        };
+        let table = |r: &str| PlanTableObject {
+            reference: r.into(),
+            kind: "file".into(),
+            format: None,
+            columns: vec![],
+            bootstrap: None,
+            stream_load_url: None,
+            auth_env: None,
+            sequence_column: None,
+        };
+        // source/sink present, dim metadata missing → the dim reference is
+        // the reported gap
+        let cat = PlanCatalog::new(
+            7,
+            vec![stmt.clone()],
+            vec![table("1.local.input"), table("1.local.out")],
+        );
+        assert_eq!(cat.missing_tables(), vec!["2.db.dim_user".to_string()]);
+        // all three present → no gap
+        let cat = PlanCatalog::new(
+            7,
+            vec![stmt],
+            vec![
+                table("1.local.input"),
+                table("1.local.out"),
+                PlanTableObject {
+                    kind: "dim".into(),
+                    sequence_column: Some("id".into()),
+                    ..table("2.db.dim_user")
+                },
+            ],
+        );
+        assert!(cat.missing_tables().is_empty());
     }
 
     #[test]
