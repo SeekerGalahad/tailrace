@@ -1,6 +1,7 @@
 //! Datasource endpoints (§4.2): type registry (dynamic-form single fact
 //! source), CRUD with generation CAS + credential split, connectivity
-//! probes, table-object registration.
+//! probes, table-object registration, and the T-A1 create-table closed loop
+//! (DDL draft → human-confirmed execute → evolve, every execution audited).
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -1412,6 +1413,686 @@ pub async fn remove_table(
     axum::http::StatusCode::NO_CONTENT.into_response()
 }
 
+// ---------------- DDL closed loop (T-A1, blueprint §7.2) ----------------
+//
+// Four steps: infer (the registered columns_json) → draft (pure generator,
+// every guess annotated) → human confirm (key model is mandatory) → execute
+// + audit. The console owns gating and audit; `tailrace-ddl` composes the
+// text and `tailrace-metadata::mysql_exec` runs it verbatim. `evolve` is the
+// additive follow-up: registered columns the live table lacks become
+// `ADD COLUMN` (Light Schema Change); anything else — a retyped or dropped
+// column — is a suggestion, never executed.
+
+/// T-A1 ⑤ / blueprint red line: Doris rejects partial-column updates on a
+/// table with a schema change in flight. Rides every evolve response (and
+/// the 409 refs) so the wizard and the future T-A7 partial-update toggle
+/// surface the same exclusivity rule from one place.
+const PARTIAL_UPDATE_NOTICE: &str = "Doris 限制：Schema Change 进行中的表不支持部分列更新（partial update）。本次 ADD COLUMN 变更完成前（SHOW ALTER TABLE COLUMN 状态为 FINISHED）请勿对该表启用部分列更新写入；部分列更新（T-A7）落地后同样遵守此互斥规则。";
+
+/// Wizard round-two hints fed back into the draft generator — all optional:
+/// the first call sends `{}` (or no body) and gets the heuristic draft with
+/// its 「猜测」 flags; a regenerate sends what the human confirmed.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DdlDraftBody {
+    /// Confirmed key column — clears `keyColumnGuessed` in the response.
+    pub key_column: Option<String>,
+    /// Key-model override: `unique` / `duplicate` (the recommendation stands
+    /// when absent).
+    pub key_model: Option<String>,
+    /// `replication_num` property. The caller probes the BE count (`SHOW
+    /// BACKENDS`) — `1` on a single-BE cluster, or CREATE TABLE fails on the
+    /// default replication; absent = property omitted (cluster default).
+    pub replication_num: Option<u32>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DdlPartitionDto {
+    pub column: String,
+    /// Name-based guess (the four-type vocabulary has no time type yet).
+    pub guessed: bool,
+}
+
+/// Draft output (§7.2 ③): the exact DDL text plus every annotation the
+/// wizard highlights — key model + reason, key column + guess flag,
+/// partition candidate, plain-column notes — and the registered columns it
+/// was built from (column-confirm step).
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DdlDraftResponse {
+    /// Full `CREATE TABLE` text — previewed verbatim, executed verbatim.
+    pub ddl: String,
+    /// `unique` / `duplicate`.
+    pub key_model: String,
+    pub key_model_reason: String,
+    /// The column the key clause and hash distribution ride on (highlight).
+    pub key_column: String,
+    /// `true` = id / `*_id` / first-column heuristic — the 「猜测」 badge;
+    /// the human confirms it (or picks another) before execute.
+    pub key_column_guessed: bool,
+    pub partition: Option<DdlPartitionDto>,
+    pub notes: Vec<String>,
+    /// Registered `[name, type]` pairs (the `columnsJson` wire shape).
+    pub columns: Vec<(String, String)>,
+    pub sequence_column: Option<String>,
+}
+
+/// Execute body: the draft text echoed back verbatim plus the key model the
+/// human confirmed. `keyModel` absent → 422 and nothing reaches Doris (§7.2
+/// 「不选键模型不给执行」).
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DdlExecuteBody {
+    pub ddl: Option<String>,
+    /// `unique` / `duplicate` — must match the key clause in `ddl`.
+    pub key_model: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DdlExecuteResponse {
+    pub ok: bool,
+    pub key_model: String,
+    pub elapsed_ms: u64,
+    pub rows_affected: u64,
+}
+
+/// Evolve outcome (200): the `ADD COLUMN` statements that ran — empty with
+/// `changed:false` when the live table already carries every registered
+/// column.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DdlEvolveResponse {
+    pub changed: bool,
+    pub statements: Vec<String>,
+    pub added: Vec<(String, String)>,
+    pub elapsed_ms: u64,
+    /// Doris partial-update exclusivity (T-A1 ⑤ / T-A7).
+    pub partial_update_notice: String,
+}
+
+/// Four-type vocabulary → Doris column type for evolve's ALTER text. Mirrors
+/// `tailrace_ddl`'s private `doris_type` (same §7.1 rows: the generator owns
+/// the CREATE TABLE side, this is the ALTER side — keep the two in step
+/// until G2 widens the vocabulary). Unknown → `None`: explicit 400, no
+/// silent fold.
+fn doris_column_type(vocab: &str) -> Option<&'static str> {
+    match vocab {
+        "utf8" => Some("VARCHAR(65533)"),
+        "int64" => Some("BIGINT"),
+        "float64" => Some("DOUBLE"),
+        "bool" => Some("BOOLEAN"),
+        _ => None,
+    }
+}
+
+/// Backtick-quote body for one identifier: backticks doubled, empty and NUL
+/// rejected (the metadata / ddl crates' discipline).
+fn ddl_ident(name: &str) -> anyhow::Result<String> {
+    if name.is_empty() || name.contains('\0') {
+        anyhow::bail!("illegal identifier (empty or NUL)");
+    }
+    Ok(name.replace('`', "``"))
+}
+
+/// `unique` / `duplicate` (case-insensitive) → key model.
+fn parse_key_model(s: &str) -> Option<tailrace_ddl::KeyModel> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "unique" => Some(tailrace_ddl::KeyModel::Unique),
+        "duplicate" => Some(tailrace_ddl::KeyModel::Duplicate),
+        _ => None,
+    }
+}
+
+/// Column-set diff behind evolve (pure, unit-tested): `current` = `DESC`
+/// folded through the four-type vocabulary, `target` = registered
+/// columns_json. Names compare case-insensitively (Doris column names are),
+/// types exactly.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct EvolvePlan {
+    /// In target, not in current — the only change evolve executes.
+    added: Vec<(String, String)>,
+    /// In current, not in target — `DROP COLUMN` suggestion, never executed.
+    removed: Vec<(String, String)>,
+    /// Same name, different vocabulary — `(name, registered, current)`;
+    /// `MODIFY COLUMN` suggestion, never executed.
+    retyped: Vec<(String, String, String)>,
+}
+
+fn diff_columns(current: &[(String, String)], target: &[(String, String)]) -> EvolvePlan {
+    let find = |set: &[(String, String)], name: &str| {
+        set.iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .cloned()
+    };
+    let mut plan = EvolvePlan::default();
+    for (name, ty) in target {
+        match find(current, name) {
+            None => plan.added.push((name.clone(), ty.clone())),
+            Some((_, have)) if &have != ty => plan.retyped.push((name.clone(), ty.clone(), have)),
+            Some(_) => {}
+        }
+    }
+    for (name, ty) in current {
+        if find(target, name).is_none() {
+            plan.removed.push((name.clone(), ty.clone()));
+        }
+    }
+    plan
+}
+
+/// One `ALTER TABLE … ADD COLUMN … AFTER <prev>` per added column (Light
+/// Schema Change): the first rides after the table's current last column,
+/// each next after the one before it — declaration order preserved, every
+/// statement individually reported by `mysql_exec`.
+fn add_column_statements(
+    db: &str,
+    table: &str,
+    current_last: &str,
+    added: &[(String, String)],
+) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::with_capacity(added.len());
+    let mut after = current_last.to_string();
+    for (name, ty) in added {
+        let doris = doris_column_type(ty).ok_or_else(|| {
+            anyhow::anyhow!("column {name:?}: type {ty:?} outside the vocabulary")
+        })?;
+        out.push(format!(
+            "ALTER TABLE `{}`.`{}` ADD COLUMN `{}` {} AFTER `{}`;",
+            ddl_ident(db)?,
+            ddl_ident(table)?,
+            ddl_ident(name)?,
+            doris,
+            ddl_ident(&after)?
+        ));
+        after = name.clone();
+    }
+    Ok(out)
+}
+
+/// 409 suggestion text — everything the diff found, in the order a human
+/// would apply it: ADD (exactly what evolve would run), then MODIFY to the
+/// registered type, then DROP. Composed, returned, never executed here
+/// (§7.2: 改类型/删列 给建议不执行).
+fn suggested_statements(
+    db: &str,
+    table: &str,
+    current_last: &str,
+    plan: &EvolvePlan,
+) -> anyhow::Result<Vec<String>> {
+    let mut out = add_column_statements(db, table, current_last, &plan.added)?;
+    for (name, want, _have) in &plan.retyped {
+        let doris = doris_column_type(want).ok_or_else(|| {
+            anyhow::anyhow!("column {name:?}: type {want:?} outside the vocabulary")
+        })?;
+        out.push(format!(
+            "ALTER TABLE `{}`.`{}` MODIFY COLUMN `{}` {};",
+            ddl_ident(db)?,
+            ddl_ident(table)?,
+            ddl_ident(name)?,
+            doris
+        ));
+    }
+    for (name, _) in &plan.removed {
+        out.push(format!(
+            "ALTER TABLE `{}`.`{}` DROP COLUMN `{}`;",
+            ddl_ident(db)?,
+            ddl_ident(table)?,
+            ddl_ident(name)?
+        ));
+    }
+    Ok(out)
+}
+
+/// Shared preamble of the three DDL endpoints: the datasource exists and is
+/// a Doris-dialect target (doris / starrocks — the generated text is Doris
+/// DDL, a MySQL server would not take it), and the table object is
+/// registered under it.
+fn ddl_target(
+    state: &AppState,
+    id: i64,
+    db: &str,
+    table: &str,
+) -> Result<(console_store::Datasource, console_store::TableObject), Response> {
+    let store = state.store();
+    let Some(ds) = store.datasource(id).ok().flatten() else {
+        return Err(super::messages::not_found(
+            "err.datasource.not_found",
+            &[&id.to_string()],
+        ));
+    };
+    if !matches!(ds.ds_type.as_str(), "doris" | "starrocks") {
+        return Err(super::messages::bad_request(
+            "err.ddl.datasource_kind",
+            &[&ds.ds_type],
+        ));
+    }
+    let Some(t) = store.table_object_by_ref(id, db, table).ok().flatten() else {
+        return Err(super::messages::not_found(
+            "err.ddl.table_unregistered",
+            &[db, table],
+        ));
+    };
+    Ok((ds, t))
+}
+
+/// Registered `[name, type]` pairs of a DDL target — 400 when the object
+/// was registered without columns (nothing to draft from or diff against).
+fn registered_columns(
+    state: &AppState,
+    t: &console_store::TableObject,
+) -> Result<Vec<(String, String)>, Response> {
+    let raw = state
+        .store()
+        .table_object_columns_json(t.id)
+        .map_err(|e| ApiError::internal(&e).into_response())?
+        .flatten();
+    let Some(raw) = raw else {
+        return Err(super::messages::bad_request(
+            "err.ddl.columns_missing",
+            &[&t.db_name, &t.table_name],
+        ));
+    };
+    let cols: Vec<(String, String)> =
+        serde_json::from_str(&raw).map_err(|e| ApiError::internal(&(e.into())).into_response())?;
+    if cols.is_empty() {
+        return Err(super::messages::bad_request(
+            "err.ddl.columns_missing",
+            &[&t.db_name, &t.table_name],
+        ));
+    }
+    Ok(cols)
+}
+
+/// Wall time + affected rows summed over a batch outcome.
+fn exec_totals(outcome: &tailrace_metadata::ExecOutcome) -> (u64, u64) {
+    outcome.statements.iter().fold((0, 0), |(ms, rows), s| {
+        (ms + s.elapsed.as_millis() as u64, rows + s.rows_affected)
+    })
+}
+
+/// `POST /api/datasources/{id}/tables/{db}/{table}/ddl/draft` (T-A1 ①+②):
+/// the registered columns through the pure generator — full DDL text, key
+/// model + reason, key column highlight with its 「猜测」 flag, partition
+/// candidate. Read-only (nothing touches Doris, nothing is audited); the
+/// body carries the human's round-two confirmations, if any.
+#[utoipa::path(
+    post,
+    path = "/api/datasources/{id}/tables/{db}/{table}/ddl/draft",
+    request_body = DdlDraftBody,
+    params(("id" = i64, Path), ("db" = String, Path), ("table" = String, Path)),
+    responses(
+        (status = 200, body = DdlDraftResponse),
+        (status = 400, body = ErrorResponse, description = "not a doris/starrocks datasource / no registered columns / hint names an unknown column or type"),
+        (status = 404, body = ErrorResponse, description = "datasource or table object not registered"),
+    )
+)]
+pub async fn ddl_draft(
+    State(state): State<AppState>,
+    Path((id, db, table)): Path<(i64, String, String)>,
+    body: Bytes,
+) -> Response {
+    // no body = first round (pure heuristics); otherwise the confirmed hints
+    let body: DdlDraftBody = if body.is_empty() {
+        DdlDraftBody::default()
+    } else {
+        match parse_body(&body) {
+            Ok(v) => v,
+            Err(r) => return r,
+        }
+    };
+    let (_ds, t) = match ddl_target(&state, id, db.trim(), table.trim()) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let columns = match registered_columns(&state, &t) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let key_model = match body
+        .key_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        None => None,
+        Some(s) => match parse_key_model(s) {
+            Some(m) => Some(m),
+            None => return super::messages::bad_request("err.ddl.key_model_unknown", &[s]),
+        },
+    };
+    let hints = tailrace_ddl::KeyHints {
+        sequence_column: t.sequence_column.clone(),
+        key_column: body
+            .key_column
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        key_model,
+        replication_num: body.replication_num,
+    };
+    let schema = tailrace_ddl::Schema {
+        db: t.db_name.clone(),
+        table: t.table_name.clone(),
+        columns: columns.clone(),
+    };
+    match tailrace_ddl::generate_draft(&schema, &hints) {
+        Ok(d) => Json(DdlDraftResponse {
+            ddl: d.ddl,
+            key_model: d.key_model.name().to_string(),
+            key_model_reason: d.key_model_reason,
+            key_column: d.key_column,
+            key_column_guessed: d.key_column_guessed,
+            partition: d.partition.map(|p| DdlPartitionDto {
+                column: p.column,
+                guessed: p.guessed,
+            }),
+            notes: d.notes,
+            columns,
+            sequence_column: t.sequence_column,
+        })
+        .into_response(),
+        // generator refusals (type outside the vocabulary, a hint naming an
+        // unknown column, …) are client-input problems, surfaced verbatim
+        Err(e) => ApiError::bad_request(e.to_string()).into_response(),
+    }
+}
+
+/// `POST /api/datasources/{id}/tables/{db}/{table}/ddl/execute` (T-A1 ③+④):
+/// run the echoed draft through `mysql_exec` once the key model is
+/// confirmed. Gate first — `keyModel` absent/unknown, `ddl` absent, or a
+/// `ddl` whose key clause contradicts `keyModel` → 422 before any
+/// connection is opened. The attempt is audited either way: the full DDL
+/// text and wall time on success, the Doris message on failure (which is
+/// also what the 502 carries, verbatim — §7.2 ④ 失败原样回传). Statements
+/// run as sent: no rewriting, no allowlist — the confirmed text is the gate.
+#[utoipa::path(
+    post,
+    path = "/api/datasources/{id}/tables/{db}/{table}/ddl/execute",
+    request_body = DdlExecuteBody,
+    params(("id" = i64, Path), ("db" = String, Path), ("table" = String, Path)),
+    responses(
+        (status = 200, body = DdlExecuteResponse),
+        (status = 400, body = ErrorResponse, description = "not a doris/starrocks datasource / connJson unparsable"),
+        (status = 404, body = ErrorResponse),
+        (status = 422, body = ErrorResponse, description = "KEY_MODEL_REQUIRED / DDL_REQUIRED / KEY_MODEL_MISMATCH — confirmation incomplete, nothing executed"),
+        (status = 502, body = ErrorResponse, description = "DDL_FAILED — the Doris error verbatim"),
+    )
+)]
+pub async fn ddl_execute(
+    State(state): State<AppState>,
+    axum::Extension(ctx): axum::Extension<AuthContext>,
+    headers: axum::http::HeaderMap,
+    Path((id, db, table)): Path<(i64, String, String)>,
+    body: Bytes,
+) -> Response {
+    let body: DdlExecuteBody = match parse_body(&body) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let (ds, t) = match ddl_target(&state, id, db.trim(), table.trim()) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    // §7.2 gate: an unconfirmed key model never reaches Doris
+    let key_model = match body
+        .key_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        None => {
+            return super::messages::respond(
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "KEY_MODEL_REQUIRED",
+                "err.ddl.key_model_required",
+                &[],
+            )
+        }
+        Some(s) => match parse_key_model(s) {
+            Some(m) => m,
+            None => {
+                return super::messages::respond(
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                    "KEY_MODEL_REQUIRED",
+                    "err.ddl.key_model_unknown",
+                    &[s],
+                )
+            }
+        },
+    };
+    let ddl = match body.ddl.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(d) => d.to_string(),
+        None => {
+            return super::messages::respond(
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "DDL_REQUIRED",
+                "err.ddl.ddl_missing",
+                &[],
+            )
+        }
+    };
+    // the echoed text must encode the confirmed model — a stale draft or a
+    // mismatched client would otherwise audit a lie
+    if !ddl.to_ascii_uppercase().contains(key_model.sql()) {
+        return super::messages::respond(
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "KEY_MODEL_MISMATCH",
+            "err.ddl.key_model_mismatch",
+            &[key_model.name(), key_model.sql()],
+        );
+    }
+    let spec = match conn_spec(&state, &ds) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let store = state.store();
+    let operator = operator_of(&ctx, &headers);
+    match tailrace_metadata::mysql_exec(&spec, &[&ddl]).await {
+        Ok(outcome) => {
+            let (elapsed_ms, rows_affected) = exec_totals(&outcome);
+            audit(
+                store,
+                &operator,
+                "TABLE_DDL_EXECUTE",
+                "table_object",
+                Some(t.id.to_string()),
+                Some(
+                    json!({
+                        "datasourceId": id, "dbName": t.db_name, "tableName": t.table_name,
+                        "keyModel": key_model.name(), "ddl": ddl, "elapsedMs": elapsed_ms, "ok": true
+                    })
+                    .to_string(),
+                ),
+            );
+            Json(DdlExecuteResponse {
+                ok: true,
+                key_model: key_model.name().to_string(),
+                elapsed_ms,
+                rows_affected,
+            })
+            .into_response()
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            audit(
+                store,
+                &operator,
+                "TABLE_DDL_EXECUTE",
+                "table_object",
+                Some(t.id.to_string()),
+                Some(
+                    json!({
+                        "datasourceId": id, "dbName": t.db_name, "tableName": t.table_name,
+                        "keyModel": key_model.name(), "ddl": ddl, "ok": false, "error": msg
+                    })
+                    .to_string(),
+                ),
+            );
+            super::messages::respond(
+                axum::http::StatusCode::BAD_GATEWAY,
+                "DDL_FAILED",
+                "err.ddl.execute_failed",
+                &[&msg],
+            )
+        }
+    }
+}
+
+/// `POST /api/datasources/{id}/tables/{db}/{table}/ddl/evolve` (T-A1 ③
+/// evolve): `DESC` the live table (through the same metadata client
+/// infer-schema uses, so Doris types fold to the four-type vocabulary and
+/// the diff compares like with like) against the registered columns.
+/// Registered-but-missing columns become chained `ADD COLUMN … AFTER`
+/// statements, executed and audited. A retyped or dropped column → 409 with
+/// the full suggestion text in `refs.suggestedDdl`, nothing executed. Every
+/// outcome carries the partial-update exclusivity notice (T-A1 ⑤). No
+/// request body.
+#[utoipa::path(
+    post,
+    path = "/api/datasources/{id}/tables/{db}/{table}/ddl/evolve",
+    params(("id" = i64, Path), ("db" = String, Path), ("table" = String, Path)),
+    responses(
+        (status = 200, body = DdlEvolveResponse, description = "ADD COLUMN statements ran (changed:true) or nothing to do (changed:false)"),
+        (status = 400, body = ErrorResponse, description = "not a doris/starrocks datasource / no registered columns / column type outside the vocabulary"),
+        (status = 404, body = ErrorResponse),
+        (status = 409, body = ErrorResponse, description = "SCHEMA_CHANGE_UNSUPPORTED — retype/drop detected; refs.suggestedDdl / retyped / removed / added / partialUpdateNotice, nothing executed"),
+        (status = 502, body = ErrorResponse, description = "UNAVAILABLE (DESC failed) / DDL_FAILED (Doris refused an ADD COLUMN)"),
+    )
+)]
+pub async fn ddl_evolve(
+    State(state): State<AppState>,
+    axum::Extension(ctx): axum::Extension<AuthContext>,
+    headers: axum::http::HeaderMap,
+    Path((id, db, table)): Path<(i64, String, String)>,
+) -> Response {
+    let (ds, t) = match ddl_target(&state, id, db.trim(), table.trim()) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let target = match registered_columns(&state, &t) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    // every registered column must map to a Doris type before any ALTER text
+    // is composed (no silent fold — the generator's stance)
+    if let Some((name, ty)) = target
+        .iter()
+        .find(|(_, ty)| doris_column_type(ty).is_none())
+    {
+        return super::messages::bad_request("err.ddl.column_unknown_type", &[name, ty]);
+    }
+    let spec = match conn_spec(&state, &ds) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let current =
+        match tailrace_metadata::infer_schema(&spec, &t.db_name, &t.table_name, None, 1).await {
+            Ok(s) => s.columns,
+            Err(e) => return unavailable("DESC 表结构失败", e),
+        };
+    // DESC never returns an empty row set (the metadata client bails on it);
+    // an empty name would be refused by ddl_ident anyway
+    let current_last = current.last().map(|(n, _)| n.clone()).unwrap_or_default();
+    let plan = diff_columns(&current, &target);
+    if !plan.removed.is_empty() || !plan.retyped.is_empty() {
+        let suggested = match suggested_statements(&t.db_name, &t.table_name, &current_last, &plan)
+        {
+            Ok(s) => s,
+            Err(e) => return ApiError::bad_request(e.to_string()).into_response(),
+        };
+        let retyped: Vec<Value> = plan
+            .retyped
+            .iter()
+            .map(|(n, want, have)| json!({"column": n, "registered": want, "current": have}))
+            .collect();
+        let mut refs = Map::new();
+        refs.insert("suggestedDdl".into(), json!(suggested));
+        refs.insert("added".into(), json!(plan.added));
+        refs.insert("retyped".into(), json!(retyped));
+        refs.insert("removed".into(), json!(plan.removed));
+        refs.insert("partialUpdateNotice".into(), json!(PARTIAL_UPDATE_NOTICE));
+        let n = plan.removed.len() + plan.retyped.len();
+        return super::messages::respond_with_refs(
+            axum::http::StatusCode::CONFLICT,
+            "SCHEMA_CHANGE_UNSUPPORTED",
+            "err.ddl.schema_conflict",
+            &[&n.to_string()],
+            refs,
+        );
+    }
+    if plan.added.is_empty() {
+        return Json(DdlEvolveResponse {
+            changed: false,
+            statements: Vec::new(),
+            added: Vec::new(),
+            elapsed_ms: 0,
+            partial_update_notice: PARTIAL_UPDATE_NOTICE.to_string(),
+        })
+        .into_response();
+    }
+    let statements =
+        match add_column_statements(&t.db_name, &t.table_name, &current_last, &plan.added) {
+            Ok(s) => s,
+            Err(e) => return ApiError::bad_request(e.to_string()).into_response(),
+        };
+    let sqls: Vec<&str> = statements.iter().map(String::as_str).collect();
+    let store = state.store();
+    let operator = operator_of(&ctx, &headers);
+    match tailrace_metadata::mysql_exec(&spec, &sqls).await {
+        Ok(outcome) => {
+            let (elapsed_ms, _) = exec_totals(&outcome);
+            audit(
+                store,
+                &operator,
+                "TABLE_DDL_EVOLVE",
+                "table_object",
+                Some(t.id.to_string()),
+                Some(
+                    json!({
+                        "datasourceId": id, "dbName": t.db_name, "tableName": t.table_name,
+                        "statements": statements, "added": plan.added, "elapsedMs": elapsed_ms, "ok": true
+                    })
+                    .to_string(),
+                ),
+            );
+            Json(DdlEvolveResponse {
+                changed: true,
+                statements,
+                added: plan.added,
+                elapsed_ms,
+                partial_update_notice: PARTIAL_UPDATE_NOTICE.to_string(),
+            })
+            .into_response()
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            audit(
+                store,
+                &operator,
+                "TABLE_DDL_EVOLVE",
+                "table_object",
+                Some(t.id.to_string()),
+                Some(
+                    json!({
+                        "datasourceId": id, "dbName": t.db_name, "tableName": t.table_name,
+                        "statements": statements, "added": plan.added, "ok": false, "error": msg
+                    })
+                    .to_string(),
+                ),
+            );
+            super::messages::respond(
+                axum::http::StatusCode::BAD_GATEWAY,
+                "DDL_FAILED",
+                "err.ddl.execute_failed",
+                &[&msg],
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1462,5 +2143,105 @@ mod tests {
             cache_get(8, 3, r#"{"bootstrap":"a:9092"}"#).is_none(),
             "other id misses"
         );
+    }
+
+    fn cols(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(n, t)| (n.to_string(), t.to_string()))
+            .collect()
+    }
+
+    /// T-A1 evolve, branch ① (add-only): registered columns the live table
+    /// lacks become chained `ADD COLUMN … AFTER` statements in declaration
+    /// order — the first after DESC's last column, each next after the one
+    /// before it; nothing else is flagged.
+    #[test]
+    fn evolve_add_only_chains_after_last_column() {
+        let current = cols(&[("id", "int64"), ("name", "utf8")]);
+        let target = cols(&[
+            ("id", "int64"),
+            ("name", "utf8"),
+            ("score", "float64"),
+            ("ok", "bool"),
+        ]);
+        let plan = diff_columns(&current, &target);
+        assert_eq!(plan.added, cols(&[("score", "float64"), ("ok", "bool")]));
+        assert!(plan.removed.is_empty(), "{plan:?}");
+        assert!(plan.retyped.is_empty(), "{plan:?}");
+        let stmts = add_column_statements("shop", "t", "name", &plan.added).unwrap();
+        assert_eq!(
+            stmts,
+            vec![
+                "ALTER TABLE `shop`.`t` ADD COLUMN `score` DOUBLE AFTER `name`;",
+                "ALTER TABLE `shop`.`t` ADD COLUMN `ok` BOOLEAN AFTER `score`;",
+            ]
+        );
+    }
+
+    /// T-A1 evolve, branch ② (409): a retyped column and a dropped column
+    /// are reported, never executed — the suggestion text carries ADD (what
+    /// evolve would run), then MODIFY to the registered type, then DROP, for
+    /// a human to weigh. Names compare case-insensitively (Doris semantics),
+    /// so `ID` vs `id` is the same column, not an add+drop pair.
+    #[test]
+    fn evolve_retype_and_drop_become_suggestions() {
+        let current = cols(&[("ID", "int64"), ("name", "utf8"), ("legacy", "utf8")]);
+        let target = cols(&[("id", "int64"), ("name", "int64"), ("extra", "bool")]);
+        let plan = diff_columns(&current, &target);
+        assert_eq!(plan.added, cols(&[("extra", "bool")]));
+        assert_eq!(
+            plan.retyped,
+            vec![("name".to_string(), "int64".to_string(), "utf8".to_string())]
+        );
+        assert_eq!(plan.removed, cols(&[("legacy", "utf8")]));
+        let s = suggested_statements("shop", "t", "legacy", &plan).unwrap();
+        assert_eq!(
+            s,
+            vec![
+                "ALTER TABLE `shop`.`t` ADD COLUMN `extra` BOOLEAN AFTER `legacy`;",
+                "ALTER TABLE `shop`.`t` MODIFY COLUMN `name` BIGINT;",
+                "ALTER TABLE `shop`.`t` DROP COLUMN `legacy`;",
+            ]
+        );
+    }
+
+    /// Live table already matches the registration → empty plan (the
+    /// `changed:false` 200).
+    #[test]
+    fn evolve_unchanged_is_empty_plan() {
+        let current = cols(&[("id", "int64"), ("Name", "utf8")]);
+        let target = cols(&[("ID", "int64"), ("name", "utf8")]);
+        assert_eq!(diff_columns(&current, &target), EvolvePlan::default());
+    }
+
+    /// ALTER text hygiene: a type outside the four-type vocabulary is an
+    /// explicit error (no silent fold), backticks in identifiers are doubled
+    /// (no breakout), NUL is refused.
+    #[test]
+    fn evolve_statements_reject_unknown_type_and_quote_identifiers() {
+        let e = add_column_statements("db", "t", "id", &cols(&[("ts", "timestamp")]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("timestamp"), "{e}");
+        let s = add_column_statements("d`b", "t", "i`d", &cols(&[("na`me", "utf8")])).unwrap();
+        assert_eq!(
+            s,
+            vec!["ALTER TABLE `d``b`.`t` ADD COLUMN `na``me` VARCHAR(65533) AFTER `i``d`;"]
+        );
+        assert!(add_column_statements("db", "t", "id", &cols(&[("x\0", "utf8")])).is_err());
+    }
+
+    #[test]
+    fn key_model_parses_case_insensitively() {
+        assert_eq!(
+            parse_key_model(" Unique "),
+            Some(tailrace_ddl::KeyModel::Unique)
+        );
+        assert_eq!(
+            parse_key_model("DUPLICATE"),
+            Some(tailrace_ddl::KeyModel::Duplicate)
+        );
+        assert_eq!(parse_key_model("aggregate"), None);
     }
 }

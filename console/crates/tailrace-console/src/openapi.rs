@@ -6,9 +6,10 @@ use crate::api::artifacts::{ArtifactItem, ArtifactUploaded, ArtifactsResponse};
 use crate::api::auth::{LoginRequest, LoginResponse, MeResponse, UserInfo};
 use crate::api::datasources::{
     DatasourceCreated, DatasourceItem, DatasourceListResponse, DatasourceType,
-    DatasourceTypesResponse, DatasourceUpsertBody, DiscoverBody, DiscoverResponse,
-    DiscoveredAssetDto, InferSchemaBody, InferSchemaResponse, TableListResponse, TableObjectItem,
-    TableRegisterBody, TableRegistered, TestBody, TestResponse, TypeField,
+    DatasourceTypesResponse, DatasourceUpsertBody, DdlDraftBody, DdlDraftResponse,
+    DdlEvolveResponse, DdlExecuteBody, DdlExecuteResponse, DdlPartitionDto, DiscoverBody,
+    DiscoverResponse, DiscoveredAssetDto, InferSchemaBody, InferSchemaResponse, TableListResponse,
+    TableObjectItem, TableRegisterBody, TableRegistered, TestBody, TestResponse, TypeField,
 };
 use crate::api::nodes::{
     HeartbeatBody, HeartbeatResponse, NodeCreated, NodeEcho, RegisterBody, RegisterResponse,
@@ -58,6 +59,10 @@ use crate::compile::{CompileDiag, DimJoinOut, StatementOut};
         crate::api::datasources::register_table,
         crate::api::datasources::list_tables,
         crate::api::datasources::remove_table,
+        // T-A1 create-table closed loop (§7.2)
+        crate::api::datasources::ddl_draft,
+        crate::api::datasources::ddl_execute,
+        crate::api::datasources::ddl_evolve,
         // node admin (§4.3/§4.4)
         crate::api::nodes_admin::list,
         crate::api::nodes_admin::detail,
@@ -110,6 +115,9 @@ use crate::compile::{CompileDiag, DimJoinOut, StatementOut};
         // without components entries every $ref dangled in swagger-ui)
         DiscoverResponse, DiscoveredAssetDto, InferSchemaBody, InferSchemaResponse,
         TableRegisterBody, TableRegistered, TableListResponse, TableObjectItem,
+        // T-A1 DDL closed-loop DTOs (draft / execute / evolve)
+        DdlDraftBody, DdlDraftResponse, DdlPartitionDto, DdlExecuteBody, DdlExecuteResponse,
+        DdlEvolveResponse,
         // nodes admin
         NodesListResponse, NodeListItem, NodesSummary, NodeCapacity, NodeDetail,
         ManualRegisterBody, ManualRegistered, NodeDeleteResponse,
@@ -247,5 +255,52 @@ mod tests {
             "TableObjectItem must publish sequenceColumn, got keys: {:?}",
             table.keys().collect::<Vec<_>>()
         );
+    }
+
+    /// T-A1: the three DDL closed-loop paths are published, execute declares
+    /// its 422 confirmation gate, and the draft / evolve DTOs carry the
+    /// annotation fields the wizard reads (`keyColumnGuessed` badge,
+    /// `partialUpdateNotice` exclusivity text) — pinned so swagger and the
+    /// web client cannot drift from the handlers.
+    #[test]
+    fn ddl_closed_loop_is_published() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("openapi serializes");
+        let base = "/api/datasources/{id}/tables/{db}/{table}/ddl";
+        for leaf in ["draft", "execute", "evolve"] {
+            assert!(
+                doc.pointer(&format!("/paths/{}~1{leaf}/post", base.replace('/', "~1")))
+                    .is_some(),
+                "missing POST {base}/{leaf}"
+            );
+        }
+        assert!(
+            doc.pointer(&format!(
+                "/paths/{}~1execute/post/responses/422",
+                base.replace('/', "~1")
+            ))
+            .is_some(),
+            "execute must declare the 422 key-model gate"
+        );
+        let draft = doc
+            .pointer("/components/schemas/DdlDraftResponse/properties")
+            .and_then(|v| v.as_object())
+            .expect("DdlDraftResponse.properties");
+        for k in [
+            "ddl",
+            "keyModel",
+            "keyColumn",
+            "keyColumnGuessed",
+            "partition",
+            "notes",
+        ] {
+            assert!(draft.contains_key(k), "DdlDraftResponse missing {k}");
+        }
+        let evolve = doc
+            .pointer("/components/schemas/DdlEvolveResponse/properties")
+            .and_then(|v| v.as_object())
+            .expect("DdlEvolveResponse.properties");
+        for k in ["changed", "statements", "added", "partialUpdateNotice"] {
+            assert!(evolve.contains_key(k), "DdlEvolveResponse missing {k}");
+        }
     }
 }

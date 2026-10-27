@@ -79,6 +79,20 @@ pub fn build_router_with_mcp(state: AppState, mcp_state: mcp::McpState) -> Route
             "/api/datasources/{id}/tables",
             post(api::datasources::register_table),
         )
+        // T-A1 create-table closed loop (§7.2): draft → confirm → execute,
+        // plus additive evolve
+        .route(
+            "/api/datasources/{id}/tables/{db}/{table}/ddl/draft",
+            post(api::datasources::ddl_draft),
+        )
+        .route(
+            "/api/datasources/{id}/tables/{db}/{table}/ddl/execute",
+            post(api::datasources::ddl_execute),
+        )
+        .route(
+            "/api/datasources/{id}/tables/{db}/{table}/ddl/evolve",
+            post(api::datasources::ddl_evolve),
+        )
         // node admin domain (§4.3)
         .route("/api/nodes", get(api::nodes_admin::list))
         .route("/api/nodes/manual", post(api::nodes_admin::register_manual))

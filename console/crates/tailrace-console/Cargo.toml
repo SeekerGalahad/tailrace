@@ -51,6 +51,10 @@ tailrace-catalog = { workspace = true }
 # (same pattern as the local compile parser; sqlx subcrates unify with
 # conn-jdbc through the workspace table).
 tailrace-metadata = { workspace = true }
+# T-A1 create-table closed loop: the pure DDL draft generator (console owns
+# the human-confirm step and feeds confirmed choices back in as hints; the
+# exec side is tailrace-metadata's mysql_exec).
+tailrace-ddl = { workspace = true }
 # T35 §4.4 SSH deploy chain: pure-Rust SSH transport (workspace table
 # carries the feature rationale — ring backend, no aws-lc).
 russh = { workspace = true }

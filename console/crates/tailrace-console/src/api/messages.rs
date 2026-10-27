@@ -9,10 +9,13 @@
 //! 模板占位 `{0}`..`{9}`，由 [`t`] 位置插值；渲染结果与收敛前的直写输出
 //! 逐字节一致（既有测试与前端提示不漂移）。
 //!
-//! 规模口径（T39 ③ 勘正，2026-10-23 实测；T35 增补；T-D1 dim join +6 key）：字典 **45 key**
+//! 规模口径（T39 ③ 勘正，2026-10-23 实测；T35 增补；T-D1 dim join +6 key；
+//! T-A1 建表闭环 +10 key，2026-10-28 实测）：字典 **55 key**
 //! （[`tests::KEY_LIST`] 与 `template` 同步，长度由 [`tests::templates_use_only_positional_placeholders`]
-//! 钉住）/ **63 调用点**（`grep -rn 'messages::' src/ --include='*.rs'`
-//! 排除本模块；T35 部署链 +3 key/+7 站点；T-D1 +6 站点——发布门禁 3 + 维表登记 3）。
+//! 钉住）/ **80 调用点**（`grep -rn 'messages::' src/ --include='*.rs'`
+//! 排除本模块；T35 部署链 +3 key/+7 站点；T-D1 +6 站点——发布门禁 3 + 维表登记 3；
+//! T-A1 +14 站点——draft/execute/evolve 三端点的 400/404/422/409/502 信封全部走字典，
+//! 改前实测 66，此前登记的 63 为 T-D1 后未同步的旧值）。
 //! T34 首提交 3cf738b 的「37 key/51 调用点」为双 off-by-one
 //! 误记，ffb1d55 勘正、本次落为模块事实。
 //!
@@ -137,6 +140,29 @@ fn template(key: &str) -> Option<&'static str> {
         "err.table_object.dim_sequence_required" => {
             "维表 {0} 必须声明键列 sequenceColumn（主键/单列唯一键，全表加载分页键）"
         }
+        // ---- T-A1 建表闭环（draft / execute / evolve）----
+        "err.ddl.datasource_kind" => {
+            "建表目标仅支持 doris/starrocks 数据源（生成的是 Doris 方言 DDL），当前类型 {0}"
+        }
+        "err.ddl.table_unregistered" => "表对象 {0}.{1} 未在该数据源下登记（先 POST /tables 登记）",
+        "err.ddl.columns_missing" => {
+            "表对象 {0}.{1} 未登记列清单（先 infer-schema 或登记时带 columnsJson），无法生成/演进 DDL"
+        }
+        "err.ddl.column_unknown_type" => {
+            "列 {0} 的类型 {1} 不在受支持词汇内（utf8/int64/float64/bool），G2 扩表前不静默折叠"
+        }
+        "err.ddl.key_model_required" => {
+            "缺少键模型确认：keyModel 必填（unique=UNIQUE KEY 去重 / duplicate=DUPLICATE KEY 追加）——未确认键模型不执行 DDL"
+        }
+        "err.ddl.key_model_unknown" => "未知键模型 {0}（仅 unique / duplicate）",
+        "err.ddl.ddl_missing" => "缺少 ddl 全文（须回传草稿原文执行）",
+        "err.ddl.key_model_mismatch" => {
+            "键模型 {0} 与回传 DDL 不符（DDL 未含 {1}）——请以同一草稿重新确认后执行"
+        }
+        "err.ddl.execute_failed" => "DDL 执行失败: {0}",
+        "err.ddl.schema_conflict" => {
+            "检测到改类型/删列（{0} 处），演进仅支持 ADD COLUMN——建议 DDL 已附于 refs.suggestedDdl，未执行，请人工评估"
+        }
         _ => return None,
     })
 }
@@ -229,14 +255,14 @@ mod tests {
     }
 
     /// 字典自洽：模板只含 {数字} 占位，且插值后无残留花括号。
-    /// 另钉字典规模 = 45 key（模块文档「规模口径」的机器锚点，T39 ③；T35 +3；
-    /// T-D1 dim join +6：发布门禁 3 + 维表登记 3）：
+    /// 另钉字典规模 = 55 key（模块文档「规模口径」的机器锚点，T39 ③；T35 +3；
+    /// T-D1 dim join +6：发布门禁 3 + 维表登记 3；T-A1 建表闭环 +10）：
     /// 加 key 时同步改此数与 KEY_LIST。
     #[test]
     fn templates_use_only_positional_placeholders() {
         let keys: Vec<&str> = KEY_LIST.to_vec();
         assert!(!keys.is_empty());
-        assert_eq!(keys.len(), 45, "字典规模漂移：同步模块文档「规模口径」");
+        assert_eq!(keys.len(), 55, "字典规模漂移：同步模块文档「规模口径」");
         for key in keys {
             let tpl = template(key).expect("listed key resolves");
             let mut rest = tpl;
@@ -622,5 +648,15 @@ mod tests {
         "err.table_object.kind_override",
         "err.table_object.dim_kind_datasource",
         "err.table_object.dim_sequence_required",
+        "err.ddl.datasource_kind",
+        "err.ddl.table_unregistered",
+        "err.ddl.columns_missing",
+        "err.ddl.column_unknown_type",
+        "err.ddl.key_model_required",
+        "err.ddl.key_model_unknown",
+        "err.ddl.ddl_missing",
+        "err.ddl.key_model_mismatch",
+        "err.ddl.execute_failed",
+        "err.ddl.schema_conflict",
     ];
 }
