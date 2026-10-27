@@ -5,6 +5,7 @@
 //! open + migration, admin seed, bootstrap token) and serves.
 
 pub mod api;
+pub mod backfill;
 pub mod compile;
 pub mod deploy;
 pub mod mcp;
@@ -146,6 +147,15 @@ pub fn build_router_with_mcp(state: AppState, mcp_state: mcp::McpState) -> Route
         .route(
             "/api/pipelines/{id}/metrics/trend",
             get(api::pipelines::metrics_trend),
+        )
+        // T-A2 backfill (§7.3): bounded replay + job progress surface
+        .route(
+            "/api/pipelines/{id}/backfill",
+            post(api::pipelines::backfill),
+        )
+        .route(
+            "/api/pipelines/{id}/backfill/jobs",
+            get(api::pipelines::backfill_jobs),
         )
         .layer(from_fn_with_state(
             state.clone(),

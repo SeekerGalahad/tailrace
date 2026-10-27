@@ -15,6 +15,12 @@ struct Inner {
     bootstrap: BootstrapAuthority,
     /// §4.4 artifact storage root (`<data-dir>/artifacts`).
     artifact_dir: PathBuf,
+    /// T-A2 backfill ledger root (`<data-dir>/backfill`, a sibling of the
+    /// artifact dir — derived once here so the executor and tests share the
+    /// same layout). One `bf-{jobId}` subdirectory per bounded replay job
+    /// (engine W2 `backfill_state_dir`); main-pipeline ledgers never live
+    /// here.
+    backfill_dir: PathBuf,
     /// Console → node client (30s total timeout; §4.6 proxies).
     node_client: reqwest::Client,
     /// Long-lived client for the SSE log bridge (no total timeout).
@@ -60,8 +66,12 @@ impl AppState {
             store,
             bootstrap,
             node_client: console_proxy::node_http_client().expect("node http client"),
-            stream_client: console_proxy::node_stream_client().expect("stream http client"),
-            artifact_dir,
+            stream_client: console_proxy::node_stream_client().expect("node stream client"),
+            artifact_dir: artifact_dir.clone(),
+            backfill_dir: artifact_dir
+                .parent()
+                .map(|data| data.join("backfill"))
+                .unwrap_or_else(|| PathBuf::from("./data/backfill")),
             cipher,
         }))
     }
@@ -76,6 +86,12 @@ impl AppState {
 
     pub fn artifact_dir(&self) -> &std::path::Path {
         &self.0.artifact_dir
+    }
+
+    /// T-A2: backfill ledger root (`<data-dir>/backfill`). The executor
+    /// creates per-job `bf-{jobId}` subdirectories lazily.
+    pub fn backfill_dir(&self) -> &std::path::Path {
+        &self.0.backfill_dir
     }
 
     pub fn node_client(&self) -> &reqwest::Client {

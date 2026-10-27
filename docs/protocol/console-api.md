@@ -1,17 +1,17 @@
 # Console API — console-api
 
 > 管理面 REST 协议正典（`tailrace-console` 二进制）。随 utoipa 注解同步维护；
-> 机器可读正典 = 运行时 `/api-docs/openapi.json`（47 路径），Swagger UI 在 `/swagger-ui/`。
-> 首版 2026-10-11；鉴权协议安全修复改版 2026-10-13；MCP 面正典化 + 维表（T-D1）动线增补 2026-10-27；建表闭环（T-A1）三端点增补 2026-10-28。
+> 机器可读正典 = 运行时 `/api-docs/openapi.json`（49 路径），Swagger UI 在 `/swagger-ui/`。
+> 首版 2026-10-11；鉴权协议安全修复改版 2026-10-13；MCP 面正典化 + 维表（T-D1）动线增补 2026-10-27；建表闭环（T-A1）三端点增补 2026-10-28；回填（T-A2）两端点增补 2026-10-28。
 
 ## 一、通用约定
 
 - **Base** `/api`；**认证** `POST /api/auth/login` 签发不透明 token（24h），经 `Cookie: tr_session=…`（HttpOnly; SameSite=Lax；SSE/EventSource 唯一免手工凭据通道）或 `Authorization: Bearer …` 携带。例外免会话端点：`POST /api/auth/login`、`POST /api/nodes/register`、`POST /api/nodes/heartbeat`（m2m，bootstrap/节点 token 在 JSON body 自证）。
 - **信封**：成功直返资源 JSON；失败 `HTTP 4xx/5xx + {"error":{"code","message"}}`。唯一例外：`POST /api/pipelines/compile` 的 400 按其自带 diagnostics 形态（`{"ok":false,"statements":[],"diagnostics":[…]}`），前端从 error body 读 diagnostics。
 - **操作人**：请求头 `X-Operator` 可选覆盖（默认会话用户名），落审计。
-- **错误码语义**：400 INVALID_ARGUMENT / 401 UNAUTHENTICATED·BAD_NODE_TOKEN / 404 NOT_FOUND / 409 CONFLICT·IN_USE·GENERATION_CONFLICT·SCHEMA_CHANGE_UNSUPPORTED / 413 PAYLOAD_TOO_LARGE / 422 KEY_MODEL_REQUIRED·DDL_REQUIRED·KEY_MODEL_MISMATCH（T-A1 建表确认门：确认要素缺失或自相矛盾，未触碰 Doris）/ 501 NOT_IMPLEMENTED / 502 ENGINE_UNREACHABLE·ENGINE_REJECTED·UNAVAILABLE·DDL_FAILED。
+- **错误码语义**：400 INVALID_ARGUMENT / 401 UNAUTHENTICATED·BAD_NODE_TOKEN / 404 NOT_FOUND / 409 CONFLICT·IN_USE·GENERATION_CONFLICT·SCHEMA_CHANGE_UNSUPPORTED / 413 PAYLOAD_TOO_LARGE / 422 KEY_MODEL_REQUIRED·DDL_REQUIRED·KEY_MODEL_MISMATCH（T-A1 建表确认门：确认要素缺失或自相矛盾，未触碰 Doris）·BACKFILL_SINK_UNSUPPORTED·BACKFILL_SOURCE_UNSUPPORTED·BACKFILL_DIM_UNSUPPORTED·BACKFILL_NO_CREDENTIAL·BOUNDS_TYPE_UNSUPPORTED·BOUNDS_INVALID·STATEMENT_INDEX_RANGE（T-A2 回填能力门：详见语义裁决 9，一律在创建任何 job 行之前拒绝）/ 501 NOT_IMPLEMENTED / 502 ENGINE_UNREACHABLE·ENGINE_REJECTED·UNAVAILABLE·DDL_FAILED。
 - **时间戳**：ISO-8601 UTC（`2026-10-11T08:00:00Z`；存储层 SQLite `datetime('now')` 序列化时转换）。
-- **审计**：所有管理面变更操作写 `audit_log`（DATASOURCE_CREATE/UPDATE/DELETE/TEST、TABLE_CREATE/DELETE、TABLE_DDL_EXECUTE/EVOLVE（T-A1：detail_json 带 DDL 全文 + elapsedMs + ok；执行被 Doris 拒绝同样落行，ok:false + error 原文——拒绝也是审计证据）、NODE_MANUAL_REGISTER/REVOKE/DELETE/DEPLOY/ACTION、ARTIFACT_UPLOAD/DELETE、PIPELINE_CREATE/UPDATE/DELETE/PUBLISH/DEPLOY/RECOVER/ACTION；LOGIN/NODE_REGISTER 沿用 P0；MCP 面 MCP_INITIALIZE/MCP_TOOL_CALL 见 §五）。
+- **审计**：所有管理面变更操作写 `audit_log`（DATASOURCE_CREATE/UPDATE/DELETE/TEST、TABLE_CREATE/DELETE、TABLE_DDL_EXECUTE/EVOLVE（T-A1：detail_json 带 DDL 全文 + elapsedMs + ok；执行被 Doris 拒绝同样落行，ok:false + error 原文——拒绝也是审计证据）、NODE_MANUAL_REGISTER/REVOKE/DELETE/DEPLOY/ACTION、ARTIFACT_UPLOAD/DELETE、PIPELINE_CREATE/UPDATE/DELETE/PUBLISH/DEPLOY/RECOVER/ACTION/BACKFILL（T-A2：detail 带 jobId/statementIndex/from/to/labelPrefix；dryRun 只读不审计）；LOGIN/NODE_REGISTER 沿用 P0；MCP 面 MCP_INITIALIZE/MCP_TOOL_CALL 见 §五）。
 
 ## 二、端点清单（P1 实装状态）
 
@@ -45,6 +45,7 @@
 | ✅ | GET /api/pipelines/{id}/logs?lines=200（SSE 桥：首屏 tail=1&limit 钳 50..500 → 1.5s after_seq 增量轮询；15s keepalive；300s 会话上限；引擎瞬断连续 5 次发 eof） |
 | ✅ | GET /api/pipelines/{id}/metrics/trend?hours=24（5 分钟桶；速率=相邻桶差分/300s） |
 | ✅ | GET /api/pipelines/templates（SQL 模板内嵌） |
+| ✅ | **回填（T-A2，2026-10-28；蓝图 §7.3）** `POST /api/pipelines/{id}/backfill`（body `{statementIndex?,from:{"type":"offset","value":N},to:{…},dryRun?}`——from/to 当前仅 offset 边界，file 源按字节位、kafka 源暂不支持【见语义裁决 9】；`dryRun:true` → 200 `{jobId:null,estimatedRows:null,labelPrefix}` **零副作用**——不建 job 行、不落审计、零执行；`dryRun:false` → 202 `{jobId,state:"pending",estimatedRows:null,labelPrefix}` + 审计 PIPELINE_BACKFILL + 后台执行（**控制面进程内执行**：W2 引擎 `run_bounded` + `bf-{jobId}` 台账命名空间 + Deterministic label——见语义裁决 9）；能力门 422：汇非 doris/starrocks（BACKFILL_SINK_UNSUPPORTED）/ 源非 file（BACKFILL_SOURCE_UNSUPPORTED）/ 语句含维表 JOIN（BACKFILL_DIM_UNSUPPORTED）/ 汇数据源未存凭据（BACKFILL_NO_CREDENTIAL）/ timestamp 边界（BOUNDS_TYPE_UNSUPPORTED）/ from≥to 或非整数值（BOUNDS_INVALID）/ statementIndex 越界（STATEMENT_INDEX_RANGE）——全部在创建 job 行之前拒绝） · `GET /api/pipelines/{id}/backfill/jobs`（该管道的 job 进度列表，新到旧：`{jobs:[{jobId,statementIndex,from,to,state,rowsWritten,error,createdAt,finishedAt}]}`，state 机 pending→running→done\|failed，终态不可变） |
 | ⛔ 501 | POST /api/nodes/ticket（票据链——依赖凭据加密与引擎侧 CredentialProvider，未在本阶段交付） |
 
 ## 三、关键语义裁决
@@ -88,12 +89,44 @@
    - 回退门：目标 Doris 不支持 Light Schema Change 时 ADD COLUMN 会被 FE 拒绝 → 502
      DDL_FAILED 原文回传（本波未做 FE 版本探测降级，蓝图回退门留 W6/评审轮按实测定）。
 
+9. **回填（T-A2）的执行位置与信任边界**（2026-10-28 增补）：
+   - **控制面进程内执行**是有意为之的例外（常态是「console 经 /v1 驱动 node」）：引擎侧
+     没有有界执行端点（W2 只交付了 runtime API `run_bounded` + `backfill_state_dir`），
+     而 console 已拥有有界重放所需的全部要素——已发布 spec、plan 表解析
+     （`build_plan_table` 与 deploy 共用）、密封凭据。代价：console 二进制链接执行栈
+     （datafusion/rdkafka，体积显著增大，W7 收口时复测发布体积）。
+   - **游标隔离**：执行器组装在 `<data-dir>/backfill/bf-{jobId}/`（W2 命名空间），
+     成功/失败一律不读不写主管道台账（主管道台账在引擎节点自身的 state dir，控制面
+     进程物理上不可达；console 的 `pipeline` 行也从不被执行器写入——契约测试断言行
+     逐字节稳定）。
+   - **确定性 label 族与 job 无关**：label 前缀 = `tr-p{pipelineId}-s{statementIndex}-bf`，
+     完整 label = `{前缀}-{statementIndex}-{sha256(from,to)前8位}_{批序号}`（W2 渲染）。
+     **刻意不把 jobId 编进前缀**——同区间换 job 重放必须重现同一批 label 才能触发
+     Doris「label already exists」去重（F1 的病灶正是换进程换 label）；把 jobId 编进去
+     会让每个新 job 都拿到全新 label，在 DUPLICATE KEY 表上双写——正是要修的 bug。
+     去重窗口 = Doris label 保留期（默认 3 天），超期重放靠表键模型兜底（W2 文档同款
+     警示）。汇工厂凭据来自 console 密封库（解密为 `Basic base64(user:pass)` 直连
+     stream load，不经引擎进程环境变量）。
+   - **kafka 源暂 422**：标量 `from` 无法寻址 kafka 分区游标（W2 的 `seed_from_cursor`
+     明示告警并回落到组的起始位置）——静默超集重放在 DUPLICATE KEY 表上是真数据事故，
+     诚实拒绝优于惊喜；分区级播种（console 侧预写 Kafka 游标台账）留后续批次。当前
+     可回填源 = file（from/to 为文件字节位，行精确）；`estimatedRows` 因 file 边界是
+     字节位而恒 null（真实行数看执行后 job 的 `rowsWritten`）。
+   - **job id** 为 `{yyyymmdd}-{序号}` 文本主键（进台账目录名、审计与隔离消费组
+     `bf-{jobId}.s{n}`；消费组隔离保证回填期间主管道消费组不受 rebalance 扰动）。
+   - dryRun 响应的 `jobId` 恒 null（零副作用契约：dry run 不创建任何行）；MCP
+     `trigger_backfill` 缺省 `dryRun:true`（蓝图 §7.5）。
+
 ## 四、未决 / 后续
 
 - ticket 端点（票据链，600s 单次票据）仍未交付——凭据加密静态半边已落地（见「关键语义裁决」3），票据链为 v1.x 结构性修复。
 - ~~SSH 部署链八步 + 节点进程动作~~（T35 已交付，见端点清单；「逐条暂停→执行→自动恢复」的管道级暂停编排仍留 v1.x——当前动作直接作用于进程，不自动暂停在跑管道）。
 - catalog 快照浏览 / 样本预览 / lag 告警规则 / SQL 片段助手（后续版本族；discover / infer-schema 已于 T14 交付）。~~jdbc 管道 console 端到端未通~~（T-D1 2026-10-27 清偿大半：plan 下推对 dim/jdbc 表由 connJson `jdbcUrl`（去 `jdbc:` 前缀）填 `bootstrap`、由表对象 `sequence_column` 列填 `sequence_column`——正是 jdbc 源工厂必填两键；维表动线有 console e2e 测试钉住，jdbc 流式批源动线仍未有 console 侧 e2e 覆盖，留后续补）。
 - 90s OFFLINE 目前为读时计算；未做后台定时器回写。
+- 回填（T-A2）kafka 源暂 422（分区级 from 寻址未做，见语义裁决 9）；同区间重放
+  行数不变（DUPLICATE KEY 实表）与「回填期间主管道持续写入」两条验收走 W6
+  testcontainers Doris e2e（console 契约测试已钉 dryRun 零副作用、422 门、
+  state 机、跨 job label 逐字节重现与游标隔离）；web 回填入口随 W5 交付。
 - 建表闭环（T-A1）console 侧未内置 BE 数探测（`replicationNum` 由调用方/向导传入）；
   成功建表 + `INSERT INTO` 管道写入对账、ADD COLUMN 后管道重启不失败两条验收走 W6
   testcontainers Doris e2e（console 契约测试只覆盖门禁、审计形状与不可达路径）；
@@ -117,6 +150,6 @@
 | 7 | `create_pipeline` | W | POST /api/pipelines | `name` `sqlContent` `dsMapping?` `checkpointMs?` `preferredNodeId?` `config?` + `confirm` |
 | 8 | `deploy_pipeline` | W | POST /api/pipelines/{id}/deploy | `id` `nodeId?` + `confirm` |
 | 9 | `pause_resume_pipeline` | W | POST /api/pipelines/{id}/pause·resume | `id` `action`("pause"|"resume") + `confirm` |
-| 10 | `trigger_backfill` | W | T-A2 未交付，恒 501 NOT_IMPLEMENTED | `id` `from?` `to?` `dryRun?` + `confirm` |
+| 10 | `trigger_backfill` | W | POST /api/pipelines/{id}/backfill（T-A2 已接真；`dryRun` 缺省 true——蓝图 §7.5 MCP 恒预览优先） | `id` `from` `to`（`{"type":"offset","value":N}` 对象）`statementIndex?` `dryRun?` + `confirm` |
 
 - **结果信封**：`content`（文本）+ `structuredContent`（`httpStatus` + 处理器 body 原文）+ `isError`（镜像 REST 状态）。

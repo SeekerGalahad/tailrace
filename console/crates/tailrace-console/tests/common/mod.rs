@@ -30,6 +30,9 @@ pub struct TestApp {
     pub store: Store,
     /// The app's credential cipher (§5.3) — same instance the handlers use.
     pub cipher: CredentialCipher,
+    /// The app's artifact dir (`<data>/artifacts`); T-A2 tests derive the
+    /// sibling `<data>/backfill` ledger root from its parent.
+    pub artifact_dir: std::path::PathBuf,
 }
 
 pub async fn app() -> TestApp {
@@ -64,8 +67,14 @@ async fn build(cipher: CredentialCipher, mcp: Option<McpState>) -> TestApp {
             "admin",
         )
         .unwrap();
+    // Production layout: <data-dir>/artifacts (so the T-A2 backfill root
+    // derives as the sibling <data-dir>/backfill). Nesting one level is not
+    // cosmetic — a bare temp-dir artifact_dir would collapse EVERY app's
+    // backfill root onto the same <temp>/backfill and same-day job ids
+    // (separate stores, identical "{yyyymmdd}-01" slugs) would share one
+    // bf- ledger dir.
     let artifact_dir = std::env::temp_dir().join(format!(
-        "tailrace-console-test-{}-{}",
+        "tailrace-console-test-{}-{}/artifacts",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -75,7 +84,7 @@ async fn build(cipher: CredentialCipher, mcp: Option<McpState>) -> TestApp {
     let state = AppState::new_full(
         store.clone(),
         BootstrapAuthority::new("tok-secret"),
-        artifact_dir,
+        artifact_dir.clone(),
         cipher.clone(),
     );
     let router = match mcp {
@@ -88,6 +97,7 @@ async fn build(cipher: CredentialCipher, mcp: Option<McpState>) -> TestApp {
         cookie,
         store,
         cipher,
+        artifact_dir: artifact_dir.clone(),
     }
 }
 

@@ -8,6 +8,7 @@
 
 mod artifacts;
 mod audit;
+mod backfill;
 mod datasources;
 mod models;
 mod nodes;
@@ -29,9 +30,9 @@ use rusqlite_migration::{Migrations, M};
 pub use artifacts::ArtifactInsert;
 pub use datasources::DatasourceUpdate;
 pub use models::{
-    Artifact, AuditEntry, Datasource, DatasourceCredential, DeployLogRow, NewDeployedNode,
-    NewNodeEvent, NewNodeMetrics, NewPipelineMetrics, Node, NodeEventRow, NodeMetricPoint,
-    Pipeline, PipelineTrendPoint, PipelineVersion, TableObject, User,
+    Artifact, AuditEntry, BackfillJob, Datasource, DatasourceCredential, DeployLogRow,
+    NewDeployedNode, NewNodeEvent, NewNodeMetrics, NewPipelineMetrics, Node, NodeEventRow,
+    NodeMetricPoint, Pipeline, PipelineTrendPoint, PipelineVersion, TableObject, User,
 };
 pub use password::{hash_password, verify_password};
 pub use pipelines::{PipelineFull, PipelineWrite};
@@ -44,6 +45,9 @@ fn migrations() -> Migrations<'static> {
         // T-D1: table_object.sequence_column (dim full-table load key /
         // doris UNIQUE KEY dedup basis / jdbc cursor column).
         M::up(include_str!("../migrations/01_table_sequence_column.sql")),
+        // T-A2: backfill_job — bounded-replay job rows (pending → running →
+        // done|failed), the progress surface for the console-side executor.
+        M::up(include_str!("../migrations/02_backfill_job.sql")),
     ])
 }
 
@@ -228,6 +232,9 @@ mod tests {
                     "idx_nm_node",
                     "audit_log",
                     "idx_audit_entity",
+                    // T-A2 (migration 02)
+                    "backfill_job",
+                    "idx_backfill_job_pipe",
                 ] {
                     assert!(
                         names.contains(&expected.to_string()),
@@ -236,8 +243,8 @@ mod tests {
                 }
                 let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
                 assert_eq!(
-                    version, 2,
-                    "user_version must be 2 after 00_init + 01_table_sequence_column"
+                    version, 3,
+                    "user_version must be 3 after 00_init + 01_sequence + 02_backfill_job"
                 );
                 Ok(())
             })

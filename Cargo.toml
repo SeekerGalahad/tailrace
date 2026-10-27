@@ -52,6 +52,17 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
+# T-A2 disk-footprint guard (machine-gate fix): the backfill control plane
+# made the console link the executor stack (datafusion/rdkafka), so every
+# console integration-test target grew to ~426MB of linked debuginfo and a
+# full `cargo test` no longer fit this 228GB dev disk (ld errno=28). Thin
+# the DEPENDENCY debuginfo to line tables only — workspace crates keep full
+# debug (own breakpoints intact), dev/test artifacts stay a single shared
+# cache (same settings on both profiles), and the giant rlibs
+# (datafusion_physical_plan etc. at 147MB apiece) shrink to a fraction.
+[profile.dev.package."*"]
+debug = "line-tables-only"
+
 # ---------------------------------------------------------------------------
 # Shared dependency version table (single fact source).
 # Engine side: copied from the original engine workspace, do not bump ad hoc.

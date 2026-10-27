@@ -21,9 +21,11 @@ use crate::api::nodes_admin::{
     NodeListItem, NodeMetricPointOut, NodesListResponse, NodesSummary,
 };
 use crate::api::pipelines::{
-    CompileBody, CompileResponse, DeployBody as PipeDeployBody, PipelineConfig, PipelineCreated,
-    PipelineDetailOut, PipelineListItem, PipelineUpsertBody, PipelinesListResponse,
-    PublishResponse, SqlTemplate, TemplatesResponse, TrendPoint, TrendResponse,
+    BackfillAccepted, BackfillBody, BackfillBound, BackfillDryRunOut, BackfillJobItem,
+    BackfillJobsResponse, CompileBody, CompileResponse, DeployBody as PipeDeployBody,
+    PipelineConfig, PipelineCreated, PipelineDetailOut, PipelineListItem, PipelineUpsertBody,
+    PipelinesListResponse, PublishResponse, SqlTemplate, TemplatesResponse, TrendPoint,
+    TrendResponse,
 };
 use crate::api::{ErrorBody, ErrorResponse};
 use crate::compile::{CompileDiag, DimJoinOut, StatementOut};
@@ -99,6 +101,9 @@ use crate::compile::{CompileDiag, DimJoinOut, StatementOut};
         crate::api::pipelines::logs,
         crate::api::pipelines::metrics_trend,
         crate::api::pipelines::templates,
+        // T-A2 backfill (§7.3): bounded replay + job progress surface
+        crate::api::pipelines::backfill,
+        crate::api::pipelines::backfill_jobs,
     ),
     components(schemas(
         // auth
@@ -131,6 +136,9 @@ use crate::compile::{CompileDiag, DimJoinOut, StatementOut};
         PipelineConfig, PipelineCreated, CompileBody, CompileResponse, CompileDiag,
         StatementOut, DimJoinOut, PublishResponse, PipeDeployBody, TrendResponse, TrendPoint,
         TemplatesResponse, SqlTemplate,
+        // T-A2 backfill DTOs (§7.3)
+        BackfillBody, BackfillBound, BackfillDryRunOut, BackfillAccepted, BackfillJobItem,
+        BackfillJobsResponse,
         // shared
         ErrorResponse, ErrorBody,
     )))]
@@ -301,6 +309,43 @@ mod tests {
             .expect("DdlEvolveResponse.properties");
         for k in ["changed", "statements", "added", "partialUpdateNotice"] {
             assert!(evolve.contains_key(k), "DdlEvolveResponse missing {k}");
+        }
+    }
+
+    /// T-A2: the backfill path pair is published, POST declares its 422
+    /// capability gate, and the dry-run DTO carries the blueprint §7.3
+    /// preview fields (jobId null by contract — a dry run creates nothing).
+    #[test]
+    fn backfill_surface_is_published() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("openapi serializes");
+        assert!(
+            doc.pointer("/paths/~1api~1pipelines~1{id}~1backfill/post")
+                .is_some(),
+            "missing POST /api/pipelines/{{id}}/backfill"
+        );
+        assert!(
+            doc.pointer("/paths/~1api~1pipelines~1{id}~1backfill~1jobs/get")
+                .is_some(),
+            "missing GET /api/pipelines/{{id}}/backfill/jobs"
+        );
+        assert!(
+            doc.pointer("/paths/~1api~1pipelines~1{id}~1backfill/post/responses/422")
+                .is_some(),
+            "backfill must declare the 422 capability gate"
+        );
+        let dry = doc
+            .pointer("/components/schemas/BackfillDryRunOut/properties")
+            .and_then(|v| v.as_object())
+            .expect("BackfillDryRunOut.properties");
+        for k in ["jobId", "estimatedRows", "labelPrefix"] {
+            assert!(dry.contains_key(k), "BackfillDryRunOut missing {k}");
+        }
+        let accepted = doc
+            .pointer("/components/schemas/BackfillAccepted/properties")
+            .and_then(|v| v.as_object())
+            .expect("BackfillAccepted.properties");
+        for k in ["jobId", "state", "labelPrefix"] {
+            assert!(accepted.contains_key(k), "BackfillAccepted missing {k}");
         }
     }
 }
