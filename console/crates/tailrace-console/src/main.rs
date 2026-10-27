@@ -6,7 +6,8 @@ use std::net::SocketAddr;
 use anyhow::{Context, Result};
 use console_auth::BootstrapAuthority;
 use console_store::Store;
-use tailrace_console::{build_router, state::AppState};
+use tailrace_console::mcp::{env_truthy, McpState, ALLOW_WRITE_ENV};
+use tailrace_console::{build_router_with_mcp, state::AppState};
 use tokio::net::TcpListener;
 
 const DEFAULT_ADDR: &str = "0.0.0.0:8080";
@@ -15,18 +16,24 @@ const DEFAULT_DATA_DIR: &str = "./data";
 struct Args {
     addr: String,
     data_dir: String,
+    /// T-E4 §7.5: MCP write tools are off unless this flag (or the
+    /// `MCP_ALLOW_WRITE` env) turns them on.
+    mcp_allow_write: bool,
 }
 
 fn usage() {
     eprintln!(
-        "Usage: tailrace-console [--addr <HOST:PORT>] [--data-dir <DIR>] [--version]\n\
+        "Usage: tailrace-console [--addr <HOST:PORT>] [--data-dir <DIR>] [--mcp-allow-write] [--version]\n\
          \n\
          Options:\n\
          \x20 -a, --addr <HOST:PORT>   listen address (default {DEFAULT_ADDR})\n\
          \x20 -d, --data-dir <DIR>     metadata dir, holds console.db (default {DEFAULT_DATA_DIR})\n\
+         \x20     --mcp-allow-write    enable the four MCP write tools on POST /mcp (default: read-only;\n\
+         \x20                             write calls additionally require \"confirm\": true)\n\
          \x20 -V, --version            print version and exit\n\
          \n\
          Env:\n\
+         \x20 MCP_ALLOW_WRITE           same as --mcp-allow-write (1/true/yes/on)\n\
          \x20 TAILRACE_BOOTSTRAP_TOKEN  pin the node self-registration bootstrap token\n\
          \x20                             (otherwise generated and printed once at startup)\n\
          \x20 TAILRACE_MASTER_KEY       credential master key, 32B base64 (§5.3; otherwise\n\
@@ -46,6 +53,7 @@ fn parse_args(argv: &[String]) -> Result<Args> {
     let mut args = Args {
         addr: DEFAULT_ADDR.into(),
         data_dir: DEFAULT_DATA_DIR.into(),
+        mcp_allow_write: false,
     };
     let mut i = 0;
     while i < argv.len() {
@@ -74,6 +82,13 @@ fn parse_args(argv: &[String]) -> Result<Args> {
         match flag {
             "-a" | "--addr" => args.addr = value(&mut i)?,
             "-d" | "--data-dir" => args.data_dir = value(&mut i)?,
+            // bare flag = on; `--mcp-allow-write=false` style spellings honoured
+            "--mcp-allow-write" => {
+                args.mcp_allow_write = match inline.as_deref() {
+                    Some(v) => env_truthy(Some(v)),
+                    None => true,
+                }
+            }
             other => anyhow::bail!("unknown flag {other:?} (see --help)"),
         }
         i += 1;
@@ -142,7 +157,10 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&artifact_dir)
         .with_context(|| format!("create {}", artifact_dir.display()))?;
     let state = AppState::new_full(store, bootstrap, artifact_dir, cipher);
-    let app = build_router(state);
+    // T-E4 §7.5: write tools on only by explicit flag or env — never by default.
+    let mcp_allow_write =
+        args.mcp_allow_write || env_truthy(std::env::var(ALLOW_WRITE_ENV).ok().as_deref());
+    let app = build_router_with_mcp(state, McpState::new(mcp_allow_write));
 
     let listener = TcpListener::bind(addr)
         .await
@@ -154,6 +172,14 @@ async fn main() -> Result<()> {
     tracing::info!(
         "data dir: {} | swagger: http://{addr}/swagger-ui | api doc: http://{addr}/api-docs/openapi.json",
         args.data_dir
+    );
+    tracing::info!(
+        "mcp: http://{addr}/mcp (write tools {})",
+        if mcp_allow_write {
+            "ENABLED"
+        } else {
+            "disabled"
+        }
     );
 
     axum::serve(listener, app)

@@ -17,7 +17,8 @@ use axum::{Json, Router};
 use console_auth::{hash_password, BootstrapAuthority};
 use console_store::{CredentialCipher, Store};
 use serde_json::{json, Value};
-use tailrace_console::{build_router, state::AppState};
+use tailrace_console::mcp::McpState;
+use tailrace_console::{build_router, build_router_with_mcp, state::AppState};
 use tower::ServiceExt;
 
 pub const PASSWORD: &str = "pw-123";
@@ -38,6 +39,22 @@ pub async fn app() -> TestApp {
 /// Same as [`app`] but with a caller-known cipher (lets tests verify the
 /// §5.3 seal/open roundtrip against the stored ciphertext).
 pub async fn app_with_cipher(cipher: CredentialCipher) -> TestApp {
+    build(cipher, None).await
+}
+
+/// Same as [`app`] but with the MCP write switch pinned (T-E4 §7.5) —
+/// independent of whatever `MCP_ALLOW_WRITE` the developer's shell carries.
+pub async fn app_with_mcp(allow_write: bool) -> TestApp {
+    app_with_mcp_state(McpState::new(allow_write)).await
+}
+
+/// Same as [`app`] with a fully caller-built MCP state (rate-limit budget,
+/// write switch).
+pub async fn app_with_mcp_state(mcp: McpState) -> TestApp {
+    build(CredentialCipher::ephemeral(), Some(mcp)).await
+}
+
+async fn build(cipher: CredentialCipher, mcp: Option<McpState>) -> TestApp {
     let store = Store::open_in_memory().unwrap();
     store
         .create_user(
@@ -61,7 +78,10 @@ pub async fn app_with_cipher(cipher: CredentialCipher) -> TestApp {
         artifact_dir,
         cipher.clone(),
     );
-    let router = build_router(state);
+    let router = match mcp {
+        Some(m) => build_router_with_mcp(state, m),
+        None => build_router(state),
+    };
     let cookie = login(&router).await;
     TestApp {
         router,

@@ -7,6 +7,7 @@
 pub mod api;
 pub mod compile;
 pub mod deploy;
+pub mod mcp;
 pub mod metrics;
 pub mod openapi;
 pub mod spa;
@@ -22,8 +23,15 @@ use utoipa_swagger_ui::SwaggerUi;
 use console_auth::{require_node_heartbeat, require_node_register, require_session};
 use state::AppState;
 
-/// Full application router: REST API + swagger + embedded SPA fallback.
+/// Full application router: REST API + swagger + MCP + embedded SPA
+/// fallback. The MCP write switch comes from `MCP_ALLOW_WRITE` here; main
+/// resolves the `--mcp-allow-write` flag and calls [`build_router_with_mcp`].
 pub fn build_router(state: AppState) -> Router {
+    build_router_with_mcp(state, mcp::McpState::from_env())
+}
+
+/// [`build_router`] with an explicit MCP configuration (T-E4 §7.5).
+pub fn build_router_with_mcp(state: AppState, mcp_state: mcp::McpState) -> Router {
     // Session-authenticated endpoints (§4.0: cookie tr_session / bearer).
     // Everything under /api except the m2m register/heartbeat pair and
     // login itself lives here.
@@ -159,6 +167,10 @@ pub fn build_router(state: AppState) -> Router {
         .merge(session_scoped)
         .merge(node_register)
         .merge(node_heartbeat)
+        // E4 (§7.5): MCP JSON-RPC endpoint — OPEN like /metrics (MCP
+        // convention: no console session; write tools gated by the process
+        // switch + confirm:true, every call audited as mcp:<client>).
+        .merge(mcp::router(mcp_state))
         .merge(
             SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", openapi::ApiDoc::openapi()),
         )
