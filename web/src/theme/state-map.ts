@@ -14,6 +14,7 @@ export type StateDomain =
   | 'datasource' // datasource conn status
   | 'eventLevel' // node event severity
   | 'startOffset' // pipeline start point
+  | 'backfillJob' // T-A2 backfill job state machine
 
 /** Naive-ui tag semantic slot; `neutral` renders a bordered gray tag. */
 export type TagTone = 'primary' | 'info' | 'success' | 'warning' | 'error' | 'neutral'
@@ -62,6 +63,16 @@ const startOffset: Record<string, TagTone> = {
   latest: 'warning', // skips backlog
 }
 
+// Backfill job states (T-A2, console-side executor): pending → running →
+// done | failed; terminal rows are immutable. `running` takes the deploy
+// in-progress tone.
+const backfillJob: Record<string, TagTone> = {
+  pending: 'warning',
+  running: 'primary',
+  done: 'success',
+  failed: 'error',
+}
+
 const tables: Record<StateDomain, Record<string, TagTone>> = {
   pipeline,
   node,
@@ -69,6 +80,7 @@ const tables: Record<StateDomain, Record<string, TagTone>> = {
   datasource,
   eventLevel,
   startOffset,
+  backfillJob,
 }
 
 /** Resolve a state value to its tone; unknown → neutral. */

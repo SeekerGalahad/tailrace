@@ -13,12 +13,14 @@ import StateTag from '../../components/StateTag.vue'
 import MonoField from '../../components/MonoField.vue'
 import MetricChart from '../../components/MetricChart.vue'
 import LogTerminal from '../../components/LogTerminal.vue'
+import BackfillPanel from './parts/BackfillPanel.vue'
 import { useAutoRefresh } from '../../components/useAutoRefresh'
 
 /**
  * Pipeline runtime monitor (design doc §6.5.4): stats KPI cards (5s poll,
  * front-end diff rates, counter-reset baseline), 24h uPlot trend, offsets
- * ledger view, SSE LogTerminal, meta/mapping/SQL/spec collapse, actions
+ * ledger view, backfill panel (T-A2: range → dryRun → confirm → job rows),
+ * SSE LogTerminal, meta/mapping/SQL/spec collapse, actions
  * (pause/resume/stop/recover).
  */
 
@@ -540,6 +542,10 @@ const logsUrl = computed(() => pipelinesApi.logsUrl(pipelineId, 200))
             </div>
           </NCard>
         </div>
+
+        <!-- backfill (T-A2): bounded replay with deterministic labels; the panel
+             greys out statements whose sink is not doris/starrocks -->
+        <BackfillPanel :pipeline-id="pipelineId" :detail="detail" :datasources="datasources" />
 
         <!-- SSE logs: mounted only when deployed — an undeployed pipeline has
              no engine to stream from (the bridge would emit eof:not_deployed

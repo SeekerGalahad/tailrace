@@ -185,6 +185,57 @@ export interface RecoverInput {
   nodeId: number | null
 }
 
+// ---------------- T-A2 bounded replay / backfill (blueprint §7.3) ----------------
+// dryRun → preview (zero side effects) → execute → 202 pending job → poll jobs.
+// Capability gate (422, before any job row): sink must be doris/starrocks
+// (label idempotency is the replay-dedup mechanism), source must be file.
+
+/** One replay bound. Only `offset` exists this wave (file source = byte
+ * position); timestamp bounds → 422 BOUNDS_TYPE_UNSUPPORTED. */
+export interface BackfillBound {
+  type: 'offset'
+  value: number
+}
+
+export interface BackfillInput {
+  /** Statement of the pipeline to replay (default 0). */
+  statementIndex?: number
+  from: BackfillBound
+  to: BackfillBound
+  /** true = preview only: no job row, no audit, no execution. */
+  dryRun?: boolean
+}
+
+/** 200 (dryRun, `jobId:null`, `state` absent) or 202 (accepted, `state:"pending"`). */
+export interface BackfillOutcome {
+  jobId: string | null
+  state?: string
+  /** null when the bound pair has no honest row count (byte positions) —
+   * the executed job's rowsWritten is the truth. */
+  estimatedRows: number | null
+  /** Deterministic label family: `{labelPrefix}-{statementIndex}-{sha256(from,to)[..8]}_{seq}`. */
+  labelPrefix: string
+}
+
+export type BackfillJobState = 'pending' | 'running' | 'done' | 'failed'
+
+export interface BackfillJob {
+  jobId: string
+  statementIndex: number
+  from: BackfillBound
+  to: BackfillBound
+  /** State machine pending → running → done | failed; terminal rows immutable. */
+  state: BackfillJobState | string
+  rowsWritten: number
+  error: string | null
+  createdAt: string
+  finishedAt: string | null
+}
+
+export interface BackfillJobList {
+  jobs: BackfillJob[]
+}
+
 export const pipelinesApi = {
   /** GET /api/pipelines?page=&pageSize= — 30s polling (§6.5). */
   list(params?: PipelineListParams, options?: HttpOptions): Promise<PipelineList> {
@@ -272,5 +323,17 @@ export const pipelinesApi = {
    * see sse.ts). `lines` clamps to 50..500 server-side (§4.5). */
   logsUrl(id: number | string, lines = 200): string {
     return `/api/pipelines/${id}/logs?lines=${lines}`
+  },
+
+  /** POST /api/pipelines/{id}/backfill — `dryRun:true` → 200 preview with zero
+   * side effects; otherwise 202 + pending job (console-side executor,
+   * `bf-{jobId}` ledger namespace, main cursors untouched). 422 capability gate. */
+  backfill(id: number | string, input: BackfillInput, options?: HttpOptions): Promise<BackfillOutcome> {
+    return http.post(`/api/pipelines/${id}/backfill`, input, options)
+  },
+
+  /** GET /api/pipelines/{id}/backfill/jobs — progress list, newest first. */
+  backfillJobs(id: number | string, options?: HttpOptions): Promise<BackfillJobList> {
+    return http.get(`/api/pipelines/${id}/backfill/jobs`, options)
   },
 }
