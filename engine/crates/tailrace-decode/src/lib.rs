@@ -1,9 +1,11 @@
 //! tailrace-decode: Decoder trait (bytes → Arrow columns, written straight
-//! into column builders — no row-shaped intermediate) plus ogg/json/csv/parquet
-//! decoders.
+//! into column builders — no row-shaped intermediate) plus ogg/json/csv/
+//! parquet/debezium-json decoders.
 //!
 //! ogg (Oracle GoldenGate CDC envelopes) is a generic adapter name: the payload
 //! carries `after` + three envelope columns (op_type/ogg_table/ogg_ts).
+//! debezium-json (blueprint C narrow path) consumes Debezium CDC events from
+//! Kafka: `after.*` is the row data; op=d / before-only / tombstone skip.
 //! Cross-sample typing is carried by the target schema (this crate only writes
 //! declared schema columns; inference belongs to the console discover step).
 //! parquet brings its own schema: the whole file is one batch, column-cast
@@ -445,6 +447,92 @@ impl Decoder for OggDecoder {
     }
 }
 
+// ==================== Debezium JSON (CDC envelope, after.* as row data) ====================
+
+/// Debezium JSON decoder (Kafka Connect JSON converter envelope, blueprint C
+/// narrow path — consumes Debezium events from Kafka; tailrace does not
+/// capture binlogs itself). Envelope shape:
+/// `{"before":null,"after":{"id":1,"name":"foo"},"op":"c","ts_ms":123}`.
+///
+/// v1 row semantics:
+/// - `after.*` keys write into same-named schema columns (typed chain
+///   identical to JsonDecoder/OggDecoder; nested objects/arrays in a field
+///   value decode as null, matching that family). `before`/`op`/`ts_ms` are
+///   envelope metadata and are NOT decoded into columns.
+/// - op=`d` (delete), `after` null or absent (delete / before-only /
+///   tombstone), and a bare JSON `null` message (Debezium tombstone) all
+///   Skip — v1 carries no delete marker downstream.
+/// - Malformed JSON, an `after` that is a non-object scalar/array, and a
+///   non-object non-null root (e.g. a JSON array — not a Debezium event) go
+///   Bad; the bad-row policy (DLQ/fail) decides upstream.
+///
+/// Pushdown is ignored: the op_type-keyed whitelist targets the OGG envelope
+/// column, which Debezium v1 does not decode.
+pub struct DebeziumJsonDecoder;
+
+impl DebeziumJsonDecoder {
+    /// Borrow-scoped walk (same rationale as [`JsonDecoder::walk`]).
+    fn walk(buf: &mut [u8], batch: &mut ColBatch) -> Result<(), WalkFail> {
+        let dom = match simd_json::to_borrowed_value(buf) {
+            Ok(v) => v,
+            Err(_) => return Err(WalkFail::Bad),
+        };
+        // Root must be the event object; a bare `null` is a Debezium
+        // tombstone (Skip), any other non-object root is not an event (Bad).
+        if !dom.is_object() {
+            return if dom.is_null() {
+                Err(WalkFail::Skip)
+            } else {
+                Err(WalkFail::Bad)
+            };
+        }
+        // Delete: after is null in a well-formed event — skip even an
+        // out-of-shape `d` carrying an after object (v1 drops deletes).
+        if dom.get("op").and_then(|v| v.as_str()) == Some("d") {
+            return Err(WalkFail::Skip);
+        }
+        let after = match dom.get("after") {
+            None => return Err(WalkFail::Skip), // before-only / tombstone: no row image
+            Some(v) if v.is_null() => return Err(WalkFail::Skip),
+            Some(v) if v.is_object() => v,
+            Some(_) => return Err(WalkFail::Bad), // envelope violation: after must be an object
+        };
+        let (fields, builders) = batch.parts();
+        for (i, f) in fields.iter().enumerate() {
+            let name = f.name();
+            match after.get(name.as_str()).and_then(|v| v.as_str()) {
+                Some(s) => append_str(builders[i].as_mut(), Some(s)),
+                None => {
+                    // Same typed chain as JsonDecoder/OggDecoder: floats and
+                    // bools must not fall through to NULL.
+                    let b = builders[i].as_mut();
+                    if let Some(iv) = after.get(name.as_str()).and_then(|v| v.as_i64()) {
+                        append_i64(b, iv);
+                    } else if let Some(fv) = after.get(name.as_str()).and_then(|v| v.as_f64()) {
+                        append_f64(b, fv);
+                    } else if let Some(bv) = after.get(name.as_str()).and_then(|v| v.as_bool()) {
+                        append_bool(b, bv);
+                    } else {
+                        // absent key, JSON null, or nested object/array
+                        append_str(b, None);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Decoder for DebeziumJsonDecoder {
+    fn decode(&self, mut raw: Vec<u8>, batch: &mut ColBatch, _pushdown: &Pushdown) -> Decoded {
+        match Self::walk(raw.as_mut_slice(), batch) {
+            Ok(()) => Decoded::Append,
+            Err(WalkFail::Skip) => Decoded::Skip,
+            Err(WalkFail::Bad) => Decoded::Bad(raw),
+        }
+    }
+}
+
 // ==================== CSV (RFC4180 via the csv crate, typed by target column) ====================
 
 /// CSV decoder: one RFC4180 record per message, fields written by column
@@ -732,6 +820,202 @@ mod tests {
             .downcast_ref::<BooleanArray>()
             .unwrap();
         assert!(flag.value(0), "after.* bools (was NULL)");
+    }
+
+    /// Debezium c/r/u events decode their `after` payload into same-named
+    /// columns across all typed builders; an update's `after` wins over
+    /// `before` (before/op/ts_ms are envelope metadata, never decoded).
+    #[test]
+    fn debezium_decode_c_r_u_events() {
+        use datafusion::arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("price", DataType::Float64, true),
+            Field::new("active", DataType::Boolean, true),
+        ]));
+        let mut batch = ColBatch::new(schema, 8);
+        // create
+        assert_eq!(
+            DebeziumJsonDecoder.decode(
+                br#"{"before":null,"after":{"id":1,"name":"foo","price":9.5,"active":true},"op":"c","ts_ms":123}"#.to_vec(),
+                &mut batch,
+                &Pushdown::default()
+            ),
+            Decoded::Append
+        );
+        // snapshot read
+        assert_eq!(
+            DebeziumJsonDecoder.decode(
+                br#"{"before":null,"after":{"id":2,"name":"bar","price":0.25,"active":false},"op":"r","ts_ms":124}"#.to_vec(),
+                &mut batch,
+                &Pushdown::default()
+            ),
+            Decoded::Append
+        );
+        // update: after (name=new) must win over before (name=old)
+        assert_eq!(
+            DebeziumJsonDecoder.decode(
+                br#"{"before":{"id":3,"name":"old"},"after":{"id":3,"name":"new"},"op":"u","ts_ms":125}"#.to_vec(),
+                &mut batch,
+                &Pushdown::default()
+            ),
+            Decoded::Append
+        );
+        let rb = batch.finish().unwrap();
+        assert_eq!(rb.num_rows(), 3);
+        let id = rb.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(id.value(0), 1);
+        assert_eq!(id.value(2), 3);
+        let name = rb.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(name.value(2), "new", "update after.* wins over before.*");
+        let price = rb
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(price.value(0), 9.5);
+        assert!(price.is_null(2), "absent after key → null");
+        let active = rb
+            .column(3)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(active.value(0));
+        assert!(!active.value(1));
+        assert!(active.is_null(2));
+    }
+
+    /// Delete (op=d, after=null), before-only events and Debezium tombstones
+    /// (bare JSON `null`) all Skip without appending — v1 drops deletes and
+    /// leaves the batch untouched.
+    #[test]
+    fn debezium_delete_before_only_and_tombstone_skip() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let mut batch = ColBatch::new(schema, 8);
+        let skips: Vec<&[u8]> = vec![
+            // canonical delete: after=null, before carries the pre-image
+            br#"{"before":{"id":1,"name":"foo"},"after":null,"op":"d","ts_ms":126}"#,
+            // before-only update (after key absent)
+            br#"{"before":{"id":1,"name":"foo"},"op":"u","ts_ms":127}"#,
+            // before-only with explicit after:null
+            br#"{"before":{"id":1},"after":null,"op":"u"}"#,
+            // no envelope at all — no after means no row image
+            br#"{}"#,
+            // Debezium tombstone (compact topics): bare JSON null
+            b"null",
+        ];
+        for s in skips {
+            assert_eq!(
+                DebeziumJsonDecoder.decode(s.to_vec(), &mut batch, &Pushdown::default()),
+                Decoded::Skip,
+                "{} must Skip",
+                String::from_utf8_lossy(s)
+            );
+        }
+        assert!(
+            batch.is_empty(),
+            "skipped events must leave the batch untouched"
+        );
+    }
+
+    /// Malformed JSON, a non-object root that is not a tombstone, and an
+    /// `after` that is a scalar/array go Bad — the existing bad-row path
+    /// (DLQ/fail) decides; the buffer rides along (T3 contract).
+    #[test]
+    fn debezium_malformed_goes_bad() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        for poisoned in [
+            b"not-json".to_vec(),
+            b"{\"before\":null,\"after\":{\"id\":1".to_vec(), // truncated
+            b"\xff\xfe".to_vec(),                             // invalid UTF-8
+            b"[1,2]".to_vec(),                                // not an event object
+            b"42".to_vec(),                                   // scalar root
+            br#"{"op":"c","after":7}"#.to_vec(),              // after not an object
+            br#"{"op":"c","after":[1]}"#.to_vec(),            // after not an object
+        ] {
+            let mut batch = ColBatch::new(schema.clone(), 4);
+            match DebeziumJsonDecoder.decode(poisoned.clone(), &mut batch, &Pushdown::default()) {
+                Decoded::Bad(buf) => assert_eq!(buf.len(), poisoned.len(), "buffer returned whole"),
+                other => panic!(
+                    "expected Bad for {:?}, got {:?}",
+                    String::from_utf8_lossy(&poisoned),
+                    other
+                ),
+            }
+            assert!(batch.is_empty(), "Bad rows append nothing");
+        }
+    }
+
+    /// Nested objects/arrays in field values and JSON-null field values
+    /// decode as null columns (the JsonDecoder/OggDecoder family rule);
+    /// sibling columns still decode and the row appends.
+    #[test]
+    fn debezium_nested_objects_and_null_fields() {
+        use datafusion::arrow::array::{Int64Array, StringArray};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("meta", DataType::Utf8, true),
+            Field::new("tags", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let mut batch = ColBatch::new(schema, 4);
+        assert_eq!(
+            DebeziumJsonDecoder.decode(
+                br#"{"before":null,"after":{"id":3,"meta":{"k":"v"},"tags":[1,2],"name":null},"op":"c","ts_ms":128}"#.to_vec(),
+                &mut batch,
+                &Pushdown::default()
+            ),
+            Decoded::Append
+        );
+        let rb = batch.finish().unwrap();
+        assert_eq!(rb.num_rows(), 1);
+        let id = rb.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(id.value(0), 3, "sibling columns still decode");
+        let meta = rb.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(meta.is_null(0), "nested object field → null");
+        let tags = rb.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(tags.is_null(0), "array field → null");
+        let name = rb.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(name.is_null(0), "JSON null field value → null");
+    }
+
+    /// Mixed batch — the pipeline shape: c/u append, d and tombstone skip,
+    /// one malformed row goes Bad; appended + skipped counts must net out.
+    #[test]
+    fn debezium_mixed_batch_counts() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let mut batch = ColBatch::new(schema, 8);
+        let mut appended = 0;
+        let mut skipped = 0;
+        let mut bad = 0;
+        for m in [
+            &br#"{"before":null,"after":{"id":1,"name":"a"},"op":"c","ts_ms":1}"#[..],
+            &br#"{"before":null,"after":{"id":2,"name":"b"},"op":"r","ts_ms":2}"#[..],
+            &br#"{"before":{"id":1},"after":null,"op":"d","ts_ms":3}"#[..],
+            b"null",
+            b"{garbage",
+        ] {
+            match DebeziumJsonDecoder.decode(m.to_vec(), &mut batch, &Pushdown::default()) {
+                Decoded::Append => appended += 1,
+                Decoded::Skip => skipped += 1,
+                Decoded::Bad(_) => bad += 1,
+            }
+        }
+        assert_eq!((appended, skipped, bad), (2, 2, 1));
+        assert_eq!(batch.len(), 2, "only appended rows sit in the batch");
+        let rb = batch.finish().unwrap();
+        assert_eq!(rb.num_rows(), 2);
+        assert!(
+            rb.column(0).len() == 2 && rb.column(1).len() == 2,
+            "column lengths stay equal"
+        );
     }
 
     #[test]

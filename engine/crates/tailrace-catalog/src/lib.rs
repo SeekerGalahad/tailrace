@@ -27,7 +27,9 @@ pub struct TableObject {
     /// doris/starrocks are sink-side)
     #[serde(default = "default_kind")]
     pub kind: String,
-    /// Decode format: ogg / json / jsonl / csv / parquet
+    /// Decode format: ogg / json / jsonl / csv / parquet / debezium-json
+    /// (debezium-json = CDC envelope consumed from Kafka, blueprint C narrow
+    /// path; `after.*` is the row data, deletes skip)
     pub format: Option<String>,
     /// Column definitions [name, arrow type] (v1 flat; discover output is the
     /// same shape)
