@@ -71,8 +71,17 @@ async fn mysql_connect(spec: &ConnSpec) -> anyhow::Result<(MySqlConnection, Opti
     if !password.is_empty() {
         opts = opts.password(password);
     }
-    // TLS off by configuration too, mirroring the conn-jdbc no-tls stance
-    let mut opts = opts.ssl_mode(MySqlSslMode::Disabled);
+    // TLS off by configuration too, mirroring the conn-jdbc no-tls stance.
+    // sqlx's connect-time SET adds `sql_mode=(SELECT CONCAT(@@sql_mode, ...))`
+    // when these two flags are on (their defaults) — Doris/StarRocks FEs reject
+    // non-constant SET expressions ("Set statement doesn't support non-constant
+    // expr", found by the R6 ddl_create e2e on doris 2.1.7). Neither mode
+    // matters for SHOW/DESC/DDL traffic, so switch both off: the remaining
+    // handshake SET (`time_zone='+00:00', NAMES utf8mb4`) is constant-only.
+    let mut opts = opts
+        .ssl_mode(MySqlSslMode::Disabled)
+        .pipes_as_concat(false)
+        .no_engine_substitution(false);
     if let Some(db) = database {
         opts = opts.database(db);
     }
