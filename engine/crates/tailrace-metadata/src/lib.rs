@@ -154,8 +154,10 @@ pub async fn infer_schema(
                 Some("csv") | Some("parquet") => anyhow::bail!(
                     "kafka 样本推断暂不支持 {format:?} 格式（无自描述样本），请手工登记列"
                 ),
-                Some("ogg") | Some("json") | Some("jsonl") | None => {}
-                Some(other) => anyhow::bail!("未知 decode 格式 {other:?}（ogg/json/jsonl）"),
+                Some("ogg") | Some("json") | Some("jsonl") | Some("debezium-json") | None => {}
+                Some(other) => {
+                    anyhow::bail!("未知 decode 格式 {other:?}（ogg/json/jsonl/debezium-json）")
+                }
             }
             let bootstrap = bootstrap.to_string();
             let topic2 = topic.clone();

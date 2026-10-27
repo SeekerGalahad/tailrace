@@ -24,7 +24,8 @@ use pipeline_log::PipelineLogHub;
 use tailrace_catalog::{CatalogProvider, TableObject};
 use tailrace_connector::ConnectorRegistry;
 use tailrace_decode::{
-    ColBatch, CsvDecoder, Decoded, Decoder, JsonDecoder, OggDecoder, ParquetDecoder, Pushdown,
+    ColBatch, CsvDecoder, DebeziumJsonDecoder, Decoded, Decoder, JsonDecoder, OggDecoder,
+    ParquetDecoder, Pushdown,
 };
 use tailrace_ir::{Cursor, SourceChunk};
 use tailrace_state::{FileOffsetStore, OffsetStore};
@@ -1146,6 +1147,7 @@ fn build_decoder(obj: &TableObject) -> anyhow::Result<Box<dyn Decoder>> {
         Some("json") | Some("jsonl") => Ok(Box::new(JsonDecoder)),
         Some("csv") => Ok(Box::new(CsvDecoder)),
         Some("parquet") => Ok(Box::new(ParquetDecoder)),
+        Some("debezium-json") => Ok(Box::new(DebeziumJsonDecoder)),
         Some(other) => anyhow::bail!("decode format unsupported: {other}"),
     }
 }
