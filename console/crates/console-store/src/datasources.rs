@@ -214,9 +214,13 @@ impl Store {
     /// Register a table object (§4.2). `cursor_semantics` derives from the
     /// kind: kafka → KAFKA_OFFSET, file → FILE_POINTER, jdbc → JDBC_KEY
     /// (IR `Cursor::JdbcKey`, the mysql/postgresql batch sources — T14 ←
-    /// R3-W1 review low#4), else NONE (doris/starrocks sinks carry no
-    /// cursor). Errors with a constraint violation when (datasource, db,
+    /// R3-W1 review low#4), else NONE (doris/starrocks sinks and dim
+    /// broadcast tables carry no cursor). `sequence_column` (T-D1): the
+    /// declared key column (dim full-table load pagination key / doris
+    /// UNIQUE KEY dedup basis / jdbc incremental cursor), None = not
+    /// declared. Errors with a constraint violation when (datasource, db,
     /// table) already exists.
+    #[allow(clippy::too_many_arguments)] // the §4.2 registration form is one flat tuple
     pub fn insert_table_object(
         &self,
         datasource_id: i64,
@@ -225,6 +229,7 @@ impl Store {
         kind: &str,
         format: Option<&str>,
         columns_json: Option<&str>,
+        sequence_column: Option<&str>,
     ) -> Result<i64> {
         let cursor = match kind {
             "kafka" => "KAFKA_OFFSET",
@@ -234,9 +239,9 @@ impl Store {
         };
         self.with_conn(|conn| {
             conn.execute(
-                "INSERT INTO table_object (datasource_id, db_name, table_name, kind, format, columns_json, cursor_semantics, source) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'manual')",
-                rusqlite::params![datasource_id, db_name, table_name, kind, format, columns_json, cursor],
+                "INSERT INTO table_object (datasource_id, db_name, table_name, kind, format, columns_json, cursor_semantics, source, sequence_column) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'manual', ?8)",
+                rusqlite::params![datasource_id, db_name, table_name, kind, format, columns_json, cursor, sequence_column],
             )?;
             Ok(conn.last_insert_rowid())
         })
@@ -251,7 +256,7 @@ impl Store {
     ) -> Result<Option<TableObject>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, datasource_id, db_name, table_name, kind, format, cursor_semantics, source \
+                "SELECT id, datasource_id, db_name, table_name, kind, format, cursor_semantics, source, sequence_column \
                  FROM table_object WHERE datasource_id = ?1 AND db_name = ?2 AND table_name = ?3",
             )?;
             let mut rows = stmt.query(rusqlite::params![datasource_id, db_name, table_name])?;
@@ -265,7 +270,7 @@ impl Store {
     pub fn table_object(&self, id: i64) -> Result<Option<TableObject>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, datasource_id, db_name, table_name, kind, format, cursor_semantics, source \
+                "SELECT id, datasource_id, db_name, table_name, kind, format, cursor_semantics, source, sequence_column \
                  FROM table_object WHERE id = ?1",
             )?;
             let mut rows = stmt.query([id])?;
@@ -289,6 +294,45 @@ impl Store {
         self.table_object_by_ref(ds_id, db, table)
     }
 
+    /// Resolve a 2-part dim-join reference ("dsId.table") → table object
+    /// (T-D1): the parser emits `${ds:dim.<datasourceId>.<table>}` for
+    /// dimension joins, so the reference carries no db segment — the JDBC
+    /// URL pins the database. The lookup matches ANY kind (the caller
+    /// diagnoses a non-dim kind with a precise message); zero rows → None
+    /// (unregistered), more than one (same table name under two dbs of one
+    /// datasource) → error (ambiguous).
+    pub fn table_object_for_dim_reference(&self, reference: &str) -> Result<Option<TableObject>> {
+        let Some((ds_part, table)) = reference.split_once('.') else {
+            return Ok(None);
+        };
+        let Ok(ds_id) = ds_part.parse::<i64>() else {
+            return Ok(None);
+        };
+        if table.is_empty() || table.contains('.') {
+            return Ok(None);
+        }
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, datasource_id, db_name, table_name, kind, format, cursor_semantics, source, sequence_column \
+                 FROM table_object WHERE datasource_id = ?1 AND table_name = ?2 ORDER BY id",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![ds_id, table])?;
+            let mut hits: Vec<TableObject> = Vec::new();
+            while let Some(row) = rows.next()? {
+                hits.push(table_from_row(row)?);
+            }
+            match hits.len() {
+                0 => Ok(None),
+                1 => Ok(hits.into_iter().next()),
+                n => anyhow::bail!(
+                    "ambiguous dim reference {reference}: {n} table objects named {table:?} \
+                     under datasource {ds_id} — dim references carry no db segment, give the \
+                     tables distinct names"
+                ),
+            }
+        })
+    }
+
     /// Full columns (registration form round-trip): + columns_json.
     pub fn table_object_columns_json(&self, id: i64) -> Result<Option<Option<String>>> {
         self.with_conn(|conn| {
@@ -308,7 +352,7 @@ impl Store {
     ) -> Result<Vec<TableObject>> {
         self.with_conn(|conn| {
             let mut sql = String::from(
-                "SELECT id, datasource_id, db_name, table_name, kind, format, cursor_semantics, source \
+                "SELECT id, datasource_id, db_name, table_name, kind, format, cursor_semantics, source, sequence_column \
                  FROM table_object WHERE 1=1",
             );
             let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -332,13 +376,18 @@ impl Store {
 
     /// Pipelines whose published `spec_json` references this table object
     /// (the §4.2 tables delete guard: "被已发布管道引用 409"). Reference form
-    /// is `${ds:<dsId>.<db>.<table>}`; matched with instr (no LIKE wildcard
-    /// hazards from `_` in names).
+    /// is `${ds:<dsId>.<db>.<table>}` — except dim tables, which the SQL
+    /// references as `${ds:dim.<dsId>.<table>}` (no db segment; T-D1);
+    /// matched with instr (no LIKE wildcard hazards from `_` in names).
     pub fn pipelines_referencing_table(&self, table: &TableObject) -> Result<Vec<i64>> {
-        let needle = format!(
-            "${{ds:{}.{}.{}}}",
-            table.datasource_id, table.db_name, table.table_name
-        );
+        let needle = if table.kind == "dim" {
+            format!("${{ds:dim.{}.{}}}", table.datasource_id, table.table_name)
+        } else {
+            format!(
+                "${{ds:{}.{}.{}}}",
+                table.datasource_id, table.db_name, table.table_name
+            )
+        };
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id FROM pipeline WHERE spec_json IS NOT NULL AND instr(spec_json, ?1) > 0 ORDER BY id",
@@ -363,6 +412,7 @@ fn table_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TableObject> {
         format: row.get(5)?,
         cursor_semantics: row.get(6)?,
         source: row.get(7)?,
+        sequence_column: row.get(8)?,
     })
 }
 
@@ -390,7 +440,7 @@ mod tests {
         assert_eq!(cred.nonce, "nonce12b");
 
         let t = store
-            .insert_table_object(id, "shop", "orders", "kafka", Some("ogg"), Some("[]"))
+            .insert_table_object(id, "shop", "orders", "kafka", Some("ogg"), Some("[]"), None)
             .unwrap();
         let to = store.table_object(t).unwrap().unwrap();
         assert_eq!(to.table_name, "orders");
@@ -399,7 +449,15 @@ mod tests {
         // jdbc derivation (T14 ← R3-W1 low#4): IR Cursor::JdbcKey — the
         // mysql/postgresql batch sources register kind "jdbc" table objects
         let jdbc_t = store
-            .insert_table_object(id, "shop", "mysql_src", "jdbc", Some("json"), None)
+            .insert_table_object(
+                id,
+                "shop",
+                "mysql_src",
+                "jdbc",
+                Some("json"),
+                None,
+                Some("id"),
+            )
             .unwrap();
         assert_eq!(
             store
@@ -409,9 +467,14 @@ mod tests {
                 .cursor_semantics,
             "JDBC_KEY"
         );
+        assert_eq!(
+            store.table_object(jdbc_t).unwrap().unwrap().sequence_column,
+            Some("id".into()),
+            "sequence_column round-trips (T-D1)"
+        );
         // sink kinds stay cursor-less
         let doris_t = store
-            .insert_table_object(id, "ods", "orders", "doris", None, None)
+            .insert_table_object(id, "ods", "orders", "doris", None, None, None)
             .unwrap();
         assert_eq!(
             store
@@ -431,7 +494,7 @@ mod tests {
         );
         // duplicate (datasource, db, table) rejected
         assert!(store
-            .insert_table_object(id, "shop", "orders", "kafka", None, None)
+            .insert_table_object(id, "shop", "orders", "kafka", None, None, None)
             .is_err());
         // kafka + jdbc + doris registrations above
         assert_eq!(store.table_count(id).unwrap(), 3);
@@ -497,6 +560,76 @@ mod tests {
                 .update_datasource(999, "x", "kafka", "{}", 1, None)
                 .unwrap(),
             DatasourceUpdate::NotFound
+        );
+    }
+
+    /// T-D1 dim reference resolution ("dsId.table", the form the parser
+    /// emits for `${ds:dim.<datasourceId>.<table>}`): resolves across dbs
+    /// (the JDBC URL pins the database), None for unregistered / malformed,
+    /// error when the same table name sits under two dbs of one datasource.
+    /// Also locks the dim delete-guard needle (`${ds:dim.<dsId>.<table>}`).
+    #[test]
+    fn dim_reference_resolution_and_guard_needle() {
+        let store = Store::open_in_memory().unwrap();
+        let ds = store
+            .insert_datasource(
+                "shop-mysql",
+                "mysql",
+                r#"{"jdbcUrl":"jdbc:mysql://127.0.0.1:3306/shop"}"#,
+            )
+            .unwrap();
+        let dim = store
+            .insert_table_object(
+                ds,
+                "shop",
+                "dim_user",
+                "dim",
+                None,
+                Some(r#"[["id","int64"]]"#),
+                Some("id"),
+            )
+            .unwrap();
+        // resolves; carries kind + sequence_column
+        let hit = store
+            .table_object_for_dim_reference(&format!("{ds}.dim_user"))
+            .unwrap()
+            .unwrap();
+        assert_eq!((hit.id, hit.kind.as_str()), (dim, "dim"));
+        assert_eq!(hit.sequence_column.as_deref(), Some("id"));
+        // unregistered / malformed / non-numeric ds → None
+        assert!(store
+            .table_object_for_dim_reference(&format!("{ds}.no_such"))
+            .unwrap()
+            .is_none());
+        assert!(store
+            .table_object_for_dim_reference("no_such.table")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .table_object_for_dim_reference("only-one-part")
+            .unwrap()
+            .is_none());
+        // a same-named table under a second db of the same datasource → ambiguous
+        store
+            .insert_table_object(ds, "other", "dim_user", "dim", None, None, Some("id"))
+            .unwrap();
+        let err = store
+            .table_object_for_dim_reference(&format!("{ds}.dim_user"))
+            .unwrap_err();
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+        // delete guard: the dim needle matches the ${ds:dim.<dsId>.<table>} form
+        store
+            .create_pipeline("dim-join", "SELECT 1", Some("{}"), 10000, None, None)
+            .unwrap();
+        let spec = format!("INSERT INTO ${{ds:9.o.w}} SELECT s.id FROM ${{ds:8.s.i}} s LEFT JOIN ${{ds:dim.{ds}.dim_user}} d ON s.id = d.id");
+        store
+            .set_pipeline_published(1, &spec, "raw", "admin")
+            .unwrap();
+        let table = store.table_object(dim).unwrap().unwrap();
+        assert_eq!(
+            store.pipelines_referencing_table(&table).unwrap(),
+            vec![1],
+            "dim tables guard on the ${{ds:dim.<dsId>.<table>}} needle"
         );
     }
 }

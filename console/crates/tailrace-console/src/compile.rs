@@ -13,6 +13,16 @@ pub struct CompileDiag {
     pub message: String,
 }
 
+/// One dim-join extracted by the compiler (T-D1): `reference` is the
+/// `${ds:dim.<datasourceId>.<table>}` body after `dim.` (`dsId.table` — the
+/// plan table-object key for the dimension), `name` the static `dim_<alias>`
+/// MemTable the rewritten selectSql joins against.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct DimJoinOut {
+    pub reference: String,
+    pub name: String,
+}
+
 /// One compiled statement (§4.5 response shape; the engine's StatementSpec
 /// with an explicit index).
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
@@ -25,6 +35,12 @@ pub struct StatementOut {
     pub pushdown: Vec<String>,
     pub select_sql: String,
     pub start_offset: Option<String>,
+    /// Dimension-table joins (T-D1 broadcast join): empty for plain
+    /// statements. The publish gate resolves each `reference` against
+    /// registered kind=dim table objects; deploy carries their metadata with
+    /// the plan (the engine preflight counts them — a missing entry rejects
+    /// the whole plan).
+    pub dims: Vec<DimJoinOut>,
 }
 
 /// Rewrite `db.table` two-part identifiers whose `db` is mapped in
@@ -136,6 +152,14 @@ pub fn compile_sql(sql: &str, pipeline_id: u64) -> (Vec<StatementOut>, Vec<Compi
                     pushdown: s.pushdown.clone(),
                     select_sql: s.select_sql.clone(),
                     start_offset: s.start_offset.clone(),
+                    dims: s
+                        .dims
+                        .iter()
+                        .map(|d| DimJoinOut {
+                            reference: d.reference.clone(),
+                            name: d.name.clone(),
+                        })
+                        .collect(),
                 })
                 .collect();
             let diags = diags

@@ -688,13 +688,29 @@ async fn protocol_errors_follow_json_rpc() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
 
-    // invalid-argument attempts are audited as rejected, too
+    // invalid-argument attempts are audited as rejected, too — and so are
+    // the attempts that never reached a tool (unknown tool / missing name /
+    // non-object arguments): §7.5's "every tool call — ok, failed or
+    // rejected — lands in audit_log" invariant
     let rows = audit_rows(&app.store, "MCP_TOOL_CALL");
-    let rejected = rows
-        .iter()
-        .filter(|(_, _, d)| d["code"] == "INVALID_ARGUMENTS")
-        .count();
-    assert_eq!(rejected, 2, "{rows:#?}");
+    let by_code = |code: &str| rows.iter().filter(|(_, _, d)| d["code"] == code).count();
+    assert_eq!(by_code("INVALID_ARGUMENTS"), 2, "{rows:#?}");
+    assert_eq!(
+        by_code("UNKNOWN_TOOL"),
+        1,
+        "the drop_everything attempt is audit evidence: {rows:#?}"
+    );
+    assert_eq!(
+        by_code("INVALID_PARAMS"),
+        2,
+        "missing tool name + non-object arguments audited: {rows:#?}"
+    );
+    // every rejected row carries outcome=rejected
+    for (_, _, d) in rows.iter() {
+        if d["code"].is_string() {
+            assert_eq!(d["outcome"], "rejected", "{d}");
+        }
+    }
 }
 
 // ---------------- rate limit ----------------

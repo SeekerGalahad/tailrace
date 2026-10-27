@@ -583,7 +583,12 @@ pub async fn publish(
         )
             .into_response();
     }
-    // publish gate: every source/sink resolves to a registered table object
+    // publish gate: every source/sink resolves to a registered table object,
+    // and every dim-join reference resolves to a registered kind=dim table
+    // object WITH its key column (T-D1 — the engine preflight rejects a plan
+    // whose dim metadata did not ride along, and load_dim refuses a dim
+    // object without sequence_column; catching both here fails the publish,
+    // not the deploy)
     let store = state.store();
     let mut gate: Vec<CompileDiag> = Vec::new();
     for (idx, st) in statements.iter().enumerate() {
@@ -601,6 +606,43 @@ pub async fn publish(
                         &[&(idx + 1).to_string(), role_ref.1, role_ref.0],
                     ),
                 });
+            }
+        }
+        for d in &st.dims {
+            match store.table_object_for_dim_reference(&d.reference) {
+                Ok(Some(t)) => {
+                    if t.kind != "dim" {
+                        gate.push(CompileDiag {
+                            line: idx as i64 + 1,
+                            message: super::messages::t(
+                                "err.pipeline.dim_kind_wrong",
+                                &[&(idx + 1).to_string(), &d.reference, &t.kind],
+                            ),
+                        });
+                    } else if t
+                        .sequence_column
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .is_none()
+                    {
+                        gate.push(CompileDiag {
+                            line: idx as i64 + 1,
+                            message: super::messages::t(
+                                "err.pipeline.dim_no_sequence",
+                                &[&(idx + 1).to_string(), &d.reference],
+                            ),
+                        });
+                    }
+                }
+                Ok(None) => gate.push(CompileDiag {
+                    line: idx as i64 + 1,
+                    message: super::messages::t(
+                        "err.pipeline.dim_table_missing",
+                        &[&(idx + 1).to_string(), &d.reference],
+                    ),
+                }),
+                Err(e) => return ApiError::internal(&e).into_response(),
             }
         }
     }
@@ -753,13 +795,21 @@ async fn push_plan(
             .into_response();
     }
 
-    // tables: one plan entry per unique reference
+    // tables: one plan entry per unique reference — source/sink (`dsId.db.
+    // table`) AND dim joins (`dsId.table`, T-D1; the engine preflight counts
+    // dim references — their metadata must ride with the plan or the whole
+    // plan is rejected)
     let store = state.store();
     let mut refs: Vec<String> = Vec::new();
     for st in &statements {
         for r in [&st.source, &st.sink] {
             if !refs.contains(r) {
                 refs.push(r.clone());
+            }
+        }
+        for d in &st.dims {
+            if !refs.contains(&d.reference) {
+                refs.push(d.reference.clone());
             }
         }
     }
@@ -870,15 +920,20 @@ async fn push_plan(
     }
 }
 
-/// Resolve one `"dsId.db.table"` reference into the plan `tables[]` entry
-/// (§4.5: kind/format/columns from the table object, bootstrap /
-/// streamLoadUrl from the datasource conn, authEnv bound per datasource —
-/// values never enter the plan). Ok(None) = not registered.
+/// Resolve one `"dsId.db.table"` (source/sink) or `"dsId.table"` (dim join,
+/// T-D1) reference into the plan `tables[]` entry (§4.5: kind/format/columns
+/// from the table object, bootstrap / streamLoadUrl from the datasource
+/// conn, authEnv bound per datasource — values never enter the plan).
+/// Ok(None) = not registered.
 fn build_plan_table(
     store: &console_store::Store,
     reference: &str,
 ) -> anyhow::Result<Option<Value>> {
-    let Some(table) = store.table_object_for_reference(reference)? else {
+    let table = match store.table_object_for_reference(reference)? {
+        Some(t) => Some(t),
+        None => store.table_object_for_dim_reference(reference)?,
+    };
+    let Some(table) = table else {
         return Ok(None);
     };
     let Some(ds) = store.datasource(table.datasource_id)? else {
@@ -914,19 +969,44 @@ fn build_plan_table(
                 table.table_name
             )
         });
+    // bootstrap: kafka keeps its broker list from connJson; dim and jdbc
+    // tables are served by the JDBC factory, which takes a `mysql://` /
+    // `postgres://` URL (engine dialect selection) — the console's
+    // mysql/postgresql datasources store `jdbc:mysql://…` / `jdbc:postgresql:
+    // //…`, so the `jdbc:` prefix is stripped here.
+    let bootstrap = match kind.as_str() {
+        "dim" | "jdbc" => conn.get("jdbcUrl").and_then(Value::as_str).map(|url| {
+            url.trim()
+                .strip_prefix("jdbc:")
+                .unwrap_or(url.trim())
+                .to_string()
+        }),
+        _ => conn
+            .get("bootstrap")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    };
+    // sequence_column (T-D1): the declared key column rides the plan's table
+    // metadata verbatim — dim full-table load pagination key (load_dim
+    // refuses without it), doris UNIQUE KEY dedup basis, jdbc cursor column.
+    let sequence_column = table
+        .sequence_column
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     Ok(Some(json!({
         "reference": reference,
         "kind": kind,
         "format": table.format,
         "columns": columns,
-        "bootstrap": conn.get("bootstrap").and_then(Value::as_str),
+        "bootstrap": bootstrap,
         // table-entry keys follow the engine /v1 plan contract (snake_case —
         // tailrace-catalog PlanTableObject has no serde renames; the camelCase
         // keys here were silently dropped, killing every doris deploy with
         // "must declare auth_env" — T11 first-run finding)
         "stream_load_url": stream_load_url,
         "auth_env": auth_env,
-        "sequence_column": null,
+        "sequence_column": sequence_column,
     })))
 }
 

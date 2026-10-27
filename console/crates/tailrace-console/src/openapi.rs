@@ -25,7 +25,7 @@ use crate::api::pipelines::{
     PublishResponse, SqlTemplate, TemplatesResponse, TrendPoint, TrendResponse,
 };
 use crate::api::{ErrorBody, ErrorResponse};
-use crate::compile::{CompileDiag, StatementOut};
+use crate::compile::{CompileDiag, DimJoinOut, StatementOut};
 
 #[derive(OpenApi)]
 #[openapi(
@@ -121,7 +121,7 @@ use crate::compile::{CompileDiag, StatementOut};
         // pipelines
         PipelinesListResponse, PipelineListItem, PipelineDetailOut, PipelineUpsertBody,
         PipelineConfig, PipelineCreated, CompileBody, CompileResponse, CompileDiag,
-        StatementOut, PublishResponse, PipeDeployBody, TrendResponse, TrendPoint,
+        StatementOut, DimJoinOut, PublishResponse, PipeDeployBody, TrendResponse, TrendPoint,
         TemplatesResponse, SqlTemplate,
         // shared
         ErrorResponse, ErrorBody,
@@ -214,5 +214,38 @@ mod tests {
         ] {
             assert!(props.contains_key(k), "missing {k}");
         }
+    }
+
+    /// T-D1: the compile DTO carries `dims` (the dim-join references the
+    /// publish gate resolves), and the list-tables DTO carries the declared
+    /// `sequenceColumn` — both are additive wire changes pinned here so the
+    /// swagger document and the web/MCP clients agree.
+    #[test]
+    fn dim_join_fields_are_published() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("openapi serializes");
+        let stmt = doc
+            .pointer("/components/schemas/StatementOut/properties")
+            .and_then(|v| v.as_object())
+            .expect("StatementOut.properties");
+        assert!(
+            stmt.contains_key("dims"),
+            "StatementOut must publish dims, got keys: {:?}",
+            stmt.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            doc.pointer("/components/schemas/DimJoinOut/properties")
+                .and_then(|v| v.as_object())
+                .is_some_and(|p| p.contains_key("reference") && p.contains_key("name")),
+            "DimJoinOut schema must be registered with reference+name"
+        );
+        let table = doc
+            .pointer("/components/schemas/TableObjectItem/properties")
+            .and_then(|v| v.as_object())
+            .expect("TableObjectItem.properties");
+        assert!(
+            table.contains_key("sequenceColumn"),
+            "TableObjectItem must publish sequenceColumn, got keys: {:?}",
+            table.keys().collect::<Vec<_>>()
+        );
     }
 }

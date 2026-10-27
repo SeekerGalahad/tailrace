@@ -15,7 +15,9 @@
 //! ④ Validator: catalog resolves references + source/sink direction checks.
 //! **The IR never carries credentials** — references are catalog anchors only.
 
-use datafusion::sql::sqlparser::ast::{Expr, ObjectName, Query, SetExpr, Statement, TableFactor};
+use datafusion::sql::sqlparser::ast::{
+    Expr, JoinOperator, ObjectName, Query, SetExpr, Statement, TableFactor,
+};
 use datafusion::sql::sqlparser::dialect::Dialect;
 use datafusion::sql::sqlparser::parser::Parser;
 
@@ -303,8 +305,30 @@ fn rewrite_query(
     // reference; it is rewritten to the static dim_<alias> MemTable the
     // runtime loads full-table over JDBC at assembly. v1 has no second
     // streaming source — a non-dim JOIN reference is rejected here.
+    //
+    // Operator gate: only INNER / bare JOIN / LEFT [OUTER] JOIN widen the
+    // stream with dim columns (the broadcast contract, engine-v1.md 维表打宽).
+    // RIGHT/FULL re-emit every unmatched dim row to the sink on EVERY
+    // micro-batch (the dim side is a static per-statement snapshot) and
+    // CROSS multiplies |src|×|dim| per batch — per-batch output
+    // amplification the unique-key guard does not prevent, so they are
+    // rejected at compile time.
     let mut dims: Vec<DimJoin> = Vec::new();
     for (ji, join) in select.from[0].joins.iter_mut().enumerate() {
+        if !matches!(
+            join.join_operator,
+            JoinOperator::Join(_)
+                | JoinOperator::Inner(_)
+                | JoinOperator::Left(_)
+                | JoinOperator::LeftOuter(_)
+        ) {
+            anyhow::bail!(
+                "JOIN #{ji} ({} against ${{ds:dim.*}} is not supported — dimension joins are \
+                 broadcast-widening: use INNER JOIN or LEFT [OUTER] JOIN (RIGHT/FULL re-emit \
+                 every unmatched dim row per micro-batch; CROSS multiplies |src|×|dim|)",
+                join_operator_name(&join.join_operator)
+            );
+        }
         let TableFactor::Table { name, alias, .. } = &mut join.relation else {
             anyhow::bail!(
                 "JOIN #{ji} must be a ${{ds:dim.datasource.table}} dimension table reference (got {:?})",
@@ -356,6 +380,34 @@ fn rewrite_query(
         .map(extract_pushdown)
         .unwrap_or_default();
     Ok((source_ref, format!("{}", q), pushdown, dims))
+}
+
+/// SQL surface name of a join operator (the dim-join operator gate's
+/// diagnostic text).
+fn join_operator_name(op: &JoinOperator) -> &'static str {
+    match op {
+        JoinOperator::Join(_) => "JOIN",
+        JoinOperator::Inner(_) => "INNER JOIN",
+        JoinOperator::Left(_) => "LEFT JOIN",
+        JoinOperator::LeftOuter(_) => "LEFT OUTER JOIN",
+        JoinOperator::Right(_) => "RIGHT JOIN",
+        JoinOperator::RightOuter(_) => "RIGHT OUTER JOIN",
+        JoinOperator::FullOuter(_) => "FULL OUTER JOIN",
+        JoinOperator::CrossJoin(_) => "CROSS JOIN",
+        JoinOperator::Semi(_) => "SEMI JOIN",
+        JoinOperator::LeftSemi(_) => "LEFT SEMI JOIN",
+        JoinOperator::RightSemi(_) => "RIGHT SEMI JOIN",
+        JoinOperator::Anti(_) => "ANTI JOIN",
+        JoinOperator::LeftAnti(_) => "LEFT ANTI JOIN",
+        JoinOperator::RightAnti(_) => "RIGHT ANTI JOIN",
+        JoinOperator::CrossApply => "CROSS APPLY",
+        JoinOperator::OuterApply => "OUTER APPLY",
+        JoinOperator::AsOf { .. } => "ASOF JOIN",
+        JoinOperator::StraightJoin(_) => "STRAIGHT_JOIN",
+        JoinOperator::ArrayJoin => "ARRAY JOIN",
+        JoinOperator::LeftArrayJoin => "LEFT ARRAY JOIN",
+        JoinOperator::InnerArrayJoin => "INNER ARRAY JOIN",
+    }
 }
 
 /// op_type constant predicate extraction (IN ('I','U') / = 'X'; a table
@@ -620,6 +672,57 @@ mod tests {
             e.contains("dimension table reference"),
             "derived table in JOIN rejected: {e}"
         );
+    }
+
+    /// T-D1 operator gate: only INNER / bare JOIN / LEFT [OUTER] JOIN widen
+    /// the stream with dim columns (broadcast-widening contract). RIGHT and
+    /// FULL would re-emit every unmatched dim row per micro-batch and CROSS
+    /// multiplies |src|×|dim| — per-batch output amplification the
+    /// unique-key guard does not prevent, so each is rejected at compile
+    /// time with a diagnostic naming the allowed forms.
+    #[test]
+    fn dim_join_rejects_right_full_cross_operators() {
+        let err = |sql: &str| match compile(sql, 1) {
+            Err(e) => e.to_string(),
+            Ok((_, d)) => panic!("must be rejected (diagnostics: {d:?})"),
+        };
+        // RIGHT JOIN / RIGHT OUTER JOIN
+        for sql in [
+            "INSERT INTO ${ds:a.b} SELECT s.x, d.y FROM ${ds:c.d} s RIGHT JOIN ${ds:dim.e.f} d ON s.x = d.x",
+            "INSERT INTO ${ds:a.b} SELECT s.x, d.y FROM ${ds:c.d} s RIGHT OUTER JOIN ${ds:dim.e.f} d ON s.x = d.x",
+        ] {
+            let e = err(sql);
+            assert!(
+                e.contains("RIGHT") && e.contains("INNER JOIN or LEFT"),
+                "RIGHT dim join rejected with the allowed forms: {e}"
+            );
+        }
+        // FULL OUTER JOIN
+        let e = err(
+            "INSERT INTO ${ds:a.b} SELECT s.x, d.y FROM ${ds:c.d} s FULL OUTER JOIN ${ds:dim.e.f} d ON s.x = d.x",
+        );
+        assert!(
+            e.contains("FULL OUTER JOIN") && e.contains("broadcast-widening"),
+            "FULL dim join rejected: {e}"
+        );
+        // CROSS JOIN (no ON)
+        let e = err(
+            "INSERT INTO ${ds:a.b} SELECT s.x, d.y FROM ${ds:c.d} s CROSS JOIN ${ds:dim.e.f} d",
+        );
+        assert!(
+            e.contains("CROSS JOIN") && e.contains("multiplies"),
+            "CROSS dim join rejected: {e}"
+        );
+        // the accepted forms still compile (bare JOIN = INNER by SQL semantics)
+        for sql in [
+            "INSERT INTO ${ds:a.b} SELECT s.x, d.y FROM ${ds:c.d} s JOIN ${ds:dim.e.f} d ON s.x = d.x",
+            "INSERT INTO ${ds:a.b} SELECT s.x, d.y FROM ${ds:c.d} s LEFT JOIN ${ds:dim.e.f} d ON s.x = d.x",
+            "INSERT INTO ${ds:a.b} SELECT s.x, d.y FROM ${ds:c.d} s LEFT OUTER JOIN ${ds:dim.e.f} d ON s.x = d.x",
+        ] {
+            let (c, diags) = compile(sql, 1).expect("widening operators accepted");
+            assert!(diags.is_empty(), "{sql}: {diags:?}");
+            assert_eq!(c.statements[0].dims.len(), 1, "{sql}");
+        }
     }
 
     /// T-D1 validator: dim references must resolve to kind=dim table objects;

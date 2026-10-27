@@ -16,8 +16,11 @@
 //! call arguments.
 //!
 //! Audit (§7.5): every tool call — ok, failed or rejected — lands in
-//! `audit_log` as `MCP_TOOL_CALL` with `actor = mcp:<client>`. Write tools
-//! that pass the gates additionally produce the REST handler's own domain
+//! `audit_log` as `MCP_TOOL_CALL` with `actor = mcp:<client>`, including
+//! the attempts that never reach a tool (unknown tool name, missing /
+//! non-string name, non-object `arguments` — audited as rejected with
+//! `UNKNOWN_TOOL` / `INVALID_PARAMS`). Write tools that pass the gates
+//! additionally produce the REST handler's own domain
 //! audit row (PIPELINE_CREATE / PIPELINE_DEPLOY / PIPELINE_ACTION) under
 //! the same actor: the handler's operator resolves to the MCP identity.
 //!
@@ -353,27 +356,62 @@ async fn tools_call(
     client: &str,
     params: &Value,
 ) -> Result<Value, RpcErr> {
-    let name = params
-        .get("name")
-        .and_then(Value::as_str)
-        .ok_or_else(|| RpcErr::invalid_params("missing tool name"))?;
+    // §7.5: every tool call — ok, failed or rejected — is audit evidence, so
+    // the actor is resolved up front and each early rejection below audits
+    // before returning (the three classes that never reached `execute`
+    // previously left no row: unknown tool, missing/non-string tool name,
+    // non-object arguments).
+    let actor = format!("mcp:{client}");
+    let name = match params.get("name").and_then(Value::as_str) {
+        Some(n) => n,
+        None => {
+            audit_tool_call(
+                state,
+                &actor,
+                &tool_label(params),
+                &Map::new(),
+                "rejected",
+                json!({ "code": "INVALID_PARAMS", "reason": "missing or non-string tool name" }),
+            );
+            return Err(RpcErr::invalid_params("missing tool name"));
+        }
+    };
     let args = match params.get("arguments") {
         None | Some(Value::Null) => Map::new(),
         Some(Value::Object(m)) => m.clone(),
-        Some(_) => {
+        Some(other) => {
+            audit_tool_call(
+                state,
+                &actor,
+                name,
+                &Map::new(),
+                "rejected",
+                json!({
+                    "code": "INVALID_PARAMS",
+                    "reason": "arguments must be a JSON object of tool arguments",
+                    "arguments": brief_value(other),
+                }),
+            );
             return Err(RpcErr::invalid_params(
                 "arguments must be a JSON object of tool arguments",
-            ))
+            ));
         }
     };
     let Some((_, write)) = TOOLS.iter().find(|(n, _)| *n == name) else {
+        audit_tool_call(
+            state,
+            &actor,
+            name,
+            &args,
+            "rejected",
+            json!({ "code": "UNKNOWN_TOOL", "tool": name }),
+        );
         return Err(RpcErr::new(
             INVALID_PARAMS,
             format!("unknown tool: {name}"),
             Some(json!({ "code": "UNKNOWN_TOOL", "tool": name })),
         ));
     };
-    let actor = format!("mcp:{client}");
     if *write {
         if !mcp.allow_write {
             audit_tool_call(
@@ -914,6 +952,30 @@ fn audit_tool_call(
         Some(tool.to_string()),
         Some(detail.to_string()),
     );
+}
+
+/// Audit-safe tool label for calls that did not resolve to a name: the
+/// name verbatim when present, a bounded marker otherwise (the raw JSON
+/// value never rides the audit row unbounded).
+fn tool_label(params: &Value) -> String {
+    match params.get("name") {
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => brief_value(other).to_string(),
+        None => "<missing>".to_string(),
+    }
+}
+
+/// One audit-bounded JSON rendering: serialized then head-truncated to
+/// [`MAX_AUDIT_STRING_CHARS`] chars (for values that cannot ride the
+/// args map, e.g. a non-object `arguments` payload).
+fn brief_value(v: &Value) -> Value {
+    let s = serde_json::to_string(v).unwrap_or_default();
+    if s.chars().count() > MAX_AUDIT_STRING_CHARS {
+        let head: String = s.chars().take(MAX_AUDIT_STRING_CHARS).collect();
+        Value::String(format!("{head}...({} chars)", s.chars().count()))
+    } else {
+        Value::String(s)
+    }
 }
 
 /// Bound audit noise: string values longer than [`MAX_AUDIT_STRING_CHARS`]

@@ -107,6 +107,11 @@ SQL 编译诊断（编辑器内联报错数据源）。
   （默认 64 MiB/表，按解码后 Arrow 内存计）。维表声明的键列无主键/单列唯一索引 →
   拒绝编译（复用 JDBC keyset 唯一性门，防笛卡尔放大）。`tables` 中该维表对象的
   `reference` 即 SQL 里 `dim.` 之后的两段（`<datasource>.<table>`）。
+  **连接词仅接受 `INNER JOIN`/`JOIN`/`LEFT [OUTER] JOIN`**（打宽契约）：维表侧是
+  每语句静态快照，RIGHT/FULL 会对每个微批重发全部未匹配维表行、CROSS 按
+  |src|×|dim| 逐批放大——编译期以诊断拒绝（唯一键门不防这两类逐批输出放大）。
+  console 侧写法与登记（`kind=dim` + `sequenceColumn`、publish 门禁）见
+  docs/protocol/console-api.md §三.7。
 - 响应：`{"ok": true, "pipelineId": 42, "statements": 2, "mode": "sql-compiled+serve-executing"}`
 - 兼容路径：旧 `specJson` 已废弃（`ok:false` + 指引重发布）。
 
