@@ -18,7 +18,9 @@ mod sessions;
 mod users;
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -40,10 +42,42 @@ fn migrations() -> Migrations<'static> {
     Migrations::new(vec![M::up(include_str!("../migrations/00_init.sql"))])
 }
 
+/// A6 (§7.4 `tailrace_console_db_write_seconds`): SQLite write-path latency
+/// statistics accumulated at the `with_tx` chokepoint — the T8 batched
+/// transactional path (heartbeats, event batches, publishes). Single-
+/// statement autocommit writes ride `with_conn` and are not timed (they are
+/// not the T8 bottleneck surface). Read at console /metrics scrape time.
+/// Durations are MICROseconds — console transactions are routinely sub-ms
+/// and would all read 0 at ms granularity.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DbWriteStats {
+    /// completed transactions (success or failure — latency is latency)
+    pub count: u64,
+    /// cumulative transaction wall time (µs)
+    pub us_total: u64,
+    /// most recent transaction wall time (µs)
+    pub us_last: u64,
+}
+
+impl DbWriteStats {
+    /// Mean transaction latency in µs (0 before the first write).
+    pub fn avg_us(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.us_total as f64 / self.count as f64
+        }
+    }
+}
+
 /// Handle to the console database. Cheap to clone (`Arc` inside).
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
+    /// A6 write-latency accumulators, µs (Arc-shared with clones).
+    tx_count: Arc<AtomicU64>,
+    tx_us_total: Arc<AtomicU64>,
+    tx_us_last: Arc<AtomicU64>,
 }
 
 impl Store {
@@ -80,6 +114,9 @@ impl Store {
             .context("apply migrations")?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            tx_count: Arc::new(AtomicU64::new(0)),
+            tx_us_total: Arc::new(AtomicU64::new(0)),
+            tx_us_last: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -93,15 +130,35 @@ impl Store {
     /// multi-statement and batch writes become atomic (no half-written
     /// state on failure) and pay one commit instead of one fsync per
     /// statement. The `Mutex` guarantees at most one transaction at a time.
+    /// A6: every transaction is timed (the `tailrace_console_db_write_seconds`
+    /// basis, µs granularity) — counted on success and failure alike, mutex
+    /// wait included (queueing behind another writer is latency a caller
+    /// experiences).
     fn with_tx<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        let t0 = Instant::now();
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        match f(&tx) {
+        let out = match f(&tx) {
             Ok(v) => tx.commit().map_err(Into::into).map(|()| v),
             Err(e) => {
                 let _ = tx.rollback();
                 Err(e)
             }
+        };
+        drop(conn);
+        let us = t0.elapsed().as_micros() as u64;
+        self.tx_count.fetch_add(1, Ordering::Relaxed);
+        self.tx_us_total.fetch_add(us, Ordering::Relaxed);
+        self.tx_us_last.store(us, Ordering::Relaxed);
+        out
+    }
+
+    /// A6: SQLite write-path latency snapshot (console /metrics).
+    pub fn db_write_stats(&self) -> DbWriteStats {
+        DbWriteStats {
+            count: self.tx_count.load(Ordering::Relaxed),
+            us_total: self.tx_us_total.load(Ordering::Relaxed),
+            us_last: self.tx_us_last.load(Ordering::Relaxed),
         }
     }
 
@@ -177,6 +234,49 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    /// A6 (`tailrace_console_db_write_seconds`): every `with_tx` lands in
+    /// the write-latency accumulators, and clones share them (Arc, like the
+    /// connection itself). (Single-statement autocommit writes ride
+    /// `with_conn` and are NOT timed — the T8 bottleneck observation targets
+    /// the batched transactional path: heartbeats, events, publishes.)
+    #[test]
+    fn db_write_stats_accumulate_per_transaction() {
+        use models::NewNodeEvent;
+        let store = Store::open_in_memory().unwrap();
+        let before = store.db_write_stats();
+        assert!(
+            before.count >= 1,
+            "open itself runs purge_expired via with_tx"
+        );
+        let ev = |msg: &str| {
+            vec![NewNodeEvent {
+                node_key: "nk-metrics".into(),
+                pipeline_id: None,
+                level: "INFO".into(),
+                kind: "TEST".into(),
+                message: msg.into(),
+                ts_unix: None,
+            }]
+        };
+        store.insert_node_events(&ev("one")).unwrap();
+        let mid = store.db_write_stats();
+        assert_eq!(
+            mid.count,
+            before.count + 1,
+            "one with_tx write = one timed tx"
+        );
+        assert!(mid.us_last <= mid.us_total, "last ≤ cumulative");
+        // clones share the accumulators (Arc-shared, like the connection)
+        let clone = store.clone();
+        store.insert_node_events(&ev("two")).unwrap();
+        assert_eq!(
+            clone.db_write_stats().count,
+            store.db_write_stats().count,
+            "Arc-shared stats"
+        );
+        assert_eq!(store.db_write_stats().count, mid.count + 1);
     }
 
     /// WAL on a real file, and reopening the same file skips re-migration.

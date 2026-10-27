@@ -307,6 +307,11 @@ impl tracing::field::Visit for FieldGrab {
 
 /// Per-statement counters (AtomicU64, Relaxed increments on the hot path —
 /// observability tolerates momentarily stale reads).
+/// A6 (/metrics): the flush sites additionally record durations —
+/// `flush_ms_total` (cumulative flush milliseconds) and `last_flush_dur_ms`
+/// (the most recent flush's duration) feed `tailrace_flush_duration_seconds`
+/// (v1 histogram→gauge+counter simplification); `last_data_ms` (wall time of
+/// the last flush that acked rows > 0) feeds `tailrace_pipeline_lag_seconds`.
 #[derive(Debug, Default)]
 pub struct StatementCounters {
     pub consumed: AtomicU64,
@@ -316,6 +321,12 @@ pub struct StatementCounters {
     pub bad: AtomicU64,
     pub flushes: AtomicU64,
     pub last_flush_ms: AtomicU64,
+    /// cumulative flush duration (ms) — A6
+    pub flush_ms_total: AtomicU64,
+    /// last flush duration (ms) — A6
+    pub last_flush_dur_ms: AtomicU64,
+    /// wall-ms of the last flush that acked rows > 0 (lag basis) — A6
+    pub last_data_ms: AtomicU64,
 }
 
 impl StatementCounters {
@@ -327,6 +338,9 @@ impl StatementCounters {
             bad: self.bad.load(Ordering::Relaxed),
             flushes: self.flushes.load(Ordering::Relaxed),
             last_flush_ms: self.last_flush_ms.load(Ordering::Relaxed),
+            flush_ms_total: self.flush_ms_total.load(Ordering::Relaxed),
+            last_flush_dur_ms: self.last_flush_dur_ms.load(Ordering::Relaxed),
+            last_data_ms: self.last_data_ms.load(Ordering::Relaxed),
         }
     }
 }
@@ -341,6 +355,15 @@ pub struct StatementCountersSnapshot {
     pub flushes: u64,
     #[serde(rename = "lastFlushMs")]
     pub last_flush_ms: u64,
+    /// cumulative flush duration ms — A6 (additive stats field)
+    #[serde(rename = "flushMsTotal")]
+    pub flush_ms_total: u64,
+    /// last flush duration ms — A6 (additive stats field)
+    #[serde(rename = "lastFlushDurMs")]
+    pub last_flush_dur_ms: u64,
+    /// wall-ms of the last data-carrying flush — A6 (additive stats field)
+    #[serde(rename = "lastDataMs")]
+    pub last_data_ms: u64,
 }
 
 /// Pipeline-level counters (Arc-shared: the registry holds them, statement
@@ -390,6 +413,9 @@ impl PipeCounters {
             bad: 0,
             flushes: 0,
             last_flush_ms: 0,
+            flush_ms_total: 0,
+            last_flush_dur_ms: 0,
+            last_data_ms: 0,
         };
         for s in &self.statements {
             let s = s.snapshot();
@@ -398,7 +424,10 @@ impl PipeCounters {
             t.skipped += s.skipped;
             t.bad += s.bad;
             t.flushes += s.flushes;
+            t.flush_ms_total += s.flush_ms_total;
             t.last_flush_ms = t.last_flush_ms.max(s.last_flush_ms);
+            t.last_flush_dur_ms = t.last_flush_dur_ms.max(s.last_flush_dur_ms);
+            t.last_data_ms = t.last_data_ms.max(s.last_data_ms);
         }
         t
     }
@@ -435,6 +464,43 @@ mod tests {
         assert_eq!(t.flushes, 12);
         // unseeded (a brand-new pipeline) equals new()
         assert_eq!(PipeCounters::new_seeded(2, &[]).totals().consumed, 0);
+    }
+
+    /// A6 (/metrics): flush-duration and data-time counters survive the
+    /// snapshot path the /metrics renderer reads — seeded construction leaves
+    /// them at zero (restart resets durations; lag reappears on the next
+    /// data-carrying flush), hot-path stores round-trip through snapshot().
+    #[test]
+    fn flush_duration_and_data_time_counters() {
+        let pc = PipeCounters::new_seeded(
+            1,
+            &[tailrace_state::StatementTotals {
+                consumed: 10,
+                flushed: 8,
+                flushes: 2,
+            }],
+        );
+        let s = &pc.statements[0];
+        let snap = s.snapshot();
+        assert_eq!((snap.flushed, snap.flushes), (8, 2), "ledger seeds intact");
+        assert_eq!(
+            (
+                snap.flush_ms_total,
+                snap.last_flush_dur_ms,
+                snap.last_data_ms
+            ),
+            (0, 0, 0),
+            "A6 fields start at zero even on seeded construction"
+        );
+        // obs_flush-equivalent hot-path stores (the runtime flush sites)
+        s.flush_ms_total.fetch_add(120, Ordering::Relaxed);
+        s.flush_ms_total.fetch_add(30, Ordering::Relaxed);
+        s.last_flush_dur_ms.store(30, Ordering::Relaxed);
+        s.last_data_ms.store(1_000, Ordering::Relaxed);
+        let t = pc.totals();
+        assert_eq!(t.flush_ms_total, 150, "cumulative duration");
+        assert_eq!(t.last_flush_dur_ms, 30, "last duration");
+        assert_eq!(t.last_data_ms, 1_000, "data-time basis for lag");
     }
 
     #[test]

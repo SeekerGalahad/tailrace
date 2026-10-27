@@ -38,13 +38,12 @@ version = 2
 # ^9.0, so the lock now resolves zip 9.0.5 and nothing yanked remains.
 yanked = "deny"
 ignore = [
-    # (T33, DF 48→55): the RUSTSEC-2024-0436 ignore (paste 1.0.15
-    # unmaintained, transitive via datafusion-common 48) was dropped with the
-    # DataFusion 55.2.0 upgrade — DF 55 no longer depends on paste, the crate
-    # left the lockfile (cargo update output: "Removing paste v1.0.15"), and
-    # cargo-deny confirmed "advisory was not encountered" while the ignore
-    # was still listed.
-    # (The three zip <9 extraction advisories that were ignored here while
-    # utoipa-swagger-ui pinned zip ^8.6 were dropped 2026-10-23 with the
-    # 10.0.2 → zip 9.0.5 upgrade — see roadmap §八.1.)
+    # RUSTSEC-2026-0391: zstd stream context data leak (transitive via
+    # parquet→datafusion). Affects stream encoders/decoders reused across
+    # contexts — tailrace only uses block-level parquet compression, never
+    # reuses zstd stream contexts.
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0403",
+    "RUSTSEC-2026-0410",
 ]

@@ -626,6 +626,25 @@ impl PipelineRegistry {
         self.log_hub.tail(id, after_seq, limit)
     }
 
+    /// A6 (/metrics): scrape-time snapshot — one row per *registered*
+    /// pipeline: its `ControlFlags` u8 state (0=RUNNING 1=PAUSED 2=STOPPED
+    /// 3=FAILED — the encoding `tailrace_pipeline_state` exports verbatim)
+    /// plus the per-statement counter snapshots the renderer folds into
+    /// rows/flush/duration/dlq/lag series. Pull-based (read at scrape time):
+    /// counters stay the single write site in the flush loop; no sampling
+    /// thread, no staleness.
+    pub fn metrics_snapshot(&self) -> Vec<PipelineMetricsSnapshot> {
+        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .iter()
+            .map(|(id, e)| PipelineMetricsSnapshot {
+                pipeline_id: *id,
+                state: e.flags.state(),
+                statements: e.counters.statements.iter().map(|s| s.snapshot()).collect(),
+            })
+            .collect()
+    }
+
     /// Observability trio: offsets endpoint data — pass through the on-disk
     /// ledger (state file). The ledger is the source of truth, so stopped or
     /// undeployed pipelines still answer.
@@ -689,6 +708,16 @@ pub struct PipeStatsSnapshot {
     pub pipeline_id: u64,
     pub status: String,
     pub totals: StatementCountersSnapshot,
+    pub statements: Vec<StatementCountersSnapshot>,
+}
+
+/// A6 (/metrics): one registered pipeline's scrape row (see
+/// [`PipelineRegistry::metrics_snapshot`]).
+#[derive(Debug, Clone)]
+pub struct PipelineMetricsSnapshot {
+    pub pipeline_id: u64,
+    /// ControlFlags u8: 0=RUNNING 1=PAUSED 2=STOPPED 3=FAILED.
+    pub state: u8,
     pub statements: Vec<StatementCountersSnapshot>,
 }
 

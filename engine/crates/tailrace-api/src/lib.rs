@@ -1,12 +1,15 @@
 //! tailrace-api: axum REST (the console's only entry into a node) —
-//! /healthz + the /v1 surface: compile, pipelines (list/plan/stats/logs/
-//! offsets/actions). Every /v1 route sits behind the shared node-token
-//! middleware (auth — upgrade plan §二 engine H1).
+//! /healthz + /metrics (open: liveness / Prometheus scrape, §7.4) + the /v1
+//! surface: compile, pipelines (list/plan/stats/logs/offsets/actions). Every
+//! /v1 route sits behind the shared node-token middleware (auth — upgrade
+//! plan §二 engine H1).
 //! The heartbeat module: identity/events/graceful-shutdown when running with
-//! --control-plane.
+//! --control-plane. The metrics module: the hand-written Prometheus text
+//! registry (A6).
 
 pub mod auth;
 pub mod heartbeat;
+pub mod metrics;
 
 /// Canonical `code` strings for the engine's `/v1` error JSON envelopes
 /// (roadmap §九 T34): an *additive* wire field — the legacy `ok`/`error`
@@ -113,6 +116,7 @@ pub fn start_server(
         let reg_action = std::sync::Arc::clone(&registry);
         let reg_stats = std::sync::Arc::clone(&registry);
         let reg_offsets = std::sync::Arc::clone(&registry);
+        let reg_metrics = std::sync::Arc::clone(&registry);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -388,6 +392,28 @@ pub fn start_server(
                     "/healthz",
                     get(|| async { axum::Json(serde_json::json!({ "ok": true })) }),
                 )
+                // A6 (§7.4): Prometheus scrape — OPEN by Prometheus
+                // convention (the exporter surface carries no secrets; the
+                // node token stays on /v1). Pull-rendered from the live
+                // registry counters + the heartbeat last-beat note.
+                .route(
+                    "/metrics",
+                    get(move || {
+                        let reg = std::sync::Arc::clone(&reg_metrics);
+                        async move {
+                            let body = metrics::node_metrics_text(&reg);
+                            (
+                                [(
+                                    axum::http::header::CONTENT_TYPE,
+                                    axum::http::HeaderValue::from_static(
+                                        "text/plain; version=0.0.4; charset=utf-8",
+                                    ),
+                                )],
+                                body,
+                            )
+                        }
+                    }),
+                )
                 .merge(v1.route_layer(axum::middleware::from_fn_with_state(
                     api_token,
                     auth::require_node_token,
@@ -573,6 +599,66 @@ mod tests {
             reqwest::StatusCode::OK,
             "x-node-token accepted"
         );
+        Ok(())
+    }
+
+    /// A6 (§7.4): /metrics is OPEN (no node token — Prometheus convention),
+    /// answers the versioned text/plain content type, and the body is valid
+    /// exposition text (TYPE line + value line + parsable value tokens).
+    /// No external dependency — always runs. The heartbeat series is made
+    /// non-empty via the public beat note; pipeline series stay absent with
+    /// an empty registry (valid: an empty registry scrapes as empty).
+    #[test]
+    fn metrics_endpoint_open_and_valid_text() -> anyhow::Result<()> {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let p = l.local_addr()?.port();
+            drop(l);
+            p
+        };
+        let addr = format!("127.0.0.1:{port}");
+        let state = StateHandle::new();
+        let reg = std::sync::Arc::new(tailrace_runtime::registry::PipelineRegistry::new(
+            &std::env::temp_dir().join(format!("tailrace-test-metrics-{}", std::process::id())),
+        ));
+        let _h = start_server(
+            &addr,
+            state,
+            reg,
+            auth::NodeApiToken::new("tr_b_unit_token"),
+        )?;
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        heartbeat::note_beat("tr-metrics-test-node");
+        let resp = reqwest::blocking::Client::new()
+            .get(format!("http://{addr}/metrics"))
+            .send()?;
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "open (no token)");
+        assert_eq!(
+            resp.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/plain; version=0.0.4; charset=utf-8"),
+            "versioned Prometheus content type"
+        );
+        let body = resp.text()?;
+        assert!(
+            body.contains("# TYPE tailrace_node_heartbeat_age_seconds gauge\n"),
+            "TYPE line present: {body}"
+        );
+        assert!(
+            body.contains("tailrace_node_heartbeat_age_seconds{node_id=\"tr-metrics-test-node\"} "),
+            "value line present: {body}"
+        );
+        for line in body
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+        {
+            let value = line.rsplit(' ').next().unwrap();
+            assert!(
+                value.parse::<f64>().is_ok(),
+                "parsable value token in {line:?}"
+            );
+        }
         Ok(())
     }
 

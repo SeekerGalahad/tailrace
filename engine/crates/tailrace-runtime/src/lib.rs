@@ -148,13 +148,27 @@ impl StatementRuntime {
             })
     }
 
-    fn obs_flush(&self, ack_rows: u64) {
+    /// Flush-point unified counter update (A6 /metrics wiring): rows + flush
+    /// count + the duration metrics — `flush_ms_total` (cumulative) and
+    /// `last_flush_dur_ms` feed `tailrace_flush_duration_seconds`; a
+    /// data-carrying flush (ack_rows > 0) stamps `last_data_ms`, the basis of
+    /// `tailrace_pipeline_lag_seconds` (an empty trailing flush carries no
+    /// data-freshness signal).
+    fn obs_flush(&self, ack_rows: u64, dur_ms: u64) {
         if let Some(c) = self.counters.as_ref() {
             c.flushed
                 .fetch_add(ack_rows, std::sync::atomic::Ordering::Relaxed);
             c.flushes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            c.flush_ms_total
+                .fetch_add(dur_ms, std::sync::atomic::Ordering::Relaxed);
+            c.last_flush_dur_ms
+                .store(dur_ms, std::sync::atomic::Ordering::Relaxed);
             c.last_flush_ms
                 .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+            if ack_rows > 0 {
+                c.last_data_ms
+                    .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 }
@@ -765,11 +779,12 @@ fn run_statement_serve(
                 let _flush_span = span.enter();
                 let flush_t0 = Instant::now();
                 let ack = st.sink.flush()?;
+                let dur_ms = flush_t0.elapsed().as_millis() as u64;
                 span.record("rows", ack.rows);
-                span.record("flush_ms", flush_t0.elapsed().as_millis() as u64);
+                span.record("flush_ms", dur_ms);
                 stats.flushed_rows += ack.rows;
                 stats.flushes += 1;
-                st.obs_flush(ack.rows);
+                st.obs_flush(ack.rows, dur_ms);
                 st.pending_rows = 0;
                 st.last_flush = Instant::now();
                 state.lock().unwrap_or_else(|e| e.into_inner()).save(
@@ -854,11 +869,12 @@ fn run_statement_serve(
             let _flush_span = span.enter();
             let flush_t0 = Instant::now();
             let ack = st.sink.flush()?;
+            let dur_ms = flush_t0.elapsed().as_millis() as u64;
             span.record("rows", ack.rows);
-            span.record("flush_ms", flush_t0.elapsed().as_millis() as u64);
+            span.record("flush_ms", dur_ms);
             stats.flushed_rows += ack.rows;
             stats.flushes += 1;
-            st.obs_flush(ack.rows);
+            st.obs_flush(ack.rows, dur_ms);
             if let Some(emit) = st.emit.as_ref() {
                 emit(
                     "INFO",
@@ -892,11 +908,12 @@ fn run_statement_serve(
         let _flush_span = span.enter();
         let flush_t0 = Instant::now();
         let ack = st.sink.flush()?;
+        let dur_ms = flush_t0.elapsed().as_millis() as u64;
         span.record("rows", ack.rows);
-        span.record("flush_ms", flush_t0.elapsed().as_millis() as u64);
+        span.record("flush_ms", dur_ms);
         stats.flushed_rows += ack.rows;
         stats.flushes += 1;
-        st.obs_flush(ack.rows);
+        st.obs_flush(ack.rows, dur_ms);
         if let Some(emit) = st.emit.as_ref() {
             emit(
                 "INFO",
@@ -964,11 +981,12 @@ fn run_statement(
                 let _flush_span = span.enter();
                 let flush_t0 = Instant::now();
                 let ack = st.sink.flush()?;
+                let dur_ms = flush_t0.elapsed().as_millis() as u64;
                 span.record("rows", ack.rows);
-                span.record("flush_ms", flush_t0.elapsed().as_millis() as u64);
+                span.record("flush_ms", dur_ms);
                 stats.flushed_rows += ack.rows;
                 stats.flushes += 1;
-                st.obs_flush(ack.rows);
+                st.obs_flush(ack.rows, dur_ms);
                 st.pending_rows = 0;
                 st.last_flush = Instant::now();
                 state.lock().unwrap_or_else(|e| e.into_inner()).save(
@@ -1047,11 +1065,12 @@ fn run_statement(
             let _flush_span = span.enter();
             let flush_t0 = Instant::now();
             let ack = st.sink.flush()?;
+            let dur_ms = flush_t0.elapsed().as_millis() as u64;
             span.record("rows", ack.rows);
-            span.record("flush_ms", flush_t0.elapsed().as_millis() as u64);
+            span.record("flush_ms", dur_ms);
             stats.flushed_rows += ack.rows;
             stats.flushes += 1;
-            st.obs_flush(ack.rows);
+            st.obs_flush(ack.rows, dur_ms);
             if let Some(emit) = st.emit.as_ref() {
                 emit(
                     "INFO",
@@ -1084,11 +1103,12 @@ fn run_statement(
         let _flush_span = span.enter();
         let flush_t0 = Instant::now();
         let ack = st.sink.flush()?;
+        let dur_ms = flush_t0.elapsed().as_millis() as u64;
         span.record("rows", ack.rows);
-        span.record("flush_ms", flush_t0.elapsed().as_millis() as u64);
+        span.record("flush_ms", dur_ms);
         stats.flushed_rows += ack.rows;
         stats.flushes += 1;
-        st.obs_flush(ack.rows);
+        st.obs_flush(ack.rows, dur_ms);
         if let Some(emit) = st.emit.as_ref() {
             emit(
                 "INFO",

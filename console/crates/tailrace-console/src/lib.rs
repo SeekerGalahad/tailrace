@@ -7,6 +7,7 @@
 pub mod api;
 pub mod compile;
 pub mod deploy;
+pub mod metrics;
 pub mod openapi;
 pub mod spa;
 pub mod state;
@@ -150,6 +151,10 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .route("/healthz", get(api::health::healthz))
+        // A6 (§7.4): Prometheus scrape — OPEN (exporter convention, like
+        // /healthz): console-local db-write gauges + per-node /metrics
+        // proxied and re-labelled with node="<name>".
+        .route("/metrics", get(metrics::scrape))
         .route("/api/auth/login", post(api::auth::login))
         .merge(session_scoped)
         .merge(node_register)

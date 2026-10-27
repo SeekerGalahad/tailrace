@@ -19,6 +19,35 @@ use std::time::Duration;
 pub const EVENT_RING_CAPACITY: usize = 64;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
+// ==================== A6 (/metrics): last-beat note ====================
+
+/// Last console-accepted contact: (node_key, unix-ms). Written by the
+/// heartbeat thread on every 200 (heartbeat or register), read by the
+/// /metrics renderer. Age is computed **at scrape time** — a beat-time gauge
+/// would always read ~0 by construction.
+static LAST_BEAT: Mutex<Option<(String, u64)>> = Mutex::new(None);
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Record a successful console contact (called by the heartbeat loop).
+pub fn note_beat(node_key: &str) {
+    *LAST_BEAT.lock().unwrap_or_else(|e| e.into_inner()) = Some((node_key.to_string(), unix_ms()));
+}
+
+/// `(node_key, seconds since the last accepted beat)` for
+/// `tailrace_node_heartbeat_age_seconds` — None when no beat ever succeeded
+/// (no --control-plane, or the console has never been reachable).
+pub fn heartbeat_age_seconds() -> Option<(String, f64)> {
+    let g = LAST_BEAT.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref()
+        .map(|(k, ms)| (k.clone(), unix_ms().saturating_sub(*ms) as f64 / 1000.0))
+}
+
 // ==================== identity ====================
 
 /// Node identity (persisted at state_dir/identity.json).
@@ -691,6 +720,7 @@ fn run_loop(
             Ok((200, body)) => {
                 registered = true;
                 events.confirm(batch.len());
+                note_beat(&identity.node_key); // A6: heartbeat-age basis
                 if let Some(adopted) = apply_echo(&identity, &body) {
                     tracing::info!(
                         from = %identity.node_key,
@@ -710,9 +740,10 @@ fn run_loop(
                 match post_json(&client, &format!("{base}/api/nodes/register"), &reg) {
                     Ok((200, body)) => {
                         registered = true;
-                        // per-node token echo: adopt (persist + rotate the
-                        // live /v1 token) whenever it differs — the console
-                        // mints a fresh one on every successful register
+                        note_beat(&identity.node_key); // A6: register counts as console contact
+                                                       // per-node token echo: adopt (persist + rotate the
+                                                       // live /v1 token) whenever it differs — the console
+                                                       // mints a fresh one on every successful register
                         if let Some(t) = extract_register_token(&body) {
                             if Some(&t) != node_token.as_ref() {
                                 match persist_node_token(&cfg.state_dir, &t) {
@@ -811,6 +842,7 @@ fn run_loop(
                 post_json(&client, &format!("{base}/api/nodes/heartbeat"), &payload)
             {
                 events.confirm(batch.len());
+                note_beat(&identity.node_key); // A6: final-beat contact
                 if let Some(adopted) = apply_echo(&identity, &body) {
                     let _ = persist_identity(&cfg.state_dir, &adopted);
                 }
