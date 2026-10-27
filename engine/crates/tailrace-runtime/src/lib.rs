@@ -8,6 +8,7 @@
 //! Statements never block each other (each advances one micro-batch round per
 //! turn; each runs on its own thread).
 
+pub mod dim;
 pub mod dlq;
 pub mod pipeline_log;
 pub mod registry;
@@ -70,6 +71,14 @@ pub struct RunOptions {
     pub poll_rows: usize,
     /// micro-batch pull time slice
     pub poll_slice: Duration,
+    /// T-D1 broadcast join: max rows per dimension table (fail-fast at
+    /// assembly; default [`dim::DEFAULT_DIM_MAX_ROWS`] = 500_000, plan tuning
+    /// `dimMaxRows`)
+    pub dim_max_rows: usize,
+    /// T-D1 broadcast join: max decoded-Arrow bytes per dimension table
+    /// (fail-fast at assembly; default [`dim::DEFAULT_DIM_MAX_BYTES`] =
+    /// 64 MiB, plan tuning `dimMaxBytes`)
+    pub dim_max_bytes: u64,
 }
 
 impl Default for RunOptions {
@@ -81,6 +90,8 @@ impl Default for RunOptions {
             flush_bytes: 8 * 1024 * 1024, // 8MB batching byte boundary
             poll_rows: 8_000,
             poll_slice: Duration::from_millis(100),
+            dim_max_rows: dim::DEFAULT_DIM_MAX_ROWS,
+            dim_max_bytes: dim::DEFAULT_DIM_MAX_BYTES,
         }
     }
 }
@@ -525,13 +536,53 @@ impl PipelineRunner {
                     .map(|(n, t)| Field::new(n.clone(), arrow_type(t), true))
                     .collect::<Vec<_>>(),
             ));
+            // T-D1 broadcast join (blueprint D narrow path): dim tables load
+            // FULL-TABLE over JDBC here — pipeline compile time, fail-fast
+            // caps (rows / decoded bytes), unique-key gate via the JDBC
+            // source's keyset precondition. The loaded snapshots are static
+            // for the plan's lifetime (broadcast, NOT streaming: no
+            // watermark, no state backend, no refresh).
+            let dim_limits = dim::DimLimits {
+                max_rows: options.dim_max_rows,
+                max_bytes: options.dim_max_bytes,
+            };
+            let mut dims: Vec<tailrace_transform::DimTable> = Vec::new();
+            for d in &spec.dims {
+                let obj = catalog.resolve(&d.reference)?;
+                if obj.kind != "dim" {
+                    anyhow::bail!(
+                        "dim reference {} must be a kind=dim table object (got {}) — \
+                         only ${{ds:dim.datasource.table}} references load as dimension tables",
+                        d.reference,
+                        obj.kind
+                    );
+                }
+                let batch =
+                    dim::load_dim(&obj, &d.name, &spec, connectors, &dim_limits).map_err(|e| {
+                        anyhow::anyhow!("statement #{idx} dim table {}: {e:#}", d.reference)
+                    })?;
+                dims.push(tailrace_transform::DimTable {
+                    name: d.name.clone(),
+                    batch,
+                });
+            }
             // T7 plan materialization: parse+plan ONCE per statement (fail
             // fast on bad SQL at assembly), per micro-batch the decoded batch
             // is injected as `src` — no re-parse/re-plan on the hot path.
-            let exec_plan = Arc::new(tailrace_ir::build_exec_plan(
-                &spec.select_sql,
-                &src_obj.columns,
-            )?);
+            // Dim-join statements plan via build_dim_plan (the dim MemTables
+            // ride inside the plan; inject_src still swaps only `src`).
+            let exec_plan = if dims.is_empty() {
+                Arc::new(tailrace_ir::build_exec_plan(
+                    &spec.select_sql,
+                    &src_obj.columns,
+                )?)
+            } else {
+                Arc::new(tailrace_transform::build_dim_plan(
+                    &spec.select_sql,
+                    schema.clone(),
+                    &dims,
+                )?)
+            };
             let batch = ColBatch::new(schema.clone(), options.poll_rows);
             let _ = state
                 .lock()
@@ -1573,6 +1624,7 @@ select_sql = "SELECT order_no AS batch_key, op_type, ogg_ts FROM src WHERE op_ty
             flush_bytes: 0, // byte boundary wired but not asserted here
             poll_rows: 100,
             poll_slice: Duration::from_millis(300),
+            ..Default::default()
         };
         let (id, stats) = run_standalone(&spec, &dir, opts)?;
         assert_eq!(id, 3201);

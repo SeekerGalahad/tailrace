@@ -288,6 +288,15 @@ pub struct TableRegisterBody {
     pub table_name: String,
     pub format: Option<String>,
     pub columns_json: Option<Vec<(String, String)>>,
+    /// Optional kind override (T-D1): `"dim"` registers a dimension table
+    /// (JDBC broadcast-join side) instead of the datasource-derived kind.
+    /// Only mysql/postgresql datasources accept it.
+    pub kind: Option<String>,
+    /// Declared key column (T-D1): dim = the PRIMARY KEY / single-column
+    /// UNIQUE column (required for kind=dim — the full-table JDBC load
+    /// pagination key); also stored for jdbc streaming tables and doris
+    /// UNIQUE KEY sequence columns. Rides the plan's table metadata.
+    pub sequence_column: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -312,6 +321,9 @@ pub struct TableObjectItem {
     pub cursor_semantics: String,
     pub source: String,
     pub columns_json: Option<Vec<(String, String)>>,
+    /// Declared key column (T-D1; null = not declared) — dim full-table
+    /// load pagination key / doris UNIQUE KEY dedup basis / jdbc cursor.
+    pub sequence_column: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1218,8 +1230,43 @@ pub async fn register_table(
             .into_response();
     };
     // kind derives from the datasource type (kafka ds → kafka table …,
-    // mysql/postgresql ds → jdbc objects — see table_kind_for)
-    let kind = table_kind_for(&ds.ds_type).to_string();
+    // mysql/postgresql ds → jdbc objects — see table_kind_for); the one
+    // accepted override is `dim` (T-D1 dimension table, JDBC broadcast-join
+    // side — mysql/postgresql datasources only)
+    let kind = match body
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        None => table_kind_for(&ds.ds_type).to_string(),
+        Some("dim") => {
+            if !matches!(ds.ds_type.as_str(), "mysql" | "postgresql") {
+                return super::messages::bad_request(
+                    "err.table_object.dim_kind_datasource",
+                    &[&ds.ds_type],
+                )
+                .into_response();
+            }
+            "dim".to_string()
+        }
+        Some(other) => {
+            return super::messages::bad_request("err.table_object.kind_override", &[other])
+                .into_response()
+        }
+    };
+    let sequence_column = body
+        .sequence_column
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if kind == "dim" && sequence_column.is_none() {
+        return super::messages::bad_request(
+            "err.table_object.dim_sequence_required",
+            &[body.table_name.trim()],
+        )
+        .into_response();
+    }
     let columns_json = body
         .columns_json
         .as_ref()
@@ -1231,6 +1278,7 @@ pub async fn register_table(
         &kind,
         body.format.as_deref(),
         columns_json.as_deref(),
+        sequence_column,
     ) {
         Ok(tid) => tid,
         Err(e) => return conflict_or_internal(&e, "该库表已登记（datasource+db+table 唯一）"),
@@ -1299,6 +1347,7 @@ pub async fn list_tables(
                 cursor_semantics: t.cursor_semantics,
                 source: t.source,
                 columns_json,
+                sequence_column: t.sequence_column,
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()

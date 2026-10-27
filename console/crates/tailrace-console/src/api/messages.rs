@@ -9,10 +9,11 @@
 //! 模板占位 `{0}`..`{9}`，由 [`t`] 位置插值；渲染结果与收敛前的直写输出
 //! 逐字节一致（既有测试与前端提示不漂移）。
 //!
-//! 规模口径（T39 ③ 勘正，2026-10-23 实测；T35 增补）：字典 **39 key**（[`tests::KEY_LIST`]
-//! 与 `template` 同步，长度由 [`tests::templates_use_only_positional_placeholders`]
-//! 钉住）/ **57 调用点**（`grep -rn 'messages::' src/ --include='*.rs'`
-//! 排除本模块；T35 部署链 +3 key/+7 站点）。T34 首提交 3cf738b 的「37 key/51 调用点」为双 off-by-one
+//! 规模口径（T39 ③ 勘正，2026-10-23 实测；T35 增补；T-D1 dim join +6 key）：字典 **45 key**
+//! （[`tests::KEY_LIST`] 与 `template` 同步，长度由 [`tests::templates_use_only_positional_placeholders`]
+//! 钉住）/ **63 调用点**（`grep -rn 'messages::' src/ --include='*.rs'`
+//! 排除本模块；T35 部署链 +3 key/+7 站点；T-D1 +6 站点——发布门禁 3 + 维表登记 3）。
+//! T34 首提交 3cf738b 的「37 key/51 调用点」为双 off-by-one
 //! 误记，ffb1d55 勘正、本次落为模块事实。
 //!
 //! 信封：`{"error":{code,message,message_key[,refs]}}`——与 console-auth
@@ -85,6 +86,16 @@ fn template(key: &str) -> Option<&'static str> {
         "err.pipeline.statement_table_missing" => {
             "语句 {0} 的{1}表对象未登记: {2}（先在数据源页登记库表）"
         }
+        // T-D1 dim joins: ${ds:dim.<dsId>.<table>} references gate at publish
+        "err.pipeline.dim_table_missing" => {
+            "语句 {0} 的维表引用 {1} 未登记（先在数据源页以 kind=dim 登记维表）"
+        }
+        "err.pipeline.dim_kind_wrong" => {
+            "语句 {0} 的维表 {1} 登记为 kind={2}，维表需以 kind=dim 登记（JDBC 全表广播加载）"
+        }
+        "err.pipeline.dim_no_sequence" => {
+            "语句 {0} 的维表 {1} 未声明键列 sequenceColumn（主键/单列唯一键，全表加载分页键）"
+        }
         "err.pipeline.node_no_api_url" => "节点 {0} 未上报 api_url（等待首次心跳）",
         "err.pipeline.engine_assembly_failed" => "引擎装配失败: {0}",
         "err.pipeline.undeployed" => "管道 #{0} 未部署（无指派节点）",
@@ -116,6 +127,16 @@ fn template(key: &str) -> Option<&'static str> {
         // ---- 表对象 ----
         "err.table_object.not_found" => "表对象 #{0} 不存在",
         "err.table_object.in_use" => "表对象被已发布管道引用: {0}",
+        // T-D1 dim 表登记（kind 覆盖 + 键列）
+        "err.table_object.kind_override" => {
+            "不支持的 kind 覆盖 {0}（登记 kind 由数据源类型派生，仅可选 dim）"
+        }
+        "err.table_object.dim_kind_datasource" => {
+            "维表（kind=dim）仅可登记在 mysql/postgresql 数据源上（JDBC 全表广播加载），当前类型 {0}"
+        }
+        "err.table_object.dim_sequence_required" => {
+            "维表 {0} 必须声明键列 sequenceColumn（主键/单列唯一键，全表加载分页键）"
+        }
         _ => return None,
     })
 }
@@ -208,13 +229,14 @@ mod tests {
     }
 
     /// 字典自洽：模板只含 {数字} 占位，且插值后无残留花括号。
-    /// 另钉字典规模 = 39 key（模块文档「规模口径」的机器锚点，T39 ③；T35 +3）：
+    /// 另钉字典规模 = 45 key（模块文档「规模口径」的机器锚点，T39 ③；T35 +3；
+    /// T-D1 dim join +6：发布门禁 3 + 维表登记 3）：
     /// 加 key 时同步改此数与 KEY_LIST。
     #[test]
     fn templates_use_only_positional_placeholders() {
         let keys: Vec<&str> = KEY_LIST.to_vec();
         assert!(!keys.is_empty());
-        assert_eq!(keys.len(), 39, "字典规模漂移：同步模块文档「规模口径」");
+        assert_eq!(keys.len(), 45, "字典规模漂移：同步模块文档「规模口径」");
         for key in keys {
             let tpl = template(key).expect("listed key resolves");
             let mut rest = tpl;
@@ -575,6 +597,9 @@ mod tests {
         "err.pipeline.not_found",
         "err.pipeline.table_objects_missing",
         "err.pipeline.statement_table_missing",
+        "err.pipeline.dim_table_missing",
+        "err.pipeline.dim_kind_wrong",
+        "err.pipeline.dim_no_sequence",
         "err.pipeline.node_no_api_url",
         "err.pipeline.engine_assembly_failed",
         "err.pipeline.undeployed",
@@ -594,5 +619,8 @@ mod tests {
         "probe.jdbc.unreachable",
         "err.table_object.not_found",
         "err.table_object.in_use",
+        "err.table_object.kind_override",
+        "err.table_object.dim_kind_datasource",
+        "err.table_object.dim_sequence_required",
     ];
 }

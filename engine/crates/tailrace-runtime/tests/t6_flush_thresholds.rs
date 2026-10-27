@@ -98,6 +98,8 @@ fn tuning(
             flush_bytes,
             poll_rows,
             poll_slice_ms: None,
+            dim_max_rows: None,
+            dim_max_bytes: None,
         }),
         ..Default::default()
     })
@@ -111,6 +113,7 @@ fn t6_statements() -> Vec<StatementSpec> {
         pushdown: vec![],
         select_sql: "SELECT order_no, qty FROM src".into(),
         start_offset: None,
+        dims: Vec::new(),
     }]
 }
 

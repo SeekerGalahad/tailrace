@@ -40,6 +40,11 @@ pub struct TableObject {
     pub format: Option<String>,
     pub cursor_semantics: String,
     pub source: String,
+    /// Key column (T-D1): dim = the PRIMARY KEY / single-column UNIQUE
+    /// column used as the full-table JDBC load pagination key; doris = the
+    /// UNIQUE KEY out-of-order dedup basis; jdbc streaming = the incremental
+    /// cursor column. Rides the plan's table-object metadata verbatim.
+    pub sequence_column: Option<String>,
 }
 
 #[derive(Debug, Clone)]

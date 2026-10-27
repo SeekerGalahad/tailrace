@@ -41,3 +41,13 @@ datafusion = { workspace = true }
 
 [dev-dependencies]
 rdkafka = { workspace = true }
+# T-D1 dim join live e2e (file src → MySQL dim broadcast join → file sink):
+# real jdbc connector for the dim load + ephemeral MySQL via testcontainers,
+# gated on TAILRACE_TESTCONTAINERS=1 (conn-jdbc's live-gate convention);
+# sqlx subcrates = the same workspace versions conn-jdbc locks (schema/seed
+# DDL through the same driver stack, no new lockfile entries)
+tailrace-conn-jdbc = { workspace = true }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+sqlx-core = { workspace = true }
+sqlx-mysql = { workspace = true }

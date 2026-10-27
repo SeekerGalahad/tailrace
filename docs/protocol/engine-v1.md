@@ -98,6 +98,20 @@ SQL 编译诊断（编辑器内联报错数据源）。
 - `dispatchId` 重复下推幂等拒绝；`initialState=PAUSED` 装配即挂分区（升级/迁移/对账恢复路径）。
 - `options` 全段缺省=引擎默认（双向向前兼容）；`options.badRowPolicy` 取值
   `dlq|fail|skip`（默认 `dlq`，见「坏行死信（DLQ）」节），非法值整体拒绝 plan。
+- **维表打宽（T-D1，`JOIN ${ds:dim.<datasource>.<table>} [AS] <alias>`）**：
+  SELECT 的 JOIN 目标可引用维表（目录对象 `kind=dim`，JDBC 来源，声明
+  `sequence_column`=主键/唯一键列）。装配期（编译期）经 JDBC 全表翻页载入为静态
+  `dim_<alias>` MemTable 嵌入执行计划——**广播维表，非流式 join**：无水位线、无
+  状态后端、运行期不刷新（重启才重载快照）。显式上限超限即整体拒绝装配（fail-fast
+  而非 OOM）：`tuning.dimMaxRows`（默认 500,000 行/表）、`tuning.dimMaxBytes`
+  （默认 64 MiB/表，按解码后 Arrow 内存计）。维表声明的键列无主键/单列唯一索引 →
+  拒绝编译（复用 JDBC keyset 唯一性门，防笛卡尔放大）。`tables` 中该维表对象的
+  `reference` 即 SQL 里 `dim.` 之后的两段（`<datasource>.<table>`）。
+  **连接词仅接受 `INNER JOIN`/`JOIN`/`LEFT [OUTER] JOIN`**（打宽契约）：维表侧是
+  每语句静态快照，RIGHT/FULL 会对每个微批重发全部未匹配维表行、CROSS 按
+  |src|×|dim| 逐批放大——编译期以诊断拒绝（唯一键门不防这两类逐批输出放大）。
+  console 侧写法与登记（`kind=dim` + `sequenceColumn`、publish 门禁）见
+  docs/protocol/console-api.md §三.7。
 - 响应：`{"ok": true, "pipelineId": 42, "statements": 2, "mode": "sql-compiled+serve-executing"}`
 - 兼容路径：旧 `specJson` 已废弃（`ok:false` + 指引重发布）。
 

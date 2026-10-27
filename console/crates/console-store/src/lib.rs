@@ -39,7 +39,12 @@ pub use secretbox::{CredentialCipher, MASTER_KEY_ENV, MASTER_KEY_FILE};
 
 /// Versioned migrations; 00_init.sql is the §5.2 DDL verbatim.
 fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(include_str!("../migrations/00_init.sql"))])
+    Migrations::new(vec![
+        M::up(include_str!("../migrations/00_init.sql")),
+        // T-D1: table_object.sequence_column (dim full-table load key /
+        // doris UNIQUE KEY dedup basis / jdbc cursor column).
+        M::up(include_str!("../migrations/01_table_sequence_column.sql")),
+    ])
 }
 
 /// A6 (§7.4 `tailrace_console_db_write_seconds`): SQLite write-path latency
@@ -230,7 +235,10 @@ mod tests {
                     );
                 }
                 let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-                assert_eq!(version, 1, "user_version must be 1 after 00_init");
+                assert_eq!(
+                    version, 2,
+                    "user_version must be 2 after 00_init + 01_table_sequence_column"
+                );
                 Ok(())
             })
             .unwrap();

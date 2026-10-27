@@ -259,6 +259,7 @@ fn t15_statements(topic: &str, sink_ref: &str) -> Vec<StatementSpec> {
         pushdown: vec![],
         select_sql: "SELECT order_no, qty FROM src".into(),
         start_offset: None,
+        dims: Vec::new(),
     }]
 }
 

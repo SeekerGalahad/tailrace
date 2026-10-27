@@ -55,6 +55,7 @@ fn build_source(url: &str, table: &str, cursor_col: &str) -> Box<dyn Source> {
         pushdown: vec![],
         select_sql: "SELECT * FROM src".into(),
         start_offset: None,
+        dims: Vec::new(),
     };
     reg.build_source(&obj, &spec, None)
         .expect("jdbc source builds")

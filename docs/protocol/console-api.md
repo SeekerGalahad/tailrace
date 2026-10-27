@@ -2,7 +2,7 @@
 
 > 管理面 REST 协议正典（`tailrace-console` 二进制）。随 utoipa 注解同步维护；
 > 机器可读正典 = 运行时 `/api-docs/openapi.json`（44 路径），Swagger UI 在 `/swagger-ui/`。
-> 首版 2026-10-11；鉴权协议安全修复改版 2026-10-13。
+> 首版 2026-10-11；鉴权协议安全修复改版 2026-10-13；MCP 面正典化 + 维表（T-D1）动线增补 2026-10-27。
 
 ## 一、通用约定
 
@@ -11,7 +11,7 @@
 - **操作人**：请求头 `X-Operator` 可选覆盖（默认会话用户名），落审计。
 - **错误码语义**：400 INVALID_ARGUMENT / 401 UNAUTHENTICATED·BAD_NODE_TOKEN / 404 NOT_FOUND / 409 CONFLICT·IN_USE·GENERATION_CONFLICT / 413 PAYLOAD_TOO_LARGE / 501 NOT_IMPLEMENTED / 502 ENGINE_UNREACHABLE·ENGINE_REJECTED。
 - **时间戳**：ISO-8601 UTC（`2026-10-11T08:00:00Z`；存储层 SQLite `datetime('now')` 序列化时转换）。
-- **审计**：所有管理面变更操作写 `audit_log`（DATASOURCE_CREATE/UPDATE/DELETE/TEST、TABLE_CREATE/DELETE、NODE_MANUAL_REGISTER/REVOKE/DELETE/DEPLOY/ACTION、ARTIFACT_UPLOAD/DELETE、PIPELINE_CREATE/UPDATE/DELETE/PUBLISH/DEPLOY/RECOVER/ACTION；LOGIN/NODE_REGISTER 沿用 P0）。
+- **审计**：所有管理面变更操作写 `audit_log`（DATASOURCE_CREATE/UPDATE/DELETE/TEST、TABLE_CREATE/DELETE、NODE_MANUAL_REGISTER/REVOKE/DELETE/DEPLOY/ACTION、ARTIFACT_UPLOAD/DELETE、PIPELINE_CREATE/UPDATE/DELETE/PUBLISH/DEPLOY/RECOVER/ACTION；LOGIN/NODE_REGISTER 沿用 P0；MCP 面 MCP_INITIALIZE/MCP_TOOL_CALL 见 §五）。
 
 ## 二、端点清单（P1 实装状态）
 
@@ -54,10 +54,50 @@
 4. **探测语义**：TCP 连通（kafka bootstrap 逐主机、doris FE jdbcUrl+BE streamLoadUrl 全部可达才 CONN_OK）+ file 路径存在性。注意：开发机 TUN 代理会劫持非环回 TCP connect（瞬时假成功）；环回地址不受影响。协议级探测（Kafka metadata / Doris·MySQL·PG 握手）已随 T14 discover/infer-schema 交付（engine `tailrace-metadata`，见端点清单）。
 5. **自动分配合格节点** = ONLINE（心跳 90s 内）且已上报 api_url。
 6. **dispatchId** = epoch-ms*1000+进程内序号（每次下推唯一；引擎幂等拒同 ID 重复下推）。
+7. **维表 join（T-D1）的 SQL 写法与登记**（2026-10-27 增补）：
+   - SQL 侧维表引用**不走 dsMapping 改写**，直接写占位符
+     `LEFT JOIN ${ds:dim.<datasourceId>.<table>} [AS] <alias> ON …`（parser 契约：
+     `dim.` 之后恰两段；`<datasourceId>` 为数字数据源 id，无库名段——库由数据源
+     jdbcUrl 钉死）。仅 `INNER JOIN`/`JOIN`/`LEFT [OUTER] JOIN` 接受——RIGHT/FULL
+     会对每个微批重发全部未匹配维表行、CROSS 按 |src|×|dim| 放大，编译期拒绝。
+   - 维表对象在 mysql/postgresql 数据源下登记：`POST /api/datasources/{id}/tables`
+     带 `"kind":"dim"` + `"sequenceColumn":"<主键/单列唯一键列>"`（缺 sequenceColumn
+     400——引擎全表加载以该列为分页键且复用 JDBC keyset 唯一性门）；列表接口回
+     `sequenceColumn` 字段。
+   - publish 门禁同时校验维表引用：可解析 + `kind=dim` + 已声明键列，任一不满足
+     400 diagnostics（`err.pipeline.dim_*`）。
+   - deploy 的 plan `tables[]` 为维表多带一条元数据：`reference` = SQL 引用去掉
+     `dim.` 的两段（`<dsId>.<table>`）、`kind=dim`、`bootstrap` = connJson `jdbcUrl`
+     去掉 `jdbc:` 前缀（引擎方言选 `mysql://`/`postgres://`）、`sequence_column` =
+     登记键列。表删除守卫对维表按 `${ds:dim.<dsId>.<table>}` 针匹配。
+   - `sequence_column` 同样随 jdbc 批源表（kind=jdbc，增量游标列）与 doris
+     UNIQUE KEY 去重列下发——此前恒 null，Doris 乱序去重经 console 不可达。
 
 ## 四、未决 / 后续
 
 - ticket 端点（票据链，600s 单次票据）仍未交付——凭据加密静态半边已落地（见「关键语义裁决」3），票据链为 v1.x 结构性修复。
 - ~~SSH 部署链八步 + 节点进程动作~~（T35 已交付，见端点清单；「逐条暂停→执行→自动恢复」的管道级暂停编排仍留 v1.x——当前动作直接作用于进程，不自动暂停在跑管道）。
-- catalog 快照浏览 / 样本预览 / lag 告警规则 / SQL 片段助手（后续版本族；discover / infer-schema 已于 T14 交付）。jdbc 管道 console 端到端未通（plan 下推 bootstrap/sequence_column 两键，见 docs/connectors/jdbc.md §七）。
+- catalog 快照浏览 / 样本预览 / lag 告警规则 / SQL 片段助手（后续版本族；discover / infer-schema 已于 T14 交付）。~~jdbc 管道 console 端到端未通~~（T-D1 2026-10-27 清偿大半：plan 下推对 dim/jdbc 表由 connJson `jdbcUrl`（去 `jdbc:` 前缀）填 `bootstrap`、由表对象 `sequence_column` 列填 `sequence_column`——正是 jdbc 源工厂必填两键；维表动线有 console e2e 测试钉住，jdbc 流式批源动线仍未有 console 侧 e2e 覆盖，留后续补）。
 - 90s OFFLINE 目前为读时计算；未做后台定时器回写。
+
+## 五、MCP 面（`POST /mcp`，T-E4 / 蓝图 §7.5）
+
+- **传输**：Streamable HTTP 请求/响应（无服务端 SSE 流）；单 body 单 JSON-RPC 消息，batch 拒绝（-32600）；`initialize` 发 `Mcp-Session-Id`（后续调用按 clientInfo.name 归因，未带回落 `X-MCP-Client`/`User-Agent`/anonymous）。协议版本 `2025-06-18`（echo 旧已知版本）。无 console 会话——全局固定窗口限速（默认 100 req/s，超限 429 + -32002）。
+- **写闸门**：四个写工具需**双重确认**——进程级开关 `--mcp-allow-write` / `MCP_ALLOW_WRITE=1` **且**调用参数 `"confirm": true`；缺一以 `WRITE_DISABLED`(-32001) / `INVALID_PARAMS`(code CONFIRM_REQUIRED) 拒绝。
+- **审计**：每次工具调用——成功、失败、被拒——都落 `audit_log` 为 `MCP_TOOL_CALL`（actor=`mcp:<client>`），含从未到达工具执行的尝试（未知工具名 / 缺名 / 非对象 arguments，以 UNKNOWN_TOOL / INVALID_PARAMS 登记）；过闸的写调用另产生对应 REST 域审计行（PIPELINE_CREATE 等，operator 归到 MCP 身份）。
+- **十工具表**（`tools/list` 顺序；R=读恒开，W=写需闸门）——仓库内正典即 `tailrace-console/src/mcp.rs` 的 `TOOLS` 表与单测 `tool_table_matches_blueprint_7_5`（10 工具、6R+4W、唯一名、写必 confirm），此处镜像供评审对拍：
+
+| # | 工具 | 读写 | 映射 | 关键参数 |
+|---|---|---|---|---|
+| 1 | `list_datasources` | R | GET /api/datasources | `type?` |
+| 2 | `list_pipelines` | R | GET /api/pipelines | `page?` `pageSize?` |
+| 3 | `get_pipeline` | R | GET /api/pipelines/{id} | `id` |
+| 4 | `get_pipeline_stats` | R | GET /api/pipelines/{id}/stats | `id` |
+| 5 | `get_pipeline_logs` | R | 引擎 tail 单快照（SSE 不可折入单结果） | `id` `lines?`（钳 50..500） |
+| 6 | `compile_sql` | R | POST /api/pipelines/compile（纯函数） | `sql` `dsMapping?` `pipelineId?` |
+| 7 | `create_pipeline` | W | POST /api/pipelines | `name` `sqlContent` `dsMapping?` `checkpointMs?` `preferredNodeId?` `config?` + `confirm` |
+| 8 | `deploy_pipeline` | W | POST /api/pipelines/{id}/deploy | `id` `nodeId?` + `confirm` |
+| 9 | `pause_resume_pipeline` | W | POST /api/pipelines/{id}/pause·resume | `id` `action`("pause"|"resume") + `confirm` |
+| 10 | `trigger_backfill` | W | T-A2 未交付，恒 501 NOT_IMPLEMENTED | `id` `from?` `to?` `dryRun?` + `confirm` |
+
+- **结果信封**：`content`（文本）+ `structuredContent`（`httpStatus` + 处理器 body 原文）+ `isError`（镜像 REST 状态）。

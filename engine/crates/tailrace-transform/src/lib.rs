@@ -2,6 +2,17 @@
 //! `select_sql` is materialized into a LogicalPlan **once** (T7), per
 //! micro-batch the decoded batch is injected as the `src` data source and the
 //! plan executed.
+//!
+//! T-D1 (blueprint D narrow path): statements with `JOIN
+//! ${ds:dim.datasource.table}` get their plan materialized by
+//! [`build_dim_plan`] — the dimension tables are registered as **static
+//! MemTables** (loaded full-table over JDBC at assembly) and ride inside the
+//! plan. This is a **broadcast join, NOT a streaming join**: no watermark, no
+//! state backend, no dim refresh while the pipeline runs; the loader enforces
+//! explicit row/memory caps and fails the assembly on breach (fail-fast, not
+//! OOM). Per micro-batch only the `src` scan swaps ([`inject_src`] is
+//! untouched); the dim scans keep their static sources for the plan's
+//! lifetime.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -15,6 +26,17 @@ use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::{DataFrame, SessionConfig};
+
+/// One loaded dimension table (T-D1 broadcast join side): the full-table
+/// snapshot taken at assembly, registered under `name` (`dim_<alias>`, the
+/// table name the rewritten select_sql joins against).
+#[derive(Debug, Clone)]
+pub struct DimTable {
+    /// Registered table name (`dim_<alias>`)
+    pub name: String,
+    /// Full-table data (limits already enforced by the loader)
+    pub batch: RecordBatch,
+}
 
 /// Per-statement plan execution options (T7): the knobs the DataFusion
 /// session is assembled with — fixed at statement assembly, NOT derived from
@@ -145,6 +167,57 @@ fn src_schema(plan: &LogicalPlan) -> Option<SchemaRef> {
         Ok(TreeNodeRecursion::Continue)
     });
     found
+}
+
+/// T-D1 (blueprint D narrow path): materialize a dim-join statement plan.
+///
+/// Registers each dim table as a **static MemTable** (`dim_<alias>`, the
+/// full-table snapshot loaded at assembly) plus the `src` placeholder with
+/// the declared source schema, then parses+plans `select_sql`. The dim
+/// MemTable sources ride inside the returned plan — execution needs no dim
+/// re-registration ([`transform_plan`]/[`inject_src`] swap only the `src`
+/// scan per micro-batch, exactly as for dim-free statements).
+///
+/// **Broadcast join, NOT a streaming join**: the dim snapshot is fixed for
+/// the plan's lifetime (no watermark, no state backend, no refresh); the
+/// loader's row/memory caps are the only memory guardrail.
+///
+/// Plans on a dedicated thread: statement assembly may run inside an async
+/// runtime (the node serve deployment handler) — nesting a tokio runtime
+/// there panics (same reason as `tailrace_ir::build_exec_plan`).
+pub fn build_dim_plan(
+    select_sql: &str,
+    src_schema: SchemaRef,
+    dims: &[DimTable],
+) -> anyhow::Result<LogicalPlan> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || -> anyhow::Result<LogicalPlan> {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                rt.block_on(async {
+                    let ctx = SessionContext::new();
+                    // src placeholder: the schema anchors the plan, per
+                    // micro-batch inject_src swaps in the live batch
+                    ctx.register_batch("src", RecordBatch::new_empty(src_schema))?;
+                    for d in dims {
+                        let table =
+                            MemTable::try_new(d.batch.schema(), vec![vec![d.batch.clone()]])?;
+                        // register_table errors on a duplicate name — a
+                        // twice-registered dim_<alias> fails the plan build
+                        ctx.register_table(d.name.as_str(), Arc::new(table))
+                            .map_err(|e| {
+                                anyhow::anyhow!("dim table {} registration failed: {e}", d.name)
+                            })?;
+                    }
+                    let df = ctx.sql(select_sql).await?;
+                    Ok(df.logical_plan().clone())
+                })
+            })
+            .join()
+            .map_err(|_| anyhow::anyhow!("dim plan build thread panicked"))?
+    })
 }
 
 /// Execute a materialized statement plan over one micro-batch (runtime hot
@@ -436,6 +509,188 @@ mod tests {
                 .map_err(|e| anyhow::anyhow!("collect: {e}"))?;
             Ok(datafusion::arrow::util::pretty::pretty_format_batches(&batches)?.to_string())
         })
+    }
+
+    // ==================== T-D1 broadcast dim join ====================
+
+    use datafusion::arrow::array::Array;
+
+    fn dim_batch(rows: &[(i64, Option<&str>)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let ids: Int64Array = rows.iter().map(|(id, _)| Some(*id)).collect();
+        let names: StringArray = rows.iter().map(|(_, n)| n.map(|s| s.to_string())).collect();
+        RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(names)]).expect("dim batch")
+    }
+
+    fn src_batch_uid(rows: &[i64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("uid", DataType::Int64, true),
+            Field::new("val", DataType::Utf8, true),
+        ]));
+        let uids: Int64Array = rows.to_vec().into();
+        let vals: StringArray = rows.iter().map(|r| Some(format!("v{r}"))).collect();
+        RecordBatch::try_new(schema, vec![Arc::new(uids), Arc::new(vals)]).expect("src batch")
+    }
+
+    /// T-D1 core acceptance: a LEFT JOIN against the static dim MemTable
+    /// produces matched rows AND NULL sides for unmatched keys — the dim data
+    /// rides inside the plan, so `inject_src` (unchanged) only swaps `src`.
+    #[test]
+    fn dim_left_join_produces_matches_and_null_sides() -> anyhow::Result<()> {
+        let dim = DimTable {
+            name: "dim_d".into(),
+            batch: dim_batch(&[(1, Some("alice")), (2, Some("bob"))]),
+        };
+        let src_schema = src_batch_uid(&[]).schema();
+        let sql = "SELECT s.uid, s.val, d.name FROM src s LEFT JOIN dim_d d ON s.uid = d.id";
+        let plan = build_dim_plan(sql, src_schema, &[dim])?;
+        // micro-batch: uid 1 matches alice, uid 9 has NO dim side (NULL),
+        // uid 2 matches bob
+        let out = transform_plan(
+            &plan,
+            src_batch_uid(&[1, 9, 2]),
+            &TransformOptions::default(),
+        )?;
+        let mut rows: Vec<(i64, Option<String>)> = out
+            .iter()
+            .flat_map(|b| {
+                let uids = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("uid col");
+                let names = b
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("name col");
+                (0..b.num_rows())
+                    .map(|i| {
+                        (
+                            uids.value(i),
+                            if names.is_null(i) {
+                                None
+                            } else {
+                                Some(names.value(i).to_string())
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        // hash-join output order is not the input order — compare as a set
+        rows.sort_by_key(|(uid, _)| *uid);
+        assert_eq!(
+            rows,
+            vec![
+                (1, Some("alice".into())),
+                (2, Some("bob".into())),
+                (9, None)
+            ],
+            "LEFT JOIN: matched dim values + NULL side for the unmatched key"
+        );
+        Ok(())
+    }
+
+    /// T-D1: the dim snapshot is STATIC across micro-batches — the same dim
+    /// rows join every batch (no re-load, no drift), and multiple dim-free
+    /// statements on the same thread keep working (session reuse unaffected).
+    /// Runs on its own thread (one statement = one thread-local session).
+    #[test]
+    fn dim_static_across_micro_batches() -> anyhow::Result<()> {
+        let dim = DimTable {
+            name: "dim_d".into(),
+            batch: dim_batch(&[(1, Some("alice"))]),
+        };
+        let src_schema = src_batch_uid(&[]).schema();
+        let plan = Arc::new(build_dim_plan(
+            "SELECT s.uid, d.name FROM src s INNER JOIN dim_d d ON s.uid = d.id",
+            src_schema,
+            &[dim],
+        )?);
+        let out = std::thread::spawn(move || {
+            let opts = TransformOptions::default();
+            let first = transform_plan(&plan, src_batch_uid(&[1, 2]), &opts)?;
+            let second = transform_plan(&plan, src_batch_uid(&[1]), &opts)?;
+            anyhow::Ok((first, second))
+        })
+        .join()
+        .expect("dim statement thread")?;
+        // INNER JOIN: unmatched uid 2 drops; the dim row still matches batch 2
+        let names = |out: &[RecordBatch]| {
+            out.iter()
+                .flat_map(|b| {
+                    b.column(1)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("name col")
+                        .iter()
+                        .map(|v| v.map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&out.0), vec![Some("alice".to_string())]);
+        assert_eq!(
+            names(&out.1),
+            vec![Some("alice".to_string())],
+            "the static dim MemTable keeps serving later micro-batches"
+        );
+        Ok(())
+    }
+
+    /// T-D1: an empty dim table (0 rows) is legal — every LEFT JOIN row gets
+    /// the NULL side (the "dim not yet populated" edge).
+    #[test]
+    fn dim_empty_table_left_join_all_null_sides() -> anyhow::Result<()> {
+        let dim = DimTable {
+            name: "dim_d".into(),
+            batch: dim_batch(&[]),
+        };
+        let src_schema = src_batch_uid(&[]).schema();
+        let plan = build_dim_plan(
+            "SELECT s.uid, d.name FROM src s LEFT JOIN dim_d d ON s.uid = d.id",
+            src_schema,
+            &[dim],
+        )?;
+        let out = transform_plan(&plan, src_batch_uid(&[1, 2]), &TransformOptions::default())?;
+        let total: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2, "all src rows survive");
+        let nulls: usize = out
+            .iter()
+            .map(|b| {
+                b.column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("name col")
+                    .null_count()
+            })
+            .sum();
+        assert_eq!(nulls, 2, "empty dim → every row has the NULL side");
+        Ok(())
+    }
+
+    /// T-D1: planning a select_sql that references an unregistered dim name
+    /// fails at plan build (assembly time), not mid-run.
+    #[test]
+    fn dim_plan_rejects_unknown_table() {
+        let src_schema = src_batch_uid(&[]).schema();
+        let err = build_dim_plan(
+            "SELECT s.uid FROM src s LEFT JOIN dim_gone g ON s.uid = g.id",
+            src_schema,
+            &[DimTable {
+                name: "dim_d".into(),
+                batch: dim_batch(&[(1, Some("alice"))]),
+            }],
+        )
+        .expect_err("unknown dim table must fail the plan build");
+        assert!(
+            err.to_string().contains("dim_gone"),
+            "error names the missing dim table: {err:#}"
+        );
     }
 
     /// T7: the memory pool is assembled into the session runtime with the

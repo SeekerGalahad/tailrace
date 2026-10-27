@@ -968,6 +968,7 @@ mod tests {
             pushdown: vec![],
             select_sql: "SELECT * FROM src".into(),
             start_offset: None,
+            dims: Vec::new(),
         };
         let err = |b: Option<&str>, q: Option<&str>| match source_factory(&obj(b, q), &spec, None) {
             Err(e) => e.to_string(),
