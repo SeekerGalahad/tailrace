@@ -23,6 +23,7 @@ members = [
     "engine/crates/tailrace-catalog",
     "engine/crates/tailrace-runtime",
     "engine/crates/tailrace-metadata",
+    "engine/crates/tailrace-ddl",
     "engine/crates/tailrace-api",
     # console
     "console/crates/tailrace-console",
@@ -173,6 +174,9 @@ tailrace-catalog = { path = "engine/crates/tailrace-catalog", version = "1.1.0" 
 # explicitly in its own manifest.
 tailrace-runtime = { path = "engine/crates/tailrace-runtime", version = "1.1.0", default-features = false }
 tailrace-metadata = { path = "engine/crates/tailrace-metadata", version = "1.1.0" }
+# T-A1 (R6): pure draft-DDL generator — no IO, no tokio; console pairs it
+# with tailrace-metadata's mysql_exec for the create-table closed loop.
+tailrace-ddl = { path = "engine/crates/tailrace-ddl", version = "1.1.0" }
 tailrace-api = { path = "engine/crates/tailrace-api", version = "1.1.0" }
 console-store = { path = "console/crates/console-store", version = "1.1.0" }
 console-auth = { path = "console/crates/console-auth", version = "1.1.0" }

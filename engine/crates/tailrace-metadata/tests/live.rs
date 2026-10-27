@@ -26,7 +26,7 @@ use testcontainers::core::ImageExt;
 use testcontainers::runners::SyncRunner;
 use testcontainers_modules::{kafka, mysql, postgres};
 
-use tailrace_metadata::{discover, infer_schema, ConnSpec};
+use tailrace_metadata::{discover, infer_schema, mysql_exec, ConnSpec};
 
 fn gated() -> bool {
     std::env::var("TAILRACE_TESTCONTAINERS").ok().as_deref() == Some("1")
@@ -289,5 +289,56 @@ fn postgres_discover_and_describe_live() -> anyhow::Result<()> {
             ("note".to_string(), "utf8".to_string()),
         ]
     );
+    Ok(())
+}
+
+/// T-A1 mysql_exec: sequential execution with per-statement echo/timing/
+/// affected rows, verbatim server error naming the failing statement, and
+/// the non-MySql spec rejected before any IO.
+#[test]
+fn mysql_exec_live() -> anyhow::Result<()> {
+    if !gated() {
+        eprintln!("[skip] TAILRACE_TESTCONTAINERS!=1 — metadata live tests skipped");
+        return Ok(());
+    }
+    let node = mysql::Mysql::default().with_tag("8.0").start()?;
+    let port = node.get_host_port_ipv4(3306)?;
+    let spec = mysql_spec(port);
+    let db = format!("ta1_exec_{}", std::process::id());
+
+    // all-success batch: DDL reports 0 affected rows, INSERT reports 2,
+    // every statement is echoed back with non-zero timing
+    let create = format!("CREATE DATABASE {db}");
+    let mk_table = format!("CREATE TABLE {db}.t (id BIGINT, v VARCHAR(8))");
+    let insert = format!("INSERT INTO {db}.t VALUES (1, 'a'), (2, 'b')");
+    let out = rt().block_on(mysql_exec(&spec, &[&create, &mk_table, &insert]))?;
+    assert_eq!(out.statements.len(), 3);
+    assert_eq!(out.statements[0].sql, create);
+    assert_eq!(out.statements[0].rows_affected, 0, "DDL affects no rows");
+    assert_eq!(out.statements[2].rows_affected, 2);
+    assert!(out.statements.iter().all(|s| !s.elapsed.is_zero()));
+
+    // failure: 1-based position + the server's message verbatim, batch
+    // aborted at the failure (statement 1 still landed — auto-committed)
+    let ok_insert = format!("INSERT INTO {db}.t VALUES (3, 'c')");
+    let bad_insert = format!("INSERT INTO {db}.nope VALUES (1)");
+    let e = rt()
+        .block_on(mysql_exec(&spec, &[&ok_insert, &bad_insert]))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("第 2 条执行失败"), "{e}");
+    assert!(e.contains("nope"), "server message verbatim: {e}");
+
+    // non-MySql spec rejected before any IO
+    let e = rt()
+        .block_on(mysql_exec(
+            &ConnSpec::Kafka {
+                bootstrap: "x".into(),
+            },
+            &["SELECT 1"],
+        ))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("MySQL 协议"), "{e}");
     Ok(())
 }
