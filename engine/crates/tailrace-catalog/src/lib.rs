@@ -28,8 +28,12 @@ pub struct TableObject {
     #[serde(default = "default_kind")]
     pub kind: String,
     /// Decode format: ogg / json / jsonl / csv / parquet / debezium-json
-    /// (debezium-json = CDC envelope consumed from Kafka, blueprint C narrow
-    /// path; `after.*` is the row data, deletes skip)
+    /// (debezium-json = Debezium CDC envelope consumed from Kafka, blueprint
+    /// C narrow path; `after.*` is the row data, deletes/tombstones skip,
+    /// schema/payload-wrapped and bare converter envelopes both accepted.
+    /// Decoder-only so far: runtime `build_decoder` and console discover
+    /// reject the value until the dispatch arm lands — no pipeline can
+    /// select it yet)
     pub format: Option<String>,
     /// Column definitions [name, arrow type] (v1 flat; discover output is the
     /// same shape)

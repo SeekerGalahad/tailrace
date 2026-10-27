@@ -5,7 +5,8 @@
 //! ogg (Oracle GoldenGate CDC envelopes) is a generic adapter name: the payload
 //! carries `after` + three envelope columns (op_type/ogg_table/ogg_ts).
 //! debezium-json (blueprint C narrow path) consumes Debezium CDC events from
-//! Kafka: `after.*` is the row data; op=d / before-only / tombstone skip.
+//! Kafka: `after.*` is the row data; op=d / `after`:null / tombstone (null
+//! record → empty payload) skip; an event object without `after` goes Bad.
 //! Cross-sample typing is carried by the target schema (this crate only writes
 //! declared schema columns; inference belongs to the console discover step).
 //! parquet brings its own schema: the whole file is one batch, column-cast
@@ -261,8 +262,13 @@ fn append_bool(b: &mut dyn ArrayBuilder, v: bool) {
     }
 }
 
-/// Decode outcome: Append=column-filled / Skip=dropped by pushdown early
-/// filter / Bad=parse failure (carrying the raw bytes back).
+/// Decode outcome: Append=column-filled / Skip=not-a-row, dropped silently /
+/// Bad=parse-or-shape failure (carrying the raw bytes back).
+///
+/// Skip sources (the runtime folds them into one `skipped` counter): pushdown
+/// early filter (OGG op_type whitelist), CSV blank line, and CDC non-row
+/// events — Debezium tombstone (null-valued record), delete (op=d) and
+/// `after`:null events (delete / truncate `t` / message `m`).
 #[derive(PartialEq, Debug)]
 pub enum Decoded {
     Append,
@@ -451,20 +457,35 @@ impl Decoder for OggDecoder {
 
 /// Debezium JSON decoder (Kafka Connect JSON converter envelope, blueprint C
 /// narrow path — consumes Debezium events from Kafka; tailrace does not
-/// capture binlogs itself). Envelope shape:
-/// `{"before":null,"after":{"id":1,"name":"foo"},"op":"c","ts_ms":123}`.
+/// capture binlogs itself). Both converter shapes are accepted:
+/// - schemas.enable=false (unwrapped):
+///   `{"before":null,"after":{"id":1,"name":"foo"},"op":"c","ts_ms":123}`
+/// - schemas.enable=true (Kafka Connect JsonConverter default): the same
+///   event wrapped as `{"schema":{…},"payload":{…}}` — the payload is
+///   unwrapped before envelope handling (both keys together identify the
+///   wrapper; a bare Debezium envelope never carries either).
 ///
 /// v1 row semantics:
 /// - `after.*` keys write into same-named schema columns (typed chain
 ///   identical to JsonDecoder/OggDecoder; nested objects/arrays in a field
-///   value decode as null, matching that family). `before`/`op`/`ts_ms` are
-///   envelope metadata and are NOT decoded into columns.
-/// - op=`d` (delete), `after` null or absent (delete / before-only /
-///   tombstone), and a bare JSON `null` message (Debezium tombstone) all
-///   Skip — v1 carries no delete marker downstream.
-/// - Malformed JSON, an `after` that is a non-object scalar/array, and a
-///   non-object non-null root (e.g. a JSON array — not a Debezium event) go
-///   Bad; the bad-row policy (DLQ/fail) decides upstream.
+///   value decode as null, matching that family). `before`/`op`/`ts_ms`/
+///   `source` are envelope metadata and are NOT decoded into columns (an
+///   OGG-style op/ts envelope-column pair is a v1.x follow-up, as is console
+///   discover inference for this format).
+/// - Tombstone: Debezium (tombstones.on.delete=true) emits a **null-valued
+///   Kafka record**, which the Kafka conn layer hands through as an empty
+///   buffer — empty/whitespace-only input Skips (a bare JSON `null` message
+///   is tolerated the same way, though Kafka never delivers it for a
+///   tombstone). op=`d` (delete) and `after`:null events (delete / truncate
+///   `t` / message `m`) also Skip — v1 carries no delete marker downstream.
+/// - Malformed JSON, a non-object non-null root, an `after` that is a
+///   non-object scalar/array, and — shape strictness — an event object with
+///   NO `after` key (or a wrapper `payload` that is not an object) go Bad:
+///   real c/r/u events always carry `after`, so a missing key means a
+///   misrouted/misconfigured producer and must surface via the bad-row
+///   policy (DLQ/fail) instead of silently vanishing.
+/// - Numbers above i64::MAX (e.g. MySQL BIGINT UNSIGNED) decode as null —
+///   shared typed-chain family behavior (Json/Ogg decoders alike).
 ///
 /// Pushdown is ignored: the op_type-keyed whitelist targets the OGG envelope
 /// column, which Debezium v1 does not decode.
@@ -473,11 +494,17 @@ pub struct DebeziumJsonDecoder;
 impl DebeziumJsonDecoder {
     /// Borrow-scoped walk (same rationale as [`JsonDecoder::walk`]).
     fn walk(buf: &mut [u8], batch: &mut ColBatch) -> Result<(), WalkFail> {
+        // Tombstone first: a null-valued Kafka record arrives as an EMPTY
+        // buffer (the Kafka conn layer maps null payloads to `&[]`) — that is
+        // a Skip, not a parse failure. Whitespace-only rides the same rule.
+        if buf.iter().all(|b| b.is_ascii_whitespace()) {
+            return Err(WalkFail::Skip);
+        }
         let dom = match simd_json::to_borrowed_value(buf) {
             Ok(v) => v,
             Err(_) => return Err(WalkFail::Bad),
         };
-        // Root must be the event object; a bare `null` is a Debezium
+        // Root must be the event object; a bare `null` is tolerated as a
         // tombstone (Skip), any other non-object root is not an event (Bad).
         if !dom.is_object() {
             return if dom.is_null() {
@@ -486,13 +513,28 @@ impl DebeziumJsonDecoder {
                 Err(WalkFail::Bad)
             };
         }
+        // schemas.enable=true wrapper: unwrap the payload (both keys together
+        // identify the wrapper — a bare Debezium envelope carries neither).
+        let env = if dom.get("schema").is_some() && dom.get("payload").is_some() {
+            match dom.get("payload") {
+                Some(p) if p.is_object() => p,
+                Some(p) if p.is_null() => return Err(WalkFail::Skip), // degenerate wrapper
+                _ => return Err(WalkFail::Bad),
+            }
+        } else {
+            &dom
+        };
         // Delete: after is null in a well-formed event — skip even an
         // out-of-shape `d` carrying an after object (v1 drops deletes).
-        if dom.get("op").and_then(|v| v.as_str()) == Some("d") {
+        if env.get("op").and_then(|v| v.as_str()) == Some("d") {
             return Err(WalkFail::Skip);
         }
-        let after = match dom.get("after") {
-            None => return Err(WalkFail::Skip), // before-only / tombstone: no row image
+        // Real c/r/u events always carry `after` (null only for delete and
+        // op t/m); an absent key is a misrouted/misconfigured producer — Bad,
+        // so the bad-row policy (DLQ/fail) makes it visible instead of the
+        // row silently vanishing.
+        let after = match env.get("after") {
+            None => return Err(WalkFail::Bad), // not a Debezium envelope
             Some(v) if v.is_null() => return Err(WalkFail::Skip),
             Some(v) if v.is_object() => v,
             Some(_) => return Err(WalkFail::Bad), // envelope violation: after must be an object
@@ -886,11 +928,15 @@ mod tests {
         assert!(active.is_null(2));
     }
 
-    /// Delete (op=d, after=null), before-only events and Debezium tombstones
-    /// (bare JSON `null`) all Skip without appending — v1 drops deletes and
-    /// leaves the batch untouched.
+    /// Deletes (op=d) and `after`:null events (u out-of-shape / truncate `t`
+    /// / message `m`) Skip without appending — v1 drops deletes and leaves
+    /// the batch untouched. The tombstone fixtures are the REAL Kafka shapes:
+    /// Debezium emits a null-valued record, which the conn layer hands
+    /// through as an empty buffer (a bare JSON `null` text is tolerated but
+    /// Kafka never delivers it for a tombstone). Events with NO `after` key
+    /// are NOT here — they go Bad (see `debezium_malformed_goes_bad`).
     #[test]
-    fn debezium_delete_before_only_and_tombstone_skip() {
+    fn debezium_delete_and_tombstone_skip() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, true),
             Field::new("name", DataType::Utf8, true),
@@ -899,20 +945,23 @@ mod tests {
         let skips: Vec<&[u8]> = vec![
             // canonical delete: after=null, before carries the pre-image
             br#"{"before":{"id":1,"name":"foo"},"after":null,"op":"d","ts_ms":126}"#,
-            // before-only update (after key absent)
-            br#"{"before":{"id":1,"name":"foo"},"op":"u","ts_ms":127}"#,
-            // before-only with explicit after:null
+            // explicit after:null (no row image) — op u out-of-shape
             br#"{"before":{"id":1},"after":null,"op":"u"}"#,
-            // no envelope at all — no after means no row image
-            br#"{}"#,
-            // Debezium tombstone (compact topics): bare JSON null
+            // truncate (op=t) and logical message (op=m): after=null by spec
+            br#"{"before":null,"after":null,"op":"t","ts_ms":127}"#,
+            br#"{"source":{},"after":null,"op":"m","ts_ms":128}"#,
+            // tombstone, real shape: null-valued record -> EMPTY payload
+            b"",
+            // whitespace-only rides the tombstone rule
+            b"\n",
+            // bare JSON `null` text: tolerated (not a real tombstone shape)
             b"null",
         ];
         for s in skips {
             assert_eq!(
                 DebeziumJsonDecoder.decode(s.to_vec(), &mut batch, &Pushdown::default()),
                 Decoded::Skip,
-                "{} must Skip",
+                "{:?} must Skip",
                 String::from_utf8_lossy(s)
             );
         }
@@ -922,8 +971,44 @@ mod tests {
         );
     }
 
-    /// Malformed JSON, a non-object root that is not a tombstone, and an
-    /// `after` that is a scalar/array go Bad — the existing bad-row path
+    /// schemas.enable=true wrapper (Kafka Connect JsonConverter default):
+    /// `{"schema":{…},"payload":{…}}` unwraps to the payload — a wrapped c
+    /// event appends `after.*`, a wrapped delete skips. Without the unwrap
+    /// every wrapped event silently skipped (no `after` at the root).
+    #[test]
+    fn debezium_schemas_enabled_wrapper_unwraps() {
+        use datafusion::arrow::array::Int64Array;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let mut batch = ColBatch::new(schema, 4);
+        assert_eq!(
+            DebeziumJsonDecoder.decode(
+                br#"{"schema":{"type":"struct","fields":[{"field":"id","type":"int64"}]},"payload":{"before":null,"after":{"id":5,"name":"wrapped"},"op":"c","ts_ms":9}}"#.to_vec(),
+                &mut batch,
+                &Pushdown::default()
+            ),
+            Decoded::Append
+        );
+        assert_eq!(
+            DebeziumJsonDecoder.decode(
+                br#"{"schema":{"type":"struct"},"payload":{"before":{"id":5},"after":null,"op":"d","ts_ms":10}}"#.to_vec(),
+                &mut batch,
+                &Pushdown::default()
+            ),
+            Decoded::Skip
+        );
+        let rb = batch.finish().unwrap();
+        assert_eq!(rb.num_rows(), 1);
+        let id = rb.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(id.value(0), 5);
+    }
+
+    /// Malformed JSON, a non-object root that is not a tombstone, an `after`
+    /// that is a scalar/array, and an event object with NO `after` key
+    /// (misrouted plain-row JSON, before-only shape, empty envelope, wrapper
+    /// with a non-object payload) go Bad — the existing bad-row path
     /// (DLQ/fail) decides; the buffer rides along (T3 contract).
     #[test]
     fn debezium_malformed_goes_bad() {
@@ -936,6 +1021,10 @@ mod tests {
             b"42".to_vec(),                                   // scalar root
             br#"{"op":"c","after":7}"#.to_vec(),              // after not an object
             br#"{"op":"c","after":[1]}"#.to_vec(),            // after not an object
+            b"{}".to_vec(),                                   // no after key at all
+            br#"{"before":{"id":1},"op":"u"}"#.to_vec(),      // before-only, after absent
+            br#"{"foo":"bar","id":1,"name":"x"}"#.to_vec(),   // misrouted plain-row JSON
+            br#"{"schema":{},"payload":7}"#.to_vec(),         // wrapper payload not an object
         ] {
             let mut batch = ColBatch::new(schema.clone(), 4);
             match DebeziumJsonDecoder.decode(poisoned.clone(), &mut batch, &Pushdown::default()) {
@@ -983,7 +1072,8 @@ mod tests {
         assert!(name.is_null(0), "JSON null field value → null");
     }
 
-    /// Mixed batch — the pipeline shape: c/u append, d and tombstone skip,
+    /// Mixed batch — the pipeline shape: c/u append, d and a real tombstone
+    /// (empty payload, the conn-layer shape of a null-valued record) skip,
     /// one malformed row goes Bad; appended + skipped counts must net out.
     #[test]
     fn debezium_mixed_batch_counts() {
@@ -999,7 +1089,7 @@ mod tests {
             &br#"{"before":null,"after":{"id":1,"name":"a"},"op":"c","ts_ms":1}"#[..],
             &br#"{"before":null,"after":{"id":2,"name":"b"},"op":"r","ts_ms":2}"#[..],
             &br#"{"before":{"id":1},"after":null,"op":"d","ts_ms":3}"#[..],
-            b"null",
+            &b""[..], // tombstone: null-valued record -> empty payload
             b"{garbage",
         ] {
             match DebeziumJsonDecoder.decode(m.to_vec(), &mut batch, &Pushdown::default()) {
