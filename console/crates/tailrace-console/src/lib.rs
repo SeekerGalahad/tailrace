@@ -16,7 +16,7 @@ pub mod state;
 
 use axum::extract::DefaultBodyLimit;
 use axum::middleware::from_fn_with_state;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::Router;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
@@ -56,7 +56,7 @@ pub fn build_router_with_mcp(state: AppState, mcp_state: mcp::McpState) -> Route
         )
         .route(
             "/api/datasources/tables/{id}",
-            delete(api::datasources::remove_table),
+            put(api::datasources::set_table_key_model).delete(api::datasources::remove_table),
         )
         .route(
             "/api/datasources/{id}",

@@ -603,6 +603,7 @@ mod tests {
             select_sql: String::new(),
             start_offset: None,
             dims: Vec::new(),
+            partial_columns: None,
         };
         let mut src = source_factory(&obj, &spec, None)?;
         src.open(&Cursor::None)?;

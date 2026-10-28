@@ -319,6 +319,7 @@ async fn dim_without_sequence_column_refuses_at_publish() {
             None,
             Some(r#"[["id","int64"],["name","utf8"]]"#),
             None,
+            None,
         )
         .unwrap();
     let sql = format!(

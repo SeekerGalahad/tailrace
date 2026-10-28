@@ -184,6 +184,17 @@ pub struct StatementSpec {
     /// backend; explicit row/memory caps fail the assembly).
     #[serde(default)]
     pub dims: Vec<DimJoin>,
+    /// Statement-level partial-column declaration (A7): the INSERT column
+    /// list — `INSERT INTO sink (k, a) SELECT …` compiles to
+    /// `Some(["k","a"])`, a bare `INSERT INTO sink SELECT …` to `None`
+    /// (full-row writes, the historical default). This is the compile-time
+    /// record of the switch; the RUNTIME reads the declaration from the sink
+    /// table object (`TableObject.partial_columns`) — the console projects
+    /// this statement field onto the sink's plan table entry at deploy, and
+    /// a TOML catalog declares it on the `[[table]]` directly. The two must
+    /// agree, which the console guarantees by deriving one from the other.
+    #[serde(default)]
+    pub partial_columns: Option<Vec<String>>,
 }
 
 /// One dimension-table join extracted by the SQL compiler (T-D1).
@@ -838,6 +849,7 @@ select_sql = "SELECT order_no, seq, qty FROM src"
                 reference: "2.db.dim_user".into(),
                 name: "dim_d".into(),
             }],
+            partial_columns: None,
         };
         let table = |r: &str| PlanTableObject {
             reference: r.into(),

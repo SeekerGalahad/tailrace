@@ -134,6 +134,20 @@ fn backfill_doris_sink(
         from: ctx.from,
         to: ctx.to,
     });
+    // A7 partial-column declaration, mirrored from the engine's sink_factory:
+    // the replayed statement projects the declared subset, so the sink must
+    // write exactly that subset under partial_columns=true — a full-row
+    // sink here would mismatch the transform's column count. Doris-only, as
+    // there (StarRocks partial update is a different load contract).
+    if let Some(subset) = &obj.partial_columns {
+        anyhow::ensure!(
+            flavor != SinkFlavor::StarRocks,
+            "partial_columns is Doris-only (kind={}); StarRocks partial update \
+             rides a different load contract and is not wired",
+            obj.kind
+        );
+        sink = sink.with_partial_columns(subset.clone())?;
+    }
     if let Some(r) = rel {
         sink = sink
             .with_retry_backoff(r.flush_backoff_ms())
@@ -194,7 +208,12 @@ fn bounded_plan(state: &AppState, pipeline_id: i64, statement_index: u32) -> Res
     }
     let mut tables = Vec::with_capacity(2);
     for reference in [&statement.source, &statement.sink] {
-        let entry = crate::api::pipelines::build_plan_table(state.store(), reference)?
+        // A7: the sink entry carries the statement's partial-column
+        // declaration exactly as a deploy push would project it
+        let partial = (reference == &statement.sink)
+            .then_some(statement.partial_columns.as_deref())
+            .flatten();
+        let entry = crate::api::pipelines::build_plan_table(state.store(), reference, partial)?
             .with_context(|| format!("table object {reference} no longer registered"))?;
         tables.push(serde_json::from_value(entry)?);
     }
@@ -317,6 +336,7 @@ fn execute(
         select_sql: plan.statement.select_sql.clone(),
         start_offset: plan.statement.start_offset.clone(),
         dims: Vec::new(),
+        partial_columns: None,
     };
     let catalog = tailrace_catalog::PlanCatalog::new(pipeline_id as u64, vec![spec], plan.tables);
 

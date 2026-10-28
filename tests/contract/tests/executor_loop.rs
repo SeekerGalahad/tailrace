@@ -18,6 +18,7 @@ fn file_statements() -> Vec<tailrace_catalog::StatementSpec> {
         select_sql: "SELECT order_no, qty FROM src".into(),
         start_offset: None,
         dims: Vec::new(),
+        partial_columns: None,
     }]
 }
 

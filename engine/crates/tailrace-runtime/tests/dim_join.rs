@@ -145,6 +145,7 @@ fn dim_statements(dim_reference: &str) -> Vec<StatementSpec> {
             reference: dim_reference.into(),
             name: "dim_d".into(),
         }],
+        partial_columns: None,
     }]
 }
 

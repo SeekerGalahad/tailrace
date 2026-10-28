@@ -8,8 +8,9 @@ use crate::api::datasources::{
     DatasourceCreated, DatasourceItem, DatasourceListResponse, DatasourceType,
     DatasourceTypesResponse, DatasourceUpsertBody, DdlDraftBody, DdlDraftResponse,
     DdlEvolveResponse, DdlExecuteBody, DdlExecuteResponse, DdlPartitionDto, DiscoverBody,
-    DiscoverResponse, DiscoveredAssetDto, InferSchemaBody, InferSchemaResponse, TableListResponse,
-    TableObjectItem, TableRegisterBody, TableRegistered, TestBody, TestResponse, TypeField,
+    DiscoverResponse, DiscoveredAssetDto, InferSchemaBody, InferSchemaResponse, TableKeyModelBody,
+    TableKeyModelSet, TableListResponse, TableObjectItem, TableRegisterBody, TableRegistered,
+    TestBody, TestResponse, TypeField,
 };
 use crate::api::nodes::{
     HeartbeatBody, HeartbeatResponse, NodeCreated, NodeEcho, RegisterBody, RegisterResponse,
@@ -23,9 +24,9 @@ use crate::api::nodes_admin::{
 use crate::api::pipelines::{
     BackfillAccepted, BackfillBody, BackfillBound, BackfillDryRunOut, BackfillJobItem,
     BackfillJobsResponse, CompileBody, CompileResponse, DeployBody as PipeDeployBody,
-    PipelineConfig, PipelineCreated, PipelineDetailOut, PipelineListItem, PipelineUpsertBody,
-    PipelinesListResponse, PublishResponse, SqlTemplate, TemplatesResponse, TrendPoint,
-    TrendResponse,
+    PartialUpdatePipeline, PipelineConfig, PipelineCreated, PipelineDetailOut, PipelineListItem,
+    PipelineUpsertBody, PipelinesListResponse, PublishResponse, SqlTemplate, TemplatesResponse,
+    TrendPoint, TrendResponse,
 };
 use crate::api::{ErrorBody, ErrorResponse};
 use crate::compile::{CompileDiag, DimJoinOut, StatementOut};
@@ -61,6 +62,8 @@ use crate::compile::{CompileDiag, DimJoinOut, StatementOut};
         crate::api::datasources::register_table,
         crate::api::datasources::list_tables,
         crate::api::datasources::remove_table,
+        // T-A7 key model on record (partial-update publish gate basis)
+        crate::api::datasources::set_table_key_model,
         // T-A1 create-table closed loop (§7.2)
         crate::api::datasources::ddl_draft,
         crate::api::datasources::ddl_execute,
@@ -120,9 +123,13 @@ use crate::compile::{CompileDiag, DimJoinOut, StatementOut};
         // without components entries every $ref dangled in swagger-ui)
         DiscoverResponse, DiscoveredAssetDto, InferSchemaBody, InferSchemaResponse,
         TableRegisterBody, TableRegistered, TableListResponse, TableObjectItem,
+        // T-A7 key model PUT
+        TableKeyModelBody, TableKeyModelSet,
         // T-A1 DDL closed-loop DTOs (draft / execute / evolve)
         DdlDraftBody, DdlDraftResponse, DdlPartitionDto, DdlExecuteBody, DdlExecuteResponse,
         DdlEvolveResponse,
+        // T-A7 evolve mutex: the partial-update pipelines on the table
+        PartialUpdatePipeline,
         // nodes admin
         NodesListResponse, NodeListItem, NodesSummary, NodeCapacity, NodeDetail,
         ManualRegisterBody, ManualRegistered, NodeDeleteResponse,
@@ -346,6 +353,78 @@ mod tests {
             .expect("BackfillAccepted.properties");
         for k in ["jobId", "state", "labelPrefix"] {
             assert!(accepted.contains_key(k), "BackfillAccepted missing {k}");
+        }
+    }
+
+    /// T-A7: the partial-update control plane is published end to end — the
+    /// compile DTO carries `partialColumns` (the statement-level switch),
+    /// the table registration / list DTOs carry `keyModel` (the publish-gate
+    /// basis), the key-model PUT exists, the evolve DTO carries the
+    /// `partialUpdatePipelines` checklist, and deploy / evolve declare the
+    /// mutex 409s — pinned so swagger and the clients cannot drift from the
+    /// handlers.
+    #[test]
+    fn partial_update_surface_is_published() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("openapi serializes");
+        let props = |schema: &str| {
+            doc.pointer(&format!("/components/schemas/{schema}/properties"))
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_else(|| panic!("{schema}.properties"))
+        };
+        assert!(
+            props("StatementOut").contains_key("partialColumns"),
+            "StatementOut must publish partialColumns"
+        );
+        assert!(
+            props("TableObjectItem").contains_key("keyModel"),
+            "TableObjectItem must publish keyModel"
+        );
+        assert!(
+            props("TableRegisterBody").contains_key("keyModel"),
+            "TableRegisterBody must accept keyModel"
+        );
+        assert!(
+            props("TableKeyModelBody").contains_key("keyModel")
+                && props("TableKeyModelSet").contains_key("keyModel"),
+            "key-model PUT DTOs must be registered"
+        );
+        assert!(
+            doc.pointer("/paths/~1api~1datasources~1tables~1{id}/put")
+                .is_some(),
+            "missing PUT /api/datasources/tables/{{id}}"
+        );
+        let evolve = props("DdlEvolveResponse");
+        assert!(
+            evolve.contains_key("partialUpdateNotice")
+                && evolve.contains_key("partialUpdatePipelines"),
+            "DdlEvolveResponse must carry the mutex notice + pipeline checklist, got {:?}",
+            evolve.keys().collect::<Vec<_>>()
+        );
+        let pipe = props("PartialUpdatePipeline");
+        for k in ["id", "name", "status", "deployed", "columns"] {
+            assert!(pipe.contains_key(k), "PartialUpdatePipeline missing {k}");
+        }
+        // the mutex 409s are declared on both sides
+        for (path, what) in [
+            ("/paths/~1api~1pipelines~1{id}~1deploy/post/responses/409", "deploy"),
+            ("/paths/~1api~1pipelines~1{id}~1recover/post/responses/409", "recover"),
+            ("/paths/~1api~1pipelines~1{id}~1backfill/post/responses/409", "backfill"),
+            (
+                "/paths/~1api~1datasources~1{id}~1tables~1{db}~1{table}~1ddl~1evolve/post/responses/409",
+                "evolve",
+            ),
+        ] {
+            let desc = doc
+                .pointer(&format!("{path}/description"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("{what} must declare a 409"));
+            let expect = if what == "evolve" {
+                "PARTIAL_UPDATE_ACTIVE"
+            } else {
+                "SCHEMA_CHANGE_IN_PROGRESS"
+            };
+            assert!(desc.contains(expect), "{what} 409 must name {expect}: {desc}");
         }
     }
 }

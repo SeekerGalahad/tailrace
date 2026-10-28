@@ -240,6 +240,7 @@ mod tests {
                 reference: "db.dim_user".into(),
                 name: "dim_d".into(),
             }],
+            partial_columns: None,
         }
     }
 

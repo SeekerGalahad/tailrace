@@ -970,6 +970,7 @@ mod tests {
             select_sql: "SELECT * FROM src".into(),
             start_offset: None,
             dims: Vec::new(),
+            partial_columns: None,
         };
         let err = |b: Option<&str>, q: Option<&str>| match source_factory(&obj(b, q), &spec, None) {
             Err(e) => e.to_string(),

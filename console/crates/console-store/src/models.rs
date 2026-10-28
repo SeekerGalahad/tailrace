@@ -45,6 +45,12 @@ pub struct TableObject {
     /// UNIQUE KEY out-of-order dedup basis; jdbc streaming = the incremental
     /// cursor column. Rides the plan's table-object metadata verbatim.
     pub sequence_column: Option<String>,
+    /// Doris key model on record (T-A7): `unique` / `duplicate`, None = not
+    /// declared. Written by the T-A1 execute step, declared at registration,
+    /// or set through the key-model PUT. The publish gate requires `unique`
+    /// under a partial-column declaration (Doris: partial update is UNIQUE
+    /// KEY merge-on-write only).
+    pub key_model: Option<String>,
 }
 
 #[derive(Debug, Clone)]
