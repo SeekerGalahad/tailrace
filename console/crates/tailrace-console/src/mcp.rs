@@ -24,9 +24,9 @@
 //! audit row (PIPELINE_CREATE / PIPELINE_DEPLOY / PIPELINE_ACTION) under
 //! the same actor: the handler's operator resolves to the MCP identity.
 //!
-//! `trigger_backfill` maps to the T-A2 route, which is not part of this
-//! build yet — the tool is listed (so the surface matches §7.5) and its
-//! calls return the standing 501 NOT_IMPLEMENTED envelope.
+//! `trigger_backfill` (T-A2, §7.3): maps to POST /api/pipelines/{id}/backfill
+//! with `dryRun` defaulting to TRUE (blueprint §7.5 — an MCP caller gets the
+//! zero-side-effect preview unless it explicitly asks for execution).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -541,11 +541,40 @@ async fn execute(
             }
         }
         "trigger_backfill" => {
-            req_i64(args, "id")?;
-            api::not_implemented(
-                "trigger_backfill (POST /api/pipelines/{id}/backfill)",
-                "blueprint T-A2",
-            )
+            let id = req_i64(args, "id")?;
+            // bounds are the §7.3 objects verbatim ({"type":"offset","value":N})
+            let bound = |key: &str| -> Result<Value, RpcErr> {
+                args.get(key)
+                    .filter(|v| v.is_object())
+                    .cloned()
+                    .ok_or_else(|| {
+                        RpcErr::invalid_params(format!(
+                            "argument {key:?} must be an object like {{\"type\":\"offset\",\"value\":0}}"
+                        ))
+                    })
+            };
+            let from = bound("from")?;
+            let to = bound("to")?;
+            let dry_run = match args.get("dryRun") {
+                None | Some(Value::Null) => true, // §7.5: MCP defaults to plan-only
+                Some(Value::Bool(b)) => *b,
+                Some(v) => {
+                    return Err(RpcErr::invalid_params(format!(
+                        "argument \"dryRun\" must be a boolean, got {v}"
+                    )))
+                }
+            };
+            let statement_index = opt_i64(args, "statementIndex")?;
+            let body = Bytes::from(
+                json!({
+                    "statementIndex": statement_index,
+                    "from": from,
+                    "to": to,
+                    "dryRun": dry_run
+                })
+                .to_string(),
+            );
+            api::pipelines::backfill(st, identity(), HeaderMap::new(), Path(id), body).await
         }
         other => return Err(RpcErr::invalid_params(format!("unknown tool: {other}"))),
     };
@@ -732,17 +761,18 @@ fn tool_definition(name: &str, write: bool) -> Value {
         ),
         "trigger_backfill" => (
             "Trigger a bounded backfill run (POST /api/pipelines/{id}/backfill, blueprint T-A2). \
-             `dryRun` defaults to true (plan only). NOTE: the backfill route is not part of this \
-             build yet — the call returns NOT_IMPLEMENTED until T-A2 lands.",
+             `from`/`to` are {\"type\":\"offset\",\"value\":N} bounds; `dryRun` defaults to true \
+             (label/estimate preview with zero side effects).",
             json!({
                 "type": "object",
                 "properties": {
                     "id": id_prop,
-                    "from": { "type": "string", "description": "Range start (T-A2 contract)" },
-                    "to": { "type": "string", "description": "Range end (T-A2 contract)" },
+                    "statementIndex": { "type": "integer", "minimum": 0, "default": 0 },
+                    "from": { "type": "object", "description": "{\"type\":\"offset\",\"value\":N}" },
+                    "to": { "type": "object", "description": "{\"type\":\"offset\",\"value\":N}" },
                     "dryRun": { "type": "boolean", "default": true, "description": "Plan only; defaults to true" }
                 },
-                "required": ["id"],
+                "required": ["id", "from", "to"],
                 "additionalProperties": false
             }),
         ),

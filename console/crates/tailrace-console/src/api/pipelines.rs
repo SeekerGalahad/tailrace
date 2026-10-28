@@ -924,8 +924,10 @@ async fn push_plan(
 /// T-D1) reference into the plan `tables[]` entry (§4.5: kind/format/columns
 /// from the table object, bootstrap / streamLoadUrl from the datasource
 /// conn, authEnv bound per datasource — values never enter the plan).
-/// Ok(None) = not registered.
-fn build_plan_table(
+/// Ok(None) = not registered. Shared with the T-A2 backfill executor
+/// (crate-visible) — a bounded replay resolves plan tables exactly like a
+/// deploy push.
+pub(crate) fn build_plan_table(
     store: &console_store::Store,
     reference: &str,
 ) -> anyhow::Result<Option<Value>> {
@@ -973,7 +975,12 @@ fn build_plan_table(
     // tables are served by the JDBC factory, which takes a `mysql://` /
     // `postgres://` URL (engine dialect selection) — the console's
     // mysql/postgresql datasources store `jdbc:mysql://…` / `jdbc:postgresql:
-    // //…`, so the `jdbc:` prefix is stripped here.
+    // //…`, so the `jdbc:` prefix is stripped here. File tables carry the
+    // datasource's registered directory (connJson `path`): the engine's file
+    // factory resolves the table name against it, so a resident node and the
+    // console-side backfill executor open the same file whatever either
+    // process's cwd is (R6 review: with the bare name resolved against the
+    // console cwd, a backfill read nothing and "succeeded" with 0 rows).
     let bootstrap = match kind.as_str() {
         "dim" | "jdbc" => conn.get("jdbcUrl").and_then(Value::as_str).map(|url| {
             url.trim()
@@ -981,6 +988,12 @@ fn build_plan_table(
                 .unwrap_or(url.trim())
                 .to_string()
         }),
+        "file" => conn
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string),
         _ => conn
             .get("bootstrap")
             .and_then(Value::as_str)
@@ -1493,4 +1506,356 @@ pub async fn templates() -> Response {
         }],
     })
     .into_response()
+}
+
+// ---------------- T-A2 backfill (blueprint §7.3) ----------------
+
+/// One replay bound: `{type:"offset", value:N}`. Only `offset` bounds exist
+/// this wave — timestamp bounds need console-side timestamp→offset
+/// resolution (blueprint §7.3 leaves it to the console; not yet built).
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct BackfillBound {
+    /// Bound addressing: "offset" only (kafka offset / file byte position,
+    /// per the source's cursor semantics).
+    #[serde(rename = "type")]
+    pub bound_type: String,
+    /// The bound value (integer for offset bounds).
+    pub value: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackfillBody {
+    /// Which statement of the pipeline to replay (default 0).
+    pub statement_index: Option<u32>,
+    pub from: BackfillBound,
+    pub to: BackfillBound,
+    /// true = preview only: no job row, no execution, no writes.
+    pub dry_run: Option<bool>,
+}
+
+/// Dry-run preview (blueprint §7.3 response shape). `jobId` is null on
+/// purpose: a dry run creates nothing.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackfillDryRunOut {
+    pub job_id: Option<String>,
+    /// Exact only for row-shaped cursors; null when the bound pair does not
+    /// translate to a row count (file bounds are byte positions).
+    pub estimated_rows: Option<i64>,
+    /// The deterministic label family a real run of this range would use
+    /// (full label = `{labelPrefix}-{statementIndex}-{sha256(from,to)[..8]}_{seq}`).
+    pub label_prefix: String,
+}
+
+/// Execute acceptance: the job exists (pending) and the executor has been
+/// spawned; poll `GET /{id}/backfill/jobs` for the state machine.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackfillAccepted {
+    pub job_id: String,
+    pub state: String,
+    pub estimated_rows: Option<i64>,
+    pub label_prefix: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackfillJobItem {
+    pub job_id: String,
+    pub statement_index: i64,
+    pub from: Value,
+    pub to: Value,
+    pub state: String,
+    pub rows_written: i64,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BackfillJobsResponse {
+    pub jobs: Vec<BackfillJobItem>,
+}
+
+/// Everything the 422 gate chain + dry-run preview need, resolved once from
+/// the CURRENT published spec (the executor re-resolves at claim time).
+struct BackfillTarget {
+    statement_index: u32,
+    from: i64,
+    to: i64,
+    label_prefix: String,
+}
+
+/// Shared request validation (blueprint §7.3 + the task card's capability
+/// gate): pipeline exists → published → compiles → statement index in range
+/// → offset bounds ordered → source/sink table objects resolve → sink is
+/// doris/starrocks (label idempotency lives there — the 回退门), source is
+/// file (scalar bounds address the byte cursor exactly; kafka needs
+/// partition-level seeding, follow-up batch), no dim joins. Every rejection
+/// is a 422/400 envelope from the dictionary; nothing is created.
+fn backfill_target(
+    state: &AppState,
+    id: i64,
+    body: &BackfillBody,
+) -> Result<BackfillTarget, Response> {
+    let full = load_pipeline(state, id)?;
+    let Some(spec) = full.base.spec_json.clone() else {
+        return Err(super::messages::bad_request(
+            "err.backfill.not_published",
+            &[&id.to_string()],
+        ));
+    };
+    let (statements, diagnostics) = compile_sql(&spec, id as u64);
+    if !diagnostics.is_empty() {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(CompileResponse {
+                ok: false,
+                statements,
+                diagnostics,
+            }),
+        )
+            .into_response());
+    }
+    let idx = body.statement_index.unwrap_or(0);
+    let Some(st) = statements.get(idx as usize) else {
+        return Err(super::messages::respond(
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "STATEMENT_INDEX_RANGE",
+            "err.backfill.statement_index",
+            &[&idx.to_string(), &statements.len().to_string()],
+        ));
+    };
+    if !st.dims.is_empty() {
+        let refs = st
+            .dims
+            .iter()
+            .map(|d| d.reference.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(super::messages::respond(
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "BACKFILL_DIM_UNSUPPORTED",
+            "err.backfill.dim_unsupported",
+            &[&(idx + 1).to_string(), &refs],
+        ));
+    }
+    // bounds: offset-typed and ordered (the bounded runner takes plain i64s)
+    let bound = |b: &BackfillBound, what: &'static str| -> Result<i64, Response> {
+        if b.bound_type != "offset" {
+            return Err(super::messages::respond(
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "BOUNDS_TYPE_UNSUPPORTED",
+                "err.backfill.bounds_type",
+                &[what, &b.bound_type],
+            ));
+        }
+        b.value.as_i64().ok_or_else(|| {
+            super::messages::respond(
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "BOUNDS_INVALID",
+                "err.backfill.bounds_value",
+                &[what, &b.value.to_string()],
+            )
+        })
+    };
+    let from = bound(&body.from, "from")?;
+    let to = bound(&body.to, "to")?;
+    if from >= to {
+        return Err(super::messages::respond(
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "BOUNDS_INVALID",
+            "err.backfill.bounds_order",
+            &[&from.to_string(), &to.to_string()],
+        ));
+    }
+    // capability gate (task card 回退门): the sink must be doris/starrocks —
+    // label idempotency (the replay-dedup mechanism) lives in the stream-load
+    // label space; file/kafka sinks would double-write every replay.
+    let store = state.store();
+    let resolve_kind = |reference: &str| -> Result<(String, i64), Response> {
+        let t = store
+            .table_object_for_reference(reference)
+            .ok()
+            .flatten()
+            .ok_or_else(|| {
+                super::messages::respond(
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                    "STATEMENT_TABLE_MISSING",
+                    "err.pipeline.statement_table_missing",
+                    &[&(idx + 1).to_string(), "源/汇", reference],
+                )
+            })?;
+        Ok((tailrace_catalog::normalize_kind(&t.kind), t.datasource_id))
+    };
+    let (source_kind, _) = resolve_kind(&st.source)?;
+    let (sink_kind, sink_ds) = resolve_kind(&st.sink)?;
+    if !matches!(sink_kind.as_str(), "doris" | "starrocks") {
+        return Err(super::messages::respond(
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "BACKFILL_SINK_UNSUPPORTED",
+            "err.backfill.sink_unsupported",
+            &[&(idx + 1).to_string(), &st.sink, &sink_kind],
+        ));
+    }
+    // source gate: file only this wave. A scalar `from` cannot address a
+    // kafka partition map (engine W2 warns and would silently replay from the
+    // group's start position — more data than asked, permanently duplicated
+    // on a DUPLICATE KEY table); per-partition console-side seeding is the
+    // follow-up. Honest refusal beats a silent superset replay.
+    if source_kind != "file" {
+        return Err(super::messages::respond(
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "BACKFILL_SOURCE_UNSUPPORTED",
+            "err.backfill.source_unsupported",
+            &[&(idx + 1).to_string(), &st.source, &source_kind],
+        ));
+    }
+    if store.credential(sink_ds).ok().flatten().is_none() {
+        return Err(super::messages::respond(
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "BACKFILL_NO_CREDENTIAL",
+            "err.backfill.no_credential",
+            &[&sink_ds.to_string()],
+        ));
+    }
+    Ok(BackfillTarget {
+        statement_index: idx,
+        from,
+        to,
+        label_prefix: crate::backfill::label_prefix(id, idx),
+    })
+}
+
+/// `POST /api/pipelines/{id}/backfill` (blueprint §7.3): preview or enqueue
+/// a bounded replay. `dryRun:true` answers the job-shape preview
+/// (jobId/estimatedRows/labelPrefix) with ZERO side effects — no job row,
+/// no audit, no execution. `dryRun:false` creates a pending job row (the
+/// console-store migration 02 table), audits the acceptance and spawns the
+/// console-side executor: bf-{jobId} ledger namespace + deterministic
+/// labels (W2), main-pipeline cursors untouched in every outcome.
+#[utoipa::path(
+    post,
+    path = "/api/pipelines/{id}/backfill",
+    request_body = BackfillBody,
+    params(("id" = i64, Path)),
+    responses(
+        (status = 200, body = BackfillDryRunOut, description = "dryRun preview — nothing created"),
+        (status = 202, body = BackfillAccepted, description = "job row created (pending), executor spawned"),
+        (status = 404, body = crate::api::ErrorResponse),
+        (status = 422, body = crate::api::ErrorResponse, description = "capability gate: BACKFILL_SINK_UNSUPPORTED (non doris/starrocks sink), BACKFILL_SOURCE_UNSUPPORTED, BACKFILL_DIM_UNSUPPORTED, BACKFILL_NO_CREDENTIAL, BOUNDS_TYPE_UNSUPPORTED, BOUNDS_INVALID, STATEMENT_INDEX_RANGE"),
+    )
+)]
+pub async fn backfill(
+    State(state): State<AppState>,
+    axum::Extension(ctx): axum::Extension<AuthContext>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<i64>,
+    body: Bytes,
+) -> Response {
+    let body: BackfillBody = match parse_json_body(&body) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let target = match backfill_target(&state, id, &body) {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+    // file bounds are byte positions and kafka needs watermark queries for a
+    // row count — no source kind yields an honest number this wave, so the
+    // preview carries null (the executed job's rowsWritten is the truth)
+    let estimated_rows: Option<i64> = None;
+    if body.dry_run.unwrap_or(false) {
+        return Json(BackfillDryRunOut {
+            job_id: None,
+            estimated_rows,
+            label_prefix: target.label_prefix,
+        })
+        .into_response();
+    }
+    let from_json = serde_json::to_string(&body.from).unwrap_or_default();
+    let to_json = serde_json::to_string(&body.to).unwrap_or_default();
+    let job_id = match state.store().create_backfill_job(
+        id,
+        target.statement_index as i64,
+        &from_json,
+        &to_json,
+    ) {
+        Ok(j) => j,
+        Err(e) => return ApiError::internal(&e).into_response(),
+    };
+    audit(
+        state.store(),
+        &operator_of(&ctx, &headers),
+        "PIPELINE_BACKFILL",
+        "pipeline",
+        Some(id.to_string()),
+        Some(
+            json!({
+                "jobId": job_id,
+                "statementIndex": target.statement_index,
+                "from": body.from.value,
+                "to": body.to.value,
+                "labelPrefix": target.label_prefix,
+                "dryRun": false
+            })
+            .to_string(),
+        ),
+    );
+    // the executor owns pending → running → done|failed from here; request
+    // handling never blocks on data movement
+    let exec_state = state.clone();
+    let exec_job = job_id.clone();
+    let (idx, from, to) = (target.statement_index, target.from, target.to);
+    tokio::task::spawn_blocking(move || {
+        crate::backfill::run_job(exec_state, exec_job, idx, from, to)
+    });
+    (
+        axum::http::StatusCode::ACCEPTED,
+        Json(BackfillAccepted {
+            job_id,
+            state: "pending".into(),
+            estimated_rows,
+            label_prefix: target.label_prefix,
+        }),
+    )
+        .into_response()
+}
+
+/// `GET /api/pipelines/{id}/backfill/jobs` — the job progress list the
+/// detail page polls (T-A2 ⑤ job 进度行; newest first).
+#[utoipa::path(
+    get,
+    path = "/api/pipelines/{id}/backfill/jobs",
+    params(("id" = i64, Path)),
+    responses(
+        (status = 200, body = BackfillJobsResponse),
+        (status = 404, body = crate::api::ErrorResponse),
+    )
+)]
+pub async fn backfill_jobs(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    if load_pipeline(&state, id).is_err() {
+        return super::messages::not_found("err.pipeline.not_found", &[&id.to_string()])
+            .into_response();
+    }
+    let jobs = match state.store().list_backfill_jobs(id) {
+        Ok(v) => v,
+        Err(e) => return ApiError::internal(&e).into_response(),
+    };
+    let jobs = jobs
+        .into_iter()
+        .map(|j| BackfillJobItem {
+            job_id: j.id,
+            statement_index: j.statement_index,
+            from: serde_json::from_str(&j.from_json).unwrap_or(Value::Null),
+            to: serde_json::from_str(&j.to_json).unwrap_or(Value::Null),
+            state: j.state,
+            rows_written: j.rows_written,
+            error: j.error,
+            created_at: iso(Some(&j.created_at)).unwrap_or_default(),
+            finished_at: j.finished_at.and_then(|f| iso(Some(&f))),
+        })
+        .collect();
+    Json(BackfillJobsResponse { jobs }).into_response()
 }

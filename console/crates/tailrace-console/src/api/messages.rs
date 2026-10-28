@@ -9,10 +9,15 @@
 //! 模板占位 `{0}`..`{9}`，由 [`t`] 位置插值；渲染结果与收敛前的直写输出
 //! 逐字节一致（既有测试与前端提示不漂移）。
 //!
-//! 规模口径（T39 ③ 勘正，2026-10-23 实测；T35 增补；T-D1 dim join +6 key）：字典 **45 key**
-//! （[`tests::KEY_LIST`] 与 `template` 同步，长度由 [`tests::templates_use_only_positional_placeholders`]
-//! 钉住）/ **63 调用点**（`grep -rn 'messages::' src/ --include='*.rs'`
-//! 排除本模块；T35 部署链 +3 key/+7 站点；T-D1 +6 站点——发布门禁 3 + 维表登记 3）。
+//! 规模口径（T39 ③ 勘正，2026-10-23 实测；T35 增补；T-D1 dim join +6 key；
+//! T-A1 建表闭环 +10 key；T-A2 回填 +9 key，2026-10-28 实测）：字典
+//! **64 key**（[`tests::KEY_LIST`] 与 `template` 同步，长度由
+//! [`tests::templates_use_only_positional_placeholders`]
+//! 钉住）/ **91 调用点**（`grep -rn 'messages::' src/ --include='*.rs'`
+//! 排除本模块；T35 部署链 +3 key/+7 站点；T-D1 +6 站点——发布门禁 3 + 维表登记 3；
+//! T-A1 +14 站点——draft/execute/evolve 三端点的 400/404/422/409/502 信封全部走字典，
+//! 改前实测 66，此前登记的 63 为 T-D1 后未同步的旧值；T-A2 回填 +11 站点，
+//! 2026-10-28 实测——backfill 请求门禁 9 + jobs 404 1 + 未发布 400 1）。
 //! T34 首提交 3cf738b 的「37 key/51 调用点」为双 off-by-one
 //! 误记，ffb1d55 勘正、本次落为模块事实。
 //!
@@ -137,6 +142,57 @@ fn template(key: &str) -> Option<&'static str> {
         "err.table_object.dim_sequence_required" => {
             "维表 {0} 必须声明键列 sequenceColumn（主键/单列唯一键，全表加载分页键）"
         }
+        // ---- T-A1 建表闭环（draft / execute / evolve）----
+        "err.ddl.datasource_kind" => {
+            "建表目标仅支持 doris/starrocks 数据源（生成的是 Doris 方言 DDL），当前类型 {0}"
+        }
+        "err.ddl.table_unregistered" => "表对象 {0}.{1} 未在该数据源下登记（先 POST /tables 登记）",
+        "err.ddl.columns_missing" => {
+            "表对象 {0}.{1} 未登记列清单（先 infer-schema 或登记时带 columnsJson），无法生成/演进 DDL"
+        }
+        "err.ddl.column_unknown_type" => {
+            "列 {0} 的类型 {1} 不在受支持词汇内（utf8/int64/float64/bool），G2 扩表前不静默折叠"
+        }
+        "err.ddl.key_model_required" => {
+            "缺少键模型确认：keyModel 必填（unique=UNIQUE KEY 去重 / duplicate=DUPLICATE KEY 追加）——未确认键模型不执行 DDL"
+        }
+        "err.ddl.key_model_unknown" => "未知键模型 {0}（仅 unique / duplicate）",
+        "err.ddl.ddl_missing" => "缺少 ddl 全文（须回传草稿原文执行）",
+        "err.ddl.key_model_mismatch" => {
+            "键模型 {0} 与回传 DDL 不符（DDL 未含 {1}）——请以同一草稿重新确认后执行"
+        }
+        "err.ddl.execute_failed" => "DDL 执行失败: {0}",
+        "err.ddl.schema_conflict" => {
+            "检测到改类型/删列（{0} 处），演进仅支持 ADD COLUMN——建议 DDL 已附于 refs.suggestedDdl，未执行，请人工评估"
+        }
+        // ---- T-A2 回填（blueprint §7.3）----
+        "err.backfill.not_published" => {
+            "管道 #{0} 尚未发布（无 spec 快照），先发布再回填"
+        }
+        "err.backfill.statement_index" => {
+            "statementIndex {0} 超出语句范围（该管道共 {1} 条语句，索引从 0 起）"
+        }
+        "err.backfill.dim_unsupported" => {
+            "语句 {0} 含维表 JOIN（{1}）——控制面回填暂不装配维表，请对无维表的语句发起回填"
+        }
+        "err.backfill.bounds_type" => {
+            "回填边界 {0} 的 type={1} 暂不支持（当前仅 offset 边界；timestamp 边界需先解析为 offset）"
+        }
+        "err.backfill.bounds_value" => {
+            "回填边界 {0} 的值 {1} 不是整数（offset 边界须为整数）"
+        }
+        "err.backfill.bounds_order" => {
+            "回填区间非法：from {0} 须小于 to {1}"
+        }
+        "err.backfill.sink_unsupported" => {
+            "回填仅支持 doris/starrocks 汇（重放去重依赖 stream load label 幂等），语句 {0} 的汇 {1} 为 {2}——file/kafka 汇重放会真重复"
+        }
+        "err.backfill.source_unsupported" => {
+            "回填当前仅支持 file 源（kafka 源的 from 需分区级游标寻址，待后续批次支持），语句 {0} 的源 {1} 为 {2}"
+        }
+        "err.backfill.no_credential" => {
+            "汇数据源 #{0} 未存储凭据（回填由控制面直连 stream load，需要已登记凭据）"
+        }
         _ => return None,
     })
 }
@@ -229,14 +285,17 @@ mod tests {
     }
 
     /// 字典自洽：模板只含 {数字} 占位，且插值后无残留花括号。
-    /// 另钉字典规模 = 45 key（模块文档「规模口径」的机器锚点，T39 ③；T35 +3；
-    /// T-D1 dim join +6：发布门禁 3 + 维表登记 3）：
+    /// 另钉字典规模 = 64 key（模块文档「规模口径」的机器锚点，T39 ③；T35 +3；
+    /// T-D1 dim join +6：发布门禁 3 + 维表登记 3；T-A1 建表闭环 +10；
+    /// T-A2 回填 +9：not_published/statement_index/dim_unsupported/
+    /// bounds_type/bounds_value/bounds_order/sink_unsupported/
+    /// source_unsupported/no_credential）：
     /// 加 key 时同步改此数与 KEY_LIST。
     #[test]
     fn templates_use_only_positional_placeholders() {
         let keys: Vec<&str> = KEY_LIST.to_vec();
         assert!(!keys.is_empty());
-        assert_eq!(keys.len(), 45, "字典规模漂移：同步模块文档「规模口径」");
+        assert_eq!(keys.len(), 64, "字典规模漂移：同步模块文档「规模口径」");
         for key in keys {
             let tpl = template(key).expect("listed key resolves");
             let mut rest = tpl;
@@ -622,5 +681,24 @@ mod tests {
         "err.table_object.kind_override",
         "err.table_object.dim_kind_datasource",
         "err.table_object.dim_sequence_required",
+        "err.ddl.datasource_kind",
+        "err.ddl.table_unregistered",
+        "err.ddl.columns_missing",
+        "err.ddl.column_unknown_type",
+        "err.ddl.key_model_required",
+        "err.ddl.key_model_unknown",
+        "err.ddl.ddl_missing",
+        "err.ddl.key_model_mismatch",
+        "err.ddl.execute_failed",
+        "err.ddl.schema_conflict",
+        "err.backfill.not_published",
+        "err.backfill.statement_index",
+        "err.backfill.dim_unsupported",
+        "err.backfill.bounds_type",
+        "err.backfill.bounds_value",
+        "err.backfill.bounds_order",
+        "err.backfill.sink_unsupported",
+        "err.backfill.source_unsupported",
+        "err.backfill.no_credential",
     ];
 }

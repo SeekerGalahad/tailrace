@@ -22,7 +22,7 @@ use sqlx_core::sql_str::AssertSqlSafe;
 use sqlx_mysql::{MySqlConnectOptions, MySqlConnection, MySqlRow, MySqlSslMode};
 use sqlx_postgres::{PgConnectOptions, PgConnection, PgRow, Postgres};
 
-use crate::ConnSpec;
+use crate::{ConnSpec, ExecOutcome, StatementOutcome};
 
 /// System schemas hidden from discovery (MySQL's four + Doris's
 /// `__internal_schema`; Postgres filters its own set in SQL).
@@ -71,8 +71,17 @@ async fn mysql_connect(spec: &ConnSpec) -> anyhow::Result<(MySqlConnection, Opti
     if !password.is_empty() {
         opts = opts.password(password);
     }
-    // TLS off by configuration too, mirroring the conn-jdbc no-tls stance
-    let mut opts = opts.ssl_mode(MySqlSslMode::Disabled);
+    // TLS off by configuration too, mirroring the conn-jdbc no-tls stance.
+    // sqlx's connect-time SET adds `sql_mode=(SELECT CONCAT(@@sql_mode, ...))`
+    // when these two flags are on (their defaults) — Doris/StarRocks FEs reject
+    // non-constant SET expressions ("Set statement doesn't support non-constant
+    // expr", found by the R6 ddl_create e2e on doris 2.1.7). Neither mode
+    // matters for SHOW/DESC/DDL traffic, so switch both off: the remaining
+    // handshake SET (`time_zone='+00:00', NAMES utf8mb4`) is constant-only.
+    let mut opts = opts
+        .ssl_mode(MySqlSslMode::Disabled)
+        .pipes_as_concat(false)
+        .no_engine_substitution(false);
     if let Some(db) = database {
         opts = opts.database(db);
     }
@@ -154,6 +163,28 @@ fn quote_ident(name: &str) -> anyhow::Result<String> {
         anyhow::bail!("非法标识符（含 NUL）");
     }
     Ok(name.replace('`', "``"))
+}
+
+/// Execute statements sequentially on one connection (T-A1 step ④). The
+/// first error aborts the batch and is reported with its 1-based position
+/// plus the server's message verbatim; nothing is rolled back (MySQL DDL is
+/// auto-committed — the console surfaces the partial state via the error).
+pub(crate) async fn mysql_exec(spec: &ConnSpec, sqls: &[&str]) -> anyhow::Result<ExecOutcome> {
+    let (mut conn, _) = mysql_connect(spec).await?;
+    let mut statements = Vec::with_capacity(sqls.len());
+    for (i, sql) in sqls.iter().enumerate() {
+        let started = std::time::Instant::now();
+        let res = conn
+            .execute(raw_sql(AssertSqlSafe((*sql).to_string())))
+            .await
+            .map_err(|e| anyhow::anyhow!("第 {} 条执行失败: {e}", i + 1))?;
+        statements.push(StatementOutcome {
+            sql: (*sql).to_string(),
+            elapsed: started.elapsed(),
+            rows_affected: res.rows_affected(),
+        });
+    }
+    Ok(ExecOutcome { statements })
 }
 
 async fn pg_connect(spec: &ConnSpec) -> anyhow::Result<PgConnection> {

@@ -33,5 +33,8 @@ tracing = { workspace = true }
 serde_json = { workspace = true }
 datafusion = { workspace = true }
 reqwest = { workspace = true }
+# T-A2: deterministic-label range fingerprint — sha256 over the canonical
+# big-endian encoding of (from, to); already a workspace dep (console-auth)
+sha2 = { workspace = true }
 tailrace-catalog = { workspace = true }
 tailrace-connector = { workspace = true }

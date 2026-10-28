@@ -1,0 +1,15 @@
+[package]
+name = "tailrace-ddl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Pure CREATE TABLE draft generator for Doris/StarRocks (T-A1): schema + key hints in, annotated draft DDL out — no IO, no tokio"
+keywords = ["doris", "starrocks", "ddl", "schema", "generator"]
+categories = ["database"]
+
+[dependencies]
+anyhow = "1"

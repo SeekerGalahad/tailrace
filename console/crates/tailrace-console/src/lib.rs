@@ -5,6 +5,7 @@
 //! open + migration, admin seed, bootstrap token) and serves.
 
 pub mod api;
+pub mod backfill;
 pub mod compile;
 pub mod deploy;
 pub mod mcp;
@@ -79,6 +80,20 @@ pub fn build_router_with_mcp(state: AppState, mcp_state: mcp::McpState) -> Route
             "/api/datasources/{id}/tables",
             post(api::datasources::register_table),
         )
+        // T-A1 create-table closed loop (§7.2): draft → confirm → execute,
+        // plus additive evolve
+        .route(
+            "/api/datasources/{id}/tables/{db}/{table}/ddl/draft",
+            post(api::datasources::ddl_draft),
+        )
+        .route(
+            "/api/datasources/{id}/tables/{db}/{table}/ddl/execute",
+            post(api::datasources::ddl_execute),
+        )
+        .route(
+            "/api/datasources/{id}/tables/{db}/{table}/ddl/evolve",
+            post(api::datasources::ddl_evolve),
+        )
         // node admin domain (§4.3)
         .route("/api/nodes", get(api::nodes_admin::list))
         .route("/api/nodes/manual", post(api::nodes_admin::register_manual))
@@ -132,6 +147,15 @@ pub fn build_router_with_mcp(state: AppState, mcp_state: mcp::McpState) -> Route
         .route(
             "/api/pipelines/{id}/metrics/trend",
             get(api::pipelines::metrics_trend),
+        )
+        // T-A2 backfill (§7.3): bounded replay + job progress surface
+        .route(
+            "/api/pipelines/{id}/backfill",
+            post(api::pipelines::backfill),
+        )
+        .route(
+            "/api/pipelines/{id}/backfill/jobs",
+            get(api::pipelines::backfill_jobs),
         )
         .layer(from_fn_with_state(
             state.clone(),

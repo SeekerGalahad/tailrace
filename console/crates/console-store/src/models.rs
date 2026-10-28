@@ -203,3 +203,20 @@ pub struct AuditEntry {
     pub entity_id: Option<String>,
     pub detail_json: Option<String>,
 }
+
+/// A `backfill_job` row (T-A2 §7.3): one bounded replay request. The state
+/// machine is pending → running → done|failed; terminal states are immutable
+/// (the CAS updates in `backfill.rs` refuse to leave them).
+#[derive(Debug, Clone)]
+pub struct BackfillJob {
+    pub id: String,
+    pub pipeline_id: i64,
+    pub statement_index: i64,
+    pub from_json: String,
+    pub to_json: String,
+    pub state: String,
+    pub rows_written: i64,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub finished_at: Option<String>,
+}

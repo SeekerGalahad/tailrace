@@ -505,18 +505,28 @@ async fn read_tools_and_actions_round_trip_through_the_mock_engine() {
     assert_eq!(status, 404);
     assert_eq!(body["error"]["code"], "NOT_FOUND");
 
-    // trigger_backfill: listed but the T-A2 route is not in this build
+    // trigger_backfill (T-A2 wired): this pipeline's source is kafka, so the
+    // bounded-replay gate answers 422 BACKFILL_SOURCE_UNSUPPORTED — the MCP
+    // surface rides the REST handler's envelopes (dryRun defaults true here)
     let (status, body) = tool_err(
         &tool(
             &app,
             &hdr,
             "trigger_backfill",
-            json!({"confirm": true, "id": pid, "dryRun": true}),
+            json!({
+                "confirm": true, "id": pid,
+                "from": {"type": "offset", "value": 0},
+                "to": {"type": "offset", "value": 100}
+            }),
         )
         .await,
     );
-    assert_eq!(status, 501);
-    assert_eq!(body["error"]["code"], "NOT_IMPLEMENTED");
+    assert_eq!(status, 422);
+    assert_eq!(body["error"]["code"], "BACKFILL_SOURCE_UNSUPPORTED");
+    assert_eq!(
+        body["error"]["message_key"], "err.backfill.source_unsupported",
+        "dictionary envelope surfaces through the tool error: {body}"
+    );
 
     // domain audit rows carry the MCP actor (§7.5 actor=mcp:<client>)
     let deploys = audit_rows(&app.store, "PIPELINE_DEPLOY");

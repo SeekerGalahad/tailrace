@@ -26,10 +26,11 @@ fn source_factory(
     _spec: &tailrace_catalog::StatementSpec,
     _rel: Option<&ReliabilityOptions>,
 ) -> anyhow::Result<Box<dyn Source>> {
+    let path = resolve_path(obj);
     if obj.format.as_deref() == Some("parquet") {
-        Ok(Box::new(FileSource::parquet(&obj.name)))
+        Ok(Box::new(FileSource::parquet(path)))
     } else {
-        Ok(Box::new(FileSource::new(&obj.name)))
+        Ok(Box::new(FileSource::new(path)))
     }
 }
 
@@ -37,7 +38,31 @@ fn sink_factory(
     obj: &TableObject,
     _rel: Option<&ReliabilityOptions>,
 ) -> anyhow::Result<Box<dyn Sink>> {
-    Ok(Box::new(FileSink::new(&obj.name, obj.format.as_deref())))
+    Ok(Box::new(FileSink::new(
+        resolve_path(obj),
+        obj.format.as_deref(),
+    )))
+}
+
+/// Where a file table lives on disk. `bootstrap` carries the datasource's
+/// registered directory when the plan has one (the console fills it from the
+/// file datasource's `connJson.path`), and the table name is resolved against
+/// it — so a resident engine node and the console-side backfill executor open
+/// the SAME file whatever either process's cwd is (R6 review: a console
+/// started elsewhere saw no file and the replay "succeeded" with 0 rows).
+/// Without a directory the bare name resolves against the cwd, exactly as
+/// before — standalone TOML catalogs declare no directory and keep working.
+/// An absolute table name wins over the directory (`Path::join` semantics).
+fn resolve_path(obj: &TableObject) -> PathBuf {
+    match obj
+        .bootstrap
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
+        Some(dir) => PathBuf::from(dir).join(&obj.name),
+        None => PathBuf::from(&obj.name),
+    }
 }
 
 // ==================== source ====================
@@ -499,6 +524,76 @@ mod tests {
     use datafusion::arrow::array::{Float64Array, Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
+
+    fn table(name: &str, bootstrap: Option<&str>) -> TableObject {
+        TableObject {
+            datasource: "f".into(),
+            name: name.into(),
+            kind: "file".into(),
+            format: Some("jsonl".into()),
+            columns: vec![],
+            bootstrap: bootstrap.map(str::to_string),
+            stream_load_url: None,
+            auth_env: None,
+            label_prefix: None,
+            sequence_column: None,
+        }
+    }
+
+    /// The plan's registered directory (`bootstrap`) anchors the table name;
+    /// no directory keeps the cwd-relative bare name (standalone catalogs);
+    /// an absolute name is left alone.
+    #[test]
+    fn resolve_path_honours_registered_directory() {
+        assert_eq!(
+            resolve_path(&table("orders_in", Some("/data/inbox"))),
+            PathBuf::from("/data/inbox/orders_in")
+        );
+        assert_eq!(
+            resolve_path(&table("orders_in", Some("  /data/inbox/  "))),
+            PathBuf::from("/data/inbox/orders_in"),
+            "surrounding whitespace is not part of the directory"
+        );
+        assert_eq!(
+            resolve_path(&table("orders_in", None)),
+            PathBuf::from("orders_in")
+        );
+        assert_eq!(
+            resolve_path(&table("orders_in", Some(""))),
+            PathBuf::from("orders_in"),
+            "empty directory = no directory"
+        );
+        assert_eq!(
+            resolve_path(&table("/abs/orders_in", Some("/data/inbox"))),
+            PathBuf::from("/abs/orders_in")
+        );
+    }
+
+    /// End to end through the factory: the source opened for a plan table
+    /// with a directory reads the file under that directory, independent of
+    /// the process cwd.
+    #[test]
+    fn source_factory_reads_under_registered_directory() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("tailrace-fdir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("orders_in"), "{\"a\":1}\n{\"a\":2}\n")?;
+        let obj = table("orders_in", Some(dir.to_str().unwrap()));
+        let spec = tailrace_catalog::StatementSpec {
+            source: "f.orders_in".into(),
+            group: "g".into(),
+            sink: "s.t".into(),
+            pushdown: Vec::new(),
+            select_sql: String::new(),
+            start_offset: None,
+            dims: Vec::new(),
+        };
+        let mut src = source_factory(&obj, &spec, None)?;
+        src.open(&Cursor::None)?;
+        let chunks = src.poll(10, Duration::from_millis(200))?;
+        assert_eq!(chunks.len(), 2, "both lines read from <dir>/orders_in");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
 
     #[test]
     fn file_source_reads_and_cursors() -> anyhow::Result<()> {

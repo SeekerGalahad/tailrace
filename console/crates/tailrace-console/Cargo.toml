@@ -51,8 +51,30 @@ tailrace-catalog = { workspace = true }
 # (same pattern as the local compile parser; sqlx subcrates unify with
 # conn-jdbc through the workspace table).
 tailrace-metadata = { workspace = true }
+# T-A1 create-table closed loop: the pure DDL draft generator (console owns
+# the human-confirm step and feeds confirmed choices back in as hints; the
+# exec side is tailrace-metadata's mysql_exec).
+tailrace-ddl = { workspace = true }
+# T-A2 backfill control plane: the console itself executes bounded one-shot
+# replays through W2's run_bounded + backfill_state_dir — a deliberate
+# exception to "console drives nodes via /v1" (the engine has no bounded-run
+# endpoint, and the console already owns the compiled spec, plan tables and
+# sealed credentials). Engine crates wired directly, same pattern as the
+# embedded parser / metadata clients. The workspace table carries
+# default-features=false (T16 node trim), so the console re-enables exactly
+# its connector set here: kafka/file sources for the replay read side, the
+# doris sink stack for the deterministic-label write side.
+tailrace-runtime = { workspace = true, features = ["connector-kafka", "connector-file", "connector-doris"] }
+tailrace-connector = { workspace = true }
+tailrace-conn-kafka = { workspace = true }
+tailrace-conn-file = { workspace = true }
+tailrace-conn-doris = { workspace = true }
 # T35 §4.4 SSH deploy chain: pure-Rust SSH transport (workspace table
 # carries the feature rationale — ring backend, no aws-lc).
+# T-A2: the backfill executor builds the stream-load Basic-auth value from
+# the sealed credential (`Basic base64(user:pass)`) — same engine workspace
+# version conn-doris/tests already lock.
+base64 = { workspace = true }
 russh = { workspace = true }
 
 [dev-dependencies]

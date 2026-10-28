@@ -144,6 +144,102 @@ pub enum SinkFlavor {
     StarRocks,
 }
 
+/// Range fingerprint of a backfill replay window (T-A2, fixes F1): the
+/// first 8 hex chars of sha256 over the canonical big-endian encoding of
+/// `(from, to)` — 8 hex chars = the first 4 digest bytes. The byte-level
+/// encoding (not a decimal string) is pinned on purpose: the fingerprint is
+/// a cross-version contract, and `"{from},{to}"` formatting would drift the
+/// moment anyone touches the separator or the integer rendering.
+pub fn range_fingerprint(from: i64, to: i64) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update((from as u64).to_be_bytes());
+    h.update((to as u64).to_be_bytes());
+    let d = h.finalize();
+    let mut out = String::with_capacity(8);
+    for b in &d[..4] {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Label idempotency mode (T-A2). `ProcessScoped` is the default and the
+/// historical behavior: labels are unique per process run (`-r{pid}`), so a
+/// restart replay gets fresh labels and Doris dedups nothing — fine for
+/// at-least-once resident pipelines (the table key model absorbs replays),
+/// wrong for backfills, where the SAME range must map to the SAME labels
+/// across processes or a replay double-commits (finding F1).
+///
+/// A stop→deploy cycle rebuilds a resident pipeline's sink INSIDE the same
+/// process: a fresh instance's ordinal would restart at `_0` and reuse the
+/// previous instance's exact label, Doris answers "label already exists",
+/// the sink maps that to Dedup — the first post-restart batch is silently
+/// dropped while the ledger advances (found live by the R6 evolve-restart
+/// e2e). [`LABEL_SEQ_FLOORS`] therefore makes the ordinal continue where
+/// the previous same-prefix instance stopped; the label FORMAT is
+/// unchanged.
+///
+/// The idempotency window of `Deterministic` is Doris' label retention
+/// (default 3 days) — replays older than that fall back to the table key
+/// model, documented with the backfill API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelMode {
+    /// `{prefix}-r{pid}_{seq}` — unique per process run (the F1 defect
+    /// site, retained for resident pipelines; backfills must not use it).
+    /// The trailing `_{seq}` ordinal is process-global per prefix (see
+    /// [`LABEL_SEQ_FLOORS`]) so a same-process rebuild cannot collide with
+    /// its predecessor's labels.
+    ProcessScoped,
+    /// `{prefix}-{statement_index}-{fingerprint}_{seq}`: the fingerprint is
+    /// [`range_fingerprint`] (sha256(from,to)[..8]). Cross-process stable:
+    /// a restart replay of batch k reuses batch k's exact label, so Doris
+    /// answers "label already exists" → `FlushOutcome::Dedup` and the row
+    /// count stays unchanged.
+    ///
+    /// The trailing `_{seq}` batch ordinal is a deliberate extension of the
+    /// blueprint's `{prefix}-{statement}-{rangeFingerprint}` formula: one
+    /// label per RANGE would make the range's second flush (any range
+    /// larger than `flush_rows` has one) Dedup against its first and
+    /// silently drop that data. The ordinal keeps in-range flushes distinct
+    /// while staying cross-process deterministic (batch k of a replayed
+    /// range still gets ordinal k — this mode is exempt from the floor: a
+    /// replayed range MUST restart its ordinals at k to collide).
+    Deterministic {
+        statement_index: u32,
+        from: i64,
+        to: i64,
+    },
+}
+
+/// Ordinal floors of ProcessScoped label prefixes, process-global: the next
+/// sink built for the same `{prefix}-r{pid}` continues after the highest
+/// ordinal a previous instance of this process successfully flushed. Keyed
+/// by the pid-suffixed prefix, so nothing crosses process boundaries.
+static LABEL_SEQ_FLOORS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// The ordinal a freshly built ProcessScoped sink starts from.
+fn label_seq_floor(prefix: &str) -> u64 {
+    LABEL_SEQ_FLOORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(prefix)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Raise a prefix's floor to at least `seq` (never lowers — two concurrent
+/// instances of one prefix interleave, the floor tracks the frontier).
+fn raise_label_seq_floor(prefix: &str, seq: u64) {
+    let mut floors = LABEL_SEQ_FLOORS.lock().unwrap_or_else(|e| e.into_inner());
+    let floor = floors.entry(prefix.to_string()).or_insert(0);
+    if seq > *floor {
+        *floor = seq;
+    }
+}
+
 /// Register the doris sink factory (plus the "starrocks" alias when that
 /// feature is on — same Stream Load protocol, StarRocks deltas gated on
 /// the table object's kind, see [`SinkFlavor`]).
@@ -248,7 +344,15 @@ pub struct DorisSink {
     /// Sequence column name (optional — a Doris UNIQUE KEY table adds a
     /// sequence column to cancel out-of-order overwrites)
     sequence_column: Option<String>,
+    /// Raw label prefix as configured (no pid suffix) — the Deterministic
+    /// mode builds labels on it (a pid in the prefix would break
+    /// cross-process determinism).
+    raw_prefix: String,
+    /// Pid-suffixed label prefix (`{raw}-r{pid}`) — the ProcessScoped
+    /// label base (historical behavior).
     label_prefix: String,
+    /// Label idempotency mode (T-A2); default ProcessScoped = historical.
+    label_mode: LabelMode,
     label_seq: u64,
     pending_rows: u64,
     /// In-flight carrier buffer (T3: `BytesMut` grows like a Vec on the write
@@ -284,6 +388,12 @@ impl DorisSink {
         label_prefix: impl Into<String>,
         sequence_column: Option<String>,
     ) -> Self {
+        let raw_prefix = label_prefix.into();
+        // label idempotency collision guard: unique per process run (Doris
+        // labels are globally deduplicated — a rerun would be rejected); the
+        // ordinal continues after any earlier same-process instance of this
+        // prefix (a rebuilt sink must not reuse its predecessor's labels)
+        let label_prefix = format!("{}-r{}", raw_prefix, std::process::id());
         Self {
             sequence_column,
             client: std::cell::OnceCell::new(),
@@ -291,14 +401,50 @@ impl DorisSink {
             url: url.into(),
             auth: auth.into(),
             columns,
-            // label idempotency collision guard: unique per process run
-            // (Doris labels are globally deduplicated — a rerun would be rejected)
-            label_prefix: format!("{}-r{}", label_prefix.into(), std::process::id()),
-            label_seq: 0,
+            raw_prefix,
+            label_seq: label_seq_floor(&label_prefix),
+            label_prefix,
+            label_mode: LabelMode::ProcessScoped,
             pending_rows: 0,
             buf: BytesMut::with_capacity(16 * 1024 * 1024),
             retry_backoff_ms: vec![2_000, 8_000, 30_000],
             request_timeout_ms: 120_000,
+        }
+    }
+
+    /// Label mode override (T-A2): backfills pass
+    /// `LabelMode::Deterministic { statement_index, from, to }` so the same
+    /// replay range maps to the same labels across processes; the default
+    /// (ProcessScoped) is byte-identical to the historical label format.
+    pub fn with_label_mode(mut self, mode: LabelMode) -> Self {
+        // Deterministic owns its ordinal outright (batch k of a replayed
+        // range must be ordinal k, in every process) — never floored;
+        // ProcessScoped (re)reads the process floor for its prefix.
+        self.label_seq = match mode {
+            LabelMode::ProcessScoped => label_seq_floor(&self.label_prefix),
+            LabelMode::Deterministic { .. } => 0,
+        };
+        self.label_mode = mode;
+        self
+    }
+
+    /// The next stream-load label under the active mode. Pure on purpose:
+    /// `label_seq` advances only after a successful flush — a failed flush
+    /// must retry the SAME label (the retry loop in `flush` reuses it).
+    fn next_label(&self) -> String {
+        match &self.label_mode {
+            LabelMode::ProcessScoped => format!("{}_{}", self.label_prefix, self.label_seq),
+            LabelMode::Deterministic {
+                statement_index,
+                from,
+                to,
+            } => format!(
+                "{}-{}-{}_{}",
+                self.raw_prefix,
+                statement_index,
+                range_fingerprint(*from, *to),
+                self.label_seq
+            ),
         }
     }
 
@@ -526,7 +672,7 @@ impl Sink for DorisSink {
                 idempotency_key: format!("{}.noop", self.label_prefix),
             });
         }
-        let label = format!("{}_{}", self.label_prefix, self.label_seq);
+        let label = self.next_label();
         // (T3) freeze the accumulated carrier into a refcounted body: every
         // retry attempt clones the handle (refcount), not the bytes.
         let body = std::mem::take(&mut self.buf).freeze();
@@ -536,6 +682,12 @@ impl Sink for DorisSink {
             match self.send_once(&label, &body) {
                 Ok(_) => {
                     self.label_seq += 1;
+                    if self.label_mode == LabelMode::ProcessScoped {
+                        // a same-process rebuild of this prefix must start
+                        // AFTER this flush's ordinal, or its first label
+                        // would collide (Dedup, data silently dropped)
+                        raise_label_seq_floor(&self.label_prefix, self.label_seq);
+                    }
                     let rows = self.pending_rows;
                     self.pending_rows = 0;
                     // restore the buffer watermark (keep capacity to avoid
@@ -883,6 +1035,216 @@ mod tests {
         sink.write(vec![mk("g")?])?;
         assert!(sink.flush().is_ok());
         assert_eq!(m.hits.load(Ord2::Relaxed), 2);
+        Ok(())
+    }
+
+    /// T-A2 regression anchor: the default (ProcessScoped) mode must keep
+    /// the historical label format byte-identical — `{prefix}-r{pid}_{seq}`
+    /// (the `with_sequence` anchor) with the seq advancing per SUCCESSFUL
+    /// flush; a failed-then-retried flush reuses the same label.
+    #[test]
+    fn process_scoped_labels_pin_the_historical_format() -> anyhow::Result<()> {
+        let pid = std::process::id();
+        let mk = |v: &str| -> anyhow::Result<RecordBatch> {
+            Ok(RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)])),
+                vec![Arc::new(StringArray::from(vec![v.to_string()]))],
+            )?)
+        };
+        // ① constructor: stored prefix is exactly `{prefix}-r{pid}` and the
+        // first label is `{prefix}-r{pid}_0`; the default mode is
+        // ProcessScoped (new/with_sequence semantics unchanged)
+        let sink = DorisSink::new("http://127.0.0.1:1/", "auth", vec!["name".into()], "mreg");
+        assert_eq!(sink.label_prefix, format!("mreg-r{pid}"));
+        assert_eq!(sink.next_label(), format!("mreg-r{pid}_0"));
+        assert_eq!(sink.label_mode, LabelMode::ProcessScoped);
+
+        // ② the seq advances per successful flush: _0 then _1
+        let m = MockDoris::start(vec![
+            (200, r#"{"Status":"Success"}"#.into()),
+            (200, r#"{"Status":"Success"}"#.into()),
+        ]);
+        let mut a = DorisSink::new(m.url(), "Basic dGVzdDp0ZXN0", vec!["name".into()], "mseq");
+        a.retry_backoff_ms = vec![0, 0];
+        a.write(vec![mk("x")?])?;
+        assert_eq!(a.flush()?.idempotency_key, format!("mseq-r{pid}_0"));
+        a.write(vec![mk("y")?])?;
+        assert_eq!(a.flush()?.idempotency_key, format!("mseq-r{pid}_1"));
+
+        // ③ a retried flush reuses the SAME label (500 → 200): both
+        // requests carry the identical label line
+        let m = MockDoris::start(vec![
+            (500, r#"{"Status":"Fail"}"#.into()),
+            (200, r#"{"Status":"Success"}"#.into()),
+        ]);
+        let mut b = DorisSink::new(m.url(), "Basic dGVzdDp0ZXN0", vec!["name".into()], "mretry");
+        b.retry_backoff_ms = vec![0];
+        b.write(vec![mk("z")?])?;
+        assert_eq!(b.flush()?.idempotency_key, format!("mretry-r{pid}_0"));
+        let heads = m.heads.lock().unwrap().clone();
+        let labels: Vec<&str> = heads
+            .iter()
+            .map(|h| {
+                h.lines()
+                    .find(|l| l.starts_with("label:"))
+                    .expect("label header present")
+            })
+            .collect();
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[0], labels[1], "a retry must reuse the same label");
+        Ok(())
+    }
+
+    /// Same-process rebuild (stop→deploy rebuilds the sink; the process —
+    /// and its pid — stays): the fresh instance's first label must continue
+    /// after the previous instance's last flushed ordinal, not restart at
+    /// `_0` (which Doris would answer "label already exists" → Dedup → the
+    /// post-restart batch silently dropped while the ledger advances —
+    /// found live by the R6 evolve-restart e2e). Deterministic mode is
+    /// exempt: a replayed range MUST restart its ordinals to collide.
+    #[test]
+    fn process_scoped_ordinal_continues_across_same_process_rebuild() -> anyhow::Result<()> {
+        let pid = std::process::id();
+        let mk = |v: &str| -> anyhow::Result<RecordBatch> {
+            Ok(RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)])),
+                vec![Arc::new(StringArray::from(vec![v.to_string()]))],
+            )?)
+        };
+        // instance #1 flushes twice: ordinals _0 and _1
+        let m = MockDoris::start(vec![
+            (200, r#"{"Status":"Success"}"#.into()),
+            (200, r#"{"Status":"Success"}"#.into()),
+            (200, r#"{"Status":"Success"}"#.into()),
+        ]);
+        let mut first =
+            DorisSink::new(m.url(), "Basic dGVzdDp0ZXN0", vec!["name".into()], "mfloor");
+        first.retry_backoff_ms = vec![0];
+        first.write(vec![mk("a")?])?;
+        assert_eq!(first.flush()?.idempotency_key, format!("mfloor-r{pid}_0"));
+        first.write(vec![mk("b")?])?;
+        assert_eq!(first.flush()?.idempotency_key, format!("mfloor-r{pid}_1"));
+
+        // the rebuild: same prefix, same process → continues at _2
+        let mut second =
+            DorisSink::new(m.url(), "Basic dGVzdDp0ZXN0", vec!["name".into()], "mfloor");
+        second.retry_backoff_ms = vec![0];
+        assert_eq!(second.next_label(), format!("mfloor-r{pid}_2"));
+        second.write(vec![mk("c")?])?;
+        assert_eq!(second.flush()?.idempotency_key, format!("mfloor-r{pid}_2"));
+
+        // a sink whose mode is switched to Deterministic is NOT floored: a
+        // replayed range restarts its ordinals (that is the dedup contract)
+        let mut det = DorisSink::new(m.url(), "Basic dGVzdDp0ZXN0", vec!["name".into()], "mfloor")
+            .with_label_mode(LabelMode::Deterministic {
+                statement_index: 0,
+                from: 0,
+                to: 9,
+            });
+        det.retry_backoff_ms = vec![0];
+        assert!(det.next_label().ends_with("_0"), "{}", det.next_label());
+        Ok(())
+    }
+
+    /// T-A2 deterministic labels: the same statement + range generates
+    /// byte-identical labels across independently built sinks (a restart
+    /// replay reuses them — cross-process stability is proxied here by the
+    /// pid never entering the label); different ranges or statements
+    /// diverge; the fingerprint itself is pinned to precomputed vectors
+    /// (algorithm-drift guard).
+    #[test]
+    fn deterministic_labels_are_range_stable() {
+        let det = |statement_index: u32, from: i64, to: i64| LabelMode::Deterministic {
+            statement_index,
+            from,
+            to,
+        };
+        // fingerprint vectors: sha256 over the big-endian bytes of (from,to),
+        // first 8 hex chars
+        assert_eq!(range_fingerprint(100, 200), "13f92842");
+        assert_eq!(range_fingerprint(100, 300), "67bc82bc");
+        assert_eq!(range_fingerprint(0, 4294967296), "3bbf4dc5");
+        assert_eq!(range_fingerprint(-5, 7).len(), 8);
+
+        let base = || DorisSink::new("http://127.0.0.1:1/", "auth", vec!["name".into()], "tr-p7");
+        let a = base().with_label_mode(det(0, 100, 200));
+        let b = base().with_label_mode(det(0, 100, 200));
+        // same statement + range → byte-identical labels, pinned in full
+        assert_eq!(a.next_label(), b.next_label());
+        assert_eq!(a.next_label(), "tr-p7-0-13f92842_0");
+        // a different range (or statement) diverges
+        let c = base().with_label_mode(det(0, 100, 300));
+        assert_ne!(a.next_label(), c.next_label());
+        let d = base().with_label_mode(det(1, 100, 200));
+        assert_ne!(a.next_label(), d.next_label());
+        // the pid must not leak into deterministic labels
+        assert!(!a
+            .next_label()
+            .contains(&format!("-r{}", std::process::id())));
+        // next_label is pure: the seq advances only on a successful flush
+        assert_eq!(a.next_label(), a.next_label());
+    }
+
+    /// T-A2 through the mock BE: a Deterministic replay of the same range
+    /// hits "label already exists" on the committed label and converges via
+    /// the Dedup path (send_once → FlushOutcome::Dedup) — no double commit.
+    /// In-range batch ordinals stay distinct: flush #1's label is never
+    /// reused by flush #2 (one-label-per-range would Dedup real data away).
+    #[test]
+    fn deterministic_replay_converges_and_batches_stay_distinct() -> anyhow::Result<()> {
+        let mk = |v: &str| -> anyhow::Result<RecordBatch> {
+            Ok(RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)])),
+                vec![Arc::new(StringArray::from(vec![v.to_string()]))],
+            )?)
+        };
+        let det = |from: i64, to: i64| LabelMode::Deterministic {
+            statement_index: 0,
+            from,
+            to,
+        };
+        // run 1 commits two in-range batches; the replay of batch 0 answers
+        // "label already exists" → must converge to success
+        let m = MockDoris::start(vec![
+            (200, r#"{"Status":"Success"}"#.into()),
+            (200, r#"{"Status":"Success"}"#.into()),
+            (
+                200,
+                r#"{"Status":"Fail","Message":"Label Already Exists. label: bf7"}"#.into(),
+            ),
+        ]);
+        let mut run1 = DorisSink::new(m.url(), "Basic dGVzdDp0ZXN0", vec!["name".into()], "bf7")
+            .with_label_mode(det(100, 200));
+        run1.retry_backoff_ms = vec![0, 0];
+        run1.write(vec![mk("r1a")?])?;
+        let ack0 = run1.flush()?;
+        run1.write(vec![mk("r1b")?])?;
+        assert_eq!(run1.flush()?.rows, 1);
+        // restart replay (a fresh sink instance, same statement + range):
+        // batch 0's label is already committed → Dedup, ack key identical
+        let mut run2 = DorisSink::new(m.url(), "Basic dGVzdDp0ZXN0", vec!["name".into()], "bf7")
+            .with_label_mode(det(100, 200));
+        run2.retry_backoff_ms = vec![0, 0];
+        run2.write(vec![mk("r1a")?])?;
+        let replay = run2.flush()?;
+        assert_eq!(replay.idempotency_key, ack0.idempotency_key);
+        // the BE saw: batch0, batch1, batch0(replay) — the replay reuses
+        // batch 0's exact label while batch 1 stays distinct
+        let heads = m.heads.lock().unwrap().clone();
+        let labels: Vec<&str> = heads
+            .iter()
+            .map(|h| {
+                h.lines()
+                    .find(|l| l.starts_with("label:"))
+                    .expect("label header present")
+            })
+            .collect();
+        assert_eq!(labels.len(), 3);
+        assert_eq!(labels[0], labels[2], "the replay reuses batch 0's label");
+        assert_ne!(
+            labels[0], labels[1],
+            "in-range batches keep distinct labels"
+        );
         Ok(())
     }
 

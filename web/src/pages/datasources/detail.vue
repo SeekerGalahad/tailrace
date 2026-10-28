@@ -13,6 +13,7 @@ import {
   NSpin,
   NTag,
   NText,
+  NTooltip,
   useMessage,
   type DataTableColumns,
 } from 'naive-ui'
@@ -27,6 +28,7 @@ import {
 import MonoField from '../../components/MonoField.vue'
 import StateTag from '../../components/StateTag.vue'
 import DatasourceEditDialog from './parts/DatasourceEditDialog.vue'
+import TableDdlWizard from './parts/TableDdlWizard.vue'
 import EmptyState from '../../components/EmptyState.vue'
 
 /**
@@ -34,7 +36,8 @@ import EmptyState from '../../components/EmptyState.vue'
  * descriptions + catalog browser (basic version: db/table/column list via the
  * existing §4.2 endpoints — listTables + infer-schema; sample preview stays a
  * TODO slot until a P2 endpoint exists) + audit placeholder. Non-numeric or
- * unknown id → NResult 404 + back button.
+ * unknown id → NResult 404 + back button. Doris/StarRocks datasources get a
+ * per-table 「建表向导」 action (T-A1 create-table closed loop).
  */
 
 const route = useRoute()
@@ -242,7 +245,7 @@ function renderExpand(row: TableObject) {
   ])
 }
 
-const catalogColumns: DataTableColumns<TableObject> = [
+const catalogBaseColumns: DataTableColumns<TableObject> = [
   { type: 'expand', renderExpand },
   { title: '逻辑库', key: 'dbName', width: 140, ellipsis: { tooltip: true } },
   {
@@ -271,6 +274,47 @@ const catalogColumns: DataTableColumns<TableObject> = [
   },
   { title: '来源', key: 'source', width: 110 },
 ]
+
+// --- T-A1 create-table wizard: doris/starrocks datasources only (the draft
+// endpoint generates Doris-dialect DDL and 400s on anything else) ---
+const isDorisLike = computed(() => {
+  const t = dsQ.data?.type
+  return t === 'doris' || t === 'starrocks'
+})
+
+const wizardShow = ref(false)
+const wizardTable = ref<TableObject | null>(null)
+
+function openWizard(row: TableObject): void {
+  wizardTable.value = row
+  wizardShow.value = true
+}
+
+/** The draft needs a registered column list — disable (with the reason)
+ * rather than let the wizard open onto a 400. */
+function renderWizardAction(row: TableObject) {
+  const noColumns = !row.columnsJson || row.columnsJson.length === 0
+  const btn = h(
+    NButton,
+    { size: 'tiny', disabled: noColumns, onClick: () => openWizard(row) },
+    { default: () => '建表向导' },
+  )
+  if (!noColumns) return btn
+  return h(
+    NTooltip,
+    {},
+    {
+      trigger: () => btn,
+      default: () => '该表对象未登记列清单（columnsJson 为空），无法生成 DDL 草稿',
+    },
+  )
+}
+
+const catalogColumns = computed<DataTableColumns<TableObject>>(() =>
+  isDorisLike.value
+    ? [...catalogBaseColumns, { title: '操作', key: 'actions', width: 100, render: renderWizardAction }]
+    : catalogBaseColumns,
+)
 
 const tableCount = computed(
   () => dsQ.data?.tableCount ?? tablesQ.items.length,
@@ -413,6 +457,9 @@ function back(): void {
       @saved="onSaved"
       @retry-types="fetchTypes"
     />
+
+    <!-- T-A1 create-table wizard (doris/starrocks rows only) -->
+    <TableDdlWizard v-model:show="wizardShow" :datasource="dsQ.data" :table="wizardTable" />
   </main>
 </template>
 

@@ -6,9 +6,10 @@ use crate::api::artifacts::{ArtifactItem, ArtifactUploaded, ArtifactsResponse};
 use crate::api::auth::{LoginRequest, LoginResponse, MeResponse, UserInfo};
 use crate::api::datasources::{
     DatasourceCreated, DatasourceItem, DatasourceListResponse, DatasourceType,
-    DatasourceTypesResponse, DatasourceUpsertBody, DiscoverBody, DiscoverResponse,
-    DiscoveredAssetDto, InferSchemaBody, InferSchemaResponse, TableListResponse, TableObjectItem,
-    TableRegisterBody, TableRegistered, TestBody, TestResponse, TypeField,
+    DatasourceTypesResponse, DatasourceUpsertBody, DdlDraftBody, DdlDraftResponse,
+    DdlEvolveResponse, DdlExecuteBody, DdlExecuteResponse, DdlPartitionDto, DiscoverBody,
+    DiscoverResponse, DiscoveredAssetDto, InferSchemaBody, InferSchemaResponse, TableListResponse,
+    TableObjectItem, TableRegisterBody, TableRegistered, TestBody, TestResponse, TypeField,
 };
 use crate::api::nodes::{
     HeartbeatBody, HeartbeatResponse, NodeCreated, NodeEcho, RegisterBody, RegisterResponse,
@@ -20,9 +21,11 @@ use crate::api::nodes_admin::{
     NodeListItem, NodeMetricPointOut, NodesListResponse, NodesSummary,
 };
 use crate::api::pipelines::{
-    CompileBody, CompileResponse, DeployBody as PipeDeployBody, PipelineConfig, PipelineCreated,
-    PipelineDetailOut, PipelineListItem, PipelineUpsertBody, PipelinesListResponse,
-    PublishResponse, SqlTemplate, TemplatesResponse, TrendPoint, TrendResponse,
+    BackfillAccepted, BackfillBody, BackfillBound, BackfillDryRunOut, BackfillJobItem,
+    BackfillJobsResponse, CompileBody, CompileResponse, DeployBody as PipeDeployBody,
+    PipelineConfig, PipelineCreated, PipelineDetailOut, PipelineListItem, PipelineUpsertBody,
+    PipelinesListResponse, PublishResponse, SqlTemplate, TemplatesResponse, TrendPoint,
+    TrendResponse,
 };
 use crate::api::{ErrorBody, ErrorResponse};
 use crate::compile::{CompileDiag, DimJoinOut, StatementOut};
@@ -58,6 +61,10 @@ use crate::compile::{CompileDiag, DimJoinOut, StatementOut};
         crate::api::datasources::register_table,
         crate::api::datasources::list_tables,
         crate::api::datasources::remove_table,
+        // T-A1 create-table closed loop (§7.2)
+        crate::api::datasources::ddl_draft,
+        crate::api::datasources::ddl_execute,
+        crate::api::datasources::ddl_evolve,
         // node admin (§4.3/§4.4)
         crate::api::nodes_admin::list,
         crate::api::nodes_admin::detail,
@@ -94,6 +101,9 @@ use crate::compile::{CompileDiag, DimJoinOut, StatementOut};
         crate::api::pipelines::logs,
         crate::api::pipelines::metrics_trend,
         crate::api::pipelines::templates,
+        // T-A2 backfill (§7.3): bounded replay + job progress surface
+        crate::api::pipelines::backfill,
+        crate::api::pipelines::backfill_jobs,
     ),
     components(schemas(
         // auth
@@ -110,6 +120,9 @@ use crate::compile::{CompileDiag, DimJoinOut, StatementOut};
         // without components entries every $ref dangled in swagger-ui)
         DiscoverResponse, DiscoveredAssetDto, InferSchemaBody, InferSchemaResponse,
         TableRegisterBody, TableRegistered, TableListResponse, TableObjectItem,
+        // T-A1 DDL closed-loop DTOs (draft / execute / evolve)
+        DdlDraftBody, DdlDraftResponse, DdlPartitionDto, DdlExecuteBody, DdlExecuteResponse,
+        DdlEvolveResponse,
         // nodes admin
         NodesListResponse, NodeListItem, NodesSummary, NodeCapacity, NodeDetail,
         ManualRegisterBody, ManualRegistered, NodeDeleteResponse,
@@ -123,6 +136,9 @@ use crate::compile::{CompileDiag, DimJoinOut, StatementOut};
         PipelineConfig, PipelineCreated, CompileBody, CompileResponse, CompileDiag,
         StatementOut, DimJoinOut, PublishResponse, PipeDeployBody, TrendResponse, TrendPoint,
         TemplatesResponse, SqlTemplate,
+        // T-A2 backfill DTOs (§7.3)
+        BackfillBody, BackfillBound, BackfillDryRunOut, BackfillAccepted, BackfillJobItem,
+        BackfillJobsResponse,
         // shared
         ErrorResponse, ErrorBody,
     )))]
@@ -247,5 +263,89 @@ mod tests {
             "TableObjectItem must publish sequenceColumn, got keys: {:?}",
             table.keys().collect::<Vec<_>>()
         );
+    }
+
+    /// T-A1: the three DDL closed-loop paths are published, execute declares
+    /// its 422 confirmation gate, and the draft / evolve DTOs carry the
+    /// annotation fields the wizard reads (`keyColumnGuessed` badge,
+    /// `partialUpdateNotice` exclusivity text) — pinned so swagger and the
+    /// web client cannot drift from the handlers.
+    #[test]
+    fn ddl_closed_loop_is_published() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("openapi serializes");
+        let base = "/api/datasources/{id}/tables/{db}/{table}/ddl";
+        for leaf in ["draft", "execute", "evolve"] {
+            assert!(
+                doc.pointer(&format!("/paths/{}~1{leaf}/post", base.replace('/', "~1")))
+                    .is_some(),
+                "missing POST {base}/{leaf}"
+            );
+        }
+        assert!(
+            doc.pointer(&format!(
+                "/paths/{}~1execute/post/responses/422",
+                base.replace('/', "~1")
+            ))
+            .is_some(),
+            "execute must declare the 422 key-model gate"
+        );
+        let draft = doc
+            .pointer("/components/schemas/DdlDraftResponse/properties")
+            .and_then(|v| v.as_object())
+            .expect("DdlDraftResponse.properties");
+        for k in [
+            "ddl",
+            "keyModel",
+            "keyColumn",
+            "keyColumnGuessed",
+            "partition",
+            "notes",
+        ] {
+            assert!(draft.contains_key(k), "DdlDraftResponse missing {k}");
+        }
+        let evolve = doc
+            .pointer("/components/schemas/DdlEvolveResponse/properties")
+            .and_then(|v| v.as_object())
+            .expect("DdlEvolveResponse.properties");
+        for k in ["changed", "statements", "added", "partialUpdateNotice"] {
+            assert!(evolve.contains_key(k), "DdlEvolveResponse missing {k}");
+        }
+    }
+
+    /// T-A2: the backfill path pair is published, POST declares its 422
+    /// capability gate, and the dry-run DTO carries the blueprint §7.3
+    /// preview fields (jobId null by contract — a dry run creates nothing).
+    #[test]
+    fn backfill_surface_is_published() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("openapi serializes");
+        assert!(
+            doc.pointer("/paths/~1api~1pipelines~1{id}~1backfill/post")
+                .is_some(),
+            "missing POST /api/pipelines/{{id}}/backfill"
+        );
+        assert!(
+            doc.pointer("/paths/~1api~1pipelines~1{id}~1backfill~1jobs/get")
+                .is_some(),
+            "missing GET /api/pipelines/{{id}}/backfill/jobs"
+        );
+        assert!(
+            doc.pointer("/paths/~1api~1pipelines~1{id}~1backfill/post/responses/422")
+                .is_some(),
+            "backfill must declare the 422 capability gate"
+        );
+        let dry = doc
+            .pointer("/components/schemas/BackfillDryRunOut/properties")
+            .and_then(|v| v.as_object())
+            .expect("BackfillDryRunOut.properties");
+        for k in ["jobId", "estimatedRows", "labelPrefix"] {
+            assert!(dry.contains_key(k), "BackfillDryRunOut missing {k}");
+        }
+        let accepted = doc
+            .pointer("/components/schemas/BackfillAccepted/properties")
+            .and_then(|v| v.as_object())
+            .expect("BackfillAccepted.properties");
+        for k in ["jobId", "state", "labelPrefix"] {
+            assert!(accepted.contains_key(k), "BackfillAccepted missing {k}");
+        }
     }
 }

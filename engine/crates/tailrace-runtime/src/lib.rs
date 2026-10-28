@@ -725,6 +725,65 @@ impl PipelineRunner {
         }
         Ok(stats_out)
     }
+
+    /// Bounded execution mode (T-A2 backfill): like [`PipelineRunner::run`]
+    /// but each statement exits when its source cursor reaches `to` (or the
+    /// source goes idle past the EOF guard), then final flush + cursor
+    /// commit + return. A NEW mode alongside run / run_serve — the serve
+    /// loop and the registry's restart loop are untouched.
+    ///
+    /// `from` seeds the source on a cold start (no ledger entry); a
+    /// ledger entry takes precedence, so a mid-job restart resumes from the
+    /// last bounded flush point. Assemble the runner against
+    /// [`backfill_state_dir`], NEVER the main pipeline ledger dir — a
+    /// bounded run commits every cursor it is given, and pointing it at the
+    /// main ledger would advance main-pipeline cursors.
+    ///
+    /// `to` alignment granularity is one poll (same overshoot semantics as
+    /// [`RunOptions::flush_due`]): the poll that crosses `to` is fully
+    /// processed.
+    pub fn run_bounded(&mut self, from: i64, to: i64) -> anyhow::Result<Vec<StatementStats>> {
+        use std::thread;
+        tracing::info!(
+            pipeline_id = self.pipeline_id,
+            statements = self.statements.len(),
+            from,
+            to,
+            "pipeline run started (bounded backfill)"
+        );
+        let mut handles = Vec::new();
+        for st in self.statements.drain(..) {
+            let state = Arc::clone(&self.state);
+            let pipeline_id = self.pipeline_id;
+            let opts = self.options.clone();
+            handles.push(thread::spawn(move || {
+                run_statement_bounded(st, pipeline_id, state, opts, from, to)
+            }));
+        }
+        // same join-aggregation contract as run(): the first error fails the
+        // call, stats and panics are all collected
+        let mut stats_out = Vec::new();
+        let mut first_err: Option<anyhow::Error> = None;
+        let mut any_panic = false;
+        for h in handles {
+            match h.join() {
+                Ok(Ok(stats)) => stats_out.push(stats),
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+                Err(_) => any_panic = true,
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        if any_panic {
+            anyhow::bail!("statement thread panicked");
+        }
+        Ok(stats_out)
+    }
 }
 
 /// serve-mode statement thread body: the loop is driven by ControlFlags
@@ -1183,6 +1242,248 @@ fn run_statement(
     Ok(stats)
 }
 
+/// Bounded-mode EOF guard: a source that stops producing (file at EOF, no
+/// more keyset rows) for this many consecutive idle polls is judged
+/// exhausted — the bounded run flushes, commits and exits instead of
+/// spinning forever on an unreachable `to` (e.g. a `to` past the end of
+/// the data). ~3s at the 50ms idle sleep.
+const BOUNDED_IDLE_POLLS: u32 = 60;
+
+/// Bounded-mode terminal check: has the source cursor reached `to`? The
+/// judgment is per cursor shape — File: byte position; JdbcKey: the keyset
+/// value parsed as i64 (a non-numeric keyset never reaches; the idle guard
+/// ends those runs); Kafka: EVERY assigned partition's next offset (a
+/// single-dimensional `to` over a multi-partition topic needs the console
+/// to resolve it per partition first).
+fn cursor_reached(c: &Cursor, to: i64) -> bool {
+    match c {
+        Cursor::File { byte_pos, .. } => *byte_pos as i64 >= to,
+        Cursor::JdbcKey { value, .. } => value.parse::<i64>().map(|v| v >= to).unwrap_or(false),
+        Cursor::Kafka { offsets, .. } => !offsets.is_empty() && offsets.values().all(|o| *o >= to),
+        Cursor::None => false,
+    }
+}
+
+/// Seed `from` into the source's own cursor shape (cold start of a bounded
+/// run — no ledger entry yet). The probe cursor comes from opening the
+/// source with `Cursor::None` first (it then carries the real shape:
+/// path / keyset / topic). Kafka shapes cannot be seeded from a single
+/// dimension (the partition map is unknown here) — the empty map is the
+/// no-cursor equivalent, so the statement starts from its declared start
+/// position (timestamp→offset resolution belongs to the console side).
+fn seed_from_cursor(probe: &Cursor, from: i64) -> Cursor {
+    match probe {
+        Cursor::File { path, .. } => Cursor::File {
+            path: path.clone(),
+            byte_pos: from.max(0) as u64,
+        },
+        Cursor::JdbcKey { key, .. } => Cursor::JdbcKey {
+            key: key.clone(),
+            value: from.to_string(),
+        },
+        Cursor::Kafka { topic, group, .. } => {
+            tracing::warn!(
+                from,
+                topic = %topic,
+                "bounded run over a kafka-shaped source: a scalar `from` cannot address the \
+                 partition map — starting from the statement's declared start position"
+            );
+            Cursor::Kafka {
+                topic: topic.clone(),
+                group: group.clone(),
+                offsets: Default::default(),
+            }
+        }
+        Cursor::None => Cursor::None,
+    }
+}
+
+/// Bounded statement thread body (T-A2 backfill): micro-batch loop until the
+/// source cursor reaches `to` (or the idle/EOF guard fires), then final
+/// flush + cursor commit — the bounded twin of [`run_statement`]. The serve
+/// loop (`run_statement_serve`) is NOT modified; this is a parallel body
+/// with the same flush-point at-least-once anchor (cursor commits only
+/// after a successful write).
+fn run_statement_bounded(
+    mut st: StatementRuntime,
+    pipeline_id: u64,
+    state: Arc<Mutex<FileOffsetStore>>,
+    options: RunOptions,
+    from: i64,
+    to: i64,
+) -> anyhow::Result<StatementStats> {
+    let mut stats = StatementStats::default();
+    let mut bad_since_event: u64 = 0; // Bad event throttling accumulator
+    let mut bad_event_emitted = false; // first-bad visibility (engine H2)
+                                       // Cursor restore order: the (bf-namespaced) ledger first — a mid-job
+                                       // restart resumes from the last bounded flush point; on a cold start
+                                       // probe-open the source so cursor() carries its real shape, then seed
+                                       // `from` into that shape. Neither open commits anything.
+    let saved = state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .load(pipeline_id, st.statement_index)?
+        .map(|(c, _, _)| c);
+    st.source.open(&Cursor::None)?;
+    let resume = match saved {
+        Some(c) => c,
+        None => seed_from_cursor(&st.source.cursor(), from),
+    };
+    st.source.open(&resume)?;
+    // T7 session assembly: same knobs as the serve/standalone loops
+    let tx_opts = tailrace_transform::TransformOptions {
+        max_rows_per_batch: options.poll_rows,
+        ..Default::default()
+    };
+    let mut idle_polls: u32 = 0;
+    loop {
+        if cursor_reached(&st.source.cursor(), to) {
+            break;
+        }
+        let chunks = st.source.poll(options.poll_rows, options.poll_slice)?;
+        if chunks.is_empty() {
+            // idle-poll sleep prevents spinning; the flush_interval still
+            // drains a trailing batch (same as the serve/standalone loops)
+            idle_polls += 1;
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if st.pending_rows > 0 && st.last_flush.elapsed() >= options.flush_interval {
+                let span = sink_flush_span(pipeline_id, &st);
+                let _flush_span = span.enter();
+                let flush_t0 = Instant::now();
+                let ack = st.sink.flush()?;
+                let dur_ms = flush_t0.elapsed().as_millis() as u64;
+                span.record("rows", ack.rows);
+                span.record("flush_ms", dur_ms);
+                stats.flushed_rows += ack.rows;
+                stats.flushes += 1;
+                st.obs_flush(ack.rows, dur_ms);
+                st.pending_rows = 0;
+                st.last_flush = Instant::now();
+                state.lock().unwrap_or_else(|e| e.into_inner()).save(
+                    pipeline_id,
+                    st.statement_index,
+                    &st.source.cursor(),
+                    Some(&ack.idempotency_key),
+                    st.ledger_totals(),
+                )?;
+            }
+            if idle_polls >= BOUNDED_IDLE_POLLS {
+                tracing::info!(
+                    pipeline_id,
+                    statement_idx = st.statement_index,
+                    to,
+                    "bounded run: source idle past the EOF guard — judged exhausted, exiting"
+                );
+                break;
+            }
+            continue;
+        }
+        idle_polls = 0;
+        stats.consumed += chunks.len() as u64;
+        if let Some(c) = st.counters.as_ref() {
+            c.consumed.fetch_add(chunks.len() as u64, Ordering::Relaxed);
+        }
+        let pd = decode_poll(
+            st.decoder.as_ref(),
+            &st.pushdown,
+            &st.schema,
+            &mut st.batch,
+            chunks,
+            st.bad_row_policy,
+            &mut stats,
+        )?;
+        if pd.skipped > 0 {
+            if let Some(c) = st.counters.as_ref() {
+                c.skipped.fetch_add(pd.skipped, Ordering::Relaxed);
+            }
+        }
+        handle_bad_rows(
+            &st,
+            pipeline_id,
+            pd.bad_now,
+            pd.bad_raws,
+            pd.fail_sample,
+            &mut bad_since_event,
+            &mut bad_event_emitted,
+        )?;
+        let Some(rb) = pd.merged else {
+            continue;
+        };
+        let out = tailrace_transform::transform_plan(&st.exec_plan, rb, &tx_opts)?; // materialized-plan variant (T7)
+                                                                                    // Validate the output column 【order】 before the first row is written
+                                                                                    // (see run_statement_serve)
+        if let Some(first) = out.first() {
+            let out_cols: Vec<String> = first
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            if out_cols != st.sink_columns && !st.sink_columns.is_empty() {
+                anyhow::bail!(
+                    "transform output column order != sink: output {:?} vs sink {:?} — check the SELECT projection order",
+                    out_cols, st.sink_columns
+                );
+            }
+        }
+        let rows: u64 = out.iter().map(|b| b.num_rows() as u64).sum();
+        if rows > 0 {
+            st.sink.write(out)?;
+        }
+        st.pending_rows += rows;
+        // same three-threshold flush predicate as the serve/standalone loops
+        // (the cursor commits only behind a successful flush — the
+        // at-least-once anchor)
+        if options.flush_due(
+            st.pending_rows,
+            st.sink.buffered_bytes(),
+            st.last_flush.elapsed(),
+        ) {
+            let span = sink_flush_span(pipeline_id, &st);
+            let _flush_span = span.enter();
+            let flush_t0 = Instant::now();
+            let ack = st.sink.flush()?;
+            let dur_ms = flush_t0.elapsed().as_millis() as u64;
+            span.record("rows", ack.rows);
+            span.record("flush_ms", dur_ms);
+            stats.flushed_rows += ack.rows;
+            stats.flushes += 1;
+            st.obs_flush(ack.rows, dur_ms);
+            st.pending_rows = 0;
+            st.last_flush = Instant::now();
+            state.lock().unwrap_or_else(|e| e.into_inner()).save(
+                pipeline_id,
+                st.statement_index,
+                &st.source.cursor(),
+                Some(&ack.idempotency_key),
+                st.ledger_totals(),
+            )?;
+        }
+    }
+    // finalization: flush the remainder + commit the cursor (same as the
+    // serve/standalone finalization)
+    if st.pending_rows > 0 {
+        let span = sink_flush_span(pipeline_id, &st);
+        let _flush_span = span.enter();
+        let flush_t0 = Instant::now();
+        let ack = st.sink.flush()?;
+        let dur_ms = flush_t0.elapsed().as_millis() as u64;
+        span.record("rows", ack.rows);
+        span.record("flush_ms", dur_ms);
+        stats.flushed_rows += ack.rows;
+        stats.flushes += 1;
+        st.obs_flush(ack.rows, dur_ms);
+    }
+    state.lock().unwrap_or_else(|e| e.into_inner()).save(
+        pipeline_id,
+        st.statement_index,
+        &st.source.cursor(),
+        None,
+        st.ledger_totals(),
+    )?;
+    Ok(stats)
+}
+
 fn arrow_type(t: &str) -> DataType {
     match t {
         "int64" => DataType::Int64,
@@ -1223,6 +1524,18 @@ pub fn run_standalone(
     )?;
     let stats = runner.run()?;
     Ok((id, stats))
+}
+
+/// Backfill ledger namespace (T-A2): a backfill job commits its cursors
+/// under `bf-{job}` beside the main ledger dir, isolating them from the
+/// main pipeline's `offsets-{id}.json` — a backfill (success or failure
+/// alike) never reads or advances main-pipeline cursors, and the main
+/// pipeline keeps running undisturbed. Assemble the bounded runner with
+/// THIS dir, never the main ledger dir. A job id already carrying the
+/// `bf-` marker is not double-prefixed.
+pub fn backfill_state_dir(state_dir: &std::path::Path, job_id: &str) -> std::path::PathBuf {
+    let job = job_id.strip_prefix("bf-").unwrap_or(job_id);
+    state_dir.join(format!("bf-{job}"))
 }
 
 #[cfg(test)]

@@ -23,6 +23,7 @@ members = [
     "engine/crates/tailrace-catalog",
     "engine/crates/tailrace-runtime",
     "engine/crates/tailrace-metadata",
+    "engine/crates/tailrace-ddl",
     "engine/crates/tailrace-api",
     # console
     "console/crates/tailrace-console",
@@ -50,6 +51,30 @@ documentation = "https://github.com/SeekerGalahad/tailrace/tree/main/docs"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# T-A2 disk-footprint guard (machine-gate fix): the backfill control plane
+# made the console link the executor stack (datafusion/rdkafka), so every
+# console integration-test target grew to ~426MB of linked debuginfo and a
+# full `cargo test` no longer fit this 228GB dev disk (ld errno=28). Thin
+# the DEPENDENCY debuginfo to line tables only — workspace crates keep full
+# debug (own breakpoints intact), dev/test artifacts stay a single shared
+# cache (same settings on both profiles), and the giant rlibs
+# (datafusion_physical_plan etc. at 147MB apiece) shrink to a fraction.
+[profile.dev.package."*"]
+debug = "line-tables-only"
+
+# R6 review round, machine-gate fix #2: the guard above thins only the
+# DEPENDENCIES — the workspace's own crates still compiled full debuginfo
+# into `cargo test`'s link fan-out (~30 test binaries × the whole executor
+# stack, target/debug alone grew past 27GiB and ld died with errno=28
+# twice, cold or warm). Extend the same trim to the TEST profile as a
+# whole: `cargo build`/`cargo run` keep the dev-profile behaviour above
+# (workspace crates with full debug for breakpoint debugging); only the
+# test-target builds — the gate's fan-out — go line-tables-only. Backtraces
+# keep file:line. Override locally with CARGO_PROFILE_TEST_DEBUG=2 when a
+# test needs stepping through with full variable info.
+[profile.test]
+debug = "line-tables-only"
 
 # ---------------------------------------------------------------------------
 # Shared dependency version table (single fact source).
@@ -173,6 +198,9 @@ tailrace-catalog = { path = "engine/crates/tailrace-catalog", version = "1.1.0" 
 # explicitly in its own manifest.
 tailrace-runtime = { path = "engine/crates/tailrace-runtime", version = "1.1.0", default-features = false }
 tailrace-metadata = { path = "engine/crates/tailrace-metadata", version = "1.1.0" }
+# T-A1 (R6): pure draft-DDL generator — no IO, no tokio; console pairs it
+# with tailrace-metadata's mysql_exec for the create-table closed loop.
+tailrace-ddl = { path = "engine/crates/tailrace-ddl", version = "1.1.0" }
 tailrace-api = { path = "engine/crates/tailrace-api", version = "1.1.0" }
 console-store = { path = "console/crates/console-store", version = "1.1.0" }
 console-auth = { path = "console/crates/console-auth", version = "1.1.0" }

@@ -134,6 +134,85 @@ export interface TableObjectList {
   items: TableObject[]
 }
 
+// ---------------- T-A1 create-table closed loop (blueprint §7.2) ----------------
+// draft (pure, read-only) → human confirms the key model → execute (audited)
+// → evolve (ADD COLUMN only). Doris/StarRocks datasources only.
+
+export type DdlKeyModel = 'unique' | 'duplicate'
+
+/** Round-two hints fed back into the generator — all optional; an empty
+ * body yields the heuristic draft with its 「猜测」 flags. */
+export interface DdlDraftInput {
+  /** Confirmed key column — clears `keyColumnGuessed` in the response. */
+  keyColumn?: string
+  /** Override of the recommendation. */
+  keyModel?: DdlKeyModel
+  /** `replication_num`: 1 on a single-BE cluster (`SHOW BACKENDS`), omitted =
+   * cluster default. The console does not probe BE count this wave. */
+  replicationNum?: number
+  /** Partition decision: omitted = the heuristic's candidate (when executable)
+   * stays a guess; `true` = confirmed (guess flag clears); `false` = dropped —
+   * no `PARTITION BY` clause and no `dynamic_partition.*` properties. */
+  partition?: boolean
+}
+
+export interface DdlPartition {
+  column: string
+  /** Name-based guess the human has not confirmed yet (confirm/drop via
+   * `DdlDraftInput.partition`). */
+  guessed: boolean
+}
+
+export interface DdlDraftResponse {
+  /** Full `CREATE TABLE` text — previewed verbatim, executed verbatim. */
+  ddl: string
+  keyModel: DdlKeyModel
+  keyModelReason: string
+  /** Column the key clause and hash distribution ride on. */
+  keyColumn: string
+  /** true = id / `*_id` / first-column heuristic — the 「猜测」 badge. */
+  keyColumnGuessed: boolean
+  partition: DdlPartition | null
+  notes: string[]
+  /** Registered `[name, type]` pairs the draft was built from. */
+  columns: [string, string][]
+  sequenceColumn: string | null
+}
+
+export interface DdlExecuteInput {
+  /** The draft text echoed back verbatim. */
+  ddl: string
+  /** Mandatory — absent/unknown → 422 KEY_MODEL_REQUIRED, nothing reaches Doris. */
+  keyModel: DdlKeyModel
+}
+
+export interface DdlExecuteResponse {
+  ok: boolean
+  keyModel: DdlKeyModel
+  elapsedMs: number
+  rowsAffected: number
+}
+
+/** 200: `changed:true` with the ADD COLUMN statements that ran, or
+ * `changed:false` when the live table already carries every registered column. */
+export interface DdlEvolveResponse {
+  changed: boolean
+  statements: string[]
+  added: [string, string][]
+  elapsedMs: number
+  /** Doris schema-change / partial-update exclusivity notice (T-A1 ⑤ / T-A7). */
+  partialUpdateNotice: string
+}
+
+/** 409 SCHEMA_CHANGE_UNSUPPORTED `error.refs` — suggestions only, nothing executed. */
+export interface DdlEvolveConflictRefs {
+  suggestedDdl: string[]
+  added: [string, string][]
+  retyped: Array<{ column: string; registered: string; current: string }>
+  removed: [string, string][]
+  partialUpdateNotice: string
+}
+
 export const datasourcesApi = {
   /** GET /api/datasource-types */
   listTypes(options?: HttpOptions): Promise<DatasourceTypeList> {
@@ -206,4 +285,41 @@ export const datasourcesApi = {
   removeTable(id: number | string, options?: HttpOptions): Promise<void> {
     return http.delete(`/api/datasources/tables/${id}`, options)
   },
+
+  /** POST /api/datasources/{id}/tables/{db}/{table}/ddl/draft — pure generator,
+   * nothing touches Doris, nothing audited. Omit `input` for the first round. */
+  ddlDraft(
+    id: number | string,
+    db: string,
+    table: string,
+    input?: DdlDraftInput,
+    options?: HttpOptions,
+  ): Promise<DdlDraftResponse> {
+    return http.post(`${ddlPath(id, db, table)}/draft`, input, options)
+  },
+
+  /** POST …/ddl/execute — runs the echoed draft verbatim via mysql_exec.
+   * 422 KEY_MODEL_REQUIRED / DDL_REQUIRED / KEY_MODEL_MISMATCH before any
+   * connection; 502 DDL_FAILED carries the Doris error verbatim. */
+  ddlExecute(
+    id: number | string,
+    db: string,
+    table: string,
+    input: DdlExecuteInput,
+    options?: HttpOptions,
+  ): Promise<DdlExecuteResponse> {
+    return http.post(`${ddlPath(id, db, table)}/execute`, input, options)
+  },
+
+  /** POST …/ddl/evolve (no body) — DESC vs registered columns; add-only runs
+   * as chained ADD COLUMN, retype/drop → 409 SCHEMA_CHANGE_UNSUPPORTED with
+   * `error.refs` (DdlEvolveConflictRefs), nothing executed. */
+  ddlEvolve(id: number | string, db: string, table: string, options?: HttpOptions): Promise<DdlEvolveResponse> {
+    return http.post(`${ddlPath(id, db, table)}/evolve`, undefined, options)
+  },
+}
+
+/** `/api/datasources/{id}/tables/{db}/{table}/ddl` with the path segments encoded. */
+function ddlPath(id: number | string, db: string, table: string): string {
+  return `/api/datasources/${id}/tables/${encodeURIComponent(db)}/${encodeURIComponent(table)}/ddl`
 }

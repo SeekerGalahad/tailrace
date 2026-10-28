@@ -112,6 +112,19 @@ async fn main() -> Result<()> {
     let db_path = data_dir.join("console.db");
     let store = Store::open(&db_path).with_context(|| format!("open {}", db_path.display()))?;
 
+    // T-A2 backfill jobs left `pending`/`running` by the previous process are
+    // orphans — their executor was a blocking thread that died with it and
+    // nothing re-attaches across restarts. Mark them failed now so the jobs
+    // list never shows a phantom `running` row (R6 review round).
+    match store.fail_orphaned_backfill_jobs() {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(
+            jobs = n,
+            "backfill jobs orphaned by the previous console process marked failed"
+        ),
+        Err(e) => tracing::warn!(error = %e, "orphaned backfill job sweep failed"),
+    }
+
     // Credential master key (§5.3): TAILRACE_MASTER_KEY env (32B base64) >
     // <data-dir>/master.key (0600, generated on first boot). Fail-closed —
     // no machine-fingerprint derivation fallback; a key that cannot be

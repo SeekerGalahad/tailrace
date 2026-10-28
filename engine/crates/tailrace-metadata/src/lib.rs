@@ -31,6 +31,12 @@ use std::time::Duration;
 /// hang a console request).
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Deadline for [`mysql_exec`] batches — looser than CALL_TIMEOUT: DDL on a
+/// loaded FE (BUCKETS AUTO estimation, replication checks) is slower than a
+/// SHOW/DESC poke, but an unreachable host still must not hang a console
+/// request.
+const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Connection spec the console derives from a datasource row (type +
 /// connJson + unsealed credential halves). Built by the caller; this crate
 /// never reads secrets itself.
@@ -196,6 +202,42 @@ pub async fn infer_schema(
             })
         }
     }
+}
+
+/// One statement's execution outcome: the echoed SQL, wall time and
+/// affected-row count (DDL reports 0).
+#[derive(Debug, Clone)]
+pub struct StatementOutcome {
+    pub sql: String,
+    pub elapsed: Duration,
+    pub rows_affected: u64,
+}
+
+/// Batch outcome of an all-success [`mysql_exec`] run — statements execute
+/// sequentially on one connection; the first failure aborts the batch (the
+/// error names the failing statement and carries the server's message
+/// verbatim), so `statements` only ever holds a complete batch.
+#[derive(Debug, Clone)]
+pub struct ExecOutcome {
+    pub statements: Vec<StatementOutcome>,
+}
+
+/// Execute SQL statements one by one against a MySQL-protocol datasource
+/// (T-A1 step ④ — Doris FE 9030 or a MySQL server; the same connection
+/// path and text protocol as `infer_schema`).
+///
+/// Trust boundary: statements run verbatim — no rewriting, no allowlist;
+/// the console owns gating (the human-confirmed DDL) and audit. Errors are
+/// passed through unmodified, because the Doris message is exactly what the
+/// user must see (§7.2 ④ 失败原样回传).
+pub async fn mysql_exec(spec: &ConnSpec, sqls: &[&str]) -> anyhow::Result<ExecOutcome> {
+    match spec {
+        ConnSpec::MySql { .. } => {}
+        _ => anyhow::bail!("mysql_exec 仅支持 MySQL 协议数据源"),
+    }
+    tokio::time::timeout(EXEC_TIMEOUT, sql::mysql_exec(spec, sqls))
+        .await
+        .map_err(|_| anyhow::anyhow!("mysql 执行超时 (>{EXEC_TIMEOUT:?})"))?
 }
 
 /// `"a.b"` → (`"a"`, `"b"`); `"flat"` → (`""`, `"flat"`) (first-dot split;
