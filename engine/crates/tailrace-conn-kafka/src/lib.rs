@@ -22,7 +22,7 @@ use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 
 use tailrace_catalog::{ReliabilityOptions, StatementSpec, TableObject};
 use tailrace_connector::registry::ConnectorRegistry;
-use tailrace_connector::{Cursor, Sink, SinkAck, Source, SourceChunk};
+use tailrace_connector::{Cursor, Sink, SinkAck, SinkCapabilities, Source, SourceChunk};
 
 /// Register the kafka source/sink factories (called by the binary's
 /// build_registry / the runtime's default_registry).
@@ -489,6 +489,23 @@ fn encode_json_lines(batches: &[RecordBatch]) -> anyhow::Result<Vec<u8>> {
 }
 
 impl Sink for KafkaSink {
+    /// G4 declaration — the honest all-false floor, stated explicitly so
+    /// the declaration is visible at the sink. The producer is idempotent
+    /// within its own session (enable.idempotence), but the ack key is
+    /// informational only: Kafka has no broker-side dedup label, so a
+    /// replayed flush after a restart re-appends (at-least-once). No
+    /// transactional producer, no overwrite, no column-subset semantics,
+    /// and payloads carry no partition key (no sink-side routing).
+    fn capabilities(&self) -> SinkCapabilities {
+        SinkCapabilities {
+            idempotent_label: false,
+            transactional: false,
+            overwrite: false,
+            partial_update: false,
+            partition_aware: false,
+        }
+    }
+
     /// Real in-flight measurement (T6): payload bytes enqueued to librdkafka
     /// minus bytes whose delivery report already arrived — the byte boundary
     /// (`sink.buffer-flush.max-bytes`) no longer degrades to "never triggers"

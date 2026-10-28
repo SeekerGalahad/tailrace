@@ -11,5 +11,8 @@ description = "Pure CREATE TABLE draft generator for Doris/StarRocks (T-A1): sch
 keywords = ["doris", "starrocks", "ddl", "schema", "generator"]
 categories = ["database"]
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = "1"

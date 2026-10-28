@@ -10,7 +10,7 @@ pub mod sink;
 pub mod source;
 
 pub use registry::{ConnectorRegistry, SinkFactory, SourceFactory};
-pub use sink::{Sink, SinkAck};
+pub use sink::{Sink, SinkAck, SinkCapabilities};
 pub use source::Source;
 
 // Cursor/SourceChunk live in tailrace-ir; re-exported so connector crates

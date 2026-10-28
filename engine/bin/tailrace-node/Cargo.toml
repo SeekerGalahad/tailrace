@@ -12,6 +12,9 @@ readme = "../../../README.md"
 keywords = ["etl", "data-pipeline", "streaming", "kafka", "doris"]
 categories = ["command-line-utilities", "database"]
 
+[lints]
+workspace = true
+
 [features]
 # Connector wiring: default registers kafka/file/doris; mqtt/jdbc/s3 stay
 # placeholder crates and register nothing until implemented.

@@ -11,6 +11,9 @@ description = "OffsetStore trait (commit only after write success — the at-lea
 keywords = ["offset", "checkpoint", "ledger", "at-least-once", "cursor"]
 categories = ["database"]
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = "1"
 # T2: engine-wide structured logging (tracing macros with pipeline/statement fields)

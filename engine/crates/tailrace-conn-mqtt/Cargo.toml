@@ -11,4 +11,7 @@ description = "MQTT connector placeholder: crate name reserved for the parked MQ
 keywords = ["mqtt", "connector", "placeholder"]
 categories = ["network-programming"]
 
+[lints]
+workspace = true
+
 [dependencies]

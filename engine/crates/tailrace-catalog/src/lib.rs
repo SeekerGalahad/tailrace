@@ -31,9 +31,12 @@ pub struct TableObject {
     /// (debezium-json = Debezium CDC envelope consumed from Kafka, blueprint
     /// C narrow path; `after.*` is the row data, deletes/tombstones skip,
     /// schema/payload-wrapped and bare converter envelopes both accepted.
-    /// Decoder-only so far: runtime `build_decoder` and console discover
-    /// reject the value until the dispatch arm lands — no pipeline can
-    /// select it yet)
+    /// The runtime dispatch arm HAS landed (`build_decoder` decodes it), so
+    /// hand-declared table objects can select it; the console discover path
+    /// still rejects the value (kafka infer-schema accepts ogg/json/jsonl
+    /// only — a debezium-json table cannot be discovered, only written into
+    /// a catalog by hand or via table registration, which does not validate
+    /// format names)
     pub format: Option<String>,
     /// Column definitions [name, arrow type] (v1 flat; discover output is the
     /// same shape)

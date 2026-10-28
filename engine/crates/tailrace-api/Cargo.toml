@@ -11,6 +11,9 @@ description = "axum REST: /healthz, /v1/compile, /v1/pipelines (+plan/stats/logs
 keywords = ["axum", "rest", "api", "pipeline", "heartbeat"]
 categories = ["web-programming::http-server", "database"]
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = "1"
 # T2: engine-wide structured logging (tracing macros with pipeline/statement fields)

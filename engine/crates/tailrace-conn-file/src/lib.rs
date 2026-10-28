@@ -13,7 +13,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 
 use tailrace_catalog::{ReliabilityOptions, TableObject};
 use tailrace_connector::registry::ConnectorRegistry;
-use tailrace_connector::{Cursor, Sink, SinkAck, Source, SourceChunk};
+use tailrace_connector::{Cursor, Sink, SinkAck, SinkCapabilities, Source, SourceChunk};
 
 /// Register the file source/sink factories.
 pub fn register(reg: &mut ConnectorRegistry) {
@@ -358,6 +358,22 @@ impl FileSink {
 }
 
 impl Sink for FileSink {
+    /// G4 declaration — the honest all-false floor, stated explicitly so
+    /// the declaration is visible at the sink: jsonl appends and parquet
+    /// rolls new part files (the ack key is run-pid based, informational
+    /// only — a replayed flush re-appends), no staged transactions, no
+    /// whole-target replace, no column-subset semantics, one flat target
+    /// path with no partition routing.
+    fn capabilities(&self) -> SinkCapabilities {
+        SinkCapabilities {
+            idempotent_label: false,
+            transactional: false,
+            overwrite: false,
+            partial_update: false,
+            partition_aware: false,
+        }
+    }
+
     /// Arrow memory estimate of the pending batches (both jsonl and parquet
     /// shapes buffer in memory up to the flush boundary).
     fn buffered_bytes(&self) -> u64 {

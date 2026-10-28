@@ -11,6 +11,9 @@ description = "SQLite metadata store for the tailrace console: single WAL file, 
 keywords = ["sqlite", "rusqlite", "migration", "argon2", "store"]
 categories = ["database"]
 
+[lints]
+workspace = true
+
 [dependencies]
 rusqlite = { workspace = true }
 rusqlite_migration = { workspace = true }

@@ -31,7 +31,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 
 use tailrace_catalog::{credential_from_env, ReliabilityOptions, TableObject};
 use tailrace_connector::registry::ConnectorRegistry;
-use tailrace_connector::{Sink, SinkAck};
+use tailrace_connector::{Sink, SinkAck, SinkCapabilities};
 
 /// Append one JSON object per row (Doris stream load `format: json` +
 /// `read_json_by_line`): column i of the batch is emitted under
@@ -652,6 +652,24 @@ impl DorisSink {
 }
 
 impl Sink for DorisSink {
+    /// G4 declaration. idempotent_label=true: every flush carries a stream
+    /// load label Doris deduplicates globally, so a replayed flush after a
+    /// restart converges ("label already exists" is success, not a
+    /// duplicate write). Everything else is honestly false today: the
+    /// prepare/commit/abort hooks stay no-op (stream-load 2PC is T36③),
+    /// full rows are always sent (column-subset writes are A7), there is
+    /// no whole-table replace mode, and no sink-side partition routing
+    /// (Doris distributes rows server-side).
+    fn capabilities(&self) -> SinkCapabilities {
+        SinkCapabilities {
+            idempotent_label: true,
+            transactional: false,
+            overwrite: false,
+            partial_update: false,
+            partition_aware: false,
+        }
+    }
+
     fn buffered_bytes(&self) -> u64 {
         self.buf.len() as u64
     }
