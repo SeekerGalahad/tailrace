@@ -150,11 +150,16 @@ export interface DdlDraftInput {
   /** `replication_num`: 1 on a single-BE cluster (`SHOW BACKENDS`), omitted =
    * cluster default. The console does not probe BE count this wave. */
   replicationNum?: number
+  /** Partition decision: omitted = the heuristic's candidate (when executable)
+   * stays a guess; `true` = confirmed (guess flag clears); `false` = dropped —
+   * no `PARTITION BY` clause and no `dynamic_partition.*` properties. */
+  partition?: boolean
 }
 
 export interface DdlPartition {
   column: string
-  /** Name-based guess (the four-type vocabulary has no time type yet). */
+  /** Name-based guess the human has not confirmed yet (confirm/drop via
+   * `DdlDraftInput.partition`). */
   guessed: boolean
 }
 

@@ -293,13 +293,14 @@ fi
 
 # ---------- S3 console boot + auth + registrations ----------
 # (work dir already created in S0.5, before the stack came up)
-# console runs WITH THE NODE'S CWD ($WORK/node): the backfill executor runs
-# in-process (backfill.rs) and re-reads the file source table, whose bare
-# name "orders_in" resolves against the process cwd — a console started at
-# the repo root sees no file, the bounded runner hits its idle/EOF guard
-# first and the job "succeeds" with 0 rows (first live run: every backfill
-# was rowsWritten=0 and the replay assertions were vacuously green)
-( cd "$WORK/node" && exec env TAILRACE_BOOTSTRAP_TOKEN="tr_b_bf_e2e_00112233445566778899aabbccddeeff" \
+# the console starts at the REPO ROOT — deliberately NOT the file source's
+# directory: the backfill executor resolves the file table through the
+# datasource's registered directory (connJson.path → plan bootstrap → the
+# engine file factory joins it with the table name), not through the process
+# cwd (R6 review: with cwd-relative resolution, a console started elsewhere
+# saw no file and every backfill "succeeded" with 0 rows — vacuously green
+# assertions; T4.2's rows>0 assertion now guards exactly this)
+( exec env TAILRACE_BOOTSTRAP_TOKEN="tr_b_bf_e2e_00112233445566778899aabbccddeeff" \
     "$CONSOLE_BIN" --addr "$CONSOLE_ADDR" --data-dir "$WORK/run" ) >"$WORK/console.log" 2>&1 &
 CONSOLE_PID=$!
 if wait_http "http://$CONSOLE_ADDR/healthz" 20; then

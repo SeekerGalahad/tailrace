@@ -975,7 +975,12 @@ pub(crate) fn build_plan_table(
     // tables are served by the JDBC factory, which takes a `mysql://` /
     // `postgres://` URL (engine dialect selection) — the console's
     // mysql/postgresql datasources store `jdbc:mysql://…` / `jdbc:postgresql:
-    // //…`, so the `jdbc:` prefix is stripped here.
+    // //…`, so the `jdbc:` prefix is stripped here. File tables carry the
+    // datasource's registered directory (connJson `path`): the engine's file
+    // factory resolves the table name against it, so a resident node and the
+    // console-side backfill executor open the same file whatever either
+    // process's cwd is (R6 review: with the bare name resolved against the
+    // console cwd, a backfill read nothing and "succeeded" with 0 rows).
     let bootstrap = match kind.as_str() {
         "dim" | "jdbc" => conn.get("jdbcUrl").and_then(Value::as_str).map(|url| {
             url.trim()
@@ -983,6 +988,12 @@ pub(crate) fn build_plan_table(
                 .unwrap_or(url.trim())
                 .to_string()
         }),
+        "file" => conn
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string),
         _ => conn
             .get("bootstrap")
             .and_then(Value::as_str)

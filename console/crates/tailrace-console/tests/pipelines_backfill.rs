@@ -25,16 +25,17 @@ use tower::ServiceExt;
 
 // ---------------- shared fixtures ----------------
 
-/// FileSource opens the table name cwd-relative (engine contract: the
-/// reference's last segment IS the path). This binary chdirs ONCE into a
-/// per-process temp dir under this lock; every test then uses its own
-/// dotless filename (parallel tests share the cwd, never the files).
-static CWD_LOCK: Mutex<()> = Mutex::new(());
-static CWD_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+/// One per-process directory holding every test's source file (dotless,
+/// per-test unique names). The file DATASOURCE is registered with this
+/// absolute path, and the process cwd is never changed: the executor must
+/// find the file through the registered directory (plan `bootstrap` → the
+/// engine file factory joins it with the table name), not through the cwd
+/// — the R6 review's silent-zero-rows backfill was exactly a console whose
+/// cwd happened to hold no such file.
+static SOURCE_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
-fn enter_shared_cwd() {
-    let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = CWD_DIR.get_or_init(|| {
+fn source_dir() -> &'static std::path::Path {
+    SOURCE_DIR.get_or_init(|| {
         let d = std::env::temp_dir().join(format!(
             "tailrace-console-bf-{}-{}",
             std::process::id(),
@@ -43,11 +44,9 @@ fn enter_shared_cwd() {
                 .unwrap()
                 .as_secs()
         ));
-        std::fs::create_dir_all(&d).expect("create shared bf cwd");
+        std::fs::create_dir_all(&d).expect("create shared source dir");
         d
-    });
-    // idempotent after the first call (same dir, same thread-safe process)
-    assert!(std::env::set_current_dir(dir).is_ok(), "chdir {dir:?}");
+    })
 }
 
 /// One captured stream-load attempt: (label, Authorization, body row count).
@@ -112,22 +111,21 @@ impl MockBe {
     }
 }
 
-/// Seed `<name>` (cwd-relative, dotless) with `n` equal json lines; returns
-/// (file name, total byte length = an exact-EOF `to` bound).
+/// Seed `<source_dir>/<name>` with `n` equal json lines; returns (file name,
+/// total byte length = an exact-EOF `to` bound).
 fn seed_source(name: &str, n: usize) -> (String, i64) {
     let mut text = String::new();
     for i in 0..n {
         text.push_str(&format!("{{\"order_no\":\"ORD-{i:04}\",\"qty\":7}}\n"));
     }
     let len = text.len() as i64;
-    std::fs::write(name, text).expect("seed source file");
+    std::fs::write(source_dir().join(name), text).expect("seed source file");
     (name.to_string(), len)
 }
 
 /// file source + doris sink datasources with table objects and a published
 /// file→doris pipeline; returns (app, pipeline id, file byte length).
 async fn file_to_doris_app(tag: &str, rows: usize, be_port: u16) -> (TestApp, i64, i64) {
-    enter_shared_cwd();
     let app = app().await;
     let src_name = format!("bf_src_{tag}");
     let (_, to) = seed_source(&src_name, rows);
@@ -138,7 +136,7 @@ async fn file_to_doris_app(tag: &str, rows: usize, be_port: u16) -> (TestApp, i6
         "/api/datasources",
         Some(json!({
             "name": format!("bf-files-{tag}"), "type": "file",
-            "connJson": {"path": "."}
+            "connJson": {"path": source_dir()}
         })),
     )
     .await;
@@ -317,7 +315,6 @@ async fn dryrun_previews_with_zero_side_effects() {
 /// with explicit dictionary envelopes, and nothing is created.
 #[tokio::test]
 async fn capability_gates_answer_422() {
-    enter_shared_cwd();
     let app = app().await;
     // kafka source + doris sink: the source gate (scalar from cannot address
     // the partition map — an honest refusal, not a silent superset replay)
@@ -338,7 +335,7 @@ async fn capability_gates_answer_422() {
         &app,
         "POST",
         "/api/datasources",
-        Some(json!({"name": "bf-files-gate", "type": "file", "connJson": {"path": "."}})),
+        Some(json!({"name": "bf-files-gate", "type": "file", "connJson": {"path": source_dir()}})),
     )
     .await;
     assert_eq!(s, StatusCode::CREATED, "{bb}");
@@ -598,7 +595,6 @@ fn hits_after(all: &[LoadHit], _job1: &str) -> usize {
 /// untouched (失败也不动主管道游标).
 #[tokio::test]
 async fn execute_failure_marks_job_failed_and_isolates_cursors() {
-    enter_shared_cwd();
     // a BE that always answers a deterministic client error → the sink
     // classifies it fatal (no retry wait)
     let app_fail = MockFailBe::serve().await;

@@ -9,7 +9,12 @@
 //! plan-table resolution (`build_plan_table`, shared with deploy) and the
 //! sealed sink credentials. A bounded one-shot replay in the console process
 //! is a deliberate exception to "console drives nodes via /v1"; resident
-//! pipelines keep flowing through the node path untouched.
+//! pipelines keep flowing through the node path untouched. Because the
+//! replay runs in THIS process, file sources must not resolve against the
+//! console's cwd — `build_plan_table` rides the datasource's registered
+//! directory as the plan `bootstrap` and the engine file factory joins it
+//! with the table name, so the replay reads the same file a resident node
+//! does from any cwd (R6 review round).
 //!
 //! Cursor isolation (the A2 acceptance anchor): the runner is assembled
 //! against `backfill_state_dir(<data>/backfill, jobId)` — a `bf-{jobId}`
@@ -230,7 +235,29 @@ fn sink_datasource_id(state: &AppState, reference: &str) -> Result<i64> {
 /// terminal state. Every failure lands in the job row as `failed` with the
 /// error chain text — a backfill failure NEVER propagates to the main
 /// pipeline (no pipeline-row writes anywhere on this path).
+///
+/// The claim is taken HERE, before `execute`, so a claim that does not go
+/// through (the row is not `pending`: another executor holds it, or it is
+/// already terminal) returns without touching the row — falling through to
+/// `finish_backfill_job` would let its `WHERE state='running'` CAS mark a
+/// job that someone else is still running as failed. The POST handler is
+/// the only spawn site today; the guard is for the next one (a retry, an
+/// admin re-run) that is not.
 pub fn run_job(state: AppState, job_id: String, statement_index: u32, from: i64, to: i64) {
+    match state.store().claim_backfill_job(&job_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                job = %job_id,
+                "backfill job not claimable (already running or terminal) — executor exits without touching it"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::error!(job = %job_id, error = %e, "backfill claim failed");
+            return;
+        }
+    }
     let outcome = execute(&state, &job_id, statement_index, from, to);
     let (done, rows, err) = match outcome {
         Ok(rows) => (true, rows, None),
@@ -244,6 +271,8 @@ pub fn run_job(state: AppState, job_id: String, statement_index: u32, from: i64,
     }
 }
 
+/// The claimed job's data movement: plan re-resolution → assembly →
+/// `run_bounded`. Returns the flushed row total.
 fn execute(
     state: &AppState,
     job_id: &str,
@@ -252,9 +281,6 @@ fn execute(
     to: i64,
 ) -> Result<i64> {
     let store = state.store();
-    if !store.claim_backfill_job(job_id)? {
-        anyhow::bail!("job not claimable (already running or terminal)");
-    }
     let pipeline_id = store
         .backfill_job(job_id)?
         .context("job row vanished")?

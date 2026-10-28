@@ -129,7 +129,28 @@ impl Store {
             )? > 0)
         })
     }
+
+    /// Boot-time sweep: every `pending` / `running` row is an orphan when the
+    /// console starts — its executor was a blocking thread of the previous
+    /// process and died with it, and nothing re-attaches to a job across
+    /// restarts. Left alone, such a row reads `running` in the jobs list
+    /// forever. The rows move to `failed` with [`ORPHANED_JOB_ERROR`];
+    /// terminal rows are untouched. Returns the number of rows swept.
+    pub fn fail_orphaned_backfill_jobs(&self) -> Result<usize> {
+        self.with_conn(|conn| {
+            Ok(conn.execute(
+                "UPDATE backfill_job SET state = 'failed', error = ?1, \
+                 finished_at = datetime('now') WHERE state IN ('pending', 'running')",
+                [ORPHANED_JOB_ERROR],
+            )?)
+        })
+    }
 }
+
+/// Error text written by [`Store::fail_orphaned_backfill_jobs`]. Re-triggering
+/// the same range is the remedy — deterministic labels make the replay
+/// converge, so a partially written orphan does not double-count.
+pub const ORPHANED_JOB_ERROR: &str = "console restarted while the job was pending/running; bounded replays do not resume across restarts — re-trigger the same range (deterministic labels keep the replay idempotent)";
 
 #[cfg(test)]
 mod tests {
@@ -226,5 +247,42 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert!(store.delete_pipeline(pid).unwrap());
         assert!(store.list_backfill_jobs(pid).unwrap().is_empty());
+    }
+
+    /// Boot-time orphan sweep: a `running` row (executor died with the
+    /// previous process) and a `pending` row (never claimed) both become
+    /// `failed` with the explanatory error; terminal rows are untouched.
+    #[test]
+    fn orphaned_jobs_are_failed_on_boot() {
+        let store = Store::open_in_memory().unwrap();
+        let pid = pipeline(&store);
+        let running = store.create_backfill_job(pid, 0, "{}", "{}").unwrap();
+        assert!(store.claim_backfill_job(&running).unwrap());
+        let pending = store.create_backfill_job(pid, 0, "{}", "{}").unwrap();
+        let done = store.create_backfill_job(pid, 0, "{}", "{}").unwrap();
+        assert!(store.claim_backfill_job(&done).unwrap());
+        assert!(store.finish_backfill_job(&done, true, 9, None).unwrap());
+        let failed = store.create_backfill_job(pid, 0, "{}", "{}").unwrap();
+        assert!(store.claim_backfill_job(&failed).unwrap());
+        assert!(store
+            .finish_backfill_job(&failed, false, 0, Some("sink refused"))
+            .unwrap());
+
+        assert_eq!(store.fail_orphaned_backfill_jobs().unwrap(), 2);
+        for id in [&running, &pending] {
+            let job = store.backfill_job(id).unwrap().unwrap();
+            assert_eq!(job.state, "failed", "{id}");
+            assert_eq!(job.error.as_deref(), Some(ORPHANED_JOB_ERROR));
+            assert!(job.finished_at.is_some());
+        }
+        let job = store.backfill_job(&done).unwrap().unwrap();
+        assert_eq!(
+            (job.state.as_str(), job.rows_written, job.error),
+            ("done", 9, None)
+        );
+        let job = store.backfill_job(&failed).unwrap().unwrap();
+        assert_eq!(job.error.as_deref(), Some("sink refused"));
+        // idempotent: a second sweep finds nothing
+        assert_eq!(store.fail_orphaned_backfill_jobs().unwrap(), 0);
     }
 }

@@ -1444,13 +1444,19 @@ pub struct DdlDraftBody {
     /// BACKENDS`) — `1` on a single-BE cluster, or CREATE TABLE fails on the
     /// default replication; absent = property omitted (cluster default).
     pub replication_num: Option<u32>,
+    /// Partition decision: absent = the heuristic's candidate (when one is
+    /// executable) stays flagged as a guess; `true` = confirmed (flag
+    /// clears); `false` = dropped — no `PARTITION BY` clause, no
+    /// `dynamic_partition.*` properties.
+    pub partition: Option<bool>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DdlPartitionDto {
     pub column: String,
-    /// Name-based guess (the four-type vocabulary has no time type yet).
+    /// Name-based guess the human has not confirmed yet (the four-type
+    /// vocabulary has no time type; confirm via `DdlDraftBody.partition`).
     pub guessed: bool,
 }
 
@@ -1541,6 +1547,21 @@ fn parse_key_model(s: &str) -> Option<tailrace_ddl::KeyModel> {
     match s.trim().to_ascii_lowercase().as_str() {
         "unique" => Some(tailrace_ddl::KeyModel::Unique),
         "duplicate" => Some(tailrace_ddl::KeyModel::Duplicate),
+        _ => None,
+    }
+}
+
+/// The key model an echoed DDL text encodes — `Some` only when exactly one
+/// of the two key-clause keywords occurs (case-insensitive). Both present,
+/// or neither, is `None`: the execute gate refuses such a text instead of
+/// letting a keyword buried anywhere in it pass as confirmation.
+fn ddl_key_clause(ddl: &str) -> Option<tailrace_ddl::KeyModel> {
+    let upper = ddl.to_ascii_uppercase();
+    let unique = upper.contains(tailrace_ddl::KeyModel::Unique.sql());
+    let duplicate = upper.contains(tailrace_ddl::KeyModel::Duplicate.sql());
+    match (unique, duplicate) {
+        (true, false) => Some(tailrace_ddl::KeyModel::Unique),
+        (false, true) => Some(tailrace_ddl::KeyModel::Duplicate),
         _ => None,
     }
 }
@@ -1772,6 +1793,7 @@ pub async fn ddl_draft(
             .map(str::to_string),
         key_model,
         replication_num: body.replication_num,
+        partition: body.partition,
     };
     let schema = tailrace_ddl::Schema {
         db: t.db_name.clone(),
@@ -1875,8 +1897,10 @@ pub async fn ddl_execute(
         }
     };
     // the echoed text must encode the confirmed model — a stale draft or a
-    // mismatched client would otherwise audit a lie
-    if !ddl.to_ascii_uppercase().contains(key_model.sql()) {
+    // mismatched client would otherwise audit a lie. Exactly one key clause
+    // keyword, and it is the confirmed one: a text carrying both (or neither)
+    // is not a draft this console produced and is refused rather than run.
+    if ddl_key_clause(&ddl) != Some(key_model) {
         return super::messages::respond(
             axum::http::StatusCode::UNPROCESSABLE_ENTITY,
             "KEY_MODEL_MISMATCH",
@@ -2243,5 +2267,31 @@ mod tests {
             Some(tailrace_ddl::KeyModel::Duplicate)
         );
         assert_eq!(parse_key_model("aggregate"), None);
+    }
+
+    /// The execute gate reads the key clause out of the echoed text: exactly
+    /// one keyword, case-insensitive; both or neither is not a draft of ours.
+    #[test]
+    fn ddl_key_clause_requires_exactly_one_keyword() {
+        use tailrace_ddl::KeyModel;
+        assert_eq!(
+            ddl_key_clause("CREATE TABLE t (a INT)\nunique key(`a`)\nDISTRIBUTED BY HASH(`a`)"),
+            Some(KeyModel::Unique)
+        );
+        assert_eq!(
+            ddl_key_clause("CREATE TABLE t (a INT) DUPLICATE KEY(`a`)"),
+            Some(KeyModel::Duplicate)
+        );
+        // both keywords (e.g. a comment smuggling the other model) → refused
+        assert_eq!(
+            ddl_key_clause("-- UNIQUE KEY would dedup\nCREATE TABLE t (a INT) DUPLICATE KEY(`a`)"),
+            None
+        );
+        // neither (AGGREGATE KEY, or no key clause at all) → refused
+        assert_eq!(
+            ddl_key_clause("CREATE TABLE t (a INT) AGGREGATE KEY(`a`)"),
+            None
+        );
+        assert_eq!(ddl_key_clause("CREATE TABLE t (a INT)"), None);
     }
 }

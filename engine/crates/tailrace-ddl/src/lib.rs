@@ -16,12 +16,16 @@
 //! DDL). For the same reason the partition heuristic is **name**-based —
 //! the current vocabulary has no timestamp/date type to key on, so
 //! time-shaped *names* stand in until G2 lands real types (then detection
-//! switches to the column type; see [`partition_candidate`]).
+//! switches to the column type; see [`partition_candidate`]). A candidate is
+//! only offered when Doris would actually accept the clause (type and
+//! key-model rules probed live on 2.1.7 — an unexecutable draft is a lie
+//! too), and the human can drop it through [`KeyHints::partition`].
 //!
 //! Every guess is annotated, never silent (§7.2 ③): key model, key column
 //! and partition column each carry a recommendation reason or a 「猜测」
 //! flag in [`DraftDdl`] — exactly what the console wizard highlights in its
-//! confirm step. Nothing here executes anything; `tailrace-metadata`'s
+//! confirm step; a partition candidate that had to be skipped says why in
+//! [`DraftDdl::notes`]. Nothing here executes anything; `tailrace-metadata`'s
 //! `mysql_exec` is the exec side of the closed loop.
 
 use anyhow::bail;
@@ -90,18 +94,34 @@ pub struct KeyHints {
     /// property (cluster default); `Some(1)` is the single-node downgrade
     /// without which CREATE TABLE fails on a 1-BE cluster.
     pub replication_num: Option<u32>,
+    /// Partition decision fed back from the wizard. `None` → the heuristic
+    /// offers its candidate (when one is executable) flagged as a guess;
+    /// `Some(true)` → the human confirmed it (guess flag clears);
+    /// `Some(false)` → dropped — no `PARTITION BY` clause and no
+    /// `dynamic_partition.*` properties, whatever the heuristic found.
+    pub partition: Option<bool>,
 }
 
 /// Day-granularity RANGE dynamic-partition candidate (§7.2 ②: 时序数据标准
-/// 做法) — offered when a time-shaped column is present, confirmed or
-/// dropped by the human.
+/// 做法) — offered when a time-shaped column can carry the RANGE key,
+/// confirmed or dropped by the human via [`KeyHints::partition`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionCandidate {
     /// Column the RANGE partition rides on.
     pub column: String,
-    /// Name-based guess — always `true` in this wave; goes `false` for
-    /// genuinely-typed columns once G2 lands.
+    /// `true` = name-based heuristic the human has not confirmed yet;
+    /// `false` once confirmed (`KeyHints::partition == Some(true)`) — or,
+    /// after G2, when a genuine time type makes the pick evidence.
     pub guessed: bool,
+}
+
+/// Outcome of the partition heuristic — a candidate, a time-shaped column
+/// that had to be skipped (with the reason, so the draft stays annotated),
+/// or nothing time-shaped at all.
+enum PartitionPick {
+    Candidate(PartitionCandidate),
+    Skipped(String),
+    None,
 }
 
 /// Generator output: the exact DDL text plus every annotation the wizard
@@ -189,8 +209,6 @@ pub fn generate_draft(schema: &Schema, hints: &KeyHints) -> anyhow::Result<Draft
         None => (guess_key_column(&schema.columns).to_string(), true),
     };
 
-    let partition = partition_candidate(&schema.columns);
-
     let mut notes = Vec::new();
     if key_model == KeyModel::Duplicate {
         if let Some(seq) = &hints.sequence_column {
@@ -199,6 +217,35 @@ pub fn generate_draft(schema: &Schema, hints: &KeyHints) -> anyhow::Result<Draft
             ));
         }
     }
+
+    // Partition: the heuristic runs after key model and key column because
+    // both gate executability (MoW partition column must be the key). The
+    // human's decision then overrides: dropped → no clause, no properties;
+    // confirmed → the guess flag clears.
+    let partition = match partition_candidate(&schema.columns, key_model, &key_column) {
+        PartitionPick::Candidate(_) if hints.partition == Some(false) => None,
+        PartitionPick::Candidate(c) => {
+            // Doris derives DAY dynamic partitions on an integer column as
+            // yyyyMMdd bounds (probed: p20261027 = [20261027, 20261028)) —
+            // an epoch column lands outside every partition and the load is
+            // refused. The vocabulary cannot tell the two apart; say so.
+            notes.push(format!(
+                "分区列 `{}` 为 BIGINT：按天动态分区生成 yyyyMMdd 整数区间（如 p20261027 = \
+                 [20261027, 20261028)），该列的值须为 yyyyMMdd 形式的整数日期，epoch 秒/毫秒值会\
+                 落在所有分区之外被拒载——不确定时请取消分区",
+                c.column
+            ));
+            Some(PartitionCandidate {
+                guessed: c.guessed && hints.partition != Some(true),
+                ..c
+            })
+        }
+        PartitionPick::Skipped(why) => {
+            notes.push(why);
+            None
+        }
+        PartitionPick::None => None,
+    };
 
     // Doris requires key columns to lead the column list: key column first,
     // the rest in declaration order.
@@ -305,24 +352,55 @@ fn guess_key_column(columns: &[Column]) -> &str {
     &columns[0].0
 }
 
-/// Partition heuristic: the first column whose name reads as a point in
-/// time. Name-based only because the four-type vocabulary cannot carry a
-/// timestamp/date type (such columns fold to utf8 upstream) — G2 replaces
-/// the name match with a type match and the guess flag with evidence.
-fn partition_candidate(columns: &[Column]) -> Option<PartitionCandidate> {
+/// Partition heuristic: the first time-shaped column that Doris would accept
+/// as a RANGE partition key. Name-based only because the four-type vocabulary
+/// cannot carry a timestamp/date type (such columns fold to utf8 upstream) —
+/// G2 replaces the name match with a type match and the guess flag with
+/// evidence. Executability rules (each one an FE refusal probed live on
+/// Doris 2.1.7, so the draft never walks into them):
+/// - only `int64` → BIGINT can be a RANGE key: VARCHAR / BOOLEAN ("cannot be
+///   a range partition key") and DOUBLE ("Floating point type column can not
+///   be partition column") are refused;
+/// - a merge-on-write UNIQUE KEY table's partition column must be a KEY
+///   column ("Merge-on-Write table's partition column must be KEY column") —
+///   with the single-column key clause emitted here, that is the key column
+///   itself.
+///
+/// Time-shaped columns are scanned in declaration order; the first executable
+/// one wins. If every one of them had to be skipped, the first one's reason
+/// comes back as a note (a dropped guess is still annotated, never silent).
+fn partition_candidate(columns: &[Column], key_model: KeyModel, key_column: &str) -> PartitionPick {
     const EXACT: [&str; 6] = ["ts", "time", "timestamp", "date", "dt", "day"];
     const SUFFIX: [&str; 5] = ["_ts", "_time", "_timestamp", "_date", "_at"];
-    columns
-        .iter()
-        .find(|(n, _)| {
-            let n = n.to_ascii_lowercase();
-            EXACT.contains(&n.as_str())
-                || SUFFIX.iter().any(|s| n.len() > s.len() && n.ends_with(s))
-        })
-        .map(|(n, _)| PartitionCandidate {
-            column: n.clone(),
-            guessed: true,
-        })
+    let time_shaped = |name: &str| {
+        let n = name.to_ascii_lowercase();
+        EXACT.contains(&n.as_str()) || SUFFIX.iter().any(|s| n.len() > s.len() && n.ends_with(s))
+    };
+    let mut first_skip: Option<String> = None;
+    for (name, ty) in columns.iter().filter(|(n, _)| time_shaped(n)) {
+        let skip = if ty != "int64" {
+            format!(
+                "时间形列 `{name}` 为 {ty}（{}），Doris RANGE 分区键仅接受整数/日期类型——未生成分区\
+                 子句（G2 落地真实时间类型后可自动分区）",
+                doris_type(ty).unwrap_or("?")
+            )
+        } else if key_model == KeyModel::Unique && name != key_column {
+            format!(
+                "时间形列 `{name}` 可作分区列，但 UNIQUE KEY（merge-on-write）表的分区列必须是键列——\
+                 未生成分区子句（如需按天分区，键须含该列，请人工决策）"
+            )
+        } else {
+            return PartitionPick::Candidate(PartitionCandidate {
+                column: name.clone(),
+                guessed: true,
+            });
+        };
+        first_skip.get_or_insert(skip);
+    }
+    match first_skip {
+        Some(why) => PartitionPick::Skipped(why),
+        None => PartitionPick::None,
+    }
 }
 
 /// Backtick-quote one identifier: backticks doubled, NUL and empty rejected
@@ -338,7 +416,10 @@ fn quote_ident(name: &str) -> anyhow::Result<String> {
 mod tests {
     //! Snapshot suite (§7.7 A1 row: 给定 schema → 固定 DDL 文本). Full-text
     //! assertions against the generator's exact output; the matrix runs
-    //! 4-type vocabulary × UNIQUE/DUPLICATE × partitioned/plain.
+    //! 4-type vocabulary × UNIQUE/DUPLICATE × partitioned/plain, and every
+    //! partitioned shape asserted here was created successfully on a live
+    //! Doris 2.1.7 (R6 review round) — the skipped shapes are the ones the
+    //! FE refused.
 
     use super::*;
 
@@ -425,10 +506,14 @@ PROPERTIES (
         assert!(d.partition.is_none());
     }
 
-    // ③ OGG envelope × UNIQUE (declared sequence_column) × partitioned on
-    // ogg_ts × single-node replication downgrade.
+    // ③ OGG envelope × UNIQUE (declared sequence_column) × single-node
+    // replication downgrade. ogg_ts is time-shaped AND BIGINT, but a
+    // merge-on-write table's partition column must be a key column (Doris
+    // 2.1.7: "Merge-on-Write table's partition column must be KEY column")
+    // — the candidate is skipped and the draft says why instead of emitting
+    // a clause the FE refuses.
     #[test]
-    fn snapshot_unique_ogg_partitioned_replication_1() {
+    fn snapshot_unique_ogg_replication_1_partition_skipped_non_key() {
         let s = schema(
             "shop",
             "ogg_orders",
@@ -458,15 +543,9 @@ PROPERTIES (
     `amount` DOUBLE
 )
 UNIQUE KEY(`order_id`)
-PARTITION BY RANGE(`ogg_ts`) ()
 DISTRIBUTED BY HASH(`order_id`) BUCKETS AUTO
 PROPERTIES (
     "enable_unique_key_merge_on_write" = "true",
-    "dynamic_partition.enable" = "true",
-    "dynamic_partition.time_unit" = "DAY",
-    "dynamic_partition.start" = "-30",
-    "dynamic_partition.end" = "3",
-    "dynamic_partition.prefix" = "p",
     "replication_num" = "1"
 );"#
         );
@@ -474,15 +553,24 @@ PROPERTIES (
         // sequence column orders updates, never becomes the key itself
         assert_eq!(d.key_column, "order_id");
         assert!(d.key_column_guessed);
-        let p = d.partition.unwrap();
-        assert_eq!(p.column, "ogg_ts");
-        assert!(p.guessed);
+        assert!(
+            d.partition.is_none(),
+            "MoW non-key time column is not a candidate"
+        );
+        assert_eq!(d.notes.len(), 1, "{:?}", d.notes);
+        assert!(
+            d.notes[0].contains("`ogg_ts`") && d.notes[0].contains("必须是键列"),
+            "skip reason annotated: {}",
+            d.notes[0]
+        );
     }
 
-    // ④ four types × DUPLICATE × partitioned (utf8 event_time name match) —
-    // *_id heuristic still picks the key; partition is a separate guess.
+    // ④ four types × DUPLICATE × utf8 event_time name match — the key guess
+    // still rides *_id; the time-shaped column is VARCHAR, which Doris
+    // refuses as a RANGE key ("Column[event_time] type[VARCHAR] cannot be a
+    // range partition key"), so no clause and a note instead.
     #[test]
-    fn snapshot_duplicate_partitioned() {
+    fn snapshot_duplicate_partition_skipped_varchar_time_column() {
         let s = schema(
             "metrics",
             "samples",
@@ -503,19 +591,19 @@ PROPERTIES (
     `ok` BOOLEAN
 )
 DUPLICATE KEY(`user_id`)
-PARTITION BY RANGE(`event_time`) ()
-DISTRIBUTED BY HASH(`user_id`) BUCKETS AUTO
-PROPERTIES (
-    "dynamic_partition.enable" = "true",
-    "dynamic_partition.time_unit" = "DAY",
-    "dynamic_partition.start" = "-30",
-    "dynamic_partition.end" = "3",
-    "dynamic_partition.prefix" = "p"
-);"#
+DISTRIBUTED BY HASH(`user_id`) BUCKETS AUTO;"#
         );
         assert_eq!(d.key_column, "user_id");
         assert!(d.key_column_guessed);
-        assert_eq!(d.partition.unwrap().column, "event_time");
+        assert!(d.partition.is_none());
+        assert_eq!(d.notes.len(), 1, "{:?}", d.notes);
+        assert!(
+            d.notes[0].contains("`event_time`")
+                && d.notes[0].contains("utf8（VARCHAR(65533)）")
+                && d.notes[0].contains("仅接受整数/日期类型"),
+            "{}",
+            d.notes[0]
+        );
     }
 
     // ⑤ confirmed key column (wizard round two) — no guess badge; probed
@@ -554,9 +642,12 @@ PROPERTIES (
     }
 
     // ⑥ human overrides UNIQUE→DUPLICATE with a sequence column declared →
-    // plain-column note, no MoW property, partition still offered.
+    // plain-column note, no MoW property; the BIGINT time column IS an
+    // executable candidate on a DUPLICATE table (probed: DUPLICATE + BIGINT
+    // non-key RANGE key + dynamic DAY partitions create fine) — offered as a
+    // guess, with the yyyyMMdd caveat spelled out.
     #[test]
-    fn snapshot_duplicate_override_with_sequence_note() {
+    fn snapshot_duplicate_override_with_sequence_note_partitioned() {
         let s = schema(
             "shop",
             "raw_cdc",
@@ -594,6 +685,58 @@ PROPERTIES (
         );
         assert_eq!(d.key_model, KeyModel::Duplicate);
         assert!(!d.ddl.contains("enable_unique_key_merge_on_write"));
+        let p = d.partition.clone().unwrap();
+        assert_eq!(p.column, "ogg_ts");
+        assert!(p.guessed, "unconfirmed candidate keeps the guess flag");
+        assert_eq!(d.notes.len(), 2, "{:?}", d.notes);
+        assert_eq!(
+            d.notes[0],
+            "sequence_column `ogg_ts` 仅作为普通列保留，DUPLICATE KEY 模式下无去重语义"
+        );
+        assert!(
+            d.notes[1].contains("`ogg_ts` 为 BIGINT") && d.notes[1].contains("yyyyMMdd"),
+            "{}",
+            d.notes[1]
+        );
+    }
+
+    // ⑥b the human DROPS the candidate (`partition: Some(false)`) — same
+    // schema as ⑥: no PARTITION clause, no dynamic_partition properties, no
+    // partition caveat; the sequence note stands.
+    #[test]
+    fn snapshot_partition_dropped_by_hint() {
+        let s = schema(
+            "shop",
+            "raw_cdc",
+            &[
+                ("op_type", "utf8"),
+                ("row_id", "int64"),
+                ("ogg_ts", "int64"),
+                ("payload", "utf8"),
+            ],
+        );
+        let hints = KeyHints {
+            sequence_column: Some("ogg_ts".into()),
+            key_model: Some(KeyModel::Duplicate),
+            partition: Some(false),
+            ..KeyHints::default()
+        };
+        let d = generate_draft(&s, &hints).unwrap();
+        assert_eq!(
+            d.ddl,
+            r#"CREATE TABLE IF NOT EXISTS `shop`.`raw_cdc` (
+    `row_id` BIGINT,
+    `op_type` VARCHAR(65533),
+    `ogg_ts` BIGINT,
+    `payload` VARCHAR(65533)
+)
+DUPLICATE KEY(`row_id`)
+DISTRIBUTED BY HASH(`row_id`) BUCKETS AUTO;"#
+        );
+        assert!(
+            d.partition.is_none(),
+            "dropped candidate leaves the response"
+        );
         assert_eq!(
             d.notes,
             vec![
@@ -601,6 +744,118 @@ PROPERTIES (
                     .to_string()
             ]
         );
+    }
+
+    // ⑥c the human CONFIRMS the candidate (`partition: Some(true)`) — DDL
+    // byte-identical to ⑥, guess flag cleared (the key-column confirm
+    // semantics, applied to the partition).
+    #[test]
+    fn snapshot_partition_confirmed_clears_guess() {
+        let s = schema(
+            "shop",
+            "raw_cdc",
+            &[
+                ("op_type", "utf8"),
+                ("row_id", "int64"),
+                ("ogg_ts", "int64"),
+                ("payload", "utf8"),
+            ],
+        );
+        let unconfirmed = generate_draft(
+            &s,
+            &KeyHints {
+                sequence_column: Some("ogg_ts".into()),
+                key_model: Some(KeyModel::Duplicate),
+                ..KeyHints::default()
+            },
+        )
+        .unwrap();
+        let confirmed = generate_draft(
+            &s,
+            &KeyHints {
+                sequence_column: Some("ogg_ts".into()),
+                key_model: Some(KeyModel::Duplicate),
+                partition: Some(true),
+                ..KeyHints::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(confirmed.ddl, unconfirmed.ddl);
+        assert!(confirmed.ddl.contains("PARTITION BY RANGE(`ogg_ts`) ()"));
+        assert_eq!(
+            confirmed.partition,
+            Some(PartitionCandidate {
+                column: "ogg_ts".into(),
+                guessed: false,
+            })
+        );
+        assert_eq!(confirmed.notes, unconfirmed.notes);
+    }
+
+    // ⑥d UNIQUE × partition column == key column — the one MoW shape Doris
+    // accepts (probed: UNIQUE KEY(ts) PARTITION BY RANGE(ts) + MoW + dynamic
+    // DAY creates fine). Here the human confirmed the time column as the key.
+    #[test]
+    fn snapshot_unique_partitioned_on_key_column() {
+        let s = schema(
+            "iot",
+            "readings",
+            &[
+                ("op_type", "utf8"),
+                ("event_ts", "int64"),
+                ("value", "float64"),
+            ],
+        );
+        let hints = KeyHints {
+            key_column: Some("event_ts".into()),
+            ..KeyHints::default()
+        };
+        let d = generate_draft(&s, &hints).unwrap();
+        assert_eq!(
+            d.ddl,
+            r#"CREATE TABLE IF NOT EXISTS `iot`.`readings` (
+    `event_ts` BIGINT,
+    `op_type` VARCHAR(65533),
+    `value` DOUBLE
+)
+UNIQUE KEY(`event_ts`)
+PARTITION BY RANGE(`event_ts`) ()
+DISTRIBUTED BY HASH(`event_ts`) BUCKETS AUTO
+PROPERTIES (
+    "enable_unique_key_merge_on_write" = "true",
+    "dynamic_partition.enable" = "true",
+    "dynamic_partition.time_unit" = "DAY",
+    "dynamic_partition.start" = "-30",
+    "dynamic_partition.end" = "3",
+    "dynamic_partition.prefix" = "p"
+);"#
+        );
+        assert_eq!(d.key_model, KeyModel::Unique);
+        assert!(!d.key_column_guessed);
+        assert_eq!(
+            d.partition.as_ref().map(|p| p.column.as_str()),
+            Some("event_ts")
+        );
+        assert_eq!(d.notes.len(), 1, "{:?}", d.notes);
+        assert!(d.notes[0].contains("yyyyMMdd"));
+    }
+
+    // ⑥e several time-shaped columns: the unexecutable one (utf8) is passed
+    // over for the first executable one (int64) — and because a candidate
+    // was found, no skip note is emitted for the utf8 column.
+    #[test]
+    fn partition_picks_first_executable_time_column() {
+        let s = schema(
+            "m",
+            "t",
+            &[("event_time", "utf8"), ("dt", "int64"), ("v", "float64")],
+        );
+        let d = generate_draft(&s, &KeyHints::default()).unwrap();
+        assert!(d.ddl.contains("PARTITION BY RANGE(`dt`) ()"), "{}", d.ddl);
+        assert!(!d.ddl.contains("event_time`) ()"));
+        assert_eq!(d.partition.as_ref().map(|p| p.column.as_str()), Some("dt"));
+        assert_eq!(d.notes.len(), 1, "{:?}", d.notes);
+        assert!(d.notes[0].contains("`dt` 为 BIGINT"));
     }
 
     // ⑦ no id-shaped column at all → key falls back to the first column,

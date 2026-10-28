@@ -14,7 +14,7 @@
 #     compose up -d --wait doris-fe doris-be（--wait SECS 覆盖 compose
 #     --wait-timeout，默认 300s）→ console boot（全新 data-dir，首启 seed
 #     admin，从 stderr 抓一次性初始密码——smoke.sh S1 先例）→ login →
-#   A1 四步闭环 ×2 例：
+#   A1 四步闭环 ×3 例：
 #     例1 DUPLICATE：注册列 [["order_no","utf8"],["qty","int64"]] →
 #        draft（空 body 第一轮：启发推荐 duplicate + keyColumnGuessed=true
 #        「猜测」标注）→ execute 缺 keyModel 的 422 负例 → execute
@@ -25,12 +25,31 @@
 #        （「确认键模型」的人工环节——无 CDC 列时启发推荐 duplicate，用户
 #        明确改选 unique 是 422 门防住的另一半语义）→ execute → SHOW CREATE
 #        TABLE 断言 UNIQUE KEY + enable_unique_key_merge_on_write；
-#   file→doris 管道 ×2（两表各一条 pipeline，file 源共享 orders_in）：
+#     例3 分区（R6 评审修复轮）：注册列多一个 int64 时间形列 dt →
+#        draft 第一轮给出分区候选 dt（guessed=true）→ 改选 unique 时候选被
+#        抑制（MoW 分区列须为键列，notes 说明）→ partition:false 取消 →
+#        partition:true 确认（guessed=false）→ execute → SHOW CREATE TABLE
+#        断言 PARTITION BY RANGE(`dt`) + dynamic_partition，SHOW PARTITIONS
+#        ≥1 个动态分区——带分区的生成 DDL 在真实 Doris 上可建；
+#   file→doris 管道 ×3（三表各一条 pipeline；orders_dup/orders_uniq 共享
+#     orders_in，orders_part 用带 dt=今日 yyyyMMdd 的 orders_part_in）：
 #     node serve 自注册 → pipeline create/publish/deploy → RUNNING →
-#     10 行 jsonl 落两表 → COUNT(*) 对账（UNIQUE 表 order_no 全唯一 → 同样
-#     10 行，merge-on-write 无折叠）；
-#   审计断言：console.db（SQLite）audit_log 恰好 2 行 TABLE_DDL_EXECUTE，
-#     keyModel 一 duplicate 一 unique，ddl 全文在 detail_json 里。
+#     10 行 jsonl 落三表 → COUNT(*) 对账（UNIQUE 表 order_no 全唯一 → 同样
+#     10 行，merge-on-write 无折叠；分区表 10 行落入今日动态分区）；
+#   evolve（R6 评审修复轮——任务卡 A1「ADD COLUMN 后重启管道不失败；改类型
+#     场景返回 409 建议」两条验收的集成级覆盖）：
+#     ADD COLUMN：orders_evo 先以 2 列建表 → 删表对象再以 3 列重登记（表对象
+#        不可改列、被管道引用不可删——先于建管道做，即运维上的真实路径）→
+#        evolve → 200 changed:true + 1 条 ADD COLUMN `note` → DESC 实表有
+#        note → 管道 file→orders_evo（SELECT 三列）deploy → RUNNING → 10 行且
+#        note 非空 → stop + deploy（重启）→ RUNNING → 追加 5 行 → 15 行；
+#     409：orders_rt 以 [order_no utf8, qty int64] 建表 → 删表对象再以
+#        qty utf8 重登记（改类型）→ evolve → 409 SCHEMA_CHANGE_UNSUPPORTED，
+#        refs.retyped[qty: registered utf8 / current int64] + suggestedDdl 含
+#        MODIFY COLUMN + partialUpdateNotice；DESC 实表 qty 仍 bigint（未执行）；
+#   审计断言：console.db（SQLite）audit_log 恰好 5 行 TABLE_DDL_EXECUTE
+#     （keyModel 四 duplicate 一 unique，ddl 全文在 detail_json 里）+ 恰好 1 行
+#     TABLE_DDL_EVOLVE（ok:true，statements 含 ADD COLUMN `note`——409 不落审计）。
 #
 # 覆盖变量（沿用 docker-compose.yml / smoke.sh 的覆盖模式）：
 #   TAILRACE_FE_MYSQL_PORT      FE mysql 宿主端口（DDL/查询）  默认 39030（外部模式 9030）
@@ -330,13 +349,19 @@ FDS="$(jq -r '.id // empty' <<<"$BODY" 2>/dev/null)"
   || step fail "S4.2 file datasource" "http=$CODE body=$BODY"
 
 COLS='[["order_no","utf8"],["qty","int64"]]'
+# the partitioned example adds an int64 time-shaped column: the ONLY shape of
+# the four-type vocabulary Doris accepts as a RANGE partition key (R6 review
+# probed VARCHAR/DOUBLE/BOOLEAN refused; MoW needs the key column)
+COLS_PART='[["order_no","utf8"],["qty","int64"],["dt","int64"]]'
 req POST "/api/datasources/$DDS/tables" "{\"dbName\":\"$E2E_DB\",\"tableName\":\"orders_dup\",\"format\":null,\"columnsJson\":$COLS}" "$TOKEN"
 DUP_OK="$CODE"
 req POST "/api/datasources/$DDS/tables" "{\"dbName\":\"$E2E_DB\",\"tableName\":\"orders_uniq\",\"format\":null,\"columnsJson\":$COLS}" "$TOKEN"
 UNIQ_OK="$CODE"
-{ [ "$DUP_OK" = "201" ] || [ "$DUP_OK" = "200" ]; } && { [ "$UNIQ_OK" = "201" ] || [ "$UNIQ_OK" = "200" ]; } \
-  && step pass "S4.3 sink table objects registered ($E2E_DB.orders_dup + orders_uniq, no CDC columns)" \
-  || step fail "S4.3 sink table objects" "dup http=$DUP_OK uniq http=$UNIQ_OK body=$BODY"
+req POST "/api/datasources/$DDS/tables" "{\"dbName\":\"$E2E_DB\",\"tableName\":\"orders_part\",\"format\":null,\"columnsJson\":$COLS_PART}" "$TOKEN"
+PART_OK="$CODE"
+{ [ "$DUP_OK" = "201" ] || [ "$DUP_OK" = "200" ]; } && { [ "$UNIQ_OK" = "201" ] || [ "$UNIQ_OK" = "200" ]; } && { [ "$PART_OK" = "201" ] || [ "$PART_OK" = "200" ]; } \
+  && step pass "S4.3 sink table objects registered ($E2E_DB.orders_dup + orders_uniq, no CDC columns; orders_part with int64 dt)" \
+  || step fail "S4.3 sink table objects" "dup http=$DUP_OK uniq http=$UNIQ_OK part http=$PART_OK body=$BODY"
 
 # ---------- S5 DUPLICATE example: heuristic draft → 422 gate → execute ----------
 # first round: no body → pure heuristics. No sequence/op_type column → the
@@ -408,15 +433,80 @@ else
   step fail "T2.3 SHOW CREATE TABLE orders_uniq" "$(head -c 200 <<<"$SHOW_UNIQ")"
 fi
 
-# ---------- S7 file source table + seed ----------
+# ---------- S6b partitioned example: candidate → suppression → drop → confirm ----------
+# round one: no body → heuristics offer the int64 time column as a RANGE
+# partition candidate, flagged as a guess
+req POST "/api/datasources/$DDS/tables/$E2E_DB/orders_part/ddl/draft" "" "$TOKEN"
+P_COL="$(jq -r '.partition.column // empty' <<<"$BODY" 2>/dev/null)"
+# no `// "null"` on booleans: jq's alternative operator swallows `false`
+P_GUESS="$(jq -r '.partition.guessed' <<<"$BODY" 2>/dev/null)"
+{ [ "$CODE" = "200" ] && [ "$P_COL" = "dt" ] && [ "$P_GUESS" = "true" ] && grep -q 'PARTITION BY RANGE(`dt`)' <<<"$(jq -r '.ddl // empty' <<<"$BODY")"; } \
+  && step pass "T2.4 draft round-1 orders_part: partition candidate dt (guessed=true) + PARTITION BY RANGE(\`dt\`) in the text" \
+  || step fail "T2.4 partition candidate" "http=$CODE col=$P_COL guess=$P_GUESS body=$BODY"
+
+# the human picks UNIQUE with order_no as the key: a merge-on-write table's
+# partition column must be a key column → the candidate is suppressed (with
+# the note saying why), even though partition:true was sent
+req POST "/api/datasources/$DDS/tables/$E2E_DB/orders_part/ddl/draft" \
+  "{\"keyModel\":\"unique\",\"keyColumn\":\"order_no\",\"partition\":true}" "$TOKEN"
+P_SUP="$(jq -r '.partition // "null"' <<<"$BODY" 2>/dev/null)"
+P_NOTE="$(jq -r '.notes // [] | join(" ")' <<<"$BODY" 2>/dev/null)"
+{ [ "$CODE" = "200" ] && [ "$P_SUP" = "null" ] && grep -q '必须是键列' <<<"$P_NOTE" \
+    && ! grep -q 'PARTITION BY' <<<"$(jq -r '.ddl // empty' <<<"$BODY")"; } \
+  && step pass "T2.5 UNIQUE override suppresses the non-key partition candidate (MoW rule, note in response)" \
+  || step fail "T2.5 MoW suppression" "http=$CODE partition=$P_SUP notes=$P_NOTE body=$BODY"
+
+# partition:false drops the clause entirely; partition:true keeps it and
+# clears the guess badge
+req POST "/api/datasources/$DDS/tables/$E2E_DB/orders_part/ddl/draft" \
+  "{\"keyModel\":\"duplicate\",\"keyColumn\":\"order_no\",\"replicationNum\":1,\"partition\":false}" "$TOKEN"
+DROP_DDL="$(jq -r '.ddl // empty' <<<"$BODY" 2>/dev/null)"
+{ [ "$CODE" = "200" ] && [ "$(jq -r '.partition // "null"' <<<"$BODY")" = "null" ] \
+    && ! grep -q 'PARTITION BY\|dynamic_partition' <<<"$DROP_DDL"; } \
+  && step pass "T2.6 partition:false drops the PARTITION clause and dynamic_partition properties" \
+  || step fail "T2.6 partition drop" "http=$CODE ddl=$(head -c 120 <<<"$DROP_DDL")"
+
+req POST "/api/datasources/$DDS/tables/$E2E_DB/orders_part/ddl/draft" \
+  "{\"keyModel\":\"duplicate\",\"keyColumn\":\"order_no\",\"replicationNum\":1,\"partition\":true}" "$TOKEN"
+PART_DDL="$(jq -r '.ddl // empty' <<<"$BODY" 2>/dev/null)"
+P_GUESS2="$(jq -r '.partition.guessed' <<<"$BODY" 2>/dev/null)"
+{ [ "$CODE" = "200" ] && [ "$P_GUESS2" = "false" ] && grep -q 'PARTITION BY RANGE(`dt`)' <<<"$PART_DDL" \
+    && grep -q '"dynamic_partition.enable" = "true"' <<<"$PART_DDL" && grep -q '"replication_num" = "1"' <<<"$PART_DDL"; } \
+  && step pass "T2.7 partition:true confirms the candidate (guessed=false) — DUPLICATE + BIGINT partition shape" \
+  || step fail "T2.7 partition confirm" "http=$CODE guess=$P_GUESS2 ddl=$(head -c 160 <<<"$PART_DDL")"
+
+req POST "/api/datasources/$DDS/tables/$E2E_DB/orders_part/ddl/execute" \
+  "{\"ddl\":$(json_sql "$PART_DDL"),\"keyModel\":\"duplicate\"}" "$TOKEN"
+{ [ "$CODE" = "200" ] && [ "$(jq -r '.ok // empty' <<<"$BODY")" = "true" ]; } \
+  && step pass "T2.8 execute orders_part (partitioned DDL) → ok — the clause is real Doris, not just text" \
+  || step fail "T2.8 execute orders_part" "http=$CODE body=$BODY"
+SHOW_PART="$(doris_mysql_exec -N -h127.0.0.1 -P9030 -uroot -e "SHOW CREATE TABLE $E2E_DB.orders_part;" 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+# PartitionName is the 2nd tab field (dynamic DAY prefixes with p, e.g. p20261028)
+N_PARTS="$(doris_mysql_exec -N -h127.0.0.1 -P9030 -uroot -e "SHOW PARTITIONS FROM $E2E_DB.orders_part;" 2>/dev/null | awk -F'\t' '$2 ~ /^p[0-9]+$/{n++} END{print n+0}')"
+{ grep -q 'partition by range(`dt`)' <<<"$SHOW_PART" && grep -q '"dynamic_partition.enable" = "true"' <<<"$SHOW_PART" \
+    && [ "${N_PARTS:-0}" -ge 1 ]; } \
+  && step pass "T2.9 live orders_part: PARTITION BY RANGE(dt) + dynamic DAY partitions created (p* count=$N_PARTS)" \
+  || step fail "T2.9 partitioned live table" "parts=$N_PARTS show=$(head -c 200 <<<"$SHOW_PART")"
+
+# ---------- S7 file source tables + seeds ----------
 req POST "/api/datasources/$FDS/tables" \
   "{\"dbName\":\"local\",\"tableName\":\"orders_in\",\"format\":\"jsonl\",\"columnsJson\":$COLS}" "$TOKEN"
-{ [ "$CODE" = "201" ] || [ "$CODE" = "200" ]; } && step pass "S7.1 file table object local.orders_in (jsonl, FILE_POINTER cursor)" \
-  || step fail "S7.1 file table object" "http=$CODE body=$BODY"
+T_F1="$CODE"
+req POST "/api/datasources/$FDS/tables" \
+  "{\"dbName\":\"local\",\"tableName\":\"orders_part_in\",\"format\":\"jsonl\",\"columnsJson\":$COLS_PART}" "$TOKEN"
+T_F2="$CODE"
+{ { [ "$T_F1" = "201" ] || [ "$T_F1" = "200" ]; } && { [ "$T_F2" = "201" ] || [ "$T_F2" = "200" ]; }; } \
+  && step pass "S7.1 file table objects local.orders_in + local.orders_part_in (jsonl, FILE_POINTER cursor)" \
+  || step fail "S7.1 file table objects" "in http=$T_F1 part_in http=$T_F2"
 for i in $(seq 0 9); do printf '{"order_no":"D-%03d","qty":%d}\n' "$i" "$i"; done > "$WORK/node/orders_in"
-[ "$(wc -l < "$WORK/node/orders_in" | tr -d ' ')" = "10" ] \
-  && step pass "S7.2 seed 10 jsonl rows into orders_in" \
-  || step fail "S7.2 seed" "orders_in not 10 lines"
+# the partitioned source carries dt = today as a yyyyMMdd INTEGER — the value
+# shape the dynamic DAY partitions slice on (epoch values fall outside every
+# partition; the draft's caveat says exactly this)
+TODAY_INT="$(date +%Y%m%d)"
+for i in $(seq 0 9); do printf '{"order_no":"P-%03d","qty":%d,"dt":%s}\n' "$i" "$i" "$TODAY_INT"; done > "$WORK/node/orders_part_in"
+{ [ "$(wc -l < "$WORK/node/orders_in" | tr -d ' ')" = "10" ] && [ "$(wc -l < "$WORK/node/orders_part_in" | tr -d ' ')" = "10" ]; } \
+  && step pass "S7.2 seed 10 jsonl rows into orders_in + orders_part_in (dt=$TODAY_INT)" \
+  || step fail "S7.2 seed" "not 10 lines"
 
 # ---------- S8 engine node self-registration ----------
 # sink credential rides the node env (authEnv = TAILRACE_DS_<id>; root: is
@@ -446,9 +536,9 @@ done
 [ "$ONLINE" = "1" ] && step pass "S8.2 node self-registered → ONLINE" \
   || step fail "S8.2 node ONLINE" "nodes=$BODY node.log=$(tail -5 "$WORK/node.log")"
 
-# ---------- S9 two pipelines into the two generated tables ----------
-deploy_pipeline() { # deploy_pipeline <name> <sink-table> → sets P_ID
-  local sql="INSERT INTO $E2E_DB.$2 SELECT order_no, qty FROM local.orders_in"
+# ---------- S9 three pipelines into the three generated tables ----------
+deploy_pipeline() { # deploy_pipeline <name> <sink-table> <source-table> <select-cols> → sets P_ID
+  local sql="INSERT INTO $E2E_DB.$2 SELECT $4 FROM local.$3"
   req POST /api/pipelines \
     "{\"name\":\"$1\",\"sqlContent\":$(json_sql "$sql"),\"dsMapping\":{\"local\":$FDS,\"$E2E_DB\":$DDS},\"checkpointMs\":2000}" "$TOKEN"
   P_ID="$(jq -r '.id // empty' <<<"$BODY" 2>/dev/null)"
@@ -460,15 +550,20 @@ deploy_pipeline() { # deploy_pipeline <name> <sink-table> → sets P_ID
   req GET "/api/pipelines/$P_ID" "" "$TOKEN"
   [ "$(jq -r '.status // empty' <<<"$BODY")" = "RUNNING" ]
 }
-if deploy_pipeline ddl-e2e-dup orders_dup; then
+if deploy_pipeline ddl-e2e-dup orders_dup orders_in "order_no, qty"; then
   step pass "S9.1 pipeline#1 file→orders_dup created/published/deployed → RUNNING"
 else
   step fail "S9.1 pipeline orders_dup" "deploy chain failed (see lines above)"
 fi
-if deploy_pipeline ddl-e2e-uniq orders_uniq; then
+if deploy_pipeline ddl-e2e-uniq orders_uniq orders_in "order_no, qty"; then
   step pass "S9.2 pipeline#2 file→orders_uniq created/published/deployed → RUNNING"
 else
   step fail "S9.2 pipeline orders_uniq" "deploy chain failed (see lines above)"
+fi
+if deploy_pipeline ddl-e2e-part orders_part orders_part_in "order_no, qty, dt"; then
+  step pass "S9.3 pipeline#3 file→orders_part created/published/deployed → RUNNING"
+else
+  step fail "S9.3 pipeline orders_part" "deploy chain failed (see lines above)"
 fi
 
 # ---------- S10 row reconciliation on the generated tables ----------
@@ -480,30 +575,157 @@ ROWS_UNIQ="$(doris_wait_rows orders_uniq 10)"
 [ "${ROWS_UNIQ:-x}" = "10" ] \
   && step pass "T3.2 UNIQUE table orders_uniq: COUNT(*)=10 (10 distinct order_no, merge-on-write folds nothing)" \
   || step fail "T3.2 orders_uniq rows" "rows=${ROWS_UNIQ:-x} (expected 10)"
+ROWS_PART="$(doris_wait_rows orders_part 10)"
+[ "${ROWS_PART:-x}" = "10" ] \
+  && step pass "T3.3 partitioned table orders_part: COUNT(*)=10 (rows landed in today's dynamic DAY partition)" \
+  || step fail "T3.3 orders_part rows" "rows=${ROWS_PART:-x} (expected 10)"
+
+# ---------- S10b evolve: ADD COLUMN, then a pipeline runs and restarts on the evolved table ----------
+# orders_evo is created from a 2-column registration, then re-registered with
+# a third column — table objects are immutable and cannot be deleted while a
+# published pipeline references them, so the re-registration happens BEFORE
+# the pipeline exists (the honest operator path with today's API). evolve
+# then reconciles the live table (ADD COLUMN), and the pipeline — deployed
+# and RESTARTED after the schema change — keeps writing into it.
+req POST "/api/datasources/$DDS/tables" \
+  "{\"dbName\":\"$E2E_DB\",\"tableName\":\"orders_evo\",\"format\":null,\"columnsJson\":$COLS}" "$TOKEN"
+EVO_TID="$(jq -r '.id // empty' <<<"$BODY" 2>/dev/null)"
+req POST "/api/datasources/$DDS/tables/$E2E_DB/orders_evo/ddl/draft" \
+  "{\"keyModel\":\"duplicate\",\"keyColumn\":\"order_no\",\"replicationNum\":1}" "$TOKEN"
+EVO_DDL="$(jq -r '.ddl // empty' <<<"$BODY" 2>/dev/null)"
+req POST "/api/datasources/$DDS/tables/$E2E_DB/orders_evo/ddl/execute" \
+  "{\"ddl\":$(json_sql "$EVO_DDL"),\"keyModel\":\"duplicate\"}" "$TOKEN"
+EVO_EXEC="$CODE"
+{ [ -n "$EVO_TID" ] && [ "$EVO_EXEC" = "200" ]; } \
+  && step pass "E1.1 orders_evo created via the A1 loop from the 2-column registration" \
+  || step fail "E1.1 orders_evo create" "exec=$EVO_EXEC body=$BODY"
+
+# drop the (still unreferenced) table object, re-register with note added
+req DELETE "/api/datasources/tables/$EVO_TID" "" "$TOKEN"
+DEL_OK="$CODE"
+req POST "/api/datasources/$DDS/tables" \
+  "{\"dbName\":\"$E2E_DB\",\"tableName\":\"orders_evo\",\"format\":null,\"columnsJson\":[[\"order_no\",\"utf8\"],[\"qty\",\"int64\"],[\"note\",\"utf8\"]]}" "$TOKEN"
+REREG_OK="$CODE"
+{ [ "$DEL_OK" = "204" ] && { [ "$REREG_OK" = "201" ] || [ "$REREG_OK" = "200" ]; }; } \
+  && step pass "E1.2 table object re-registered with the grown column set (+note utf8)" \
+  || step fail "E1.2 re-register" "delete=$DEL_OK re-register=$REREG_OK body=$BODY"
+
+req POST "/api/datasources/$DDS/tables/$E2E_DB/orders_evo/ddl/evolve" "" "$TOKEN"
+EV_CHANGED="$(jq -r '.changed // empty' <<<"$BODY" 2>/dev/null)"
+EV_STMTS="$(jq -r '.statements // [] | join(" ")' <<<"$BODY" 2>/dev/null)"
+EV_ADDED="$(jq -r '.added // [] | map(.[0]) | join(",")' <<<"$BODY" 2>/dev/null)"
+{ [ "$CODE" = "200" ] && [ "$EV_CHANGED" = "true" ] && grep -q 'ADD COLUMN `note`' <<<"$EV_STMTS" && [ "$EV_ADDED" = "note" ]; } \
+  && step pass "E2.1 evolve → 200 changed:true, 1× ADD COLUMN \`note\` executed (Light Schema Change)" \
+  || step fail "E2.1 evolve add" "http=$CODE changed=$EV_CHANGED stmts=$EV_STMTS body=$BODY"
+DESC_EVO="$(doris_mysql_exec -N -h127.0.0.1 -P9030 -uroot -e "DESC $E2E_DB.orders_evo;" 2>/dev/null)"
+if grep -q '^note' <<<"$DESC_EVO"; then
+  step pass "E2.2 live orders_evo carries the added column (DESC shows note)"
+else
+  step fail "E2.2 DESC orders_evo" "no note column: $(head -c 200 <<<"$DESC_EVO")"
+fi
+
+# pipeline file→orders_evo with the 3-column SELECT; deployed AFTER the
+# schema change, then STOP + DEPLOY (the restart) — rows keep landing
+req POST "/api/datasources/$FDS/tables" \
+  "{\"dbName\":\"local\",\"tableName\":\"orders_evo_in\",\"format\":\"jsonl\",\"columnsJson\":$COLS}" "$TOKEN"
+for i in $(seq 0 9); do printf '{"order_no":"E-%03d","qty":%d}\n' "$i" "$i"; done > "$WORK/node/orders_evo_in"
+if deploy_pipeline ddl-e2e-evo orders_evo orders_evo_in "order_no, qty, order_no AS note"; then
+  step pass "E3.1 pipeline#4 file→orders_evo (3-col SELECT incl. note) deployed → RUNNING"
+else
+  step fail "E3.1 pipeline orders_evo" "deploy chain failed (see lines above)"
+fi
+ROWS_EVO="$(doris_wait_rows orders_evo 10)"
+NOTES_EVO="$(doris_query "SELECT COUNT(note) FROM $E2E_DB.orders_evo;")"
+{ [ "${ROWS_EVO:-x}" = "10" ] && [ "${NOTES_EVO:-x}" = "10" ]; } \
+  && step pass "E3.2 pipeline wrote 10 rows into the EVOLVED table, the added column populated (COUNT(note)=10)" \
+  || step fail "E3.2 evolved-table rows" "rows=${ROWS_EVO:-?} notes=${NOTES_EVO:-?}"
+req POST "/api/pipelines/$P_ID/stop" "" "$TOKEN"
+STOP_OK="$CODE"
+req POST "/api/pipelines/$P_ID/deploy" '{}' "$TOKEN"
+DEPLOY_OK="$CODE"
+req GET "/api/pipelines/$P_ID" "" "$TOKEN"
+EVO_STATUS="$(jq -r '.status // empty' <<<"$BODY" 2>/dev/null)"
+{ [ "$STOP_OK" = "200" ] && [ "$DEPLOY_OK" = "200" ] && [ "$EVO_STATUS" = "RUNNING" ]; } \
+  && step pass "E4.1 restart after ADD COLUMN: stop → deploy → RUNNING (pipeline survives the schema change)" \
+  || step fail "E4.1 restart" "stop=$STOP_OK deploy=$DEPLOY_OK status=$EVO_STATUS"
+for i in $(seq 10 14); do printf '{"order_no":"E-%03d","qty":%d}\n' "$i" "$i"; done >> "$WORK/node/orders_evo_in"
+ROWS_EVO2="$(doris_wait_rows orders_evo 15)"
+[ "${ROWS_EVO2:-x}" = "15" ] \
+  && step pass "E4.2 restarted pipeline consumed the appended batch → COUNT(*)=15" \
+  || step fail "E4.2 post-restart rows" "rows=${ROWS_EVO2:-?} (expected 15)"
+
+# ---------- S10c evolve 409: retype detected → suggestion, nothing executed ----------
+req POST "/api/datasources/$DDS/tables" \
+  "{\"dbName\":\"$E2E_DB\",\"tableName\":\"orders_rt\",\"format\":null,\"columnsJson\":$COLS}" "$TOKEN"
+RT_TID="$(jq -r '.id // empty' <<<"$BODY" 2>/dev/null)"
+req POST "/api/datasources/$DDS/tables/$E2E_DB/orders_rt/ddl/draft" \
+  "{\"keyModel\":\"duplicate\",\"keyColumn\":\"order_no\",\"replicationNum\":1}" "$TOKEN"
+RT_DDL="$(jq -r '.ddl // empty' <<<"$BODY" 2>/dev/null)"
+req POST "/api/datasources/$DDS/tables/$E2E_DB/orders_rt/ddl/execute" \
+  "{\"ddl\":$(json_sql "$RT_DDL"),\"keyModel\":\"duplicate\"}" "$TOKEN"
+req DELETE "/api/datasources/tables/$RT_TID" "" "$TOKEN"
+req POST "/api/datasources/$DDS/tables" \
+  "{\"dbName\":\"$E2E_DB\",\"tableName\":\"orders_rt\",\"format\":null,\"columnsJson\":[[\"order_no\",\"utf8\"],[\"qty\",\"utf8\"]]}" "$TOKEN"
+{ [ -n "$RT_TID" ] && { [ "$CODE" = "201" ] || [ "$CODE" = "200" ]; }; } \
+  && step pass "E5.1 orders_rt created (qty int64 live) then re-registered as qty utf8 — the retype fixture" \
+  || step fail "E5.1 orders_rt fixture" "http=$CODE body=$BODY"
+req POST "/api/datasources/$DDS/tables/$E2E_DB/orders_rt/ddl/evolve" "" "$TOKEN"
+EV409_CODE="$CODE"
+EV409_RETYPE="$(jq -r '.error.refs.retyped[0] // empty' <<<"$BODY" 2>/dev/null)"
+EV409_SUGG="$(jq -r '.error.refs.suggestedDdl // [] | join(" ")' <<<"$BODY" 2>/dev/null)"
+EV409_NOTICE="$(jq -r '.error.refs.partialUpdateNotice // empty' <<<"$BODY" 2>/dev/null)"
+{ [ "$EV409_CODE" = "409" ] && [ "$(jq -r '.error.code // empty' <<<"$BODY")" = "SCHEMA_CHANGE_UNSUPPORTED" ] \
+    && [ "$(jq -r '.error.refs.retyped[0].column // empty' <<<"$BODY")" = "qty" ] \
+    && [ "$(jq -r '.error.refs.retyped[0].registered // empty' <<<"$BODY")" = "utf8" ] \
+    && [ "$(jq -r '.error.refs.retyped[0].current // empty' <<<"$BODY")" = "int64" ] \
+    && grep -q 'MODIFY COLUMN `qty` VARCHAR(65533)' <<<"$EV409_SUGG" \
+    && [ -n "$EV409_NOTICE" ]; } \
+  && step pass "E5.2 evolve retype → 409 SCHEMA_CHANGE_UNSUPPORTED: refs.retyped[qty utf8/int64] + suggestedDdl MODIFY COLUMN + partialUpdateNotice" \
+  || step fail "E5.2 evolve 409" "http=$EV409_CODE retype=$EV409_RETYPE sugg=$EV409_SUGG body=$BODY"
+DESC_RT="$(doris_mysql_exec -N -h127.0.0.1 -P9030 -uroot -e "DESC $E2E_DB.orders_rt;" 2>/dev/null)"
+if grep -qi '^qty[[:space:]]*bigint' <<<"$DESC_RT"; then
+  step pass "E5.3 live orders_rt qty is STILL bigint — the 409 executed nothing"
+else
+  step fail "E5.3 DESC orders_rt" "qty not bigint: $(head -c 200 <<<"$DESC_RT")"
+fi
 
 # ---------- S11 audit assertion (full DDL text in audit_log) ----------
 # console.db is SQLite; the migration-00 audit_log carries the whole execute
-# payload in detail_json (api/datasources.rs audit json!) — assert both rows,
-# one per key model, ok=true, the CREATE TABLE text verbatim
+# payload in detail_json (api/datasources.rs audit json!) — assert the five
+# execute rows (dup/uniq/part/evo/rt: four duplicate, one unique), ok=true,
+# the CREATE TABLE text verbatim; plus exactly one evolve row (the ADD
+# COLUMN run — the 409 path audits nothing because it executes nothing)
 AUDIT_ERR="$(python3 - "$WORK/run/console.db" "$E2E_DB" <<'PY' 2>&1
 import json, sqlite3, sys
 conn = sqlite3.connect(sys.argv[1])
 rows = conn.execute(
     "SELECT action, detail_json FROM audit_log WHERE action='TABLE_DDL_EXECUTE' ORDER BY id"
 ).fetchall()
-assert len(rows) == 2, f"expected 2 TABLE_DDL_EXECUTE rows, got {len(rows)}: {rows}"
+assert len(rows) == 5, f"expected 5 TABLE_DDL_EXECUTE rows, got {len(rows)}: {rows}"
 models = []
+tables = []
 for action, detail in rows:
     d = json.loads(detail)
     assert d["ok"] is True, d
-    assert d["dbName"] == sys.argv[2] and d["tableName"] in ("orders_dup", "orders_uniq"), d
+    assert d["dbName"] == sys.argv[2], d
     assert "CREATE TABLE" in d["ddl"] and "BUCKETS" in d["ddl"], d["ddl"]
     models.append(d["keyModel"])
-assert sorted(models) == ["duplicate", "unique"], models
-print("audit ok:", sorted(models))
+    tables.append(d["tableName"])
+assert sorted(models) == ["duplicate"] * 4 + ["unique"], models
+assert sorted(tables) == ["orders_dup", "orders_evo", "orders_part", "orders_rt", "orders_uniq"], tables
+part = [json.loads(dt) for _, dt in rows if json.loads(dt)["tableName"] == "orders_part"][0]
+assert "PARTITION BY RANGE(`dt`)" in part["ddl"], part["ddl"]
+ev = conn.execute(
+    "SELECT detail_json FROM audit_log WHERE action='TABLE_DDL_EVOLVE' ORDER BY id"
+).fetchall()
+assert len(ev) == 1, f"expected exactly 1 TABLE_DDL_EVOLVE row (the 409 audits nothing), got {len(ev)}: {ev}"
+e = json.loads(ev[0][0])
+assert e["ok"] is True and e["tableName"] == "orders_evo", e
+assert any("ADD COLUMN `note`" in s for s in e["statements"]), e["statements"]
+print("audit ok:", sorted(models), "+ evolve", e["added"])
 PY
 )"
-[ $? -eq 0 ] && [ -n "$AUDIT_ERR" ] && step pass "T4.1 audit_log: 2×TABLE_DDL_EXECUTE (duplicate+unique), full DDL text + ok=true in detail_json" \
+[ $? -eq 0 ] && [ -n "$AUDIT_ERR" ] && step pass "T4.1 audit_log: 5×TABLE_DDL_EXECUTE (4 duplicate + 1 unique, partitioned DDL verbatim) + 1×TABLE_DDL_EVOLVE (ADD COLUMN note, ok=true)" \
   || step fail "T4.1 audit assertion" "$AUDIT_ERR"
 
 # ---------- teardown ----------

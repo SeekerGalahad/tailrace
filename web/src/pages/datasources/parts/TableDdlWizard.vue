@@ -3,6 +3,7 @@ import { computed, h, ref, watch } from 'vue'
 import {
   NAlert,
   NButton,
+  NCheckbox,
   NCode,
   NDataTable,
   NDescriptions,
@@ -41,10 +42,11 @@ import MonoField from '../../../components/MonoField.vue'
  * draft/execute/evolve endpoints — ① column confirm (the registered
  * columnsJson the generator builds from) → ② key model, MANDATORY, with the
  * heuristic key column carrying its 「猜测」 badge (next stays disabled until
- * a model is picked) → ③ read-only DDL preview + execute / evolve entries.
- * No DDL hand-editor on purpose (task-card 风险登记): confirm differently and
- * regenerate instead of editing text. Doris/StarRocks datasources only —
- * the caller hides the entry otherwise.
+ * a model is picked) and the partition candidate, when the generator offered
+ * one, as a keep/drop checkbox → ③ read-only DDL preview + execute / evolve
+ * entries. No DDL hand-editor on purpose (task-card 风险登记): confirm
+ * differently and regenerate instead of editing text. Doris/StarRocks
+ * datasources only — the caller hides the entry otherwise.
  */
 
 const props = defineProps<{
@@ -72,6 +74,10 @@ const draft = ref<DdlDraftResponse | null>(null)
 const keyModel = ref<DdlKeyModel | null>(null)
 const keyColumn = ref<string | null>(null)
 const replicationNum = ref<number | null>(null)
+/** Partition decision: null = no candidate seen yet (hint omitted); true =
+ * keep (confirms, clears the guess badge); false = drop (no PARTITION clause).
+ * Seeded to true the first time a draft offers a candidate. */
+const keepPartition = ref<boolean | null>(null)
 
 // --- execute / evolve outcomes (step ③) ---
 const executing = ref(false)
@@ -93,6 +99,7 @@ function reset(): void {
   keyModel.value = null
   keyColumn.value = null
   replicationNum.value = null
+  keepPartition.value = null
   execResult.value = null
   execError.value = null
   evolveState.value = { kind: 'idle' }
@@ -126,6 +133,7 @@ async function runDraft(withHints: boolean): Promise<boolean> {
             keyModel: keyModel.value ?? undefined,
             keyColumn: keyColumn.value ?? undefined,
             replicationNum: replicationNum.value ?? undefined,
+            partition: keepPartition.value ?? undefined,
           }
         : undefined,
       { silent: true },
@@ -134,6 +142,10 @@ async function runDraft(withHints: boolean): Promise<boolean> {
     // round one seeds the key-column pick (a select with a value); the key
     // model itself stays unpicked — the human must choose it
     if (!withHints) keyColumn.value = res.keyColumn
+    // the first draft that offers a partition candidate seeds the keep/drop
+    // checkbox to keep (the human unticks to drop; the decision then persists
+    // across regenerations)
+    if (res.partition && keepPartition.value == null) keepPartition.value = true
     return true
   } catch (e) {
     draftError.value = e instanceof ApiError ? e.message : '草稿生成失败，请稍后重试'
@@ -365,6 +377,19 @@ function close(): void {
             <NInputNumber v-model:value="replicationNum" :min="1" :precision="0" size="small" placeholder="留空 = 集群默认" clearable class="replica-input" />
             <NText depth="3" class="desc-hint">——单 BE 集群填 1（console 不代查 SHOW BACKENDS，缺省走集群默认副本数）</NText>
           </NFormItem>
+          <!-- partition candidate: keep (confirms) or drop — the generator only
+               offers shapes Doris accepts; the human still decides -->
+          <NFormItem v-if="draft.partition" label="分区" label-placement="left" label-width="90">
+            <div class="partition-row">
+              <NCheckbox :checked="keepPartition === true" @update:checked="(v: boolean) => (keepPartition = v)">
+                按天 RANGE 动态分区 · 分区列 <span class="model-label">{{ draft.partition.column }}</span>
+              </NCheckbox>
+              <NTag v-if="draft.partition.guessed && keepPartition !== false" size="small" type="warning" :bordered="false">猜测</NTag>
+              <NText depth="3" class="desc-hint">
+                ——分区列须为 yyyyMMdd 形式的整数日期（epoch 秒/毫秒值会落在所有分区之外被拒载）；取消勾选则不生成 PARTITION 子句
+              </NText>
+            </div>
+          </NFormItem>
           <NAlert v-if="keyColumnStillGuessed" type="warning" :bordered="false" class="step-alert">
             键列为启发式猜测（id / *_id / 首列）——请确认或改选后再执行。
           </NAlert>
@@ -385,16 +410,25 @@ function close(): void {
               <MonoField :value="draft.keyColumn" />
               <NTag v-if="draft.keyColumnGuessed" size="small" type="warning" :bordered="false" class="summary-tag">猜测</NTag>
             </NDescriptionsItem>
-            <NDescriptionsItem label="分区候选">
+            <NDescriptionsItem label="分区">
               <template v-if="draft.partition">
-                {{ draft.partition.column }}（按天 RANGE）<NTag v-if="draft.partition.guessed" size="small" type="warning" :bordered="false">猜测</NTag>
+                {{ draft.partition.column }}（按天 RANGE 动态分区）<NTag v-if="draft.partition.guessed" size="small" type="warning" :bordered="false">猜测</NTag>
               </template>
+              <NText v-else-if="keepPartition === false" depth="3">已取消（不生成 PARTITION 子句）</NText>
               <NText v-else depth="3">无</NText>
             </NDescriptionsItem>
             <NDescriptionsItem label="副本数">
               {{ replicationNum ?? '集群默认' }}
             </NDescriptionsItem>
           </NDescriptions>
+          <!-- round-two notes: the reasons behind THIS text (a partition
+               skipped by the chosen key model, a plain-column sequence
+               column, …) — step ① showed the round-one set -->
+          <NAlert v-if="draft.notes.length" type="default" :bordered="false" class="step-alert" title="生成器备注">
+            <ul class="note-list">
+              <li v-for="n in draft.notes" :key="n">{{ n }}</li>
+            </ul>
+          </NAlert>
           <div class="ddl-head">
             <span class="ddl-title">DDL 预览（只读——执行的就是这段原文）</span>
           </div>
@@ -577,6 +611,13 @@ function close(): void {
 
 .replica-input {
   width: 180px;
+}
+
+.partition-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .summary-desc {

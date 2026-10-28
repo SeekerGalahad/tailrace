@@ -25,7 +25,7 @@
 | ✅ | POST /api/datasources/test · POST /api/datasources/{id}/test（HTTP 恒 200，结果在 status 字段） |
 | ✅ | POST /api/datasources/{id}/tables · GET /api/datasources/tables?datasourceId=&kind= · DELETE /api/datasources/tables/{id} |
 | ✅ | POST /api/datasources/{id}/discover（T14，2026-10-21；非 501——engine `tailrace-metadata` 内嵌转发：kafka 经 rdkafka fetch_metadata 列 topics（首点拆 db.table，带 partitions）；doris/mysql 走 9030 mysql **文本协议** SHOW DATABASES/SHOW TABLES；postgres 走 information_schema（扩展协议绑定参数）；回 `{"assets":[{dbName,tableName,kind,format:null,partitions?}]}`，kind 按 `table_kind_for` 派生（kafka→kafka、doris→doris、mysql/postgresql→jdbc）；成功缓存 30s（键=datasource id+generation+connJson 逐字节，失败不缓存以便改参即重探）；file 型/connJson 缺字段 400、数据源不存在 404、后端不可达 502） · POST /api/datasources/{id}/infer-schema（body `{dbName,tableName,format?,sampleRows?}`：kafka 尾采 sampleRows 条（默认 20 钳 1..=100）经 decode 链类型格推断列 + 给出 format 建议（ogg/json/jsonl，其它显式格式 400）；SQL 后端读 DDL 列型（DESC / information_schema.columns），format 恒 null；回 `{"columns":[[列名,arrow 型]…],"format":null|"ogg"|"json"}`——**不落库**，登记仍走 POST /tables；同档 400/404/502） |
-| ✅ | **建表闭环（T-A1，2026-10-28；蓝图 §7.2 四步：推断→草稿→人工确认→执行审计）** `POST /api/datasources/{id}/tables/{db}/{table}/ddl/draft`（body 可省或 `{keyColumn?,keyModel?:"unique"\|"duplicate",replicationNum?}`——首轮空 body 得纯启发式草稿，二轮回灌人工确认项重生成；仅 doris/starrocks 数据源（生成 Doris 方言 DDL）且表对象须已登记 columnsJson；engine `tailrace-ddl` 纯函数生成：4 类词汇映射 utf8→VARCHAR(65533)/int64→BIGINT/float64→DOUBLE/bool→BOOLEAN、有 sequence_column 或 op_type 列推荐 UNIQUE KEY（MoW）否则 DUPLICATE KEY、键列 id/`*_id` 首列否则第一列**并标注猜测**、时间形列名→按天 RANGE 动态分区候选；回 `{ddl,keyModel,keyModelReason,keyColumn,keyColumnGuessed,partition:{column,guessed}|null,notes[],columns,sequenceColumn}`；**只读不审计**；`replicationNum` 由调用方给（单 BE 集群须传 1，缺省省略属性走集群默认——BE 数探测本波不在 console 内置，向导侧 `SHOW BACKENDS` 自填）；非 doris 类型/无列清单/hint 指向未知列或超纲类型 400、未登记 404） · `POST .../ddl/execute`（body `{ddl,keyModel}`：**`keyModel` 缺省或非 unique/duplicate → 422 KEY_MODEL_REQUIRED**、`ddl` 缺省 → 422 DDL_REQUIRED、`keyModel` 与 DDL 键子句关键字不符 → 422 KEY_MODEL_MISMATCH——三者皆在开连接前拒绝、不落审计；通过后 engine `tailrace-metadata::mysql_exec` 原文执行（不重写、不白名单——人工确认的全文即门）；成功 200 `{ok:true,keyModel,elapsedMs,rowsAffected}` + 审计 TABLE_DDL_EXECUTE（detail 带 DDL 全文/elapsedMs/ok:true）；Doris 拒绝 → **502 DDL_FAILED，message 为 Doris 报错原文**，同样落审计 ok:false+error） · `POST .../ddl/evolve`（无 body：对登记 columnsJson 与 `DESC` 实表（经 infer-schema 同一元数据客户端折叠为 4 类词汇再比对，列名大小写不敏感）做差；仅「登记有、实表无」的列生成 `ALTER TABLE … ADD COLUMN … AFTER <末列>` 逐列链式执行（Light Schema Change）→ 200 `{changed:true,statements[],added[],elapsedMs,partialUpdateNotice}` + 审计 TABLE_DDL_EVOLVE；实表已含全部登记列 → 200 `changed:false` 不执行不审计；**检测到改类型或删列 → 409 SCHEMA_CHANGE_UNSUPPORTED 不执行**，`error.refs` 带 `suggestedDdl[]`（ADD→MODIFY→DROP 顺序的建议全文）/`added`/`retyped[{column,registered,current}]`/`removed`/`partialUpdateNotice` 供人工评估；登记列超纲类型 400、DESC 不可达 502 UNAVAILABLE、ADD COLUMN 被拒 502 DDL_FAILED。**互斥提示（蓝图红线 T-A1 ⑤）**：evolve 每种响应均携带 `partialUpdateNotice`——Doris 中 Schema Change 进行中的表不支持部分列更新（partial update），ADD COLUMN 完成前（`SHOW ALTER TABLE COLUMN` 为 FINISHED）勿对该表启用部分列更新写入；T-A7 落地后同样遵守） |
+| ✅ | **建表闭环（T-A1，2026-10-28；蓝图 §7.2 四步：推断→草稿→人工确认→执行审计；R6 评审修复轮补分区可执行性规则）** `POST /api/datasources/{id}/tables/{db}/{table}/ddl/draft`（body 可省或 `{keyColumn?,keyModel?:"unique"\|"duplicate",replicationNum?,partition?}`——首轮空 body 得纯启发式草稿，二轮回灌人工确认项重生成；仅 doris/starrocks 数据源（生成 Doris 方言 DDL）且表对象须已登记 columnsJson；engine `tailrace-ddl` 纯函数生成：4 类词汇映射 utf8→VARCHAR(65533)/int64→BIGINT/float64→DOUBLE/bool→BOOLEAN、有 sequence_column 或 op_type 列推荐 UNIQUE KEY（MoW）否则 DUPLICATE KEY、键列 id/`*_id` 首列否则第一列**并标注猜测**、时间形列名→按天 RANGE 动态分区候选（**仅 int64 列可当 RANGE 分区键；UNIQUE/MoW 表分区列必须为键列——其余形态在生成阶段即被跳过并在 notes 说明原因，落库必败的 PARTITION 子句不再产出**，Doris 2.1.7 实测规则）；`partition:false` 取消分区子句、`partition:true` 确认（guessed 清零）；回 `{ddl,keyModel,keyModelReason,keyColumn,keyColumnGuessed,partition:{column,guessed}\|null,notes[],columns,sequenceColumn}`；**只读不审计**；`replicationNum` 由调用方给（单 BE 集群须传 1，缺省省略属性走集群默认——BE 数探测本波不在 console 内置，向导侧 `SHOW BACKENDS` 自填）；非 doris 类型/无列清单/hint 指向未知列或超纲类型 400、未登记 404） · `POST .../ddl/execute`（body `{ddl,keyModel}`：**`keyModel` 缺省或非 unique/duplicate → 422 KEY_MODEL_REQUIRED**、`ddl` 缺省 → 422 DDL_REQUIRED、`ddl` 键子句与 `keyModel` 不符（**须恰含一个键模型关键字——双含或全无均拒**）→ 422 KEY_MODEL_MISMATCH——三者皆在开连接前拒绝、不落审计；通过后 engine `tailrace-metadata::mysql_exec` 原文执行（不重写、不白名单——人工确认的全文即门）；成功 200 `{ok:true,keyModel,elapsedMs,rowsAffected}` + 审计 TABLE_DDL_EXECUTE（detail 带 DDL 全文/elapsedMs/ok:true）；Doris 拒绝 → **502 DDL_FAILED，message 为 Doris 报错原文**，同样落审计 ok:false+error） · `POST .../ddl/evolve`（无 body：对登记 columnsJson 与 `DESC` 实表（经 infer-schema 同一元数据客户端折叠为 4 类词汇再比对，列名大小写不敏感）做差；仅「登记有、实表无」的列生成 `ALTER TABLE … ADD COLUMN … AFTER <末列>` 逐列链式执行（Light Schema Change）→ 200 `{changed:true,statements[],added[],elapsedMs,partialUpdateNotice}` + 审计 TABLE_DDL_EVOLVE；实表已含全部登记列 → 200 `changed:false` 不执行不审计；**检测到改类型或删列 → 409 SCHEMA_CHANGE_UNSUPPORTED 不执行**，`error.refs` 带 `suggestedDdl[]`（ADD→MODIFY→DROP 顺序的建议全文）/`added`/`retyped[{column,registered,current}]`/`removed`/`partialUpdateNotice` 供人工评估；登记列超纲类型 400、DESC 不可达 502 UNAVAILABLE、ADD COLUMN 被拒 502 DDL_FAILED。**互斥提示（蓝图红线 T-A1 ⑤）**：evolve 每种响应均携带 `partialUpdateNotice`——Doris 中 Schema Change 进行中的表不支持部分列更新（partial update），ADD COLUMN 完成前（`SHOW ALTER TABLE COLUMN` 为 FINISHED）勿对该表启用部分列更新写入；T-A7 落地后同样遵守） |
 | ✅ | GET /api/nodes（90s 无心跳判 OFFLINE，只读计算） · GET /api/nodes/{id} |
 | ✅ | POST /api/nodes/manual（先探活 `GET http://host:port/healthz`，200 才登记；node_key 由控制面生成 `sn-<16hex>`，per-node token 响应一次性回显，库内仅存 sha256；探活失败 502） |
 | ✅ | POST /api/nodes/{id}/revoke（204） · DELETE /api/nodes/{id}（被 assigned 管道引用 409 IN_USE；T35 起 SSH 托管节点先 best-effort 远端卸载（停进程+清安装目录）再删行，失败降级「跳过并警告」：`{"remoteCleaned":bool,"warning":…}`） |
@@ -79,7 +79,16 @@
      （422 三码见 §一），execute 的 DDL 原文执行、不重写、不设白名单——人工确认过的
      全文就是门；失败把 Doris 报错原样回传并同样落审计（拒绝也是证据）。
    - 「猜测」必标：键列启发式（id/`*_id` 首列否则第一列）与时间形列名分区候选都带
-     `guessed:true`，向导据此高亮并要求确认；人工回灌 `keyColumn` 后标志清零。
+     `guessed:true`，向导据此高亮并要求确认；人工回灌 `keyColumn` / `partition:true` 后
+     标志清零，`partition:false` 取消分区子句（**分区候选必须先可执行才会被给出**：
+     Doris 2.1 实测 RANGE 分区键仅接受整数/日期类型——4 类词汇里只有 `int64`→BIGINT
+     合格，utf8/float64/bool 的时间形列一律跳过并在 `notes` 给出原因；UNIQUE（MoW）
+     表的分区列必须是键列，非键列候选同样跳过并说明；被给出的 BIGINT 候选附带
+     「值须为 yyyyMMdd 整数日期，epoch 秒/毫秒会落在所有分区之外被拒载」的警示——
+     动态按天分区生成 p20261028=[20261028,20261029) 形态的整数区间）。
+   - execute 的键模型确认门比对键子句：echo 回的 DDL 文本须**恰含一个**键模型关键字
+     （UNIQUE KEY / DUPLICATE KEY）且与确认值一致——双含（如注释里走私另一个模型）或
+     全无均 422 KEY_MODEL_MISMATCH，不执行不落审计。
    - evolve 只做加法：ADD COLUMN（Light Schema Change）执行；改类型/删列只给建议
      （409 + `refs.suggestedDdl`），永不代执行。类型比对在 4 类词汇层面（DESC 经
      `ddl_arrow_type` 折叠），DECIMAL/DATETIME 等在 Doris 侧折叠为 utf8——与登记类型
@@ -114,6 +123,14 @@
      字节位而恒 null（真实行数看执行后 job 的 `rowsWritten`）。
    - **job id** 为 `{yyyymmdd}-{序号}` 文本主键（进台账目录名、审计与隔离消费组
      `bf-{jobId}.s{n}`；消费组隔离保证回填期间主管道消费组不受 rebalance 扰动）。
+   - **file 源路径按登记目录解析**（R6 评审修复轮）：回填执行器在 console 进程内
+     组装 file 源，但表文件**不按 console 进程 cwd 解析**——`build_plan_table` 把 file
+     数据源 connJson 的 `path`（登记目录）作为 plan `bootstrap` 下发，引擎 file 工厂
+     以 `目录/表名` 打开源文件（与常驻 node 同一解析），console 以任意目录启动都能读
+     到同一文件；未登记目录（TOML 本地 catalog 无 bootstrap）则沿用按 cwd 的裸名解析。
+   - **崩溃恢复**：有界重放不跨进程续跑——console 启动时把遗留 `pending`/`running`
+     的 job 行统一置为 `failed`（error 说明「重新触发同区间即可，确定性 label 保证
+     重放幂等」）；终态行不动。
    - dryRun 响应的 `jobId` 恒 null（零副作用契约：dry run 不创建任何行）；MCP
      `trigger_backfill` 缺省 `dryRun:true`（蓝图 §7.5）。
 
@@ -124,12 +141,15 @@
 - catalog 快照浏览 / 样本预览 / lag 告警规则 / SQL 片段助手（后续版本族；discover / infer-schema 已于 T14 交付）。~~jdbc 管道 console 端到端未通~~（T-D1 2026-10-27 清偿大半：plan 下推对 dim/jdbc 表由 connJson `jdbcUrl`（去 `jdbc:` 前缀）填 `bootstrap`、由表对象 `sequence_column` 列填 `sequence_column`——正是 jdbc 源工厂必填两键；维表动线有 console e2e 测试钉住，jdbc 流式批源动线仍未有 console 侧 e2e 覆盖，留后续补）。
 - 90s OFFLINE 目前为读时计算；未做后台定时器回写。
 - 回填（T-A2）kafka 源暂 422（分区级 from 寻址未做，见语义裁决 9）；同区间重放
-  行数不变（DUPLICATE KEY 实表）与「回填期间主管道持续写入」两条验收走 W6
-  testcontainers Doris e2e（console 契约测试已钉 dryRun 零副作用、422 门、
-  state 机、跨 job label 逐字节重现与游标隔离）；web 回填入口随 W5 交付。
+  行数不变（DUPLICATE KEY 实表）与「回填期间主管道持续写入」两条验收由
+  `scripts/e2e/backfill_replay.sh` 覆盖（R6 评审修复轮起 console 从仓库根启动、
+  file 源按登记目录解析——`rowsWritten>0` 断言专防 0 行空洞成功）；`estimatedRows`
+  为记录在案的验收偏离：file 边界是字节位、无源可诚实估行，恒 null（见语义裁决 9）。
 - 建表闭环（T-A1）console 侧未内置 BE 数探测（`replicationNum` 由调用方/向导传入）；
-  成功建表 + `INSERT INTO` 管道写入对账、ADD COLUMN 后管道重启不失败两条验收走 W6
-  testcontainers Doris e2e（console 契约测试只覆盖门禁、审计形状与不可达路径）；
+  成功建表 + `INSERT INTO` 管道写入对账（含**分区表**：候选→取消→确认→落库→
+  SHOW PARTITIONS→数据落分区）与 evolve 两条验收（**ADD COLUMN 后管道 stop/deploy
+  重启不失败 + 数据继续落表**、**改类型 409 + refs 建议 + 实表不变**）由
+  `scripts/e2e/ddl_create.sh` 覆盖（console 契约测试钉门禁、审计形状与不可达路径）；
   web 三步建表向导随 W5 交付。
 
 ## 五、MCP 面（`POST /mcp`，T-E4 / 蓝图 §7.5）

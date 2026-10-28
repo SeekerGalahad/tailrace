@@ -171,6 +171,15 @@ pub fn range_fingerprint(from: i64, to: i64) -> String {
 /// wrong for backfills, where the SAME range must map to the SAME labels
 /// across processes or a replay double-commits (finding F1).
 ///
+/// A stop→deploy cycle rebuilds a resident pipeline's sink INSIDE the same
+/// process: a fresh instance's ordinal would restart at `_0` and reuse the
+/// previous instance's exact label, Doris answers "label already exists",
+/// the sink maps that to Dedup — the first post-restart batch is silently
+/// dropped while the ledger advances (found live by the R6 evolve-restart
+/// e2e). [`LABEL_SEQ_FLOORS`] therefore makes the ordinal continue where
+/// the previous same-prefix instance stopped; the label FORMAT is
+/// unchanged.
+///
 /// The idempotency window of `Deterministic` is Doris' label retention
 /// (default 3 days) — replays older than that fall back to the table key
 /// model, documented with the backfill API.
@@ -178,6 +187,9 @@ pub fn range_fingerprint(from: i64, to: i64) -> String {
 pub enum LabelMode {
     /// `{prefix}-r{pid}_{seq}` — unique per process run (the F1 defect
     /// site, retained for resident pipelines; backfills must not use it).
+    /// The trailing `_{seq}` ordinal is process-global per prefix (see
+    /// [`LABEL_SEQ_FLOORS`]) so a same-process rebuild cannot collide with
+    /// its predecessor's labels.
     ProcessScoped,
     /// `{prefix}-{statement_index}-{fingerprint}_{seq}`: the fingerprint is
     /// [`range_fingerprint`] (sha256(from,to)[..8]). Cross-process stable:
@@ -191,12 +203,41 @@ pub enum LabelMode {
     /// larger than `flush_rows` has one) Dedup against its first and
     /// silently drop that data. The ordinal keeps in-range flushes distinct
     /// while staying cross-process deterministic (batch k of a replayed
-    /// range still gets ordinal k).
+    /// range still gets ordinal k — this mode is exempt from the floor: a
+    /// replayed range MUST restart its ordinals at k to collide).
     Deterministic {
         statement_index: u32,
         from: i64,
         to: i64,
     },
+}
+
+/// Ordinal floors of ProcessScoped label prefixes, process-global: the next
+/// sink built for the same `{prefix}-r{pid}` continues after the highest
+/// ordinal a previous instance of this process successfully flushed. Keyed
+/// by the pid-suffixed prefix, so nothing crosses process boundaries.
+static LABEL_SEQ_FLOORS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// The ordinal a freshly built ProcessScoped sink starts from.
+fn label_seq_floor(prefix: &str) -> u64 {
+    LABEL_SEQ_FLOORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(prefix)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Raise a prefix's floor to at least `seq` (never lowers — two concurrent
+/// instances of one prefix interleave, the floor tracks the frontier).
+fn raise_label_seq_floor(prefix: &str, seq: u64) {
+    let mut floors = LABEL_SEQ_FLOORS.lock().unwrap_or_else(|e| e.into_inner());
+    let floor = floors.entry(prefix.to_string()).or_insert(0);
+    if seq > *floor {
+        *floor = seq;
+    }
 }
 
 /// Register the doris sink factory (plus the "starrocks" alias when that
@@ -348,6 +389,11 @@ impl DorisSink {
         sequence_column: Option<String>,
     ) -> Self {
         let raw_prefix = label_prefix.into();
+        // label idempotency collision guard: unique per process run (Doris
+        // labels are globally deduplicated — a rerun would be rejected); the
+        // ordinal continues after any earlier same-process instance of this
+        // prefix (a rebuilt sink must not reuse its predecessor's labels)
+        let label_prefix = format!("{}-r{}", raw_prefix, std::process::id());
         Self {
             sequence_column,
             client: std::cell::OnceCell::new(),
@@ -355,12 +401,10 @@ impl DorisSink {
             url: url.into(),
             auth: auth.into(),
             columns,
-            raw_prefix: raw_prefix.clone(),
-            // label idempotency collision guard: unique per process run
-            // (Doris labels are globally deduplicated — a rerun would be rejected)
-            label_prefix: format!("{}-r{}", raw_prefix, std::process::id()),
+            raw_prefix,
+            label_seq: label_seq_floor(&label_prefix),
+            label_prefix,
             label_mode: LabelMode::ProcessScoped,
-            label_seq: 0,
             pending_rows: 0,
             buf: BytesMut::with_capacity(16 * 1024 * 1024),
             retry_backoff_ms: vec![2_000, 8_000, 30_000],
@@ -373,6 +417,13 @@ impl DorisSink {
     /// replay range maps to the same labels across processes; the default
     /// (ProcessScoped) is byte-identical to the historical label format.
     pub fn with_label_mode(mut self, mode: LabelMode) -> Self {
+        // Deterministic owns its ordinal outright (batch k of a replayed
+        // range must be ordinal k, in every process) — never floored;
+        // ProcessScoped (re)reads the process floor for its prefix.
+        self.label_seq = match mode {
+            LabelMode::ProcessScoped => label_seq_floor(&self.label_prefix),
+            LabelMode::Deterministic { .. } => 0,
+        };
         self.label_mode = mode;
         self
     }
@@ -631,6 +682,12 @@ impl Sink for DorisSink {
             match self.send_once(&label, &body) {
                 Ok(_) => {
                     self.label_seq += 1;
+                    if self.label_mode == LabelMode::ProcessScoped {
+                        // a same-process rebuild of this prefix must start
+                        // AFTER this flush's ordinal, or its first label
+                        // would collide (Dedup, data silently dropped)
+                        raise_label_seq_floor(&self.label_prefix, self.label_seq);
+                    }
                     let rows = self.pending_rows;
                     self.pending_rows = 0;
                     // restore the buffer watermark (keep capacity to avoid
@@ -1035,6 +1092,57 @@ mod tests {
             .collect();
         assert_eq!(labels.len(), 2);
         assert_eq!(labels[0], labels[1], "a retry must reuse the same label");
+        Ok(())
+    }
+
+    /// Same-process rebuild (stop→deploy rebuilds the sink; the process —
+    /// and its pid — stays): the fresh instance's first label must continue
+    /// after the previous instance's last flushed ordinal, not restart at
+    /// `_0` (which Doris would answer "label already exists" → Dedup → the
+    /// post-restart batch silently dropped while the ledger advances —
+    /// found live by the R6 evolve-restart e2e). Deterministic mode is
+    /// exempt: a replayed range MUST restart its ordinals to collide.
+    #[test]
+    fn process_scoped_ordinal_continues_across_same_process_rebuild() -> anyhow::Result<()> {
+        let pid = std::process::id();
+        let mk = |v: &str| -> anyhow::Result<RecordBatch> {
+            Ok(RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)])),
+                vec![Arc::new(StringArray::from(vec![v.to_string()]))],
+            )?)
+        };
+        // instance #1 flushes twice: ordinals _0 and _1
+        let m = MockDoris::start(vec![
+            (200, r#"{"Status":"Success"}"#.into()),
+            (200, r#"{"Status":"Success"}"#.into()),
+            (200, r#"{"Status":"Success"}"#.into()),
+        ]);
+        let mut first =
+            DorisSink::new(m.url(), "Basic dGVzdDp0ZXN0", vec!["name".into()], "mfloor");
+        first.retry_backoff_ms = vec![0];
+        first.write(vec![mk("a")?])?;
+        assert_eq!(first.flush()?.idempotency_key, format!("mfloor-r{pid}_0"));
+        first.write(vec![mk("b")?])?;
+        assert_eq!(first.flush()?.idempotency_key, format!("mfloor-r{pid}_1"));
+
+        // the rebuild: same prefix, same process → continues at _2
+        let mut second =
+            DorisSink::new(m.url(), "Basic dGVzdDp0ZXN0", vec!["name".into()], "mfloor");
+        second.retry_backoff_ms = vec![0];
+        assert_eq!(second.next_label(), format!("mfloor-r{pid}_2"));
+        second.write(vec![mk("c")?])?;
+        assert_eq!(second.flush()?.idempotency_key, format!("mfloor-r{pid}_2"));
+
+        // a sink whose mode is switched to Deterministic is NOT floored: a
+        // replayed range restarts its ordinals (that is the dedup contract)
+        let mut det = DorisSink::new(m.url(), "Basic dGVzdDp0ZXN0", vec!["name".into()], "mfloor")
+            .with_label_mode(LabelMode::Deterministic {
+                statement_index: 0,
+                from: 0,
+                to: 9,
+            });
+        det.retry_backoff_ms = vec![0];
+        assert!(det.next_label().ends_with("_0"), "{}", det.next_label());
         Ok(())
     }
 

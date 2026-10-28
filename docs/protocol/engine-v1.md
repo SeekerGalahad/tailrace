@@ -89,6 +89,11 @@ SQL 编译诊断（编辑器内联报错数据源）。
 ```
 
 - `tables` 随 plan 携带表对象元数据（缺引用表整体拒绝，不启动半装配管道）；`kind` 规范化为注册表键：`topic→kafka`、`doris_table`/`JDBC_TABLE→doris`（旧值作别名兼容）。
+- **file 表的 `bootstrap` = 登记目录**（R6 评审修复轮）：file 表对象在 `tables[]` 里
+  携带 `bootstrap`（console 由 file 数据源 connJson 的 `path` 填充）时，file 源/汇以
+  `bootstrap/表名` 解析文件路径——与进程 cwd 无关，常驻 node 与 console 内回填执行器
+  打开同一文件。无 `bootstrap`（TOML 本地 catalog）时沿用裸名按 cwd 解析，行为不变；
+  表名为绝对路径时优先。
 - **`stream_load_url` 域白名单（engine H1）**：Doris/SR 表对象的 `stream_load_url`
   主机域必须在节点侧允许清单内，否则整个 plan 被拒绝（`ok:false`，错误指明越界
   host 与允许集）。URL 域由 console 登记表对象（数据源登记的 streamLoadUrl）决定

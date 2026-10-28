@@ -42,7 +42,8 @@ async fn ddl_app() -> (TestApp, i64, i64) {
         Some(json!({
             "dbName": "shop", "tableName": "orders", "format": null,
             // op_type → UNIQUE recommendation; order_id → *_id key guess;
-            // event_ts → partition guess; seq → declared sequence column
+            // event_ts → time-shaped but utf8 (partition candidate skipped,
+            // note emitted); seq → declared sequence column
             "columnsJson": [
                 ["op_type", "utf8"], ["order_id", "utf8"], ["amount", "float64"],
                 ["event_ts", "utf8"], ["seq", "int64"]
@@ -150,20 +151,31 @@ async fn ddl_draft_annotates_every_guess() {
         "heuristic key carries the 「猜测」 badge: {b}"
     );
     assert!(b["keyModelReason"].as_str().unwrap().contains("CDC"));
-    assert_eq!(b["partition"]["column"], "event_ts");
-    assert!(b["partition"]["guessed"].as_bool().unwrap());
+    // event_ts is time-shaped but utf8 → VARCHAR, which Doris refuses as a
+    // RANGE partition key: no candidate, and the draft says why in notes
+    // (annotated, never silent) instead of emitting an unexecutable clause
+    assert!(b["partition"].is_null(), "{b}");
+    assert!(
+        b["notes"].as_array().unwrap().iter().any(|n| n
+            .as_str()
+            .is_some_and(|s| s.contains("event_ts") && s.contains("RANGE"))),
+        "skip reason surfaces as a note: {b}"
+    );
     assert_eq!(b["sequenceColumn"], "seq");
     assert_eq!(b["columns"].as_array().unwrap().len(), 5);
     let ddl = b["ddl"].as_str().unwrap();
     for fragment in [
         "CREATE TABLE IF NOT EXISTS `shop`.`orders`",
         "UNIQUE KEY(`order_id`)",
-        "PARTITION BY RANGE(`event_ts`)",
         "DISTRIBUTED BY HASH(`order_id`) BUCKETS AUTO",
         "\"enable_unique_key_merge_on_write\" = \"true\"",
     ] {
         assert!(ddl.contains(fragment), "draft missing {fragment}:\n{ddl}");
     }
+    assert!(
+        !ddl.contains("PARTITION BY"),
+        "no unexecutable partition clause:\n{ddl}"
+    );
     // read-only step: no audit row, nothing executed
     assert!(audit_rows(&app.store, "TABLE_DDL_EXECUTE").is_empty());
     assert!(audit_rows(&app.store, "TABLE_DDL_EVOLVE").is_empty());
@@ -190,6 +202,105 @@ async fn ddl_draft_annotates_every_guess() {
         "{b}"
     );
     assert!(!b["ddl"].as_str().unwrap().contains("merge_on_write"));
+}
+
+/// The partition candidate over HTTP: offered (guessed) when executable,
+/// dropped by `partition:false`, confirmed by `partition:true`, and skipped
+/// with a note when the confirmed key model makes it unexecutable (MoW
+/// partition column must be the key column).
+#[tokio::test]
+async fn ddl_draft_partition_candidate_confirm_and_drop() {
+    let (app, ds, _tid) = ddl_app().await;
+    // int64 `dt` IS a RANGE-able time column; event_id → *_id key guess
+    let (s, b) = req(
+        &app,
+        "POST",
+        &format!("/api/datasources/{ds}/tables"),
+        Some(json!({
+            "dbName": "shop", "tableName": "events", "format": null,
+            "columnsJson": [["event_id", "int64"], ["dt", "int64"], ["v", "float64"]]
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let path = format!("/api/datasources/{ds}/tables/shop/events/ddl/draft");
+
+    // round one: DUPLICATE recommended (no CDC evidence) → candidate offered
+    // as a guess, clause + dynamic_partition properties in the text, caveat
+    // about yyyyMMdd integer bounds in notes
+    let (s, b) = req(&app, "POST", &path, None).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["keyModel"], "duplicate");
+    assert_eq!(b["partition"]["column"], "dt");
+    assert!(b["partition"]["guessed"].as_bool().unwrap(), "{b}");
+    let ddl = b["ddl"].as_str().unwrap();
+    assert!(ddl.contains("PARTITION BY RANGE(`dt`) ()"), "{ddl}");
+    assert!(
+        ddl.contains("\"dynamic_partition.enable\" = \"true\""),
+        "{ddl}"
+    );
+    assert!(
+        b["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n.as_str().is_some_and(|s| s.contains("yyyyMMdd"))),
+        "{b}"
+    );
+
+    // the human drops it → no clause, no properties, no partition in the
+    // response (the wizard's 取消 control)
+    let (s, b) = req(
+        &app,
+        "POST",
+        &path,
+        Some(json!({"keyModel": "duplicate", "keyColumn": "event_id", "partition": false})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert!(b["partition"].is_null(), "{b}");
+    let ddl = b["ddl"].as_str().unwrap();
+    assert!(!ddl.contains("PARTITION BY"), "{ddl}");
+    assert!(!ddl.contains("dynamic_partition"), "{ddl}");
+
+    // the human confirms it → same clause, guess flag cleared
+    let (s, b) = req(
+        &app,
+        "POST",
+        &path,
+        Some(json!({"keyModel": "duplicate", "keyColumn": "event_id", "partition": true})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["partition"]["column"], "dt");
+    assert!(!b["partition"]["guessed"].as_bool().unwrap(), "{b}");
+    assert!(b["ddl"]
+        .as_str()
+        .unwrap()
+        .contains("PARTITION BY RANGE(`dt`) ()"));
+
+    // UNIQUE override with event_id as the key: a merge-on-write table's
+    // partition column must be a KEY column, so the candidate is skipped —
+    // even with partition:true — and the note says why
+    let (s, b) = req(
+        &app,
+        "POST",
+        &path,
+        Some(json!({"keyModel": "unique", "keyColumn": "event_id", "partition": true})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["keyModel"], "unique");
+    assert!(b["partition"].is_null(), "{b}");
+    assert!(!b["ddl"].as_str().unwrap().contains("PARTITION BY"));
+    assert!(
+        b["notes"].as_array().unwrap().iter().any(|n| n
+            .as_str()
+            .is_some_and(|s| s.contains("`dt`") && s.contains("必须是键列"))),
+        "{b}"
+    );
+    // nothing above touched a backend
+    assert!(audit_rows(&app.store, "TABLE_DDL_EXECUTE").is_empty());
 }
 
 #[tokio::test]
@@ -293,6 +404,22 @@ async fn ddl_execute_rejects_unconfirmed_key_model() {
         Some(json!({
             "ddl": "CREATE TABLE `shop`.`orders` (…) DUPLICATE KEY(`order_id`)",
             "keyModel": "unique"
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{b}");
+    assert_eq!(b["error"]["code"], "KEY_MODEL_MISMATCH");
+
+    // a text carrying BOTH key-clause keywords (the other one smuggled in a
+    // comment) is not a draft this console produced — refused even though the
+    // confirmed keyword is present somewhere in it
+    let (s, b) = req(
+        &app,
+        "POST",
+        &path,
+        Some(json!({
+            "ddl": "-- UNIQUE KEY considered\nCREATE TABLE `shop`.`orders` (…) DUPLICATE KEY(`order_id`)",
+            "keyModel": "duplicate"
         })),
     )
     .await;

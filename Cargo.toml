@@ -63,6 +63,19 @@ strip = true
 [profile.dev.package."*"]
 debug = "line-tables-only"
 
+# R6 review round, machine-gate fix #2: the guard above thins only the
+# DEPENDENCIES — the workspace's own crates still compiled full debuginfo
+# into `cargo test`'s link fan-out (~30 test binaries × the whole executor
+# stack, target/debug alone grew past 27GiB and ld died with errno=28
+# twice, cold or warm). Extend the same trim to the TEST profile as a
+# whole: `cargo build`/`cargo run` keep the dev-profile behaviour above
+# (workspace crates with full debug for breakpoint debugging); only the
+# test-target builds — the gate's fan-out — go line-tables-only. Backtraces
+# keep file:line. Override locally with CARGO_PROFILE_TEST_DEBUG=2 when a
+# test needs stepping through with full variable info.
+[profile.test]
+debug = "line-tables-only"
+
 # ---------------------------------------------------------------------------
 # Shared dependency version table (single fact source).
 # Engine side: copied from the original engine workspace, do not bump ad hoc.
