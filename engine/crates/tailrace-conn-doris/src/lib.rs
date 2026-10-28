@@ -489,23 +489,27 @@ impl DorisSink {
 
     /// Partial-column update mode (A7): `subset` names the columns every
     /// stream load writes. Enabling (1) adds the `partial_columns: true`
-    /// load header and (2) narrows the carrier to the subset — the
-    /// positional contract is unchanged (batch column i is emitted under
-    /// `subset[i]`), so the plan's SELECT must project exactly the subset,
-    /// in declaration order, same as the full-column contract. Doris
-    /// merges the written keys into existing UNIQUE KEY merge-on-write
-    /// rows; unlisted columns keep their previous values.
+    /// load header together with a `columns` header listing the subset
+    /// (both are required — see the flush-side note; without `columns`
+    /// Doris nulls the unlisted columns), and (2) narrows the carrier to
+    /// the subset — the positional contract is unchanged (batch column i
+    /// is emitted under `subset[i]`), so the plan's SELECT must project
+    /// exactly the subset, in declaration order, same as the full-column
+    /// contract. Doris merges the written keys into existing UNIQUE KEY
+    /// merge-on-write rows; unlisted columns keep their previous values.
     ///
     /// Validated here (fail-fast at assembly, not mid-pipeline):
     /// - non-empty, duplicate-free (duplicates would emit colliding JSON
     ///   keys);
     /// - every name among the sink's declared columns;
-    /// - Doris 2.1 constraint: with a sequence column declared, the subset
-    ///   must CONTAIN it — a partial load derives merge ordering from the
-    ///   loaded sequence value, it cannot be recovered from the old row
-    ///   (a load without it fails server-side with "sequence column must
-    ///   be in the columns"; the constraint is enforced engine-side so
-    ///   the failure surfaces at deploy, not at 3am).
+    /// - with a sequence column declared, the subset must CONTAIN it. This
+    ///   is an engine-side safety margin, deliberately stricter than the
+    ///   server: doris 2.1.7 live-probed (W4) ACCEPTS a partial load whose
+    ///   `columns` omit the sequence column and keeps the row's old
+    ///   sequence value — but then the loaded row carries no ordering
+    ///   evidence of its own, so an out-of-order CDC change would merge
+    ///   unguarded. Requiring the value in every partial load keeps the
+    ///   dedup ordering explicit.
     ///
     /// The key columns of the table must also be inside the subset for
     /// Doris to match rows — that is a table-schema property the engine
@@ -538,8 +542,9 @@ impl DorisSink {
             anyhow::ensure!(
                 subset.iter().any(|c| c == seq),
                 "doris partial_update: sequence column {seq} must be inside the \
-                 partial subset — Doris 2.1 partial loads carry the sequence value \
-                 explicitly (merge ordering cannot be recovered from the old row)"
+                 partial subset — every partial load must carry its own sequence \
+                 value so the merge ordering stays explicit (engine-side rule; \
+                 add {seq} to the INSERT column list)"
             );
         }
         self.columns = subset;
@@ -622,13 +627,25 @@ impl DorisSink {
                         "sequence_column",
                         self.sequence_column.as_deref().unwrap_or(""),
                     );
-                // A7 partial-column update: with format=json the JSON keys
-                // ARE the column subset (no `columns` header needed — the
-                // carrier emits exactly the declared subset), so this one
-                // header is the whole request-shape delta. Doris-only: the
-                // factory rejects starrocks + partial_columns up front.
+                // A7 partial-column update: `partial_columns: true` PLUS an
+                // explicit `columns` header naming the subset. The header is
+                // not optional — live-probed on doris 2.1.7 (W4 e2e, raw
+                // stream loads): with format=json and NO `columns` header
+                // Doris resolves the written set to EVERY table column, the
+                // keys absent from the JSON become NULL, and the "partial"
+                // load silently nulls the unlisted columns of a UNIQUE KEY
+                // MoW row (Status Success, no warning). With `columns`
+                // listing the subset the unlisted columns keep their old
+                // values; extra JSON keys outside the list are ignored. The
+                // W2 mock pinned the header-less shape and passed — the
+                // request shape is only as right as the live run says.
+                // `self.columns` is the subset once `with_partial_columns`
+                // ran. Doris-only: the factory rejects starrocks +
+                // partial_columns up front.
                 if self.partial_update {
-                    req = req.header("partial_columns", "true");
+                    req = req
+                        .header("partial_columns", "true")
+                        .header("columns", self.columns.join(","));
                 }
             }
             let resp = req
@@ -1396,6 +1413,13 @@ mod tests {
             !head.contains("partial_columns"),
             "default must not send partial_columns: {head}"
         );
+        // no `columns` header either: the full-row request shape is the
+        // historical one, byte-for-byte (`\n`-anchored so the
+        // `sequence_column` header line cannot satisfy the match)
+        assert!(
+            !head.contains("\ncolumns:"),
+            "default must not send a columns header: {head}"
+        );
         let body = m.bodies.lock().unwrap()[0].clone();
         let body = std::str::from_utf8(&body)?;
         let v: serde_json::Value = serde_json::from_str(body.lines().next().expect("1 line"))?;
@@ -1403,7 +1427,7 @@ mod tests {
         assert_eq!(v["a"], "v-a");
         assert_eq!(v["b"], "v-b", "full-row carrier: every column rides");
 
-        // —— on: header + subset carrier + capability flip ——
+        // —— on: both headers + subset carrier + capability flip ——
         let m = MockDoris::start(vec![(200, r#"{"Status":"Success"}"#.into())]);
         let mut sink = DorisSink::new(m.url(), "Basic dGVzdDp0ZXN0", full, "puon")
             .with_partial_columns(vec!["k".into(), "a".into()])?;
@@ -1417,8 +1441,15 @@ mod tests {
             head.contains("partial_columns: true"),
             "partial mode must send the header: {head}"
         );
+        // the explicit column list is what makes Doris treat the load as a
+        // subset write (live-probed on 2.1.7: without it the unlisted
+        // columns are nulled) — the header names the subset, in order
+        assert!(
+            head.contains("\ncolumns: k,a\r\n"),
+            "partial mode must send the columns header naming the subset: {head}"
+        );
         // the other Doris load headers stay (format/read_json_by_line ride
-        // unchanged — partial is a one-header delta on the same carrier)
+        // unchanged — partial is a two-header delta on the same carrier)
         assert!(head.contains("read_json_by_line: true"));
         assert!(head.contains("format: json"));
         let body = m.bodies.lock().unwrap()[0].clone();
@@ -1433,15 +1464,14 @@ mod tests {
         Ok(())
     }
 
-    /// A7 × sequence column (Doris 2.1 semantic constraint): a partial load
-    /// derives merge ordering from the LOADED sequence value — it cannot be
-    /// recovered from the old row — so Doris requires the sequence column
-    /// inside the imported columns. The engine enforces that at assembly
-    /// (fail-fast at deploy instead of Doris' mid-pipeline load error);
-    /// when the subset DOES carry it, the request locks both headers riding
-    /// together. (Live infeasibility note: the W2 suite has no live Doris —
-    /// the real-behavior matrix is the W4 e2e; this locks the request
-    /// shape the documented constraint demands.)
+    /// A7 × sequence column: the subset must carry the declared sequence
+    /// column — an engine-side safety margin (doris 2.1.7 live-probed in W4
+    /// accepts a partial load without it and keeps the old sequence value,
+    /// which leaves the loaded change without ordering evidence of its own;
+    /// the engine refuses the shape at assembly so the gap surfaces at
+    /// deploy). When the subset DOES carry it, the request locks the three
+    /// headers riding together: sequence_column, partial_columns and the
+    /// `columns` list that includes the sequence column.
     #[test]
     fn partial_update_with_sequence_column_combination() -> anyhow::Result<()> {
         let mk = |cols: &[(&str, DataType)]| -> anyhow::Result<RecordBatch> {
@@ -1459,7 +1489,7 @@ mod tests {
             )?)
         };
         // ① sequence column OUTSIDE the subset → assembly-time rejection
-        //    (Doris 2.1: partial loads must carry the sequence value)
+        //    (engine safety margin, see the test doc)
         let err = DorisSink::with_sequence(
             "http://127.0.0.1:1/",
             "auth",
@@ -1476,8 +1506,8 @@ mod tests {
             "{err}"
         );
 
-        // ② sequence column INSIDE the subset → both headers ride together,
-        //    the sequence value is in the carrier
+        // ② sequence column INSIDE the subset → the three headers ride
+        //    together, the sequence value is in the carrier
         let m = MockDoris::start(vec![(200, r#"{"Status":"Success"}"#.into())]);
         let mut sink = DorisSink::with_sequence(
             m.url(),
@@ -1495,6 +1525,7 @@ mod tests {
         let head = m.heads.lock().unwrap()[0].clone();
         assert!(head.contains("sequence_column: seq"), "{head}");
         assert!(head.contains("partial_columns: true"), "{head}");
+        assert!(head.contains("\ncolumns: k,seq\r\n"), "{head}");
         let body = m.bodies.lock().unwrap()[0].clone();
         let body = std::str::from_utf8(&body)?;
         let v: serde_json::Value = serde_json::from_str(body.lines().next().expect("1 line"))?;
@@ -1577,9 +1608,14 @@ mod tests {
         )?;
         sink.write(vec![rb])?;
         assert_eq!(sink.flush()?.rows, 1);
+        let head = m.heads.lock().unwrap()[0].clone();
         assert!(
-            m.heads.lock().unwrap()[0].contains("partial_columns: true"),
-            "the factory-declared subset rides the load header"
+            head.contains("partial_columns: true"),
+            "the factory-declared subset rides the load header: {head}"
+        );
+        assert!(
+            head.contains("\ncolumns: k,a\r\n"),
+            "the factory-declared subset rides the columns header: {head}"
         );
 
         // no declaration → the historical full-row sink
