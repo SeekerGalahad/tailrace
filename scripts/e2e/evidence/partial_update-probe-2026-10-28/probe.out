@@ -1,0 +1,340 @@
+=========== A: UNIQUE MoW, no sequence col ===========
+--- A load1 full ---
+{
+    "TxnId": 2,
+    "Label": "a_full_16997",
+    "Comment": "",
+    "TwoPhaseCommit": "false",
+    "Status": "Success",
+    "Message": "OK",
+    "NumberTotalRows": 2,
+    "NumberLoadedRows": 2,
+    "NumberFilteredRows": 0,
+    "NumberUnselectedRows": 0,
+    "LoadBytes": 133,
+    "LoadTimeMs": 1308,
+    "BeginTxnTimeMs": 104,
+    "StreamLoadPutTimeMs": 374,
+    "ReadDataTimeMs": 0,
+    "WriteDataTimeMs": 668,
+    "ReceiveDataTimeMs": 532,
+    "CommitAndPublishTimeMs": 149
+}
+
+order_no	qty	note	price	flag
+A-1	1	first	1.5	1
+A-2	2	first	2.5	0
+--- A load2 partial (order_no,qty) ---
+{
+    "TxnId": 3,
+    "Label": "a_part_11476",
+    "Comment": "",
+    "TwoPhaseCommit": "false",
+    "Status": "Success",
+    "Message": "OK",
+    "NumberTotalRows": 2,
+    "NumberLoadedRows": 2,
+    "NumberFilteredRows": 0,
+    "NumberUnselectedRows": 0,
+    "LoadBytes": 58,
+    "LoadTimeMs": 232,
+    "BeginTxnTimeMs": 2,
+    "StreamLoadPutTimeMs": 18,
+    "ReadDataTimeMs": 0,
+    "WriteDataTimeMs": 67,
+    "ReceiveDataTimeMs": 24,
+    "CommitAndPublishTimeMs": 143
+}
+
+order_no	qty	note	price	flag
+A-1	100	NULL	NULL	NULL
+A-2	200	NULL	NULL	NULL
+--- A load3 partial WITHOUT partial_columns header (regression: full-replace nulls?) ---
+{
+    "TxnId": 4,
+    "Label": "a_nopart_12175",
+    "Comment": "",
+    "TwoPhaseCommit": "false",
+    "Status": "Success",
+    "Message": "OK",
+    "NumberTotalRows": 1,
+    "NumberLoadedRows": 1,
+    "NumberFilteredRows": 0,
+    "NumberUnselectedRows": 0,
+    "LoadBytes": 29,
+    "LoadTimeMs": 119,
+    "BeginTxnTimeMs": 1,
+    "StreamLoadPutTimeMs": 4,
+    "ReadDataTimeMs": 0,
+    "WriteDataTimeMs": 53,
+    "ReceiveDataTimeMs": 7,
+    "CommitAndPublishTimeMs": 58
+}
+
+order_no	qty	note	price	flag
+A-1	111	NULL	NULL	NULL
+A-2	200	NULL	NULL	NULL
+--- A load4 partial missing KEY column (qty,note only) ---
+{
+    "TxnId": 5,
+    "Label": "a_nokey_14377",
+    "Comment": "",
+    "TwoPhaseCommit": "false",
+    "Status": "Fail",
+    "Message": "[DATA_QUALITY_ERROR]too many filtered rows",
+    "NumberTotalRows": 1,
+    "NumberLoadedRows": 0,
+    "NumberFilteredRows": 1,
+    "NumberUnselectedRows": 0,
+    "LoadBytes": 25,
+    "LoadTimeMs": 20,
+    "BeginTxnTimeMs": 2,
+    "StreamLoadPutTimeMs": 7,
+    "ReadDataTimeMs": 0,
+    "WriteDataTimeMs": 9,
+    "ReceiveDataTimeMs": 12,
+    "CommitAndPublishTimeMs": 0,
+    "ErrorURL": "http://172.28.0.3:8040/api/_load_error_log?file=__shard_0/error_log_insert_stmt_d24bc52f15da2df0-c90bd0fb354e19b9_d24bc52f15da2df0_c90bd0fb354e19b9"
+}
+
+--- A load5 partial NEW key (upsert insert path: unlisted cols → NULL/default) ---
+{
+    "TxnId": 6,
+    "Label": "a_new_10906",
+    "Comment": "",
+    "TwoPhaseCommit": "false",
+    "Status": "Success",
+    "Message": "OK",
+    "NumberTotalRows": 1,
+    "NumberLoadedRows": 1,
+    "NumberFilteredRows": 0,
+    "NumberUnselectedRows": 0,
+    "LoadBytes": 27,
+    "LoadTimeMs": 156,
+    "BeginTxnTimeMs": 1,
+    "StreamLoadPutTimeMs": 5,
+    "ReadDataTimeMs": 0,
+    "WriteDataTimeMs": 57,
+    "ReceiveDataTimeMs": 8,
+    "CommitAndPublishTimeMs": 90
+}
+
+order_no	qty	note	price	flag
+A-1	111	NULL	NULL	NULL
+A-2	200	NULL	NULL	NULL
+A-3	3	NULL	NULL	NULL
+=========== B: DUPLICATE KEY + partial_columns ===========
+--- B partial load ---
+{
+    "TxnId": 7,
+    "Label": "b_part_5193",
+    "Comment": "",
+    "TwoPhaseCommit": "false",
+    "Status": "Fail",
+    "Message": "[ANALYSIS_ERROR]TStatus: errCode = 2, detailMessage = Only unique key merge on write support partial update",
+    "NumberTotalRows": 0,
+    "NumberLoadedRows": 0,
+    "NumberFilteredRows": 0,
+    "NumberUnselectedRows": 0,
+    "LoadBytes": 0,
+    "LoadTimeMs": 0,
+    "BeginTxnTimeMs": 0,
+    "StreamLoadPutTimeMs": 6,
+    "ReadDataTimeMs": 0,
+    "WriteDataTimeMs": 0,
+    "ReceiveDataTimeMs": 0,
+    "CommitAndPublishTimeMs": 0
+}
+
+=========== B2: UNIQUE MoR (merge_on_write=false) + partial_columns ===========
+--- B2 partial load ---
+{
+    "TxnId": 8,
+    "Label": "b2_part_9192",
+    "Comment": "",
+    "TwoPhaseCommit": "false",
+    "Status": "Fail",
+    "Message": "[ANALYSIS_ERROR]TStatus: errCode = 2, detailMessage = Only unique key merge on write support partial update",
+    "NumberTotalRows": 0,
+    "NumberLoadedRows": 0,
+    "NumberFilteredRows": 0,
+    "NumberUnselectedRows": 0,
+    "LoadBytes": 0,
+    "LoadTimeMs": 0,
+    "BeginTxnTimeMs": 1,
+    "StreamLoadPutTimeMs": 2,
+    "ReadDataTimeMs": 0,
+    "WriteDataTimeMs": 0,
+    "ReceiveDataTimeMs": 0,
+    "CommitAndPublishTimeMs": 0
+}
+
+=========== C: UNIQUE MoW + function_column.sequence_col=seq ===========
+--- C load1 full (no header) ---
+{
+    "TxnId": 9,
+    "Label": "c_full_29103",
+    "Comment": "",
+    "TwoPhaseCommit": "false",
+    "Status": "Success",
+    "Message": "OK",
+    "NumberTotalRows": 1,
+    "NumberLoadedRows": 1,
+    "NumberFilteredRows": 0,
+    "NumberUnselectedRows": 0,
+    "LoadBytes": 51,
+    "LoadTimeMs": 258,
+    "BeginTxnTimeMs": 1,
+    "StreamLoadPutTimeMs": 7,
+    "ReadDataTimeMs": 0,
+    "WriteDataTimeMs": 104,
+    "ReceiveDataTimeMs": 9,
+    "CommitAndPublishTimeMs": 145
+}
+
+order_no	seq	qty	note
+C-1	10	1	first
+--- C load2 partial with seq=20 + sequence_column header ---
+{
+    "TxnId": 10,
+    "Label": "c_hi_7840",
+    "Comment": "",
+    "TwoPhaseCommit": "false",
+    "Status": "Success",
+    "Message": "OK",
+    "NumberTotalRows": 1,
+    "NumberLoadedRows": 1,
+    "NumberFilteredRows": 0,
+    "NumberUnselectedRows": 0,
+    "LoadBytes": 38,
+    "LoadTimeMs": 105,
+    "BeginTxnTimeMs": 1,
+    "StreamLoadPutTimeMs": 3,
+    "ReadDataTimeMs": 0,
+    "WriteDataTimeMs": 39,
+    "ReceiveDataTimeMs": 6,
+    "CommitAndPublishTimeMs": 61
+}
+
+order_no	seq	qty	note
+C-1	20	100	NULL
+--- C load3 partial with LOWER seq=5 (should be ignored by ordering) ---
+{
+    "TxnId": 11,
+    "Label": "c_lo_26334",
+    "Comment": "",
+    "TwoPhaseCommit": "false",
+    "Status": "Success",
+    "Message": "OK",
+    "NumberTotalRows": 1,
+    "NumberLoadedRows": 1,
+    "NumberFilteredRows": 0,
+    "NumberUnselectedRows": 0,
+    "LoadBytes": 37,
+    "LoadTimeMs": 333,
+    "BeginTxnTimeMs": 1,
+    "StreamLoadPutTimeMs": 7,
+    "ReadDataTimeMs": 0,
+    "WriteDataTimeMs": 67,
+    "ReceiveDataTimeMs": 12,
+    "CommitAndPublishTimeMs": 257
+}
+
+order_no	seq	qty	note
+C-1	20	100	NULL
+--- C load4 partial WITHOUT seq in payload (engine refuses this shape; Doris verdict:) ---
+{
+    "TxnId": 12,
+    "Label": "c_noseq_303",
+    "Comment": "",
+    "TwoPhaseCommit": "false",
+    "Status": "Success",
+    "Message": "OK",
+    "NumberTotalRows": 1,
+    "NumberLoadedRows": 1,
+    "NumberFilteredRows": 0,
+    "NumberUnselectedRows": 0,
+    "LoadBytes": 29,
+    "LoadTimeMs": 636,
+    "BeginTxnTimeMs": 1,
+    "StreamLoadPutTimeMs": 8,
+    "ReadDataTimeMs": 0,
+    "WriteDataTimeMs": 226,
+    "ReceiveDataTimeMs": 11,
+    "CommitAndPublishTimeMs": 398
+}
+
+--- C load5 partial with seq in payload but NO sequence_column header ---
+{
+    "TxnId": 13,
+    "Label": "c_nohdr_32658",
+    "Comment": "",
+    "TwoPhaseCommit": "false",
+    "Status": "Success",
+    "Message": "OK",
+    "NumberTotalRows": 1,
+    "NumberLoadedRows": 1,
+    "NumberFilteredRows": 0,
+    "NumberUnselectedRows": 0,
+    "LoadBytes": 38,
+    "LoadTimeMs": 219,
+    "BeginTxnTimeMs": 1,
+    "StreamLoadPutTimeMs": 3,
+    "ReadDataTimeMs": 0,
+    "WriteDataTimeMs": 100,
+    "ReceiveDataTimeMs": 5,
+    "CommitAndPublishTimeMs": 113
+}
+
+order_no	seq	qty	note
+C-1	20	100	NULL
+=========== D: UNIQUE MoW WITHOUT sequence_col property, load sends sequence_column header ===========
+--- D load1 full + sequence_column header ---
+{
+    "TxnId": 14,
+    "Label": "d_full_25324",
+    "Comment": "",
+    "TwoPhaseCommit": "false",
+    "Status": "Success",
+    "Message": "OK",
+    "NumberTotalRows": 1,
+    "NumberLoadedRows": 1,
+    "NumberFilteredRows": 0,
+    "NumberUnselectedRows": 0,
+    "LoadBytes": 51,
+    "LoadTimeMs": 347,
+    "BeginTxnTimeMs": 1,
+    "StreamLoadPutTimeMs": 5,
+    "ReadDataTimeMs": 0,
+    "WriteDataTimeMs": 65,
+    "ReceiveDataTimeMs": 9,
+    "CommitAndPublishTimeMs": 274
+}
+
+--- D load2 partial + sequence_column header ---
+{
+    "TxnId": 15,
+    "Label": "d_part_1055",
+    "Comment": "",
+    "TwoPhaseCommit": "false",
+    "Status": "Success",
+    "Message": "OK",
+    "NumberTotalRows": 1,
+    "NumberLoadedRows": 1,
+    "NumberFilteredRows": 0,
+    "NumberUnselectedRows": 0,
+    "LoadBytes": 38,
+    "LoadTimeMs": 240,
+    "BeginTxnTimeMs": 0,
+    "StreamLoadPutTimeMs": 4,
+    "ReadDataTimeMs": 0,
+    "WriteDataTimeMs": 100,
+    "ReceiveDataTimeMs": 6,
+    "CommitAndPublishTimeMs": 134
+}
+
+order_no	seq	qty	note
+C-1	20	100	NULL
+--- D: can ALTER add sequence_col property? ---
+"function_column.sequence_type" = "bigint",
+=========== DONE ===========
