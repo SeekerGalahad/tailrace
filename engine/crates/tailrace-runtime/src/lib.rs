@@ -588,7 +588,15 @@ impl PipelineRunner {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .load(pipeline_id, idx)?; // open = restore (cursor passed to source.open)
-            let sink_cols = sink_obj.columns.iter().map(|(n, _)| n.clone()).collect();
+                                          // A7 partial-column update: a declared subset narrows the write
+                                          // shape — the transform must project exactly this subset (ordered,
+                                          // same contract as full columns) and the sink writes only it,
+                                          // unlisted columns keeping their existing values server-side. The
+                                          // doris factory validated the subset at build_sink time (above).
+            let sink_cols = sink_obj
+                .partial_columns
+                .clone()
+                .unwrap_or_else(|| sink_obj.columns.iter().map(|(n, _)| n.clone()).collect());
             let dlq = (bad_row_policy == BadRowPolicy::Dlq)
                 .then(|| dlq::BadRowDlq::new(state_dir, pipeline_id, idx));
             statements.push(StatementRuntime {

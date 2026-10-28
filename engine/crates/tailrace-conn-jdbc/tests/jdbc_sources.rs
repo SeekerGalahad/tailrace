@@ -41,6 +41,7 @@ fn jdbc_obj(url: &str, table: &str, cursor_col: &str) -> TableObject {
         auth_env: None,
         label_prefix: None,
         sequence_column: Some(cursor_col.into()),
+        partial_columns: None,
     }
 }
 

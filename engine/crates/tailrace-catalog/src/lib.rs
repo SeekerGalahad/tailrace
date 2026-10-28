@@ -58,6 +58,16 @@ pub struct TableObject {
     /// absent = not declared)
     #[serde(default)]
     pub sequence_column: Option<String>,
+    /// Partial-column update declaration (A7): the subset of `columns`
+    /// each stream load writes. Some(non-empty subset) puts the doris sink
+    /// into `partial_columns=true` mode — Doris merges the written keys
+    /// into existing UNIQUE KEY merge-on-write rows, unlisted columns keep
+    /// their previous values (CDC upsert shape: ogg/debezium sources that
+    /// only carry the changed columns). None = full-row writes, the
+    /// historical default. Validated at sink assembly (subset ⊆ columns,
+    /// sequence column inside the subset when declared).
+    #[serde(default)]
+    pub partial_columns: Option<Vec<String>>,
 }
 
 fn default_kind() -> String {
@@ -239,6 +249,10 @@ pub struct TableSpec {
     /// UNIQUE key, used as the full-table load pagination key)
     #[serde(default)]
     pub sequence_column: Option<String>,
+    /// Doris partial-column update subset (A7; doris-kind table objects
+    /// only — see TableObject.partial_columns)
+    #[serde(default)]
+    pub partial_columns: Option<Vec<String>>,
 }
 
 /// Catalog backend trait (all backends the same shape — the golden-set parity
@@ -300,6 +314,7 @@ impl CatalogProvider for FileCatalog {
                 .map(|p| format!("{p}-{}", self.spec.pipeline.id))
                 .clone(),
             sequence_column: tbl.sequence_column.clone(),
+            partial_columns: tbl.partial_columns.clone(),
         })
     }
 
@@ -428,6 +443,10 @@ impl CatalogProvider for ControlPlaneCatalog {
             auth_env: None,
             label_prefix: None,
             sequence_column: None,
+            // A7 partial-column declaration is console metadata — not yet
+            // carried by the managed datasource API (skeleton catalog; W3
+            // wires the console side)
+            partial_columns: None,
         })
     }
     fn statements(&self) -> anyhow::Result<Vec<StatementSpec>> {
@@ -490,6 +509,11 @@ pub struct PlanTableObject {
     /// table metadata)
     #[serde(default)]
     pub sequence_column: Option<String>,
+    /// Doris partial-column update subset (A7; filled by the console from
+    /// the plan's sink-side declaration — serde-default keeps pre-A7 plan
+    /// bodies valid)
+    #[serde(default)]
+    pub partial_columns: Option<Vec<String>>,
 }
 
 /// Plan catalog backend: statements + the table object list (HashMap indexed,
@@ -571,6 +595,7 @@ impl CatalogProvider for PlanCatalog {
             auth_env: t.auth_env.clone(),
             label_prefix: Some(format!("p{}", self.pipeline_id)),
             sequence_column: t.sequence_column.clone(),
+            partial_columns: t.partial_columns.clone(),
         })
     }
 
@@ -715,6 +740,88 @@ name = "dim_d"
         Ok(())
     }
 
+    /// A7: the partial-column subset declared at plan level (toml table /
+    /// plan-body table object) rides resolve() verbatim — None (the
+    /// serde-default) keeps pre-A7 declarations meaning full-row writes.
+    #[test]
+    fn partial_columns_flow_through_catalogs() -> anyhow::Result<()> {
+        // FileCatalog: toml `partial_columns = [...]` on the sink table
+        let dir = std::env::temp_dir().join(format!("tailrace-cat-pu-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let f = dir.join("pu.toml");
+        std::fs::write(
+            &f,
+            r#"
+[pipeline]
+id = 44
+name = "partial-demo"
+
+[[datasource]]
+name = "d"
+type = "doris"
+stream_load_url = "http://127.0.0.1:8040/api/db/t/_stream_load"
+auth_env = "TAILRACE_TEST_AUTH"
+
+[[table]]
+datasource = "d"
+name = "orders"
+kind = "doris"
+columns = [["order_no", "utf8"], ["qty", "int64"], ["note", "utf8"]]
+sequence_column = "seq"
+
+[[table]]
+datasource = "d"
+name = "orders_partial"
+kind = "doris"
+columns = [["order_no", "utf8"], ["seq", "int64"], ["qty", "int64"], ["note", "utf8"]]
+sequence_column = "seq"
+partial_columns = ["order_no", "seq", "qty"]
+
+[[statement]]
+source = "d.orders"
+group = "tr.p44.s0"
+sink = "d.orders_partial"
+select_sql = "SELECT order_no, seq, qty FROM src"
+"#,
+        )?;
+        let cat = FileCatalog::load(&f)?;
+        assert_eq!(
+            cat.resolve("d.orders")?.partial_columns,
+            None,
+            "no declaration = full-row writes (the default)"
+        );
+        assert_eq!(
+            cat.resolve("d.orders_partial")?.partial_columns,
+            Some(vec![
+                "order_no".to_string(),
+                "seq".to_string(),
+                "qty".to_string()
+            ]),
+            "the declared subset rides the table object"
+        );
+        std::fs::remove_dir_all(&dir)?;
+
+        // PlanCatalog: the console-pushed plan body carries the same field
+        // (serde-default keeps pre-A7 plan bodies valid)
+        let table = PlanTableObject {
+            reference: "1.db.orders_partial".into(),
+            kind: "doris".into(),
+            format: None,
+            columns: vec![("order_no".into(), "utf8".into())],
+            bootstrap: None,
+            stream_load_url: None,
+            auth_env: None,
+            sequence_column: None,
+            partial_columns: Some(vec!["order_no".into()]),
+        };
+        let plan = PlanCatalog::new(9, cat.statements()?, vec![table]);
+        assert_eq!(
+            plan.resolve("1.db.orders_partial")?.partial_columns,
+            Some(vec!["order_no".to_string()])
+        );
+        Ok(())
+    }
+
     /// T-D1: the plan preflight (`missing_tables`) counts dim references — a
     /// dim join whose table object metadata did not ride with the plan
     /// rejects the whole plan up front (not at first assembly).
@@ -741,6 +848,7 @@ name = "dim_d"
             stream_load_url: None,
             auth_env: None,
             sequence_column: None,
+            partial_columns: None,
         };
         // source/sink present, dim metadata missing → the dim reference is
         // the reported gap

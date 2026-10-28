@@ -553,6 +553,7 @@ mod tests {
             auth_env: None,
             label_prefix: None,
             sequence_column: None,
+            partial_columns: None,
         }
     }
 

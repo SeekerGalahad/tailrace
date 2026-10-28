@@ -77,6 +77,7 @@ pub type SinkFactory =
 ///     auth_env: None,
 ///     label_prefix: None,
 ///     sequence_column: None,
+///     partial_columns: None,
 /// };
 /// let spec = StatementSpec {
 ///     source: "ds.t".into(),
@@ -181,6 +182,7 @@ mod tests {
             auth_env: None,
             label_prefix: None,
             sequence_column: None,
+            partial_columns: None,
         };
         let err = match reg.build_source(&obj, &spec(), None) {
             Err(e) => e.to_string(),

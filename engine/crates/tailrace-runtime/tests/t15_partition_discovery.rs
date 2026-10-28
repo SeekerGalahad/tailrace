@@ -277,6 +277,7 @@ fn t15_tables(topic: &str, sink_ref: &str, sink_kind: &str) -> Vec<PlanTableObje
             stream_load_url: None,
             auth_env: None,
             sequence_column: None,
+            partial_columns: None,
         },
         PlanTableObject {
             reference: sink_ref.into(),
@@ -290,6 +291,7 @@ fn t15_tables(topic: &str, sink_ref: &str, sink_kind: &str) -> Vec<PlanTableObje
             stream_load_url: None,
             auth_env: None,
             sequence_column: None,
+            partial_columns: None,
         },
     ]
 }

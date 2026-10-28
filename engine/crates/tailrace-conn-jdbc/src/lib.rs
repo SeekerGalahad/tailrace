@@ -960,6 +960,7 @@ mod tests {
             auth_env: None,
             label_prefix: None,
             sequence_column: seq.map(str::to_string),
+            partial_columns: None,
         };
         let spec = StatementSpec {
             source: "ds.orders".into(),

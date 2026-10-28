@@ -38,6 +38,7 @@ fn file_tables() -> Vec<tailrace_catalog::PlanTableObject> {
             stream_load_url: None,
             auth_env: None,
             sequence_column: None,
+            partial_columns: None,
         },
         tailrace_catalog::PlanTableObject {
             reference: "1.local.orders_out".into(),
@@ -48,6 +49,7 @@ fn file_tables() -> Vec<tailrace_catalog::PlanTableObject> {
             stream_load_url: None,
             auth_env: None,
             sequence_column: None,
+            partial_columns: None,
         },
     ]
 }

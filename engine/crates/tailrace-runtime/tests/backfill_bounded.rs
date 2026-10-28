@@ -104,6 +104,7 @@ fn bf_tables(sink_name: &str) -> Vec<PlanTableObject> {
             stream_load_url: None,
             auth_env: None,
             sequence_column: None,
+            partial_columns: None,
         },
         PlanTableObject {
             reference: format!("1.local.{sink_name}"),
@@ -114,6 +115,7 @@ fn bf_tables(sink_name: &str) -> Vec<PlanTableObject> {
             stream_load_url: None,
             auth_env: None,
             sequence_column: None,
+            partial_columns: None,
         },
     ]
 }
