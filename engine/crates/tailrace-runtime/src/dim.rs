@@ -97,8 +97,8 @@ pub fn load_dim(
     let schema = Arc::new(Schema::new(
         obj.columns
             .iter()
-            .map(|(n, t)| Field::new(n.clone(), arrow_type(t), true))
-            .collect::<Vec<_>>(),
+            .map(|(n, t)| Ok(Field::new(n.clone(), arrow_type(n, t)?, true)))
+            .collect::<anyhow::Result<Vec<_>>>()?,
     ));
     // bridge to the JDBC source factory through the registry (kind rewrite —
     // dim is the catalog kind, jdbc is the connector kind that serves it)

@@ -3,6 +3,8 @@
 //! Iron rule: **the IR never carries credentials** (references are catalog
 //! anchors only); `debug_sql_echo` is diagnostic echo and never executed.
 
+pub mod column_type;
+pub use column_type::{arrow_type_or_utf8, ColumnType, UNKNOWN_TYPE_UTF8_MIGRATION_WINDOW};
 pub mod placeholder;
 pub use placeholder::{IrCodec, SrcPlaceholderTable};
 
@@ -60,13 +62,16 @@ pub fn build_exec_plan(
                         src_columns
                             .iter()
                             .map(|(n, t)| {
-                                datafusion::arrow::datatypes::Field::new(
+                                // G2: vocabulary goes through ColumnType::parse
+                                // (16 words, blueprint §7.1) — unknown words
+                                // warn + fold to Utf8 for one minor version
+                                Ok(datafusion::arrow::datatypes::Field::new(
                                     n.clone(),
-                                    arrow_type(t),
+                                    arrow_type_or_utf8(n, t)?,
                                     true,
-                                )
+                                ))
                             })
-                            .collect::<Vec<_>>(),
+                            .collect::<anyhow::Result<Vec<_>>>()?,
                     );
                     placeholder::register_src(&ctx, std::sync::Arc::new(schema))?;
                     let df = ctx.sql(select_sql).await?;
@@ -137,15 +142,6 @@ fn build_plan(select_sql: &str, src_columns: &[(String, String)]) -> anyhow::Res
         other => Ok(datafusion::common::tree_node::Transformed::no(other)),
     })?;
     Ok(plan.data)
-}
-
-fn arrow_type(t: &str) -> datafusion::arrow::datatypes::DataType {
-    match t {
-        "int64" => datafusion::arrow::datatypes::DataType::Int64,
-        "float64" => datafusion::arrow::datatypes::DataType::Float64,
-        "bool" => datafusion::arrow::datatypes::DataType::Boolean,
-        _ => datafusion::arrow::datatypes::DataType::Utf8,
-    }
 }
 
 // ==== Cursor/SourceChunk contract (the runtime-side read cursors) ====
@@ -276,6 +272,157 @@ mod tests {
             summary.contains("ORD-1") && summary.contains("30"),
             "{summary}"
         );
+        assert!(!summary.contains("ORD-2"), "D rows must be filtered");
+        Ok(())
+    }
+
+    /// G2 (R8, blueprint §7.7): golden coverage for the parameterized type
+    /// words. The original layer A/B fixtures stay untouched (the 4-legacy-
+    /// word regression anchor); these wide twins carry `decimal(18,2)` and
+    /// `timestamp(us)` columns through the same SQL→IR→execution path.
+    fn wide_cols() -> Vec<(String, String)> {
+        vec![
+            ("op_type".to_string(), "utf8".to_string()),
+            ("order_no".to_string(), "utf8".to_string()),
+            ("amount".to_string(), "decimal(18,2)".to_string()),
+            ("created_at".to_string(), "timestamp(us)".to_string()),
+        ]
+    }
+
+    const WIDE_SQL: &str = "SELECT order_no, amount, created_at FROM src WHERE op_type <> 'D'";
+
+    /// Layer A wide (SQL→IR): the decimal/timestamp vocabulary plans, the
+    /// declared schema survives into the LogicalPlan byte-for-byte, and the
+    /// JSON carrier snapshot is stable.
+    #[test]
+    fn layer_a_wide_ir_json_snapshot() -> anyhow::Result<()> {
+        let b64 = plan_to_b64(WIDE_SQL, &wide_cols())?;
+        assert!(!b64.is_empty(), "proto serialization must succeed");
+        // readable schema anchor: the parameterized words reached the plan
+        // as Decimal128(18,2) / Timestamp(Microsecond, None), not Utf8 folds
+        let plan = build_plan(WIDE_SQL, &wide_cols())?;
+        let schema = plan.schema();
+        let amount = schema.field_with_name(None, "amount")?;
+        assert_eq!(
+            amount.data_type(),
+            &datafusion::arrow::datatypes::DataType::Decimal128(18, 2)
+        );
+        let created_at = schema.field_with_name(None, "created_at")?;
+        assert_eq!(
+            created_at.data_type(),
+            &datafusion::arrow::datatypes::DataType::Timestamp(
+                datafusion::arrow::datatypes::TimeUnit::Microsecond,
+                None
+            )
+        );
+        let ir = PipelineIr {
+            ir_version: IR_VERSION.to_string(),
+            pipeline_id: 42,
+            statements: vec![StatementIr {
+                source_ref: "12.default.orders_ogg".into(),
+                sink_ref: "3.shop.orders".into(),
+                group: "tr.p42.s0".into(),
+                pushdown: vec!["I".into(), "U".into()],
+                proto_plan_b64: b64,
+                debug_sql_echo: WIDE_SQL.into(),
+            }],
+        };
+        let json = serde_json::to_string_pretty(&ir)?;
+        let fixture = "tests/golden_layer_a_wide.json";
+        if std::env::var("UPDATE_GOLDEN").is_ok() {
+            std::fs::write(fixture, &json)?;
+        }
+        let expected = std::fs::read_to_string(fixture)?;
+        assert_eq!(
+            json.trim(),
+            expected.trim(),
+            "layer A wide golden snapshot drifted (UPDATE_GOLDEN=1 to regenerate, review required)"
+        );
+        Ok(())
+    }
+
+    /// Layer B wide (IR→execution): decimal/timestamp values survive a real
+    /// DataFusion execution and pretty-print identically (the local
+    /// counterpart of the W5 file→doris precision e2e).
+    #[test]
+    fn layer_b_wide_execute_snapshot() -> anyhow::Result<()> {
+        use datafusion::arrow::array::{Decimal128Array, StringArray, TimestampMicrosecondArray};
+        use std::sync::Arc;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let summary = rt.block_on(async {
+            let ctx = SessionContext::new();
+            let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+                datafusion::arrow::datatypes::Field::new(
+                    "op_type",
+                    datafusion::arrow::datatypes::DataType::Utf8,
+                    true,
+                ),
+                datafusion::arrow::datatypes::Field::new(
+                    "order_no",
+                    datafusion::arrow::datatypes::DataType::Utf8,
+                    true,
+                ),
+                datafusion::arrow::datatypes::Field::new(
+                    "amount",
+                    datafusion::arrow::datatypes::DataType::Decimal128(18, 2),
+                    true,
+                ),
+                datafusion::arrow::datatypes::Field::new(
+                    "created_at",
+                    datafusion::arrow::datatypes::DataType::Timestamp(
+                        datafusion::arrow::datatypes::TimeUnit::Microsecond,
+                        None,
+                    ),
+                    true,
+                ),
+            ]));
+            let rb = datafusion::arrow::record_batch::RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(StringArray::from(vec!["I", "D", "U"])),
+                    Arc::new(StringArray::from(vec!["ORD-1", "ORD-2", "ORD-3"])),
+                    Arc::new(
+                        Decimal128Array::from(vec![Some(1999_i128), Some(-5_i128), Some(0_i128)])
+                            .with_data_type(datafusion::arrow::datatypes::DataType::Decimal128(
+                                18, 2,
+                            )),
+                    ),
+                    Arc::new(TimestampMicrosecondArray::from(vec![
+                        Some(1_i64),
+                        Some(2_i64),
+                        Some(3_i64),
+                    ])),
+                ],
+            )?;
+            ctx.register_batch("src", rb)?;
+            let df = ctx.sql(WIDE_SQL).await?;
+            let batches = df.collect().await?;
+            let mut out = String::new();
+            for b in &batches {
+                out.push_str(
+                    &datafusion::arrow::util::pretty::pretty_format_batches(std::slice::from_ref(
+                        b,
+                    ))?
+                    .to_string(),
+                );
+            }
+            Ok::<_, anyhow::Error>(out)
+        })?;
+        let fixture = "tests/golden_layer_b_wide.txt";
+        if std::env::var("UPDATE_GOLDEN").is_ok() {
+            std::fs::write(fixture, &summary)?;
+        }
+        let expected = std::fs::read_to_string(fixture)?;
+        assert_eq!(
+            summary.trim(),
+            expected.trim(),
+            "layer B wide execution snapshot drifted"
+        );
+        // decimal precision shape: 1999 with scale 2 renders as 19.99 — the
+        // 0.01-class value survives planning + execution unfolded
+        assert!(summary.contains("19.99"), "{summary}");
         assert!(!summary.contains("ORD-2"), "D rows must be filtered");
         Ok(())
     }

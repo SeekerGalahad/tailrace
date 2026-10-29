@@ -17,6 +17,8 @@ workspace = true
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
+# G2 (R8): the unknown-type migration window warns from column_type.rs
+tracing = { workspace = true }
 async-trait = "0.1"
 datafusion = { workspace = true }
 datafusion-proto = { workspace = true }

@@ -14,6 +14,18 @@
 pub mod plan_options;
 pub use plan_options::{PlanOptions, RecoveryOptions, ReliabilityOptions, TuningOptions};
 
+/// G2 (R8, blueprint §7.1): the 16-word column type vocabulary for
+/// `TableObject.columns` type strings. Canonical home is tailrace-ir (the
+/// wire-contract crate — this crate already depends on it, and the reverse
+/// placement would be a dependency cycle); re-exported here so the stable
+/// public path is `tailrace_catalog::ColumnType::parse` (blueprint G2:
+/// "arrow_type 迁至 tailrace-catalog::ColumnType::parse"). The two legacy
+/// `arrow_type` sites (runtime + ir) map through
+/// [`arrow_type_or_utf8`], which folds unknown words to Utf8 behind a
+/// one-minor-version warn window (const in tailrace-ir) instead of erroring
+/// on the spot.
+pub use tailrace_ir::column_type::{arrow_type_or_utf8, ColumnType};
+
 /// Table object, connection-side view (catalog resolution product; the caller
 /// fetches credentials by env name just-in-time and discards them).
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -622,6 +634,54 @@ impl CatalogProvider for PlanCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G2: the stable public path `tailrace_catalog::ColumnType::parse` is
+    /// live (canonical home tailrace-ir, re-exported here — blueprint G2
+    /// wording). Representative words across the 16-word vocabulary plus the
+    /// unknown-word fold through [`arrow_type_or_utf8`] (migration window:
+    /// warn + Utf8, never a silent hard error mid-window). The full 16-word
+    /// round-trip / illegal-input matrices live next to the parser in
+    /// tailrace-ir's column_type tests.
+    #[test]
+    fn column_type_vocabulary_reexport_path() {
+        use datafusion::arrow::datatypes::DataType;
+        use datafusion::arrow::datatypes::TimeUnit;
+
+        // legacy 4 words — the byte-compat anchor the two migrated
+        // arrow_type sites rely on
+        assert_eq!(
+            ColumnType::parse("utf8").unwrap().to_arrow(),
+            DataType::Utf8
+        );
+        assert_eq!(
+            ColumnType::parse("int64").unwrap().to_arrow(),
+            DataType::Int64
+        );
+        // new parameterized words reach catalog consumers unmodified
+        assert_eq!(
+            ColumnType::parse("decimal(18,2)").unwrap(),
+            ColumnType::Decimal {
+                precision: 18,
+                scale: 2
+            }
+        );
+        assert_eq!(
+            ColumnType::parse("timestamp(us)").unwrap(),
+            ColumnType::Timestamp(TimeUnit::Microsecond)
+        );
+        assert_eq!(
+            ColumnType::parse("decimal(18,2)").unwrap().to_string(),
+            "decimal(18,2)"
+        );
+        // strict parse: unknown words error
+        assert!(ColumnType::parse("varchar(64)").is_err());
+        // migration window fold (blueprint §7.6): same unknown word through
+        // the schema-construction entry lands Utf8, not an error
+        assert_eq!(
+            arrow_type_or_utf8("note", "varchar(64)").unwrap(),
+            DataType::Utf8
+        );
+    }
 
     #[test]
     fn file_catalog_resolves_and_statements() -> anyhow::Result<()> {

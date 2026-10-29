@@ -551,8 +551,8 @@ impl PipelineRunner {
                 src_obj
                     .columns
                     .iter()
-                    .map(|(n, t)| Field::new(n.clone(), arrow_type(t), true))
-                    .collect::<Vec<_>>(),
+                    .map(|(n, t)| Ok(Field::new(n.clone(), arrow_type(n, t)?, true)))
+                    .collect::<anyhow::Result<Vec<_>>>()?,
             ));
             // T-D1 broadcast join (blueprint D narrow path): dim tables load
             // FULL-TABLE over JDBC here — pipeline compile time, fail-fast
@@ -1511,13 +1511,15 @@ fn run_statement_bounded(
     Ok(stats)
 }
 
-fn arrow_type(t: &str) -> DataType {
-    match t {
-        "int64" => DataType::Int64,
-        "float64" => DataType::Float64,
-        "bool" => DataType::Boolean,
-        _ => DataType::Utf8,
-    }
+/// G2 (R8, blueprint §7.1): column vocabulary → arrow DataType through
+/// `tailrace_catalog::ColumnType::parse` (16 words: 4 legacy kept
+/// byte-compatible + 12 new). Unknown words warn (column name + known
+/// vocabulary) and fold to Utf8 for one minor version (migration window,
+/// blueprint §7.6) — behavior-identical to the pre-G2 `_ => Utf8` fallback
+/// arm, only the warn is new. When the window const in tailrace-ir flips,
+/// this returns the hard error callers already propagate via `?`.
+fn arrow_type(column: &str, t: &str) -> anyhow::Result<DataType> {
+    tailrace_catalog::arrow_type_or_utf8(column, t)
 }
 
 fn build_decoder(obj: &TableObject) -> anyhow::Result<Box<dyn Decoder>> {
@@ -1619,8 +1621,8 @@ mod tests {
         ];
         let schema = Arc::new(Schema::new(
             cols.iter()
-                .map(|(n, t)| Field::new(n.clone(), arrow_type(t), true))
-                .collect::<Vec<_>>(),
+                .map(|(n, t)| Ok(Field::new(n.clone(), arrow_type(n, t)?, true)))
+                .collect::<anyhow::Result<Vec<_>>>()?,
         ));
         let n = 4096; // → decode_workers ≥ 2 (floor is 512×2)
         assert!(
@@ -1773,8 +1775,8 @@ mod tests {
             let schema = Arc::new(Schema::new(
                 cols_for_batches
                     .iter()
-                    .map(|(n, t)| Field::new(n.clone(), arrow_type(t), true))
-                    .collect::<Vec<_>>(),
+                    .map(|(n, t)| Ok(Field::new(n.clone(), arrow_type(n, t)?, true)))
+                    .collect::<anyhow::Result<Vec<_>>>()?,
             ));
             let ops: Vec<String> = (0..rows)
                 .map(|i| if i % 2 == 0 { "I" } else { "D" }.to_string())
