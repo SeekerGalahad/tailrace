@@ -30,28 +30,12 @@ fn file_tables() -> Vec<tailrace_catalog::PlanTableObject> {
         ]
     };
     vec![
-        tailrace_catalog::PlanTableObject {
-            reference: "1.local.orders_in".into(),
-            kind: "file".into(),
-            format: Some("jsonl".into()),
-            columns: cols(),
-            bootstrap: None,
-            stream_load_url: None,
-            auth_env: None,
-            sequence_column: None,
-            partial_columns: None,
-        },
-        tailrace_catalog::PlanTableObject {
-            reference: "1.local.orders_out".into(),
-            kind: "file".into(),
-            format: Some("jsonl".into()),
-            columns: cols(),
-            bootstrap: None,
-            stream_load_url: None,
-            auth_env: None,
-            sequence_column: None,
-            partial_columns: None,
-        },
+        tailrace_catalog::PlanTableObject::new("1.local.orders_in", "file")
+            .with_format("jsonl")
+            .with_columns(cols()),
+        tailrace_catalog::PlanTableObject::new("1.local.orders_out", "file")
+            .with_format("jsonl")
+            .with_columns(cols()),
     ]
 }
 

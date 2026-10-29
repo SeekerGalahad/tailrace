@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use datafusion::arrow::datatypes::{Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
-use tailrace_catalog::{StatementSpec, TableObject};
+use tailrace_catalog::{option_keys, StatementSpec, TableObject};
 use tailrace_connector::{ConnectorRegistry, Cursor};
 use tailrace_decode::{ColBatch, Decoded, Decoder, JsonDecoder, Pushdown};
 
@@ -82,7 +82,7 @@ pub fn load_dim(
             obj.kind
         );
     }
-    if obj.sequence_column.is_none() {
+    if obj.option_str(option_keys::SEQUENCE_COLUMN).is_none() {
         anyhow::bail!(
             "dim table {registered_name} ({}.{}) requires `sequence_column` — the PRIMARY KEY / \
              single-column UNIQUE column used as the full-table load pagination key (broadcast join guard)",
@@ -208,22 +208,14 @@ mod tests {
     }
 
     fn dim_obj(overrides: impl FnOnce(&mut TableObject)) -> TableObject {
-        let mut o = TableObject {
-            datasource: "db".into(),
-            name: "dim_user".into(),
-            kind: "dim".into(),
-            format: Some("json".into()),
-            columns: vec![
+        let mut o = TableObject::new("db", "dim_user", "dim")
+            .with_format("json")
+            .with_columns(vec![
                 ("id".into(), "int64".into()),
                 ("name".into(), "utf8".into()),
-            ],
-            bootstrap: Some("mysql://root@localhost/test".into()),
-            stream_load_url: None,
-            auth_env: None,
-            label_prefix: None,
-            sequence_column: Some("id".into()),
-            partial_columns: None,
-        };
+            ])
+            .with_option(option_keys::BOOTSTRAP, "mysql://root@localhost/test")
+            .with_option(option_keys::SEQUENCE_COLUMN, "id");
         overrides(&mut o);
         o
     }
@@ -376,7 +368,9 @@ mod tests {
         .expect_err("non-dim kind must refuse");
         assert!(format!("{err:#}").contains("kind must be dim"), "{err:#}");
         let err = load_dim(
-            &dim_obj(|o| o.sequence_column = None),
+            &dim_obj(|o| {
+                o.options.remove(option_keys::SEQUENCE_COLUMN);
+            }),
             "dim_d",
             &spec(),
             &reg,

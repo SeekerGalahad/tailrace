@@ -276,9 +276,9 @@ impl PipelineRegistry {
         // time via --stream-load-hosts / TAILRACE_STREAM_LOAD_HOSTS)
         for t in tables.iter() {
             if let Some(url) = t
-                .stream_load_url
-                .as_deref()
-                .filter(|u| !u.trim().is_empty())
+                .option_str(tailrace_catalog::option_keys::STREAM_LOAD_URL)
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
             {
                 if !tailrace_catalog::stream_load_url_allowed(url, self.stream_load_hosts.as_ref())
                 {

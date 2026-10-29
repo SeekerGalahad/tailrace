@@ -1363,6 +1363,39 @@ pub(crate) fn build_plan_table(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    // R8 G1: connector params ride an `options` map (the engine folds it
+    // into TableObject.options); the legacy top-level spellings stay
+    // dual-written for one minor version so a pre-G1 engine reads the same
+    // plan body byte-for-byte (nulls included — the pre-G1 entry shape).
+    let mut options = serde_json::Map::new();
+    let mut opt = |k: &'static str, v: Option<&str>| {
+        if let Some(v) = v {
+            options.insert(k.into(), Value::String(v.to_string()));
+        }
+    };
+    opt("bootstrap", bootstrap.as_deref());
+    opt("stream_load_url", stream_load_url.as_deref());
+    opt("auth_env", auth_env.as_deref());
+    opt("sequence_column", sequence_column);
+    if let Some(cols) = partial_columns {
+        options.insert("partial_columns".into(), json!(cols));
+    }
+    // connJson pass-through (G1): unconsumed keys ride `options` verbatim,
+    // so a connector option added to the datasource form reaches the engine
+    // without console mapping code. The keys already consumed above are
+    // excluded (no double spelling), and credential-looking keys are
+    // dropped defensively — credentials never ride the plan body (they live
+    // in the encrypted store and reach engines as TAILRACE_DS_* env names).
+    const CONSUMED_CONN_KEYS: [&str; 4] = ["jdbcUrl", "streamLoadUrl", "bootstrap", "path"];
+    const CREDENTIAL_CONN_KEYS: [&str; 4] = ["username", "password", "token", "secret"];
+    for (k, v) in conn.as_object().into_iter().flatten() {
+        if !CONSUMED_CONN_KEYS.contains(&k.as_str())
+            && !CREDENTIAL_CONN_KEYS.contains(&k.as_str())
+            && !k.starts_with('_')
+        {
+            options.entry(k.clone()).or_insert_with(|| v.clone()); // an explicit option above wins
+        }
+    }
     let mut entry = json!({
         "reference": reference,
         "kind": kind,
@@ -1376,6 +1409,7 @@ pub(crate) fn build_plan_table(
         "stream_load_url": stream_load_url,
         "auth_env": auth_env,
         "sequence_column": sequence_column,
+        "options": options,
     });
     // T-A7: the declared subset rides only when declared (serde-default on
     // the engine side; absent key = full-row writes)
@@ -2338,8 +2372,9 @@ mod tests {
 
     /// T-A7 plan projection: the declared subset becomes the sink entry's
     /// `partial_columns` key (snake_case — the engine's PlanTableObject
-    /// field); without a declaration the key is ABSENT, not null, so an
-    /// undeclared entry is byte-identical to the pre-A7 shape.
+    /// field); without a declaration the key is ABSENT, not null — both at
+    /// the legacy top-level spelling and inside the G1 `options` map — so
+    /// an undeclared entry is byte-identical to the pre-A7 shape.
     #[test]
     fn build_plan_table_projects_the_declaration_only_when_declared() {
         let store = console_store::Store::open_in_memory().unwrap();
@@ -2383,12 +2418,79 @@ mod tests {
             .expect("registered");
         assert!(
             off.get("partial_columns").is_none(),
-            "no declaration = no key: {off}"
+            "no declaration = no legacy key: {off}"
+        );
+        assert!(
+            off["options"].get("partial_columns").is_none(),
+            "no declaration = no options key either: {off}"
         );
         // everything else is identical between the two shapes
         let mut on_sans = on.clone();
         on_sans.as_object_mut().unwrap().remove("partial_columns");
+        on_sans["options"]
+            .as_object_mut()
+            .unwrap()
+            .remove("partial_columns");
         assert_eq!(on_sans, off);
+    }
+
+    /// R8 G1 dual-write: the plan entry carries the connector params BOTH at
+    /// their legacy top-level spellings (a pre-G1 engine reads exactly the
+    /// pre-G1 shape, nulls included) and inside the `options` map (the
+    /// post-G1 engine folds options-first). Unconsumed connJson keys
+    /// pass through into `options`; credential-looking keys never do.
+    #[test]
+    fn build_plan_table_dual_writes_options_and_legacy_spellings() {
+        let store = console_store::Store::open_in_memory().unwrap();
+        let ds = store
+            .insert_datasource(
+                "d",
+                "doris",
+                r#"{"jdbcUrl":"jdbc:mysql://127.0.0.1:1/x","streamLoadUrl":"http://127.0.0.1:1","groupCommit":"off_mode","password":"leak"}"#,
+            )
+            .unwrap();
+        store
+            .insert_table_object(
+                ds,
+                "ods",
+                "orders",
+                "doris",
+                None,
+                Some(r#"[["k","utf8"]]"#),
+                None,
+                Some("unique"),
+            )
+            .unwrap();
+        // no stored credential → auth_env stays unset (the fold's null
+        // spelling); the consumed connJson keys do not double-spell
+        let entry = build_plan_table(&store, &format!("{ds}.ods.orders"), None)
+            .unwrap()
+            .expect("registered");
+        assert_eq!(
+            entry["stream_load_url"], "http://127.0.0.1:1/api/ods/orders/_stream_load",
+            "legacy top-level spelling intact (pre-G1 engines read this)"
+        );
+        assert_eq!(entry["auth_env"], Value::Null, "no credential = null");
+        assert_eq!(
+            entry["options"]["stream_load_url"], "http://127.0.0.1:1/api/ods/orders/_stream_load",
+            "options map carries the same value"
+        );
+        // connJson pass-through: unconsumed key rides options verbatim
+        assert_eq!(entry["options"]["groupCommit"], "off_mode");
+        // consumed keys are NOT passed through a second time
+        assert!(entry["options"].get("jdbcUrl").is_none());
+        assert!(entry["options"].get("streamLoadUrl").is_none());
+        // credential-looking keys never ride the plan body
+        assert!(entry["options"].get("password").is_none());
+        assert!(entry.get("password").is_none());
+        // and the entry parses into the engine's PlanTableObject with every
+        // option landing (the deploy path's own read-back)
+        let t: tailrace_catalog::PlanTableObject = serde_json::from_value(entry.clone()).unwrap();
+        assert_eq!(
+            t.option_str(tailrace_catalog::option_keys::STREAM_LOAD_URL),
+            Some("http://127.0.0.1:1/api/ods/orders/_stream_load")
+        );
+        assert_eq!(t.option_str("groupCommit"), Some("off_mode"));
     }
 
     /// T-A7 re-gate (R7 review): the gate over a statement set follows the

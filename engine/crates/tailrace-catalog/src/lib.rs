@@ -26,9 +26,57 @@ pub use plan_options::{PlanOptions, RecoveryOptions, ReliabilityOptions, TuningO
 /// on the spot.
 pub use tailrace_ir::column_type::{arrow_type_or_utf8, ColumnType};
 
+/// Option key canon (R8 G1): the names of the legacy top-level fields that
+/// moved into `TableObject::options`. The catalog owns the SPELLING only
+/// (one constant set, so the three consumers of `sequence_column` — jdbc
+/// cursor, dim pagination key, doris dedup basis — cannot drift apart);
+/// each connector owns the SEMANTICS through its own typed accessor
+/// (`KafkaTableExt`, `DorisTableExt`, …).
+pub mod option_keys {
+    /// kafka broker list / file directory / jdbc URL — the per-kind
+    /// "where to connect" string (kafka + file + dim/jdbc kinds)
+    pub const BOOTSTRAP: &str = "bootstrap";
+    /// doris stream load endpoint (BE direct, doris/starrocks sinks)
+    pub const STREAM_LOAD_URL: &str = "stream_load_url";
+    /// environment variable name holding the Basic credential
+    pub const AUTH_ENV: &str = "auth_env";
+    /// doris sink label prefix (idempotency anchor)
+    pub const LABEL_PREFIX: &str = "label_prefix";
+    /// key column: dim = full-table load pagination key, jdbc = incremental
+    /// cursor column, doris = UNIQUE KEY out-of-order dedup basis
+    pub const SEQUENCE_COLUMN: &str = "sequence_column";
+    /// doris partial-column update subset (A7)
+    pub const PARTIAL_COLUMNS: &str = "partial_columns";
+
+    /// Every key that serializes dual-written (options + legacy top-level)
+    /// during the one-minor-version serde window — the write side of the
+    /// G1 compatibility contract (read side = the `Raw` fold below).
+    pub const LEGACY: [&str; 6] = [
+        BOOTSTRAP,
+        STREAM_LOAD_URL,
+        AUTH_ENV,
+        LABEL_PREFIX,
+        SEQUENCE_COLUMN,
+        PARTIAL_COLUMNS,
+    ];
+}
+
+/// Connector-specific table options (R8 G1): everything a connector needs
+/// beyond the five universal fields. Key spelling canon =
+/// [`option_keys`]; arbitrary extra keys ride along verbatim (the console
+/// passes datasource connJson keys through), typed reads go through
+/// connector-side accessors.
+pub type TableOptions = std::collections::BTreeMap<String, serde_json::Value>;
+
 /// Table object, connection-side view (catalog resolution product; the caller
 /// fetches credentials by env name just-in-time and discards them).
+///
+/// Construction goes through [`TableObject::new`] (the single construction
+/// site — R8 G1 collapsed the per-callsite struct literals); the five
+/// universal fields stay typed, everything connector-specific rides
+/// `options`.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(from = "TableObjectRaw")]
 pub struct TableObject {
     /// Owning datasource name (namespace inside the catalog)
     pub datasource: String,
@@ -37,7 +85,6 @@ pub struct TableObject {
     /// Canonical connector kind: kafka / file / jdbc / doris / starrocks (see
     /// `normalize_kind` for the accepted aliases; jdbc is source-only,
     /// doris/starrocks are sink-side)
-    #[serde(default = "default_kind")]
     pub kind: String,
     /// Decode format: ogg / json / jsonl / csv / parquet / debezium-json
     /// (debezium-json = Debezium CDC envelope consumed from Kafka, blueprint
@@ -53,33 +100,175 @@ pub struct TableObject {
     /// Column definitions [name, arrow type] (v1 flat; discover output is the
     /// same shape)
     pub columns: Vec<(String, String)>,
-    /// kafka bootstrap (kafka-kind source/sink side)
+    /// Connector-specific options (R8 G1). Key canon: [`option_keys`]; the
+    /// serde window folds the legacy top-level field names into this map on
+    /// read (explicit `options` keys win over the legacy spelling).
     #[serde(default)]
-    pub bootstrap: Option<String>,
-    /// doris stream load URL (doris sink side; BE direct)
+    pub options: TableOptions,
+}
+
+impl TableObject {
+    /// The single construction site (R8 G1): five universal fields +
+    /// connector options through the `with_*` builders. Former struct
+    /// literals at 17+ callsites collapsed here; `grep "TableObject {"`
+    /// finds only this factory body and the struct definition.
+    pub fn new(
+        datasource: impl Into<String>,
+        name: impl Into<String>,
+        kind: impl Into<String>,
+    ) -> Self {
+        Self {
+            datasource: datasource.into(),
+            name: name.into(),
+            kind: kind.into(),
+            format: None,
+            columns: Vec::new(),
+            options: TableOptions::new(),
+        }
+    }
+}
+
+/// Shared options API of [`TableObject`] / [`PlanTableObject`] (same
+/// builders + typed read primitives on both — the runtime reads plan tables,
+/// the connectors read resolved objects; one spelling).
+macro_rules! impl_table_options_api {
+    ($ty:ty) => {
+        impl $ty {
+            /// Set the decode format (builder).
+            pub fn with_format(mut self, format: impl Into<String>) -> Self {
+                self.format = Some(format.into());
+                self
+            }
+
+            /// Set (or clear) the decode format from an `Option` (builder).
+            pub fn format_opt(mut self, format: Option<String>) -> Self {
+                self.format = format;
+                self
+            }
+
+            /// Set the column list (builder).
+            pub fn with_columns(mut self, columns: Vec<(String, String)>) -> Self {
+                self.columns = columns;
+                self
+            }
+
+            /// Replace the whole options map (builder).
+            pub fn with_options(mut self, options: TableOptions) -> Self {
+                self.options = options;
+                self
+            }
+
+            /// Set one connector option (builder); `value` anything
+            /// JSON-shaped (`"str"`, `json!(["k","a"])`, …).
+            pub fn with_option(mut self, key: &str, value: impl Into<serde_json::Value>) -> Self {
+                self.options.insert(key.to_string(), value.into());
+                self
+            }
+
+            /// Raw option value (generic primitive; connectors prefer their
+            /// own typed accessors over this).
+            pub fn option(&self, key: &str) -> Option<&serde_json::Value> {
+                self.options.get(key)
+            }
+
+            /// String option read (the shared primitive behind the
+            /// connector-side typed accessors).
+            pub fn option_str(&self, key: &str) -> Option<&str> {
+                self.options.get(key).and_then(serde_json::Value::as_str)
+            }
+
+            /// String-list option read (`partial_columns` shape).
+            pub fn option_str_list(&self, key: &str) -> Option<Vec<String>> {
+                self.options.get(key).and_then(|v| {
+                    v.as_array().map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+                })
+            }
+        }
+    };
+}
+
+impl_table_options_api!(TableObject);
+
+/// Deserialize mirror of [`TableObject`] accepting BOTH shapes — the G1
+/// serde window's read side: the legacy top-level field names (`bootstrap`,
+/// `stream_load_url`, …) fold into `options` (an explicit `options` key wins
+/// over the legacy spelling of the same field); `null` legacy values mean
+/// "unset" exactly like the pre-G1 `Option::None`. Works for every
+/// self-describing format the catalog reads (TOML specs, JSON plan bodies).
+#[derive(serde::Deserialize)]
+pub(crate) struct TableObjectRaw {
+    datasource: String,
+    name: String,
+    #[serde(default = "default_kind")]
+    kind: String,
     #[serde(default)]
-    pub stream_load_url: Option<String>,
-    /// Environment variable name holding the Basic credential (value like
-    /// "Basic xxx")
+    format: Option<String>,
     #[serde(default)]
-    pub auth_env: Option<String>,
-    /// doris sink label prefix (idempotency anchor)
+    columns: Vec<(String, String)>,
     #[serde(default)]
-    pub label_prefix: Option<String>,
-    /// Doris UNIQUE KEY sequence column name (out-of-order dedup basis;
-    /// absent = not declared)
+    options: TableOptions,
+    // ---- legacy top-level fields (folded into options on conversion) ----
     #[serde(default)]
-    pub sequence_column: Option<String>,
-    /// Partial-column update declaration (A7): the subset of `columns`
-    /// each stream load writes. Some(non-empty subset) puts the doris sink
-    /// into `partial_columns=true` mode — Doris merges the written keys
-    /// into existing UNIQUE KEY merge-on-write rows, unlisted columns keep
-    /// their previous values (CDC upsert shape: ogg/debezium sources that
-    /// only carry the changed columns). None = full-row writes, the
-    /// historical default. Validated at sink assembly (subset ⊆ columns,
-    /// sequence column inside the subset when declared).
+    bootstrap: Option<String>,
     #[serde(default)]
-    pub partial_columns: Option<Vec<String>>,
+    stream_load_url: Option<String>,
+    #[serde(default)]
+    auth_env: Option<String>,
+    #[serde(default)]
+    label_prefix: Option<String>,
+    #[serde(default)]
+    sequence_column: Option<String>,
+    #[serde(default)]
+    partial_columns: Option<Vec<String>>,
+}
+
+/// Fold one legacy `Option<T>` field into `options` unless the map already
+/// carries the key (explicit `options` spelling wins).
+fn fold_legacy(
+    options: &mut TableOptions,
+    key: &str,
+    legacy: Option<impl Into<serde_json::Value>>,
+) {
+    if let Some(v) = legacy {
+        options.entry(key.to_string()).or_insert_with(|| v.into());
+    }
+}
+
+impl From<TableObjectRaw> for TableObject {
+    fn from(raw: TableObjectRaw) -> Self {
+        let TableObjectRaw {
+            datasource,
+            name,
+            kind,
+            format,
+            columns,
+            mut options,
+            bootstrap,
+            stream_load_url,
+            auth_env,
+            label_prefix,
+            sequence_column,
+            partial_columns,
+        } = raw;
+        fold_legacy(&mut options, option_keys::BOOTSTRAP, bootstrap);
+        fold_legacy(&mut options, option_keys::STREAM_LOAD_URL, stream_load_url);
+        fold_legacy(&mut options, option_keys::AUTH_ENV, auth_env);
+        fold_legacy(&mut options, option_keys::LABEL_PREFIX, label_prefix);
+        fold_legacy(&mut options, option_keys::SEQUENCE_COLUMN, sequence_column);
+        fold_legacy(&mut options, option_keys::PARTIAL_COLUMNS, partial_columns);
+        Self {
+            datasource,
+            name,
+            kind,
+            format,
+            columns,
+            options,
+        }
+    }
 }
 
 fn default_kind() -> String {
@@ -201,7 +390,8 @@ pub struct StatementSpec {
     /// `Some(["k","a"])`, a bare `INSERT INTO sink SELECT …` to `None`
     /// (full-row writes, the historical default). This is the compile-time
     /// record of the switch; the RUNTIME reads the declaration from the sink
-    /// table object (`TableObject.partial_columns`) — the console projects
+    /// table object (option key `partial_columns` — R8 G1 moved it into
+    /// `TableObject.options`) — the console projects
     /// this statement field onto the sink's plan table entry at deploy, and
     /// a TOML catalog declares it on the `[[table]]` directly. The two must
     /// agree, which the console guarantees by deriving one from the other.
@@ -224,7 +414,10 @@ pub struct DimJoin {
 pub struct PipelineSpec {
     pub pipeline: PipelineMeta,
     pub datasource: Vec<DatasourceSpec>,
-    pub table: Vec<TableSpec>,
+    /// `[[table]]` entries deserialize straight into [`TableObject`]
+    /// (R8 G1: the former 12-field `TableSpec` was field-identical to it;
+    /// legacy top-level connection fields fold into `options` on read)
+    pub table: Vec<TableObject>,
     #[serde(default)]
     pub statement: Vec<StatementSpec>,
 }
@@ -235,47 +428,51 @@ pub struct PipelineMeta {
     pub name: String,
 }
 
+/// Datasource-level connection defaults (table-level `options` keys override
+/// these at resolve time). The former top-level `bootstrap` /
+/// `stream_load_url` / `auth_env` fields fold into `options` on read (same
+/// serde window as [`TableObject`]).
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(from = "DatasourceSpecRaw")]
 pub struct DatasourceSpec {
     pub name: String,
     #[serde(rename = "type")]
     pub ty: String,
     #[serde(default)]
-    pub bootstrap: Option<String>,
-    #[serde(default)]
-    pub stream_load_url: Option<String>,
-    #[serde(default)]
-    pub auth_env: Option<String>,
+    pub options: TableOptions,
 }
 
-/// Table declaration (datasource-level connection params can be overridden at
-/// the table level).
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct TableSpec {
-    pub datasource: String,
-    pub name: String,
-    #[serde(default = "default_kind")]
-    pub kind: String,
+/// Deserialize mirror of [`DatasourceSpec`] (legacy field fold, G1 window).
+#[derive(serde::Deserialize)]
+struct DatasourceSpecRaw {
+    name: String,
+    #[serde(rename = "type")]
+    ty: String,
     #[serde(default)]
-    pub format: Option<String>,
+    options: TableOptions,
     #[serde(default)]
-    pub columns: Vec<(String, String)>,
+    bootstrap: Option<String>,
     #[serde(default)]
-    pub bootstrap: Option<String>,
+    stream_load_url: Option<String>,
     #[serde(default)]
-    pub stream_load_url: Option<String>,
-    #[serde(default)]
-    pub auth_env: Option<String>,
-    #[serde(default)]
-    pub label_prefix: Option<String>,
-    /// JDBC cursor column (dim tables: the PRIMARY KEY / single-column
-    /// UNIQUE key, used as the full-table load pagination key)
-    #[serde(default)]
-    pub sequence_column: Option<String>,
-    /// Doris partial-column update subset (A7; doris-kind table objects
-    /// only — see TableObject.partial_columns)
-    #[serde(default)]
-    pub partial_columns: Option<Vec<String>>,
+    auth_env: Option<String>,
+}
+
+impl From<DatasourceSpecRaw> for DatasourceSpec {
+    fn from(raw: DatasourceSpecRaw) -> Self {
+        let DatasourceSpecRaw {
+            name,
+            ty,
+            mut options,
+            bootstrap,
+            stream_load_url,
+            auth_env,
+        } = raw;
+        fold_legacy(&mut options, option_keys::BOOTSTRAP, bootstrap);
+        fold_legacy(&mut options, option_keys::STREAM_LOAD_URL, stream_load_url);
+        fold_legacy(&mut options, option_keys::AUTH_ENV, auth_env);
+        Self { name, ty, options }
+    }
 }
 
 /// Catalog backend trait (all backends the same shape — the golden-set parity
@@ -319,26 +516,26 @@ impl CatalogProvider for FileCatalog {
             .iter()
             .find(|t| t.datasource == ds && t.name == name)
             .ok_or_else(|| anyhow::anyhow!("table object not found: {reference}"))?;
-        Ok(TableObject {
-            datasource: ds.into(),
-            name: name.into(),
-            kind: normalize_kind(&tbl.kind),
-            format: tbl.format.clone(),
-            columns: tbl.columns.clone(),
-            bootstrap: tbl.bootstrap.clone().or_else(|| ds_spec.bootstrap.clone()),
-            stream_load_url: tbl
-                .stream_load_url
-                .clone()
-                .or_else(|| ds_spec.stream_load_url.clone()),
-            auth_env: tbl.auth_env.clone().or_else(|| ds_spec.auth_env.clone()),
-            label_prefix: tbl
-                .label_prefix
-                .clone()
-                .map(|p| format!("{p}-{}", self.spec.pipeline.id))
-                .clone(),
-            sequence_column: tbl.sequence_column.clone(),
-            partial_columns: tbl.partial_columns.clone(),
-        })
+        // connection defaults: table-level option keys override the
+        // datasource-level ones (the pre-G1 `tbl.X.or(ds.X)` fallback,
+        // generalized to the whole options map — a datasource can now carry
+        // any connector default, not just the three legacy fields)
+        let mut options = ds_spec.options.clone();
+        for (k, v) in &tbl.options {
+            options.insert(k.clone(), v.clone());
+        }
+        // standalone label prefix convention: `{declared}-{pipeline id}`
+        // (serve mode uses `p{pipeline id}` — PlanCatalog::resolve)
+        if let Some(p) = tbl.option_str(option_keys::LABEL_PREFIX) {
+            options.insert(
+                option_keys::LABEL_PREFIX.to_string(),
+                serde_json::json!(format!("{p}-{}", self.spec.pipeline.id)),
+            );
+        }
+        Ok(TableObject::new(ds, name, normalize_kind(&tbl.kind))
+            .format_opt(tbl.format.clone())
+            .with_columns(tbl.columns.clone())
+            .with_options(options))
     }
 
     fn statements(&self) -> anyhow::Result<Vec<StatementSpec>> {
@@ -455,22 +652,15 @@ impl CatalogProvider for ControlPlaneCatalog {
                     .and_then(|a| a.as_str())
                     .map(|s| s.to_string())
             });
-        Ok(TableObject {
-            datasource: ds_id.to_string(),
-            name: hit.table_name,
-            kind: normalize_kind(&hit.table_kind),
-            format: hit.format,
-            columns: parse_arrow_columns(arrow.as_deref().or(hit.arrow_schema.as_deref())),
-            bootstrap: None,
-            stream_load_url: None,
-            auth_env: None,
-            label_prefix: None,
-            sequence_column: None,
-            // A7 partial-column declaration is console metadata — not yet
-            // carried by the managed datasource API (skeleton catalog; W3
-            // wires the console side)
-            partial_columns: None,
-        })
+        Ok(TableObject::new(
+            ds_id.to_string(),
+            hit.table_name,
+            normalize_kind(&hit.table_kind),
+        )
+        .format_opt(hit.format)
+        .with_columns(parse_arrow_columns(
+            arrow.as_deref().or(hit.arrow_schema.as_deref()),
+        )))
     }
     fn statements(&self) -> anyhow::Result<Vec<StatementSpec>> {
         anyhow::bail!("managed statements are pushed via console PUT /v1/pipelines/{{id}}/plan (not pulled from a catalog)")
@@ -512,31 +702,127 @@ fn parse_arrow_columns(arrow_json: Option<&str>) -> Vec<(String, String)> {
 /// pushPlan from its datasource table directory and carried with the plan;
 /// connection params and the credential env name pass through verbatim —
 /// credential values never enter the plan body).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+///
+/// R8 G1 serde window, both directions:
+/// - **read**: legacy top-level field names (`bootstrap`,
+///   `stream_load_url`, `auth_env`, `sequence_column`, `partial_columns`)
+///   fold into `options` (pre-G1 plan bodies stay deployable);
+/// - **write**: known legacy keys are dual-written (options map + legacy
+///   top-level spelling) so a pre-G1 engine reading a post-G1 artifact
+///   still finds every field — drop the top-level spelling after one minor
+///   version.
+#[derive(Debug, Clone)]
 pub struct PlanTableObject {
     /// Reference key ("datasource.table", the same namespace as
     /// StatementSpec.source/sink)
     pub reference: String,
     pub kind: String,
-    #[serde(default)]
     pub format: Option<String>,
-    #[serde(default)]
     pub columns: Vec<(String, String)>,
+    /// Connector-specific options (same canon as [`TableObject::options`]).
+    pub options: TableOptions,
+}
+
+impl PlanTableObject {
+    /// The single construction site for plan table entries (R8 G1; the
+    /// runtime/contract tests formerly spelled 19 struct literals).
+    pub fn new(reference: impl Into<String>, kind: impl Into<String>) -> Self {
+        Self {
+            reference: reference.into(),
+            kind: kind.into(),
+            format: None,
+            columns: Vec::new(),
+            options: TableOptions::new(),
+        }
+    }
+}
+
+impl_table_options_api!(PlanTableObject);
+
+/// Deserialize mirror of [`PlanTableObject`] (legacy field fold — the G1
+/// window's read side; `null` legacy values mean "unset").
+#[derive(serde::Deserialize)]
+struct PlanTableObjectRaw {
+    reference: String,
+    kind: String,
     #[serde(default)]
-    pub bootstrap: Option<String>,
+    format: Option<String>,
     #[serde(default)]
-    pub stream_load_url: Option<String>,
+    columns: Vec<(String, String)>,
     #[serde(default)]
-    pub auth_env: Option<String>,
-    /// Doris UNIQUE KEY sequence column name (filled by the console from
-    /// table metadata)
+    options: TableOptions,
+    // ---- legacy top-level fields (folded into options on conversion) ----
     #[serde(default)]
-    pub sequence_column: Option<String>,
-    /// Doris partial-column update subset (A7; filled by the console from
-    /// the plan's sink-side declaration — serde-default keeps pre-A7 plan
-    /// bodies valid)
+    bootstrap: Option<String>,
     #[serde(default)]
-    pub partial_columns: Option<Vec<String>>,
+    stream_load_url: Option<String>,
+    #[serde(default)]
+    auth_env: Option<String>,
+    #[serde(default)]
+    sequence_column: Option<String>,
+    #[serde(default)]
+    partial_columns: Option<Vec<String>>,
+}
+
+impl From<PlanTableObjectRaw> for PlanTableObject {
+    fn from(raw: PlanTableObjectRaw) -> Self {
+        let PlanTableObjectRaw {
+            reference,
+            kind,
+            format,
+            columns,
+            mut options,
+            bootstrap,
+            stream_load_url,
+            auth_env,
+            sequence_column,
+            partial_columns,
+        } = raw;
+        fold_legacy(&mut options, option_keys::BOOTSTRAP, bootstrap);
+        fold_legacy(&mut options, option_keys::STREAM_LOAD_URL, stream_load_url);
+        fold_legacy(&mut options, option_keys::AUTH_ENV, auth_env);
+        fold_legacy(&mut options, option_keys::SEQUENCE_COLUMN, sequence_column);
+        fold_legacy(&mut options, option_keys::PARTIAL_COLUMNS, partial_columns);
+        Self {
+            reference,
+            kind,
+            format,
+            columns,
+            options,
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PlanTableObject {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        PlanTableObjectRaw::deserialize(d).map(Self::from)
+    }
+}
+
+impl serde::Serialize for PlanTableObject {
+    /// Dual-write serialization (the G1 window's write side): the whole
+    /// `options` map under the `options` key + each known legacy key ALSO
+    /// at its pre-G1 top-level spelling. A pre-G1 engine ignores the
+    /// `options` key it does not know and reads the top-level fields; a
+    /// post-G1 engine reads `options` (the fold prefers it).
+    /// `format`/`columns` stay top-level in both eras.
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+        let mut map = s.serialize_map(None)?;
+        map.serialize_entry("reference", &self.reference)?;
+        map.serialize_entry("kind", &self.kind)?;
+        if let Some(f) = &self.format {
+            map.serialize_entry("format", f)?;
+        }
+        map.serialize_entry("columns", &self.columns)?;
+        map.serialize_entry("options", &self.options)?;
+        for key in option_keys::LEGACY {
+            if let Some(v) = self.options.get(key) {
+                map.serialize_entry(key, v)?;
+            }
+        }
+        map.end()
+    }
 }
 
 /// Plan catalog backend: statements + the table object list (HashMap indexed,
@@ -607,19 +893,13 @@ impl CatalogProvider for PlanCatalog {
             .split_once('.')
             .map(|(d, _)| d.to_string())
             .unwrap_or_default();
-        Ok(TableObject {
-            datasource: ds,
-            name: table,
-            kind: normalize_kind(&t.kind),
-            format: t.format.clone(),
-            columns: t.columns.clone(),
-            bootstrap: t.bootstrap.clone(),
-            stream_load_url: t.stream_load_url.clone(),
-            auth_env: t.auth_env.clone(),
-            label_prefix: Some(format!("p{}", self.pipeline_id)),
-            sequence_column: t.sequence_column.clone(),
-            partial_columns: t.partial_columns.clone(),
-        })
+        Ok(TableObject::new(ds, table, normalize_kind(&t.kind))
+            .format_opt(t.format.clone())
+            .with_columns(t.columns.clone())
+            .with_options(t.options.clone())
+            // serve-mode label prefix convention (`p{pipeline id}`;
+            // standalone FileCatalog uses `{declared}-{pipeline id}`)
+            .with_option(option_keys::LABEL_PREFIX, format!("p{}", self.pipeline_id)))
     }
 
     fn statements(&self) -> anyhow::Result<Vec<StatementSpec>> {
@@ -716,7 +996,11 @@ select_sql = "SELECT * FROM src"
         assert_eq!(cat.pipeline_id(), 42);
         let t = cat.resolve("k.t1")?;
         assert_eq!(t.kind, "kafka", "default kind normalized topic→kafka");
-        assert_eq!(t.bootstrap.as_deref(), Some("localhost:9092"));
+        assert_eq!(
+            t.option_str(option_keys::BOOTSTRAP),
+            Some("localhost:9092"),
+            "datasource-level bootstrap folds into options and resolves"
+        );
         assert_eq!(cat.statements()?.len(), 1);
         assert!(cat.resolve("k.none").is_err());
         assert!(cat.resolve("bad-ref").is_err());
@@ -802,10 +1086,10 @@ name = "dim_d"
         let dim = cat.resolve("db.users")?;
         assert_eq!(dim.kind, "dim", "kind=dim normalizes to the dim key");
         assert_eq!(
-            dim.bootstrap.as_deref(),
+            dim.option_str(option_keys::BOOTSTRAP),
             Some("mysql://root@localhost/test")
         );
-        assert_eq!(dim.sequence_column.as_deref(), Some("id"));
+        assert_eq!(dim.option_str(option_keys::SEQUENCE_COLUMN), Some("id"));
         assert_eq!(dim.columns.len(), 2);
         std::fs::remove_dir_all(&dir)?;
         Ok(())
@@ -857,37 +1141,35 @@ select_sql = "SELECT order_no, seq, qty FROM src"
         )?;
         let cat = FileCatalog::load(&f)?;
         assert_eq!(
-            cat.resolve("d.orders")?.partial_columns,
+            cat.resolve("d.orders")?
+                .option_str_list(option_keys::PARTIAL_COLUMNS),
             None,
             "no declaration = full-row writes (the default)"
         );
         assert_eq!(
-            cat.resolve("d.orders_partial")?.partial_columns,
+            cat.resolve("d.orders_partial")?
+                .option_str_list(option_keys::PARTIAL_COLUMNS),
             Some(vec![
                 "order_no".to_string(),
                 "seq".to_string(),
                 "qty".to_string()
             ]),
-            "the declared subset rides the table object"
+            "the declared subset rides the table object options"
         );
         std::fs::remove_dir_all(&dir)?;
 
-        // PlanCatalog: the console-pushed plan body carries the same field
+        // PlanCatalog: the console-pushed plan body carries the same option
         // (serde-default keeps pre-A7 plan bodies valid)
-        let table = PlanTableObject {
-            reference: "1.db.orders_partial".into(),
-            kind: "doris".into(),
-            format: None,
-            columns: vec![("order_no".into(), "utf8".into())],
-            bootstrap: None,
-            stream_load_url: None,
-            auth_env: None,
-            sequence_column: None,
-            partial_columns: Some(vec!["order_no".into()]),
-        };
+        let table = PlanTableObject::new("1.db.orders_partial", "doris")
+            .with_columns(vec![("order_no".into(), "utf8".into())])
+            .with_option(
+                option_keys::PARTIAL_COLUMNS,
+                serde_json::json!(["order_no"]),
+            );
         let plan = PlanCatalog::new(9, cat.statements()?, vec![table]);
         assert_eq!(
-            plan.resolve("1.db.orders_partial")?.partial_columns,
+            plan.resolve("1.db.orders_partial")?
+                .option_str_list(option_keys::PARTIAL_COLUMNS),
             Some(vec!["order_no".to_string()])
         );
         Ok(())
@@ -911,17 +1193,7 @@ select_sql = "SELECT order_no, seq, qty FROM src"
             }],
             partial_columns: None,
         };
-        let table = |r: &str| PlanTableObject {
-            reference: r.into(),
-            kind: "file".into(),
-            format: None,
-            columns: vec![],
-            bootstrap: None,
-            stream_load_url: None,
-            auth_env: None,
-            sequence_column: None,
-            partial_columns: None,
-        };
+        let table = |r: &str| PlanTableObject::new(r, "file");
         // source/sink present, dim metadata missing → the dim reference is
         // the reported gap
         let cat = PlanCatalog::new(
@@ -937,11 +1209,8 @@ select_sql = "SELECT order_no, seq, qty FROM src"
             vec![
                 table("1.local.input"),
                 table("1.local.out"),
-                PlanTableObject {
-                    kind: "dim".into(),
-                    sequence_column: Some("id".into()),
-                    ..table("2.db.dim_user")
-                },
+                PlanTableObject::new("2.db.dim_user", "dim")
+                    .with_option(option_keys::SEQUENCE_COLUMN, "id"),
             ],
         );
         assert!(cat.missing_tables().is_empty());
@@ -1023,5 +1292,213 @@ select_sql = "SELECT order_no, seq, qty FROM src"
             "http://be3.internal:8040/x",
             Some(&cfg)
         ));
+    }
+
+    // ==================== R8 G1: options decoupling — dual-write/dual-read equivalence ====================
+
+    /// The canonical post-G1 plan table entry (options map) and the pre-G1
+    /// one (legacy top-level fields) deserialize to the SAME PlanTableObject
+    /// — the dual-read half of the G1 serde window. Explicit `options` keys
+    /// win over a legacy spelling of the same field.
+    #[test]
+    fn plan_body_legacy_and_options_shapes_read_identically() {
+        let legacy = serde_json::json!({
+            "reference": "1.ods.orders",
+            "kind": "doris",
+            "format": "ogg",
+            "columns": [["k", "utf8"], ["seq", "int64"]],
+            "bootstrap": null,
+            "stream_load_url": "http://127.0.0.1:8040/api/ods/orders/_stream_load",
+            "auth_env": "TAILRACE_DS_1",
+            "sequence_column": "seq",
+            "partial_columns": ["k", "seq"]
+        });
+        let modern = serde_json::json!({
+            "reference": "1.ods.orders",
+            "kind": "doris",
+            "format": "ogg",
+            "columns": [["k", "utf8"], ["seq", "int64"]],
+            "options": {
+                "stream_load_url": "http://127.0.0.1:8040/api/ods/orders/_stream_load",
+                "auth_env": "TAILRACE_DS_1",
+                "sequence_column": "seq",
+                "partial_columns": ["k", "seq"]
+            }
+        });
+        let a: PlanTableObject = serde_json::from_value(legacy).expect("legacy shape parses");
+        let b: PlanTableObject = serde_json::from_value(modern).expect("options shape parses");
+        assert_eq!(a.reference, b.reference);
+        assert_eq!(a.kind, b.kind);
+        assert_eq!(a.format, b.format);
+        assert_eq!(a.columns, b.columns);
+        assert_eq!(a.options, b.options, "both shapes fold to one options map");
+        assert_eq!(
+            a.option_str(option_keys::STREAM_LOAD_URL),
+            Some("http://127.0.0.1:8040/api/ods/orders/_stream_load")
+        );
+        assert_eq!(
+            a.option_str_list(option_keys::PARTIAL_COLUMNS),
+            Some(vec!["k".to_string(), "seq".to_string()])
+        );
+
+        // options spelling WINS over the legacy spelling of the same field
+        // (one field spelled both ways in the same body)
+        let mixed = serde_json::json!({
+            "reference": "1.ods.orders",
+            "kind": "doris",
+            "bootstrap": "legacy-value",
+            "options": { "bootstrap": "options-value" }
+        });
+        let m: PlanTableObject = serde_json::from_value(mixed).unwrap();
+        assert_eq!(m.option_str(option_keys::BOOTSTRAP), Some("options-value"));
+    }
+
+    /// The dual-write half: a serialized post-G1 PlanTableObject carries the
+    /// options map AND every known legacy key at its pre-G1 top-level
+    /// spelling — a pre-G1 engine (which ignores the unknown `options` key)
+    /// still reads every field, and re-parsing the artifact reproduces the
+    /// same object (round-trip).
+    #[test]
+    fn plan_table_object_serializes_dual_write_and_round_trips() {
+        let obj = PlanTableObject::new("4.ods.orders", "doris")
+            .with_format("ogg")
+            .with_columns(vec![("k".into(), "utf8".into())])
+            .with_option(option_keys::STREAM_LOAD_URL, "http://127.0.0.1:8040/x")
+            .with_option(option_keys::AUTH_ENV, "TAILRACE_DS_4")
+            .with_option(option_keys::SEQUENCE_COLUMN, "seq")
+            .with_option(
+                option_keys::PARTIAL_COLUMNS,
+                serde_json::json!(["k", "seq"]),
+            )
+            .with_option("groupCommit", "off_mode"); // arbitrary extra key rides along
+        let v = serde_json::to_value(&obj).unwrap();
+        // dual-written legacy spellings present at top level
+        assert_eq!(
+            v["stream_load_url"], "http://127.0.0.1:8040/x",
+            "legacy top-level spelling survives (pre-G1 engines read this)"
+        );
+        assert_eq!(v["auth_env"], "TAILRACE_DS_4");
+        assert_eq!(v["sequence_column"], "seq");
+        assert_eq!(v["partial_columns"], serde_json::json!(["k", "seq"]));
+        // options map carries everything, including keys that have no legacy
+        // spelling
+        assert_eq!(v["options"]["groupCommit"], "off_mode");
+        // round-trip: serialize → deserialize reproduces the object
+        let back: PlanTableObject = serde_json::from_value(v).unwrap();
+        assert_eq!(back.reference, obj.reference);
+        assert_eq!(back.kind, obj.kind);
+        assert_eq!(back.format, obj.format);
+        assert_eq!(back.columns, obj.columns);
+        assert_eq!(back.options, obj.options);
+    }
+
+    /// The regression anchor (blueprint §7.7 G1 row): a pre-G1 plan body —
+    /// legacy field names, `null`s where the console writes nulls — deploys
+    /// through PlanCatalog::resolve with every connector option intact.
+    #[test]
+    fn legacy_plan_body_resolves_through_plan_catalog() -> anyhow::Result<()> {
+        // byte shape of a real pre-G1 doris sink entry (console
+        // build_plan_table output, T11-era): nulls included
+        let body = r#"{
+            "reference": "3.shop.orders",
+            "kind": "doris_table",
+            "format": null,
+            "columns": [["order_no","utf8"],["qty","int64"]],
+            "bootstrap": null,
+            "stream_load_url": "http://localhost:8040/api/shop/orders/_stream_load",
+            "auth_env": "TAILRACE_TEST",
+            "sequence_column": null,
+            "partial_columns": null
+        }"#;
+        let t: PlanTableObject = serde_json::from_str(body)?;
+        let cat = PlanCatalog::new(31, Vec::new(), vec![t]);
+        let obj = cat.resolve("3.shop.orders")?;
+        assert_eq!(obj.kind, "doris", "doris_table alias normalizes");
+        assert_eq!(
+            obj.option_str(option_keys::STREAM_LOAD_URL),
+            Some("http://localhost:8040/api/shop/orders/_stream_load")
+        );
+        assert_eq!(obj.option_str(option_keys::AUTH_ENV), Some("TAILRACE_TEST"));
+        assert_eq!(
+            obj.option_str(option_keys::LABEL_PREFIX),
+            Some("p31"),
+            "serve-mode label prefix is synthesized at resolve"
+        );
+        assert_eq!(obj.option_str(option_keys::SEQUENCE_COLUMN), None);
+        assert_eq!(obj.option_str_list(option_keys::PARTIAL_COLUMNS), None);
+        assert_eq!(obj.columns.len(), 2);
+        Ok(())
+    }
+
+    /// Legacy TOML specs (standalone FileCatalog) keep deploying: top-level
+    /// connection fields fold into options at both the datasource and the
+    /// table level, table-level keys overriding datasource-level ones; the
+    /// `options` table spelling reads identically.
+    #[test]
+    fn legacy_toml_table_fields_fold_into_options() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("tailrace-cat-g1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let f = dir.join("g1.toml");
+        std::fs::write(
+            &f,
+            r#"
+[pipeline]
+id = 77
+name = "fold"
+
+[[datasource]]
+name = "d"
+type = "doris"
+stream_load_url = "http://127.0.0.1:8040/api/a/b/_stream_load"
+auth_env = "TAILRACE_TEST_AUTH"
+
+[[table]]
+datasource = "d"
+name = "legacy_spelled"
+kind = "doris"
+columns = [["k", "utf8"]]
+label_prefix = "mreg"
+sequence_column = "k"
+partial_columns = ["k"]
+
+[[table]]
+datasource = "d"
+name = "options_spelled"
+kind = "doris"
+columns = [["k", "utf8"]]
+options = { label_prefix = "opt", sequence_column = "k" }
+"#,
+        )?;
+        let cat = FileCatalog::load(&f)?;
+        let legacy = cat.resolve("d.legacy_spelled")?;
+        // table-level fold + datasource fallback (none of these are on the
+        // table) + the standalone `{prefix}-{pipeline}` label convention
+        assert_eq!(
+            legacy.option_str(option_keys::STREAM_LOAD_URL),
+            Some("http://127.0.0.1:8040/api/a/b/_stream_load"),
+            "datasource-level stream_load_url falls through"
+        );
+        assert_eq!(
+            legacy.option_str(option_keys::AUTH_ENV),
+            Some("TAILRACE_TEST_AUTH")
+        );
+        assert_eq!(
+            legacy.option_str(option_keys::LABEL_PREFIX),
+            Some("mreg-77")
+        );
+        assert_eq!(legacy.option_str(option_keys::SEQUENCE_COLUMN), Some("k"));
+        assert_eq!(
+            legacy.option_str_list(option_keys::PARTIAL_COLUMNS),
+            Some(vec!["k".to_string()])
+        );
+        // the `options` table spelling reads the same way
+        let spelled = cat.resolve("d.options_spelled")?;
+        assert_eq!(
+            spelled.option_str(option_keys::LABEL_PREFIX),
+            Some("opt-77")
+        );
+        assert_eq!(spelled.option_str(option_keys::SEQUENCE_COLUMN), Some("k"));
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 }

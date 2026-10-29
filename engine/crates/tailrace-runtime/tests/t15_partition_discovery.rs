@@ -266,34 +266,18 @@ fn t15_statements(topic: &str, sink_ref: &str) -> Vec<StatementSpec> {
 
 fn t15_tables(topic: &str, sink_ref: &str, sink_kind: &str) -> Vec<PlanTableObject> {
     vec![
-        PlanTableObject {
-            reference: format!("1.kafka.{topic}"),
-            kind: "mockparts".into(),
-            format: Some("json".into()),
-            columns: vec![
+        PlanTableObject::new(format!("1.kafka.{topic}"), "mockparts")
+            .with_format("json")
+            .with_columns(vec![
                 ("order_no".to_string(), "utf8".to_string()),
                 ("qty".to_string(), "int64".to_string()),
-            ],
-            bootstrap: None,
-            stream_load_url: None,
-            auth_env: None,
-            sequence_column: None,
-            partial_columns: None,
-        },
-        PlanTableObject {
-            reference: sink_ref.into(),
-            kind: sink_kind.into(),
-            format: Some("jsonl".into()),
-            columns: vec![
+            ]),
+        PlanTableObject::new(sink_ref, sink_kind)
+            .with_format("jsonl")
+            .with_columns(vec![
                 ("order_no".to_string(), "utf8".to_string()),
                 ("qty".to_string(), "int64".to_string()),
-            ],
-            bootstrap: None,
-            stream_load_url: None,
-            auth_env: None,
-            sequence_column: None,
-            partial_columns: None,
-        },
+            ]),
     ]
 }
 

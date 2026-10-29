@@ -29,7 +29,7 @@ use bytes::{Bytes, BytesMut};
 use datafusion::arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
 use datafusion::arrow::record_batch::RecordBatch;
 
-use tailrace_catalog::{credential_from_env, ReliabilityOptions, TableObject};
+use tailrace_catalog::{credential_from_env, option_keys, ReliabilityOptions, TableObject};
 use tailrace_connector::registry::ConnectorRegistry;
 use tailrace_connector::{Sink, SinkAck, SinkCapabilities};
 
@@ -249,22 +249,69 @@ pub fn register(reg: &mut ConnectorRegistry) {
     reg.register_sink("starrocks", sink_factory);
 }
 
+/// Doris/StarRocks-side typed view of [`TableObject`] options (R8 G1): the
+/// pre-G1 struct fields the sink factory read, restored as named accessors
+/// over the options map. Also the accessor set the console's backfill
+/// executor reads (the console links this crate).
+pub trait DorisTableExt {
+    /// Stream load endpoint (BE direct, full
+    /// `http://be:8040/api/{db}/{table}/_stream_load` shape — the sink
+    /// PUTs it verbatim; host-allowlisted at plan push, engine H1).
+    fn stream_load_url(&self) -> Option<&str>;
+    /// Environment variable name holding the Basic credential (value like
+    /// "Basic xxx"; read just-in-time through `credential_from_env`,
+    /// TAILRACE_-prefix-only).
+    fn auth_env(&self) -> Option<&str>;
+    /// Label prefix (idempotency anchor; absent = the catalog's
+    /// `p{pipeline}` / `{datasource}` default).
+    fn label_prefix(&self) -> Option<&str>;
+    /// Doris UNIQUE KEY sequence column name (out-of-order dedup basis;
+    /// None = not declared).
+    fn sequence_column(&self) -> Option<&str>;
+    /// Partial-column update declaration (A7): the subset of `columns`
+    /// each stream load writes. Some(non-empty subset) puts the sink into
+    /// `partial_columns=true` mode — Doris merges the written keys into
+    /// existing UNIQUE KEY merge-on-write rows, unlisted columns keep
+    /// their previous values (CDC upsert shape: ogg/debezium sources that
+    /// only carry the changed columns). None = full-row writes, the
+    /// historical default. Validated at sink assembly (subset ⊆ columns,
+    /// sequence column inside the subset when declared).
+    fn partial_columns(&self) -> Option<Vec<String>>;
+}
+
+impl DorisTableExt for TableObject {
+    fn stream_load_url(&self) -> Option<&str> {
+        self.option_str(option_keys::STREAM_LOAD_URL)
+    }
+    fn auth_env(&self) -> Option<&str> {
+        self.option_str(option_keys::AUTH_ENV)
+    }
+    fn label_prefix(&self) -> Option<&str> {
+        self.option_str(option_keys::LABEL_PREFIX)
+    }
+    fn sequence_column(&self) -> Option<&str> {
+        self.option_str(option_keys::SEQUENCE_COLUMN)
+    }
+    fn partial_columns(&self) -> Option<Vec<String>> {
+        self.option_str_list(option_keys::PARTIAL_COLUMNS)
+    }
+}
+
 fn sink_factory(
     obj: &TableObject,
     rel: Option<&ReliabilityOptions>,
 ) -> anyhow::Result<Box<dyn Sink>> {
-    let auth_env = obj.auth_env.as_deref().ok_or_else(|| {
+    let auth_env = obj.auth_env().ok_or_else(|| {
         anyhow::anyhow!("doris sink must declare auth_env (credentials never enter files)")
     })?;
     let auth = credential_from_env(auth_env)?;
     let url = obj
-        .stream_load_url
-        .as_deref()
+        .stream_load_url()
         .ok_or_else(|| anyhow::anyhow!("doris sink must declare stream_load_url (BE direct)"))?;
     let columns = obj.columns.iter().map(|(n, _)| n.clone()).collect();
     let prefix = obj
-        .label_prefix
-        .clone()
+        .label_prefix()
+        .map(str::to_string)
         .unwrap_or_else(|| format!("p{}", obj.datasource));
     // the kind itself is the datasource-level knob selecting the flavor
     // (catalog normalize_kind keeps "starrocks" canonical)
@@ -274,9 +321,14 @@ fn sink_factory(
         SinkFlavor::Doris
     };
     // sequence column wiring + reliability knobs (retry backoff / request timeout)
-    let mut sink =
-        DorisSink::with_sequence(url, auth, columns, prefix, obj.sequence_column.clone())
-            .with_flavor(flavor);
+    let mut sink = DorisSink::with_sequence(
+        url,
+        auth,
+        columns,
+        prefix,
+        obj.sequence_column().map(str::to_string),
+    )
+    .with_flavor(flavor);
     // A7 plan-level partial-column declaration: a non-empty subset switches
     // the sink into partial_columns mode (validated inside the builder —
     // subset ⊆ table columns, sequence column included when declared).
@@ -284,7 +336,7 @@ fn sink_factory(
     // contract (primary-key tables + a `partial_update` header, T12
     // matrix) and is not wired — reject the plan rather than silently
     // write subset rows under full-replace semantics.
-    if let Some(subset) = &obj.partial_columns {
+    if let Some(subset) = obj.partial_columns() {
         anyhow::ensure!(
             flavor != SinkFlavor::StarRocks,
             "partial_columns is Doris-only (kind={}); StarRocks partial update \
@@ -1573,27 +1625,27 @@ mod tests {
     #[test]
     fn sink_factory_wires_partial_columns_from_the_table_object() -> anyhow::Result<()> {
         std::env::set_var("TAILRACE_TEST_AUTH", "Basic dGVzdDp0ZXN0");
-        let obj = |kind: &str, partial: Option<Vec<String>>| TableObject {
-            datasource: "db".into(),
-            name: "t".into(),
-            kind: kind.into(),
-            format: None,
-            columns: vec![
-                ("k".into(), "utf8".into()),
-                ("a".into(), "utf8".into()),
-                ("b".into(), "utf8".into()),
-            ],
-            bootstrap: None,
-            stream_load_url: Some("http://127.0.0.1:1/api/db/t/_stream_load".into()),
-            auth_env: Some("TAILRACE_TEST_AUTH".into()),
-            label_prefix: None,
-            sequence_column: None,
-            partial_columns: partial,
+        let obj = |kind: &str, partial: Option<Vec<String>>| {
+            let o = TableObject::new("db", "t", kind)
+                .with_columns(vec![
+                    ("k".into(), "utf8".into()),
+                    ("a".into(), "utf8".into()),
+                    ("b".into(), "utf8".into()),
+                ])
+                .with_option(
+                    option_keys::STREAM_LOAD_URL,
+                    "http://127.0.0.1:1/api/db/t/_stream_load",
+                )
+                .with_option(option_keys::AUTH_ENV, "TAILRACE_TEST_AUTH");
+            match partial {
+                Some(p) => o.with_option(option_keys::PARTIAL_COLUMNS, serde_json::json!(p)),
+                None => o,
+            }
         };
         // declared subset → partial mode with the narrowed carrier
         let m = MockDoris::start(vec![(200, r#"{"Status":"Success"}"#.into())]);
-        let mut partial_obj = obj("doris", Some(vec!["k".into(), "a".into()]));
-        partial_obj.stream_load_url = Some(m.url());
+        let partial_obj = obj("doris", Some(vec!["k".into(), "a".into()]))
+            .with_option(option_keys::STREAM_LOAD_URL, m.url());
         let mut sink = sink_factory(&partial_obj, None)?;
         assert!(sink.capabilities().partial_update);
         let rb = RecordBatch::try_new(

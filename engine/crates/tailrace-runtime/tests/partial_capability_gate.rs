@@ -57,29 +57,23 @@ fn plan(kind: &str, bootstrap: Option<&str>, partial: Option<Vec<&str>>) -> Plan
         dims: Vec::new(),
         partial_columns: None,
     }];
+    let mut sink = PlanTableObject::new("1.local.orders_out", kind)
+        .with_format("jsonl")
+        .with_columns(cols());
+    if let Some(b) = bootstrap {
+        sink = sink.with_option(tailrace_catalog::option_keys::BOOTSTRAP, b);
+    }
+    if let Some(p) = partial {
+        sink = sink.with_option(
+            tailrace_catalog::option_keys::PARTIAL_COLUMNS,
+            serde_json::json!(p),
+        );
+    }
     let tables = vec![
-        PlanTableObject {
-            reference: "1.local.orders_in".into(),
-            kind: "file".into(),
-            format: Some("json".into()),
-            columns: cols(),
-            bootstrap: None,
-            stream_load_url: None,
-            auth_env: None,
-            sequence_column: None,
-            partial_columns: None,
-        },
-        PlanTableObject {
-            reference: "1.local.orders_out".into(),
-            kind: kind.into(),
-            format: Some("jsonl".into()),
-            columns: cols(),
-            bootstrap: bootstrap.map(str::to_string),
-            stream_load_url: None,
-            auth_env: None,
-            sequence_column: None,
-            partial_columns: partial.map(|p| p.into_iter().map(str::to_string).collect()),
-        },
+        PlanTableObject::new("1.local.orders_in", "file")
+            .with_format("json")
+            .with_columns(cols()),
+        sink,
     ];
     PlanCatalog::new(7301, statements, tables)
 }

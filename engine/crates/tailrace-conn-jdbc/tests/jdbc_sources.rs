@@ -30,19 +30,11 @@ fn gated() -> bool {
 }
 
 fn jdbc_obj(url: &str, table: &str, cursor_col: &str) -> TableObject {
-    TableObject {
-        datasource: "db".into(),
-        name: table.into(),
-        kind: "jdbc".into(),
-        format: Some("json".into()),
-        columns: vec![],
-        bootstrap: Some(url.to_string()),
-        stream_load_url: None,
-        auth_env: None,
-        label_prefix: None,
-        sequence_column: Some(cursor_col.into()),
-        partial_columns: None,
-    }
+    TableObject::new("db", table, "jdbc")
+        .with_format("json")
+        .with_columns(Vec::new())
+        .with_option(tailrace_catalog::option_keys::BOOTSTRAP, url)
+        .with_option(tailrace_catalog::option_keys::SEQUENCE_COLUMN, cursor_col)
 }
 
 fn build_source(url: &str, table: &str, cursor_col: &str) -> Box<dyn Source> {

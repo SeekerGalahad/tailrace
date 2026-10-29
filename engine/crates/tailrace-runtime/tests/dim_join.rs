@@ -151,52 +151,33 @@ fn dim_statements(dim_reference: &str) -> Vec<StatementSpec> {
 
 fn plan_tables(dim: PlanTableObject) -> Vec<PlanTableObject> {
     vec![
-        PlanTableObject {
-            reference: "1.local.input".into(),
-            kind: "file".into(),
-            format: Some("json".into()),
-            columns: vec![
+        PlanTableObject::new("1.local.input", "file")
+            .with_format("json")
+            .with_columns(vec![
                 ("order_no".into(), "utf8".into()),
                 ("uid".into(), "int64".into()),
-            ],
-            bootstrap: None,
-            stream_load_url: None,
-            auth_env: None,
-            sequence_column: None,
-            partial_columns: None,
-        },
-        PlanTableObject {
-            reference: "1.local.orders_wide".into(),
-            kind: "file".into(),
-            format: Some("jsonl".into()),
-            columns: vec![
+            ]),
+        PlanTableObject::new("1.local.orders_wide", "file")
+            .with_format("jsonl")
+            .with_columns(vec![
                 ("order_no".into(), "utf8".into()),
                 ("name".into(), "utf8".into()),
-            ],
-            bootstrap: None,
-            stream_load_url: None,
-            auth_env: None,
-            sequence_column: None,
-            partial_columns: None,
-        },
+            ]),
         dim,
     ]
 }
 
 fn dim_table_obj(bootstrap: Option<String>, table: &str, key: &str) -> PlanTableObject {
-    PlanTableObject {
-        reference: format!("2.db.{table}"),
-        kind: "dim".into(),
-        format: Some("json".into()),
-        columns: vec![
+    let obj = PlanTableObject::new(format!("2.db.{table}"), "dim")
+        .with_format("json")
+        .with_columns(vec![
             ("id".into(), "int64".into()),
             ("name".into(), "utf8".into()),
-        ],
-        bootstrap,
-        stream_load_url: None,
-        auth_env: None,
-        sequence_column: Some(key.into()),
-        partial_columns: None,
+        ])
+        .with_option(tailrace_catalog::option_keys::SEQUENCE_COLUMN, key);
+    match bootstrap {
+        Some(b) => obj.with_option(tailrace_catalog::option_keys::BOOTSTRAP, b),
+        None => obj,
     }
 }
 
@@ -327,17 +308,9 @@ fn dim_join_assembly_refuses_unresolvable_and_wrong_kind() -> anyhow::Result<()>
     assert!(format!("{err:#}").contains("no_such"), "{err:#}");
     // dim reference resolving to a kind=file object (not dim)
     let mut tables = plan_tables(dim_table_obj(None, "dim_user", "id"));
-    tables[2] = PlanTableObject {
-        reference: "2.db.dim_user".into(),
-        kind: "file".into(),
-        format: Some("json".into()),
-        columns: vec![("id".into(), "int64".into())],
-        bootstrap: None,
-        stream_load_url: None,
-        auth_env: None,
-        sequence_column: None,
-        partial_columns: None,
-    };
+    tables[2] = PlanTableObject::new("2.db.dim_user", "file")
+        .with_format("json")
+        .with_columns(vec![("id".into(), "int64".into())]);
     let cat = PlanCatalog::new(PIPELINE_ID, dim_statements("2.db.dim_user"), tables);
     let err = assemble_err(&cat, &work.join("state"), run_opts(), &reg);
     assert!(

@@ -124,28 +124,12 @@ fn t6_tables() -> Vec<PlanTableObject> {
         ("qty".to_string(), "int64".to_string()),
     ];
     vec![
-        PlanTableObject {
-            reference: "1.local.input".into(),
-            kind: "file".into(),
-            format: Some("json".into()),
-            columns: cols.clone(),
-            bootstrap: None,
-            stream_load_url: None,
-            auth_env: None,
-            sequence_column: None,
-            partial_columns: None,
-        },
-        PlanTableObject {
-            reference: "1.local.orders_out".into(),
-            kind: "file".into(),
-            format: Some("jsonl".into()),
-            columns: cols,
-            bootstrap: None,
-            stream_load_url: None,
-            auth_env: None,
-            sequence_column: None,
-            partial_columns: None,
-        },
+        PlanTableObject::new("1.local.input", "file")
+            .with_format("json")
+            .with_columns(cols.clone()),
+        PlanTableObject::new("1.local.orders_out", "file")
+            .with_format("jsonl")
+            .with_columns(cols),
     ]
 }
 

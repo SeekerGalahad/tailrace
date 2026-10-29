@@ -20,9 +20,26 @@ use rdkafka::message::Message;
 use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
 use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 
-use tailrace_catalog::{ReliabilityOptions, StatementSpec, TableObject};
+use tailrace_catalog::{option_keys, ReliabilityOptions, StatementSpec, TableObject};
 use tailrace_connector::registry::ConnectorRegistry;
 use tailrace_connector::{Cursor, Sink, SinkAck, SinkCapabilities, Source, SourceChunk};
+
+/// Kafka-side typed view of [`TableObject`] options (R8 G1): the connector
+/// reads its connection params through named accessors instead of struct
+/// fields — the type safety the options map took away, returned here at the
+/// only consumer.
+pub trait KafkaTableExt {
+    /// Broker list ("host:port,host:port"); empty string = not declared
+    /// (the factories then build a client against localhost:9092's default
+    /// config, same as the pre-G1 `unwrap_or_default`).
+    fn bootstrap(&self) -> &str;
+}
+
+impl KafkaTableExt for TableObject {
+    fn bootstrap(&self) -> &str {
+        self.option_str(option_keys::BOOTSTRAP).unwrap_or_default()
+    }
+}
 
 /// Register the kafka source/sink factories (called by the binary's
 /// build_registry / the runtime's default_registry).
@@ -36,11 +53,7 @@ fn source_factory(
     spec: &StatementSpec,
     rel: Option<&ReliabilityOptions>,
 ) -> anyhow::Result<Box<dyn Source>> {
-    let mut src = KafkaSource::new(
-        obj.bootstrap.as_deref().unwrap_or_default(),
-        &obj.name,
-        &spec.group,
-    );
+    let mut src = KafkaSource::new(obj.bootstrap(), &obj.name, &spec.group);
     if let Some(r) = rel {
         src = src.with_poll_interval(r.poll_interval_ms());
     }
@@ -57,12 +70,10 @@ fn sink_factory(
     rel: Option<&ReliabilityOptions>,
 ) -> anyhow::Result<Box<dyn Sink>> {
     let sink = match rel {
-        Some(r) => KafkaSink::with_send_timeout(
-            obj.bootstrap.as_deref().unwrap_or_default(),
-            &obj.name,
-            Some(r.kafka_timeout_ms()),
-        )?,
-        None => KafkaSink::new(obj.bootstrap.as_deref().unwrap_or_default(), &obj.name)?,
+        Some(r) => {
+            KafkaSink::with_send_timeout(obj.bootstrap(), &obj.name, Some(r.kafka_timeout_ms()))?
+        }
+        None => KafkaSink::new(obj.bootstrap(), &obj.name)?,
     };
     Ok(Box::new(sink))
 }

@@ -22,7 +22,7 @@ use datafusion::logical_expr::LogicalPlan;
 
 use dlq::{BadRowPolicy, BadRowRecord};
 use pipeline_log::PipelineLogHub;
-use tailrace_catalog::{CatalogProvider, TableObject};
+use tailrace_catalog::{option_keys, CatalogProvider, TableObject};
 use tailrace_connector::ConnectorRegistry;
 use tailrace_decode::{
     ColBatch, CsvDecoder, DebeziumJsonDecoder, Decoded, Decoder, JsonDecoder, OggDecoder,
@@ -537,7 +537,9 @@ impl PipelineRunner {
             // nothing "preserved" anywhere) — refuse at assembly. The G4
             // capability flag is the branch point here, not the sink's
             // concrete type, so a future sink gets this check for free.
-            if sink_obj.partial_columns.is_some() && !sink.capabilities().partial_update {
+            if sink_obj.option(option_keys::PARTIAL_COLUMNS).is_some()
+                && !sink.capabilities().partial_update
+            {
                 anyhow::bail!(
                     "statement #{idx}: sink {} (kind={}) declares partial_columns but does \
                      not support partial update (capabilities().partial_update=false) — \
@@ -613,8 +615,7 @@ impl PipelineRunner {
                                           // doris factory validated the subset at build_sink time and the
                                           // capability gate (above) refused any sink that cannot honour it.
             let sink_cols = sink_obj
-                .partial_columns
-                .clone()
+                .option_str_list(option_keys::PARTIAL_COLUMNS)
                 .unwrap_or_else(|| sink_obj.columns.iter().map(|(n, _)| n.clone()).collect());
             let dlq = (bad_row_policy == BadRowPolicy::Dlq)
                 .then(|| dlq::BadRowDlq::new(state_dir, pipeline_id, idx));
