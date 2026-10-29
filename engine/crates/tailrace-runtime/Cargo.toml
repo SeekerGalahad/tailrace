@@ -11,6 +11,9 @@ description = "Micro-batch pipeline executor: per-statement threads, ledger-back
 keywords = ["runtime", "executor", "micro-batch", "pipeline", "etl"]
 categories = ["database", "concurrency"]
 
+[lints]
+workspace = true
+
 [features]
 # Connector wiring: the default registry registers whatever is compiled in.
 # The binary mirrors these features via build_registry().

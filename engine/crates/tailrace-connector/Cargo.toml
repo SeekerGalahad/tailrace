@@ -11,6 +11,9 @@ description = "Source/Sink connector traits plus the explicit ConnectorRegistry"
 keywords = ["connector", "source", "sink", "registry", "etl"]
 categories = ["database"]
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = "1"
 datafusion = { workspace = true }

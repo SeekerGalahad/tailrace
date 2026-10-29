@@ -529,6 +529,24 @@ impl PipelineRunner {
                     .insert("op_type".into(), spec.pushdown.clone());
             }
             let sink = connectors.build_sink(&sink_obj, reliability.as_ref())?;
+            // A7 × G4: a declared column subset is only meaningful on a sink
+            // that declares `partial_update` (DorisSink flips it per instance
+            // once `with_partial_columns` ran). Any other sink would take
+            // the narrowed projection below and silently write subset rows
+            // under full-row semantics (file/kafka: rows missing columns,
+            // nothing "preserved" anywhere) — refuse at assembly. The G4
+            // capability flag is the branch point here, not the sink's
+            // concrete type, so a future sink gets this check for free.
+            if sink_obj.partial_columns.is_some() && !sink.capabilities().partial_update {
+                anyhow::bail!(
+                    "statement #{idx}: sink {} (kind={}) declares partial_columns but does \
+                     not support partial update (capabilities().partial_update=false) — \
+                     only a doris UNIQUE KEY merge-on-write sink does; drop the INSERT \
+                     column list for full-row writes",
+                    spec.sink,
+                    sink_obj.kind
+                );
+            }
             let schema = Arc::new(Schema::new(
                 src_obj
                     .columns
@@ -588,7 +606,16 @@ impl PipelineRunner {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .load(pipeline_id, idx)?; // open = restore (cursor passed to source.open)
-            let sink_cols = sink_obj.columns.iter().map(|(n, _)| n.clone()).collect();
+                                          // A7 partial-column update: a declared subset narrows the write
+                                          // shape — the transform must project exactly this subset (ordered,
+                                          // same contract as full columns) and the sink writes only it,
+                                          // unlisted columns keeping their existing values server-side. The
+                                          // doris factory validated the subset at build_sink time and the
+                                          // capability gate (above) refused any sink that cannot honour it.
+            let sink_cols = sink_obj
+                .partial_columns
+                .clone()
+                .unwrap_or_else(|| sink_obj.columns.iter().map(|(n, _)| n.clone()).collect());
             let dlq = (bad_row_policy == BadRowPolicy::Dlq)
                 .then(|| dlq::BadRowDlq::new(state_dir, pipeline_id, idx));
             statements.push(StatementRuntime {

@@ -41,6 +41,12 @@ pub struct StatementOut {
     /// the plan (the engine preflight counts them — a missing entry rejects
     /// the whole plan).
     pub dims: Vec<DimJoinOut>,
+    /// Partial-column declaration (T-A7): the INSERT column list, `null`
+    /// when the statement has none (full-row writes). The publish gate
+    /// requires a doris sink registered `keyModel=unique` whose columns
+    /// cover the list; deploy projects it onto the sink's plan table entry
+    /// (`partial_columns`) — the switch the engine's DorisSink reads.
+    pub partial_columns: Option<Vec<String>>,
 }
 
 /// Rewrite `db.table` two-part identifiers whose `db` is mapped in
@@ -160,6 +166,7 @@ pub fn compile_sql(sql: &str, pipeline_id: u64) -> (Vec<StatementOut>, Vec<Compi
                             name: d.name.clone(),
                         })
                         .collect(),
+                    partial_columns: s.partial_columns.clone(),
                 })
                 .collect();
             let diags = diags
@@ -247,5 +254,34 @@ mod tests {
             !diags.is_empty(),
             "unmapped target must diagnose: {diags:?}"
         );
+    }
+
+    /// T-A7 switch, both states through the console compile: the INSERT
+    /// column list rides `partialColumns` verbatim; without one the field is
+    /// null and the statement shape is otherwise identical. The db.table
+    /// rewrite leaves the list alone (plain identifiers, no `db.` prefix).
+    #[test]
+    fn compile_carries_the_partial_columns_switch() {
+        let off = substitute_db_refs(
+            "INSERT INTO ods.orders SELECT id, payload FROM shop.orders",
+            &mapping(),
+        );
+        let (stmts, diags) = compile_sql(&off, 42);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(stmts[0].partial_columns, None, "no list = full-row writes");
+
+        let on = substitute_db_refs(
+            "INSERT INTO ods.orders (id, payload) SELECT id, payload FROM shop.orders",
+            &mapping(),
+        );
+        assert!(on.contains("${ds:4.ods.orders} (id, payload)"), "{on}");
+        let (stmts, diags) = compile_sql(&on, 42);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(
+            stmts[0].partial_columns.as_deref(),
+            Some(&["id".to_string(), "payload".into()][..])
+        );
+        assert_eq!(stmts[0].sink, "4.ods.orders");
+        assert_eq!(stmts[0].source, "3.shop.orders");
     }
 }

@@ -86,6 +86,7 @@ fn bf_statements(sink_name: &str) -> Vec<StatementSpec> {
         select_sql: "SELECT order_no, qty FROM src".into(),
         start_offset: None,
         dims: Vec::new(),
+        partial_columns: None,
     }]
 }
 
@@ -104,6 +105,7 @@ fn bf_tables(sink_name: &str) -> Vec<PlanTableObject> {
             stream_load_url: None,
             auth_env: None,
             sequence_column: None,
+            partial_columns: None,
         },
         PlanTableObject {
             reference: format!("1.local.{sink_name}"),
@@ -114,6 +116,7 @@ fn bf_tables(sink_name: &str) -> Vec<PlanTableObject> {
             stream_load_url: None,
             auth_env: None,
             sequence_column: None,
+            partial_columns: None,
         },
     ]
 }

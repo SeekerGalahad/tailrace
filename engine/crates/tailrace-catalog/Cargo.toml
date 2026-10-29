@@ -11,6 +11,9 @@ description = "CatalogProvider with three backends: local toml file (standalone)
 keywords = ["catalog", "datasource", "toml", "datafusion", "table"]
 categories = ["database"]
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

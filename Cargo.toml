@@ -47,6 +47,14 @@ repository = "https://github.com/SeekerGalahad/tailrace"
 homepage = "https://github.com/SeekerGalahad/tailrace"
 documentation = "https://github.com/SeekerGalahad/tailrace/tree/main/docs"
 
+# R7 tail debt (G4 wave): forbid unsafe across the whole workspace —
+# engine, console and the contract suite. Grep-verified zero `unsafe`
+# tokens in engine/ console/ tests/ on 2026-10-28 (not even in comments),
+# so the fence is load-bearing for the future, not a migration. Members
+# inherit via `[lints] workspace = true` in every member manifest.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

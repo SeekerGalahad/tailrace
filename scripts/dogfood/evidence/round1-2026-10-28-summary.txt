@@ -1,0 +1,23 @@
+ok   0s  D0.1 standing doris reachable: FE doris-3.1.4-rc02-7f5ba43de6 / BE doris-3.1.4-rc02-7f5ba43de6c alive=1 (container: doris-2.1 apache/doris:fe-3.1.4)
+ok   0s  D0.2 release binaries present
+ok   1s  D0.3 dedicated database tailrace_dogfood empty (DROP FORCE + CREATE; nothing else on the standing stack touched)
+ok   1s  D1.1 console booted (fresh data-dir)
+ok   0s  D1.2 login with the log-scraped initial password → token
+ok   0s  D2.1 datasources: doris(id=1, jdbc+streamLoad, root) + file(id=2, path=/tmp/tailrace-dogfood/node)
+ok   0s  D2.2 sink table object tailrace_dogfood.df_orders registered (3 columns, no CDC marker)
+ok   0s  D3.1 draft round-1 (no body): recommends duplicate, key column guessed=true, default replication_num absent (the caller must probe SHOW BACKENDS itself: alive=1)
+ok   0s  D3.2 draft round-2 (confirmed duplicate/order_no, replicationNum=1) → guessed=false, DDL carries replication_num=1
+ok   0s  D3.3 execute without keyModel → 422 KEY_MODEL_REQUIRED (gate holds, nothing ran)
+ok   0s  D3.4 execute → ok (Doris elapsed 118ms); live SHOW CREATE TABLE = DUPLICATE KEY(order_no) — zero hand-written DDL
+ok   0s  D3.5 key model recorded on the table object by execute (keyModel=duplicate in the list)
+ok   0s  D4.1 file table local.df_in + batch1 seeded (10 rows, run-id 1793211538, 570 bytes = replay range end)
+ok   1s  D4.2 engine node up (serve; sink credential via TAILRACE_DS_1 env)
+ok   1s  D4.3 node self-registered → ONLINE
+ok   0s  D4.4 pipeline#1 create→publish→deploy → RUNNING
+ok   3s  D4.5 batch1 landed: tailrace_dogfood.df_orders COUNT(*)=10
+ok   1s  D5.1 dryRun [0,570) → 200 jobId=null labelPrefix=tr-p1-s0-bf, table untouched (10)
+ok   2s  D5.2 backfill#1 job=20261028-01 done rowsWritten=10 → table 10→20 (replay adds under deterministic labels; DUPLICATE makes it visible)
+ok   3s  D5.3 backfill#2 same range job=20261028-02 done (rowsWritten=10 ack-side) → table still 20: label dedup held, no double write
+ok   0s  D5.4 main pipeline still RUNNING after both backfills
+ok   0s  D6.1 DROP DATABASE tailrace_dogfood FORCE (standing stack untouched otherwise)
+total 13s  22/22

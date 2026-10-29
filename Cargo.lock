@@ -6034,10 +6034,14 @@ version = "1.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "datafusion",
  "reqwest",
  "serde_json",
  "tailrace-api",
  "tailrace-catalog",
+ "tailrace-conn-doris",
+ "tailrace-conn-file",
+ "tailrace-conn-kafka",
  "tailrace-connector",
  "tailrace-runtime",
 ]

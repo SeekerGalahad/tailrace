@@ -240,6 +240,35 @@ pub async fn mysql_exec(spec: &ConnSpec, sqls: &[&str]) -> anyhow::Result<ExecOu
         .map_err(|_| anyhow::anyhow!("mysql 执行超时 (>{EXEC_TIMEOUT:?})"))?
 }
 
+/// One Doris schema-change job as `SHOW ALTER TABLE COLUMN` lists it: the
+/// job id and its state (`PENDING` / `WAITING_TXN` / `RUNNING` /
+/// `FINISHED` / `CANCELLED`). Anything but the last two is in flight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterColumnJob {
+    pub job_id: String,
+    pub state: String,
+}
+
+/// The schema-change jobs a Doris FE lists for one table (A7 partial-update
+/// × evolve mutex, deploy-side half: a table whose ADD COLUMN job is not
+/// yet FINISHED/CANCELLED must not receive partial loads — Doris refuses
+/// them, so the console refuses the deploy first). Same connection path as
+/// `infer_schema` / `mysql_exec`; a MySQL-protocol spec is required (Doris
+/// FE 9030). All states are returned; the caller decides what counts.
+pub async fn doris_alter_column_jobs(
+    spec: &ConnSpec,
+    db: &str,
+    table: &str,
+) -> anyhow::Result<Vec<AlterColumnJob>> {
+    match spec {
+        ConnSpec::MySql { .. } => {}
+        _ => anyhow::bail!("doris_alter_column_jobs 仅支持 MySQL 协议数据源"),
+    }
+    tokio::time::timeout(CALL_TIMEOUT, sql::doris_alter_column_jobs(spec, db, table))
+        .await
+        .map_err(|_| anyhow::anyhow!("SHOW ALTER TABLE COLUMN 超时 (>{CALL_TIMEOUT:?})"))?
+}
+
 /// `"a.b"` → (`"a"`, `"b"`); `"flat"` → (`""`, `"flat"`) (first-dot split;
 /// the reference form `${ds:id.db.table}` is three-part, so the remainder
 /// stays one identifier however many dots the topic carries).

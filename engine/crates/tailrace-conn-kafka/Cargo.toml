@@ -11,6 +11,9 @@ description = "Kafka connector: BaseConsumer source (assign-only resume, partiti
 keywords = ["kafka", "rdkafka", "source", "sink", "consumer"]
 categories = ["database", "network-programming"]
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = "1"
 # T2: engine-wide structured logging (tracing macros with pipeline/statement fields)

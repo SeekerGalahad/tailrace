@@ -11,6 +11,9 @@ description = "File connector: tailing source (jsonl/csv text + parquet batch) a
 keywords = ["file", "jsonl", "csv", "parquet", "tailing"]
 categories = ["database", "filesystem"]
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = "1"
 # T2: engine-wide structured logging (tracing macros with pipeline/statement fields)

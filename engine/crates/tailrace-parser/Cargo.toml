@@ -11,6 +11,9 @@ description = "SQL frontend: ${ds:} reference extraction, FlinkDialect parsing, 
 keywords = ["sql", "parser", "dialect", "flink", "frontend"]
 categories = ["parser-implementations", "database"]
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

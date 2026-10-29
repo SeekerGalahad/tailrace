@@ -11,6 +11,9 @@ description = "JDBC-style batch source: MySQL/PostgreSQL keyset incremental poll
 keywords = ["jdbc", "mysql", "postgresql", "source", "keyset"]
 categories = ["database"]
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = "1"
 # T2: engine-wide structured logging (tracing macros with table/dialect fields)

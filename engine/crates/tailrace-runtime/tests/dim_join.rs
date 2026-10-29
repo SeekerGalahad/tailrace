@@ -145,6 +145,7 @@ fn dim_statements(dim_reference: &str) -> Vec<StatementSpec> {
             reference: dim_reference.into(),
             name: "dim_d".into(),
         }],
+        partial_columns: None,
     }]
 }
 
@@ -162,6 +163,7 @@ fn plan_tables(dim: PlanTableObject) -> Vec<PlanTableObject> {
             stream_load_url: None,
             auth_env: None,
             sequence_column: None,
+            partial_columns: None,
         },
         PlanTableObject {
             reference: "1.local.orders_wide".into(),
@@ -175,6 +177,7 @@ fn plan_tables(dim: PlanTableObject) -> Vec<PlanTableObject> {
             stream_load_url: None,
             auth_env: None,
             sequence_column: None,
+            partial_columns: None,
         },
         dim,
     ]
@@ -193,6 +196,7 @@ fn dim_table_obj(bootstrap: Option<String>, table: &str, key: &str) -> PlanTable
         stream_load_url: None,
         auth_env: None,
         sequence_column: Some(key.into()),
+        partial_columns: None,
     }
 }
 
@@ -332,6 +336,7 @@ fn dim_join_assembly_refuses_unresolvable_and_wrong_kind() -> anyhow::Result<()>
         stream_load_url: None,
         auth_env: None,
         sequence_column: None,
+        partial_columns: None,
     };
     let cat = PlanCatalog::new(PIPELINE_ID, dim_statements("2.db.dim_user"), tables);
     let err = assemble_err(&cat, &work.join("state"), run_opts(), &reg);

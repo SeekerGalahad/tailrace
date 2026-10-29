@@ -11,6 +11,9 @@ description = "Metadata clients for console discover / infer-schema: Kafka topic
 keywords = ["metadata", "kafka", "doris", "schema", "discovery"]
 categories = ["database"]
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = "1"
 tracing = { workspace = true }

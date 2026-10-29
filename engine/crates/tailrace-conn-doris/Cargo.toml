@@ -11,6 +11,9 @@ description = "Doris sink: BE-direct stream load with idempotent labels, bounded
 keywords = ["doris", "starrocks", "stream-load", "olap", "sink"]
 categories = ["database"]
 
+[lints]
+workspace = true
+
 [features]
 # StarRocks speaks the same Stream Load protocol: enabling this registers the
 # extra "starrocks" sink kind on the same factory, which switches to the

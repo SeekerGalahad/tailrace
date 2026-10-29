@@ -11,6 +11,9 @@ description = "Console-to-node HTTP layer: shared reqwest client factories, type
 keywords = ["proxy", "reqwest", "http", "probe", "datasource"]
 categories = ["web-programming::http-client"]
 
+[lints]
+workspace = true
+
 [dependencies]
 reqwest = { workspace = true }
 serde_json = { workspace = true }

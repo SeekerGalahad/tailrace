@@ -18,6 +18,7 @@ fn file_statements() -> Vec<tailrace_catalog::StatementSpec> {
         select_sql: "SELECT order_no, qty FROM src".into(),
         start_offset: None,
         dims: Vec::new(),
+        partial_columns: None,
     }]
 }
 
@@ -38,6 +39,7 @@ fn file_tables() -> Vec<tailrace_catalog::PlanTableObject> {
             stream_load_url: None,
             auth_env: None,
             sequence_column: None,
+            partial_columns: None,
         },
         tailrace_catalog::PlanTableObject {
             reference: "1.local.orders_out".into(),
@@ -48,6 +50,7 @@ fn file_tables() -> Vec<tailrace_catalog::PlanTableObject> {
             stream_load_url: None,
             auth_env: None,
             sequence_column: None,
+            partial_columns: None,
         },
     ]
 }

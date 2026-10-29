@@ -114,6 +114,7 @@ fn t6_statements() -> Vec<StatementSpec> {
         select_sql: "SELECT order_no, qty FROM src".into(),
         start_offset: None,
         dims: Vec::new(),
+        partial_columns: None,
     }]
 }
 
@@ -132,6 +133,7 @@ fn t6_tables() -> Vec<PlanTableObject> {
             stream_load_url: None,
             auth_env: None,
             sequence_column: None,
+            partial_columns: None,
         },
         PlanTableObject {
             reference: "1.local.orders_out".into(),
@@ -142,6 +144,7 @@ fn t6_tables() -> Vec<PlanTableObject> {
             stream_load_url: None,
             auth_env: None,
             sequence_column: None,
+            partial_columns: None,
         },
     ]
 }

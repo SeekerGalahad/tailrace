@@ -264,6 +264,7 @@ fn t5_statements(topic: &str, sink_ref: &str) -> Vec<StatementSpec> {
         select_sql: "SELECT order_no, qty FROM src".into(),
         start_offset: None,
         dims: Vec::new(),
+        partial_columns: None,
     }]
 }
 
@@ -281,6 +282,7 @@ fn t5_tables(topic: &str, sink_ref: &str, sink_kind: &str) -> Vec<PlanTableObjec
             stream_load_url: None,
             auth_env: None,
             sequence_column: None,
+            partial_columns: None,
         },
         PlanTableObject {
             reference: sink_ref.into(),
@@ -294,6 +296,7 @@ fn t5_tables(topic: &str, sink_ref: &str, sink_kind: &str) -> Vec<PlanTableObjec
             stream_load_url: None,
             auth_env: None,
             sequence_column: None,
+            partial_columns: None,
         },
     ]
 }

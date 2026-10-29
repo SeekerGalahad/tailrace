@@ -11,6 +11,9 @@ description = "Authentication plane of the tailrace console: argon2id login with
 keywords = ["authentication", "argon2", "session", "token", "middleware"]
 categories = ["authentication", "web-programming::http-server"]
 
+[lints]
+workspace = true
+
 [dependencies]
 axum = { workspace = true }
 console-store = { workspace = true }

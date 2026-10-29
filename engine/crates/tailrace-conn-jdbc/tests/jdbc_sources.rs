@@ -41,6 +41,7 @@ fn jdbc_obj(url: &str, table: &str, cursor_col: &str) -> TableObject {
         auth_env: None,
         label_prefix: None,
         sequence_column: Some(cursor_col.into()),
+        partial_columns: None,
     }
 }
 
@@ -56,6 +57,7 @@ fn build_source(url: &str, table: &str, cursor_col: &str) -> Box<dyn Source> {
         select_sql: "SELECT * FROM src".into(),
         start_offset: None,
         dims: Vec::new(),
+        partial_columns: None,
     };
     reg.build_source(&obj, &spec, None)
         .expect("jdbc source builds")

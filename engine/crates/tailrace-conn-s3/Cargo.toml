@@ -11,4 +11,7 @@ description = "S3 connector placeholder: crate name reserved for the parked S3 r
 keywords = ["s3", "object-storage", "connector", "placeholder"]
 categories = ["network-programming"]
 
+[lints]
+workspace = true
+
 [dependencies]

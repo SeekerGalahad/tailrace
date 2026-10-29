@@ -90,6 +90,12 @@ pub fn compile_with_opts(
         };
         let sink = ref_of(table_name, &refs)
             .map_err(|e| anyhow::anyhow!("statement #{} sink reference invalid: {e}", idx))?;
+        // A7 partial-column declaration: an explicit INSERT column list
+        // (`INSERT INTO sink (k, a) SELECT …`) is the statement-level switch
+        // — the sink writes exactly that subset and Doris keeps the unlisted
+        // columns' row values (UNIQUE KEY merge-on-write partial update).
+        // No list = full-row writes, the historical default.
+        let partial_columns = insert_column_list(idx, &ins.columns)?;
         let Some(query) = ins.source.as_deref() else {
             anyhow::bail!("statement #{}: INSERT missing SELECT source", idx);
         };
@@ -107,6 +113,7 @@ pub fn compile_with_opts(
             select_sql,
             start_offset: start_offset.map(str::to_owned),
             dims,
+            partial_columns,
         });
     }
     if statements.is_empty() {
@@ -264,6 +271,30 @@ fn ref_of(
     refs.get(&ident)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("{ident} is not a ${{ds:}} placeholder"))
+}
+
+/// The INSERT column list as the statement's partial-column declaration:
+/// `None` when absent (full-row writes), else the plain column names in
+/// declaration order. Duplicates are refused here, statement-indexed — the
+/// doris sink would refuse them too (colliding JSON keys), but at assembly,
+/// after deploy; the editor's compile is the right place to say it.
+fn insert_column_list(idx: usize, columns: &[ObjectName]) -> anyhow::Result<Option<Vec<String>>> {
+    if columns.is_empty() {
+        return Ok(None);
+    }
+    let mut out: Vec<String> = Vec::with_capacity(columns.len());
+    for c in columns {
+        let name = ident_name(c).ok_or_else(|| {
+            anyhow::anyhow!(
+                "statement #{idx}: INSERT column list entries must be plain column names (got {c})"
+            )
+        })?;
+        if out.contains(&name) {
+            anyhow::bail!("statement #{idx}: duplicate column {name} in the INSERT column list");
+        }
+        out.push(name);
+    }
+    Ok(Some(out))
 }
 
 /// FROM table rewritten to src + dim JOINs rewritten to their static
@@ -562,6 +593,49 @@ mod tests {
         // blank prefix = unset (falls back to the default convention)
         let (fallback, _) = compile_with_opts(EXAMPLE, 42, Some("  "), None)?;
         assert_eq!(fallback.statements[0].group, "tr.p42.s0");
+        Ok(())
+    }
+
+    /// A7 statement-level switch, both states: an INSERT column list compiles
+    /// to `partial_columns = Some(names in declaration order)`; a bare INSERT
+    /// (the golden example, every pre-A7 pipeline) compiles to `None` — the
+    /// statement shape is otherwise identical. Duplicates and non-plain
+    /// entries are refused at compile, statement-indexed.
+    #[test]
+    fn insert_column_list_is_the_partial_columns_switch() -> anyhow::Result<()> {
+        // off: the golden example carries no column list anywhere
+        let (plain, _) = compile(EXAMPLE, 42)?;
+        assert!(
+            plain.statements.iter().all(|s| s.partial_columns.is_none()),
+            "no INSERT column list = full-row writes"
+        );
+        // on: the list rides verbatim, in declaration order
+        let (on, diags) = compile(
+            "INSERT INTO ${ds:4.ods.orders} (order_no, seq, qty) \
+             SELECT order_no, seq, qty FROM ${ds:3.shop.orders} WHERE op_type IN ('I','U')",
+            42,
+        )?;
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(
+            on.statements[0].partial_columns.as_deref(),
+            Some(&["order_no".to_string(), "seq".into(), "qty".into()][..])
+        );
+        // the rest of the statement is unchanged by the list
+        assert_eq!(on.statements[0].sink, "4.ods.orders");
+        assert_eq!(on.statements[0].pushdown, vec!["I", "U"]);
+        assert!(on.statements[0].select_sql.contains("FROM src"));
+        // duplicate entry → refused, naming the statement and the column
+        let e = match compile(
+            "INSERT INTO ${ds:4.ods.orders} (order_no, order_no) SELECT a, b FROM ${ds:3.shop.orders}",
+            42,
+        ) {
+            Err(e) => e.to_string(),
+            Ok((_, d)) => panic!("duplicate column must be rejected (diagnostics: {d:?})"),
+        };
+        assert!(
+            e.contains("statement #0") && e.contains("duplicate column order_no"),
+            "{e}"
+        );
         Ok(())
     }
 

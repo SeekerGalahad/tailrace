@@ -48,6 +48,9 @@ fn migrations() -> Migrations<'static> {
         // T-A2: backfill_job — bounded-replay job rows (pending → running →
         // done|failed), the progress surface for the console-side executor.
         M::up(include_str!("../migrations/02_backfill_job.sql")),
+        // T-A7: table_object.key_model (unique/duplicate) — the publish-gate
+        // basis for partial-column declarations (Doris: UNIQUE MoW only).
+        M::up(include_str!("../migrations/03_table_key_model.sql")),
     ])
 }
 
@@ -243,8 +246,8 @@ mod tests {
                 }
                 let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
                 assert_eq!(
-                    version, 3,
-                    "user_version must be 3 after 00_init + 01_sequence + 02_backfill_job"
+                    version, 4,
+                    "user_version must be 4 after 00_init + 01_sequence + 02_backfill_job + 03_key_model"
                 );
                 Ok(())
             })

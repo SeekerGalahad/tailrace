@@ -218,8 +218,9 @@ impl Store {
     /// broadcast tables carry no cursor). `sequence_column` (T-D1): the
     /// declared key column (dim full-table load pagination key / doris
     /// UNIQUE KEY dedup basis / jdbc incremental cursor), None = not
-    /// declared. Errors with a constraint violation when (datasource, db,
-    /// table) already exists.
+    /// declared. `key_model` (T-A7): the Doris key model on record
+    /// (`unique` / `duplicate`), None = not declared. Errors with a
+    /// constraint violation when (datasource, db, table) already exists.
     #[allow(clippy::too_many_arguments)] // the §4.2 registration form is one flat tuple
     pub fn insert_table_object(
         &self,
@@ -230,6 +231,7 @@ impl Store {
         format: Option<&str>,
         columns_json: Option<&str>,
         sequence_column: Option<&str>,
+        key_model: Option<&str>,
     ) -> Result<i64> {
         let cursor = match kind {
             "kafka" => "KAFKA_OFFSET",
@@ -239,11 +241,23 @@ impl Store {
         };
         self.with_conn(|conn| {
             conn.execute(
-                "INSERT INTO table_object (datasource_id, db_name, table_name, kind, format, columns_json, cursor_semantics, source, sequence_column) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'manual', ?8)",
-                rusqlite::params![datasource_id, db_name, table_name, kind, format, columns_json, cursor, sequence_column],
+                "INSERT INTO table_object (datasource_id, db_name, table_name, kind, format, columns_json, cursor_semantics, source, sequence_column, key_model) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'manual', ?8, ?9)",
+                rusqlite::params![datasource_id, db_name, table_name, kind, format, columns_json, cursor, sequence_column, key_model],
             )?;
             Ok(conn.last_insert_rowid())
+        })
+    }
+
+    /// Record the Doris key model of a table object (T-A7): the T-A1
+    /// execute step writes what it created; the key-model PUT lets a table
+    /// that pre-exists the console declare it. `false` = no such row.
+    pub fn set_table_key_model(&self, id: i64, key_model: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            Ok(conn.execute(
+                "UPDATE table_object SET key_model = ?2 WHERE id = ?1",
+                rusqlite::params![id, key_model],
+            )? > 0)
         })
     }
 
@@ -256,7 +270,7 @@ impl Store {
     ) -> Result<Option<TableObject>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, datasource_id, db_name, table_name, kind, format, cursor_semantics, source, sequence_column \
+                "SELECT id, datasource_id, db_name, table_name, kind, format, cursor_semantics, source, sequence_column, key_model \
                  FROM table_object WHERE datasource_id = ?1 AND db_name = ?2 AND table_name = ?3",
             )?;
             let mut rows = stmt.query(rusqlite::params![datasource_id, db_name, table_name])?;
@@ -270,7 +284,7 @@ impl Store {
     pub fn table_object(&self, id: i64) -> Result<Option<TableObject>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, datasource_id, db_name, table_name, kind, format, cursor_semantics, source, sequence_column \
+                "SELECT id, datasource_id, db_name, table_name, kind, format, cursor_semantics, source, sequence_column, key_model \
                  FROM table_object WHERE id = ?1",
             )?;
             let mut rows = stmt.query([id])?;
@@ -313,7 +327,7 @@ impl Store {
         }
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, datasource_id, db_name, table_name, kind, format, cursor_semantics, source, sequence_column \
+                "SELECT id, datasource_id, db_name, table_name, kind, format, cursor_semantics, source, sequence_column, key_model \
                  FROM table_object WHERE datasource_id = ?1 AND table_name = ?2 ORDER BY id",
             )?;
             let mut rows = stmt.query(rusqlite::params![ds_id, table])?;
@@ -352,7 +366,7 @@ impl Store {
     ) -> Result<Vec<TableObject>> {
         self.with_conn(|conn| {
             let mut sql = String::from(
-                "SELECT id, datasource_id, db_name, table_name, kind, format, cursor_semantics, source, sequence_column \
+                "SELECT id, datasource_id, db_name, table_name, kind, format, cursor_semantics, source, sequence_column, key_model \
                  FROM table_object WHERE 1=1",
             );
             let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -413,6 +427,7 @@ fn table_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TableObject> {
         cursor_semantics: row.get(6)?,
         source: row.get(7)?,
         sequence_column: row.get(8)?,
+        key_model: row.get(9)?,
     })
 }
 
@@ -440,7 +455,16 @@ mod tests {
         assert_eq!(cred.nonce, "nonce12b");
 
         let t = store
-            .insert_table_object(id, "shop", "orders", "kafka", Some("ogg"), Some("[]"), None)
+            .insert_table_object(
+                id,
+                "shop",
+                "orders",
+                "kafka",
+                Some("ogg"),
+                Some("[]"),
+                None,
+                None,
+            )
             .unwrap();
         let to = store.table_object(t).unwrap().unwrap();
         assert_eq!(to.table_name, "orders");
@@ -457,6 +481,7 @@ mod tests {
                 Some("json"),
                 None,
                 Some("id"),
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -474,7 +499,16 @@ mod tests {
         );
         // sink kinds stay cursor-less
         let doris_t = store
-            .insert_table_object(id, "ods", "orders", "doris", None, None, None)
+            .insert_table_object(
+                id,
+                "ods",
+                "orders",
+                "doris",
+                None,
+                None,
+                None,
+                Some("unique"),
+            )
             .unwrap();
         assert_eq!(
             store
@@ -485,6 +519,18 @@ mod tests {
             "NONE"
         );
         assert_eq!(
+            store.table_object(doris_t).unwrap().unwrap().key_model,
+            Some("unique".into()),
+            "key_model round-trips (T-A7); None when not declared"
+        );
+        assert_eq!(store.table_object(t).unwrap().unwrap().key_model, None);
+        assert!(store.set_table_key_model(doris_t, "duplicate").unwrap());
+        assert_eq!(
+            store.table_object(doris_t).unwrap().unwrap().key_model,
+            Some("duplicate".into())
+        );
+        assert!(!store.set_table_key_model(999_999, "unique").unwrap());
+        assert_eq!(
             store
                 .table_object_by_ref(id, "shop", "orders")
                 .unwrap()
@@ -494,7 +540,7 @@ mod tests {
         );
         // duplicate (datasource, db, table) rejected
         assert!(store
-            .insert_table_object(id, "shop", "orders", "kafka", None, None, None)
+            .insert_table_object(id, "shop", "orders", "kafka", None, None, None, None)
             .is_err());
         // kafka + jdbc + doris registrations above
         assert_eq!(store.table_count(id).unwrap(), 3);
@@ -587,6 +633,7 @@ mod tests {
                 None,
                 Some(r#"[["id","int64"]]"#),
                 Some("id"),
+                None,
             )
             .unwrap();
         // resolves; carries kind + sequence_column
@@ -611,7 +658,7 @@ mod tests {
             .is_none());
         // a same-named table under a second db of the same datasource → ambiguous
         store
-            .insert_table_object(ds, "other", "dim_user", "dim", None, None, Some("id"))
+            .insert_table_object(ds, "other", "dim_user", "dim", None, None, Some("id"), None)
             .unwrap();
         let err = store
             .table_object_for_dim_reference(&format!("{ds}.dim_user"))

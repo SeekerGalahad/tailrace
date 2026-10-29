@@ -222,6 +222,7 @@ mod tests {
             auth_env: None,
             label_prefix: None,
             sequence_column: Some("id".into()),
+            partial_columns: None,
         };
         overrides(&mut o);
         o
@@ -239,6 +240,7 @@ mod tests {
                 reference: "db.dim_user".into(),
                 name: "dim_d".into(),
             }],
+            partial_columns: None,
         }
     }
 

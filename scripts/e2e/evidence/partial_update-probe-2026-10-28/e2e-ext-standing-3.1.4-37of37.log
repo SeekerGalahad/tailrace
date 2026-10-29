@@ -1,0 +1,41 @@
+== partial_update e2e: work=/tmp/tailrace-pu-e2e-ext fe=127.0.0.1:9030 be=127.0.0.1:8040 db=tailrace_pu_e2e console=127.0.0.1:18085 ==
+  ok    S0.1 console binary /Users/wagic/GLMProjects/tailrace/target/release/tailrace-console
+  ok    S0.2 engine node binary /Users/wagic/GLMProjects/tailrace/target/release/tailrace-node
+  ok    S0.4 compose override generated: BE swap check neutralized for the e2e stack only (/tmp/tailrace-pu-e2e-ext/compose-be-swap-override.yml)
+  ok    S1.1 external standing doris via TAILRACE_E2E_DORIS_MYSQL (compose skipped; fe=127.0.0.1:9030 be=127.0.0.1:8040)
+  ok    S2.0 backend Alive=true (heartbeat-driven availability)
+  ok    S2.1 database tailrace_pu_e2e empty (DROP FORCE + CREATE)
+  ok    P0.1 probe_mow created (UNIQUE KEY + merge-on-write, 5 columns)
+  ok    P0.2 probe full-column load (2 rows, first-round values)
+  ok    P1.1 partial + columns header: qty updated, note/price/flag kept first-round values (the contract the engine rides)
+  ok    P2.0 probe_dup created (DUPLICATE KEY)
+  ok    P2.1 DUPLICATE KEY partial load refused: "Only unique key merge on write support partial update" (Doris-side non-UNIQUE rejection)
+  ok    P3.1 observation: header-less partial load accepted; unlisted note after it = NULL (2.1.7: NULL — the trap; recorded, not asserted)
+  ok    S3.1 console booted (fresh data-dir)
+  ok    S3.2 login → 200 + token
+  ok    S3.3 doris+file datasources (d=1 f=2)
+  ok    S4.1 sink table objects: orders_mow(5列) + orders_dup + orders_seq(sequenceColumn=seq, keyModel=unique)
+  ok    S4.2 A1 loop created orders_mow: UNIQUE KEY(order_no) + merge-on-write (key_model recorded by execute)
+  ok    S4.3 A1 loop created orders_dup: DUPLICATE KEY (key_model=duplicate recorded)
+  ok    S4.4 orders_seq hand-created: UNIQUE+MoW+function_column.sequence_col=seq (table-level sequence property)
+  ok    S5.1 file table objects: full_in/delta_in/seq_full_in/seq_delta_in (jsonl)
+  ok    S5.2 seeds: full_in(10×5列) delta_in(10×2列) seq_full_in(10) seq_delta_in(10, 混合 seq)
+  ok    S6.1 engine node up (serve)
+  ok    S6.2 node ONLINE
+  ok    T1.1 pipeline#1 full-column file→orders_mow deployed → RUNNING
+  ok    T1.2 first round in place: 10 rows, SUM(qty)=45, per-row note/price/flag match the seed (the baseline T2 must preserve)
+  ok    T2.1 pipeline#2 'INSERT INTO orders_mow (order_no, qty)' deployed → RUNNING (partial mode)
+  ok    T2.2 CORE: partial round wrote qty=100+i on all 10 keys (SUM 45→1045), COUNT(*) still 10, and all 3 unwritten columns (note/price/flag) kept their first-round values on every row
+  ok    T3.1 evolve on orders_mow while the partial pipeline is RUNNING → 409 PARTIAL_UPDATE_ACTIVE naming it (refs.pipelines), nothing executed
+  ok    T3.2 stop the pipeline → evolve 200 changed:false (nothing to add) + partialUpdatePipelines redeploy checklist names it
+  ok    T4.1 partial pipeline on the DUPLICATE table: publish → 400, diagnostic names keyModel=duplicate (console gate fires before Doris ever could)
+  ok    T4.2 regression anchor: bare INSERT on the same DUPLICATE table publishes untouched (no declaration = no gate)
+  ok    T5.1 pipeline#5 full write → orders_seq deployed → RUNNING (sequence_column header rides every load)
+  ok    T5.2 orders_seq first round: 10 rows at seq=10, SUM(qty)=45
+  ok    T5.3 pipeline#6 'INSERT INTO orders_seq (order_no, seq, qty)' deployed → RUNNING (partial × sequence)
+  ok    T5.4 CORE sequence round: 5 newer-seq rows landed (seq=20, qty=200+i), 5 older-seq rows discarded (seq=10 kept, qty unchanged), and the unwritten note survived all 10 rows — partial + sequence ordering + retention in one load
+  ok    T6.1 subset without the sequence column: publish passes (console gate does not know sequence membership) but deploy → 502 ENGINE_REJECTED carrying the engine's assembly refusal (pipeline DEPLOY_FAILED) — the safety margin fires before any load (late-failure friction logged for R8)
+scripts/e2e/partial_update.sh: line 138: 27983 Terminated: 15          TAILRACE_BOOTSTRAP_TOKEN="tr_b_pu_e2e_00112233445566778899aabbccddeeff" "$CONSOLE_BIN" --addr "$CONSOLE_ADDR" --data-dir "$WORK/run" > "$WORK/console.log" 2>&1
+  ok    S7.1 external doris cleanup: DROP DATABASE tailrace_pu_e2e FORCE (standing stack untouched)
+== partial_update e2e summary: 37/37 steps passed ==
+E2E_EXT_EXIT=0

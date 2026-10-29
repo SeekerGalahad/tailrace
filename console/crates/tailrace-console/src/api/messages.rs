@@ -10,14 +10,17 @@
 //! 逐字节一致（既有测试与前端提示不漂移）。
 //!
 //! 规模口径（T39 ③ 勘正，2026-10-23 实测；T35 增补；T-D1 dim join +6 key；
-//! T-A1 建表闭环 +10 key；T-A2 回填 +9 key，2026-10-28 实测）：字典
-//! **64 key**（[`tests::KEY_LIST`] 与 `template` 同步，长度由
+//! T-A1 建表闭环 +10 key；T-A2 回填 +9 key；T-A7 部分列更新 +9 key，
+//! 2026-10-28 实测；R7 评审修复轮 +1 key——回填 accept 重跑部分列发布门）：字典
+//! **74 key**（[`tests::KEY_LIST`] 与 `template` 同步，长度由
 //! [`tests::templates_use_only_positional_placeholders`]
-//! 钉住）/ **91 调用点**（`grep -rn 'messages::' src/ --include='*.rs'`
+//! 钉住）/ **106 调用点**（`grep -rn 'messages::' src/ --include='*.rs'`
 //! 排除本模块；T35 部署链 +3 key/+7 站点；T-D1 +6 站点——发布门禁 3 + 维表登记 3；
 //! T-A1 +14 站点——draft/execute/evolve 三端点的 400/404/422/409/502 信封全部走字典，
 //! 改前实测 66，此前登记的 63 为 T-D1 后未同步的旧值；T-A2 回填 +11 站点，
-//! 2026-10-28 实测——backfill 请求门禁 9 + jobs 404 1 + 未发布 400 1）。
+//! 2026-10-28 实测——backfill 请求门禁 9 + jobs 404 1 + 未发布 400 1；
+//! T-A7 +14 站点——发布门禁 6 + 部署侧互斥 2 + evolve 侧互斥 1 + keyModel
+//! 登记/PUT 5，改前实测 91；R7 评审修复轮 +1 站点——backfill 部分列重门 422）。
 //! T34 首提交 3cf738b 的「37 key/51 调用点」为双 off-by-one
 //! 误记，ffb1d55 勘正、本次落为模块事实。
 //!
@@ -107,6 +110,29 @@ fn template(key: &str) -> Option<&'static str> {
         // 引擎镜像形态（{"ok":false,"error":…} 透传语义，非 §4.0 信封）
         "err.pipeline.undeployed_plain" => "pipeline #{0} 未部署（无指派节点）",
         "err.pipeline.assigned_node_missing" => "指派节点 #{0} 不存在",
+        // T-A7 partial-column declarations (INSERT column list) gate at publish
+        "err.pipeline.partial_sink_conflict" => {
+            "语句 {0} 与语句 {1} 写同一汇 {2} 但部分列声明不一致（同一汇的所有语句须带相同的 INSERT 列清单，或都不带）"
+        }
+        "err.pipeline.partial_sink_kind" => {
+            "语句 {0} 对汇 {1} 声明了部分列更新（INSERT 列清单），但该汇登记为 kind={2}——部分列更新仅支持 doris 汇（UNIQUE KEY merge-on-write 表）"
+        }
+        "err.pipeline.partial_key_model_missing" => {
+            "语句 {0} 对汇 {1} 声明了部分列更新，但该表未登记键模型——Doris 部分列更新仅对 UNIQUE KEY（merge-on-write）表合法，请先登记 keyModel=unique（PUT /api/datasources/tables/<id>，建表向导建的表已自动记录）"
+        }
+        "err.pipeline.partial_key_model_wrong" => {
+            "语句 {0} 对汇 {1} 声明了部分列更新，但该表登记为 keyModel={2}——Doris 部分列更新仅对 UNIQUE KEY（merge-on-write）表合法，DUPLICATE KEY 表的 partial load 会被 Doris 拒绝"
+        }
+        "err.pipeline.partial_column_unknown" => {
+            "语句 {0} 对汇 {1} 的 INSERT 列清单含未登记列 {2}（以该表登记的 columnsJson 为准）"
+        }
+        // T-A7 mutex, deploy side (live SHOW ALTER TABLE COLUMN)
+        "err.pipeline.partial_schema_change" => {
+            "表 {0} 有 Schema Change 进行中（{1}）——Doris 不接受该表的部分列更新写入，待 SHOW ALTER TABLE COLUMN 状态为 FINISHED 后再部署"
+        }
+        "err.pipeline.partial_precheck_failed" => {
+            "部分列更新前置检查失败（{0} 的 SHOW ALTER TABLE COLUMN）"
+        }
         // ---- datasources ----
         "err.datasource.not_found" => "数据源 #{0} 不存在",
         "err.datasource.unknown_type" => "未知数据源类型 {0}",
@@ -142,6 +168,10 @@ fn template(key: &str) -> Option<&'static str> {
         "err.table_object.dim_sequence_required" => {
             "维表 {0} 必须声明键列 sequenceColumn（主键/单列唯一键，全表加载分页键）"
         }
+        // T-A7 key model on record (unique/duplicate)
+        "err.table_object.key_model_datasource" => {
+            "keyModel 仅可声明在 doris/starrocks 数据源的表上（Doris 键模型概念），当前类型 {0}"
+        }
         // ---- T-A1 建表闭环（draft / execute / evolve）----
         "err.ddl.datasource_kind" => {
             "建表目标仅支持 doris/starrocks 数据源（生成的是 Doris 方言 DDL），当前类型 {0}"
@@ -164,6 +194,10 @@ fn template(key: &str) -> Option<&'static str> {
         "err.ddl.execute_failed" => "DDL 执行失败: {0}",
         "err.ddl.schema_conflict" => {
             "检测到改类型/删列（{0} 处），演进仅支持 ADD COLUMN——建议 DDL 已附于 refs.suggestedDdl，未执行，请人工评估"
+        }
+        // T-A7 mutex, evolve side
+        "err.ddl.partial_update_active" => {
+            "表 {0} 上有已部署的部分列更新管道（{1}）——Schema Change 进行中 Doris 会拒绝其 partial load，请先停止这些管道再演进（refs.pipelines）"
         }
         // ---- T-A2 回填（blueprint §7.3）----
         "err.backfill.not_published" => {
@@ -192,6 +226,10 @@ fn template(key: &str) -> Option<&'static str> {
         }
         "err.backfill.no_credential" => {
             "汇数据源 #{0} 未存储凭据（回填由控制面直连 stream load，需要已登记凭据）"
+        }
+        // T-A7 re-gate at backfill accept (the publish-gate diagnostic rides as {0})
+        "err.backfill.partial_declaration" => {
+            "部分列声明未通过发布门禁，拒绝回填：{0}"
         }
         _ => return None,
     })
@@ -285,17 +323,21 @@ mod tests {
     }
 
     /// 字典自洽：模板只含 {数字} 占位，且插值后无残留花括号。
-    /// 另钉字典规模 = 64 key（模块文档「规模口径」的机器锚点，T39 ③；T35 +3；
+    /// 另钉字典规模 = 74 key（模块文档「规模口径」的机器锚点，T39 ③；T35 +3；
     /// T-D1 dim join +6：发布门禁 3 + 维表登记 3；T-A1 建表闭环 +10；
     /// T-A2 回填 +9：not_published/statement_index/dim_unsupported/
     /// bounds_type/bounds_value/bounds_order/sink_unsupported/
-    /// source_unsupported/no_credential）：
-    /// 加 key 时同步改此数与 KEY_LIST。
+    /// source_unsupported/no_credential；T-A7 部分列更新 +9：发布门禁 5
+    /// （sink_conflict/sink_kind/key_model_missing/key_model_wrong/
+    /// column_unknown）+ 部署侧互斥 2（schema_change/precheck_failed）+
+    /// evolve 侧互斥 1（partial_update_active）+ keyModel 登记 1
+    /// （key_model_datasource）；R7 评审修复轮 +1：backfill 部分列重门
+    /// （partial_declaration））：加 key 时同步改此数与 KEY_LIST。
     #[test]
     fn templates_use_only_positional_placeholders() {
         let keys: Vec<&str> = KEY_LIST.to_vec();
         assert!(!keys.is_empty());
-        assert_eq!(keys.len(), 64, "字典规模漂移：同步模块文档「规模口径」");
+        assert_eq!(keys.len(), 74, "字典规模漂移：同步模块文档「规模口径」");
         for key in keys {
             let tpl = template(key).expect("listed key resolves");
             let mut rest = tpl;
@@ -664,6 +706,13 @@ mod tests {
         "err.pipeline.undeployed",
         "err.pipeline.undeployed_plain",
         "err.pipeline.assigned_node_missing",
+        "err.pipeline.partial_sink_conflict",
+        "err.pipeline.partial_sink_kind",
+        "err.pipeline.partial_key_model_missing",
+        "err.pipeline.partial_key_model_wrong",
+        "err.pipeline.partial_column_unknown",
+        "err.pipeline.partial_schema_change",
+        "err.pipeline.partial_precheck_failed",
         "err.datasource.not_found",
         "err.datasource.unknown_type",
         "err.datasource.unknown_type_registry",
@@ -681,6 +730,7 @@ mod tests {
         "err.table_object.kind_override",
         "err.table_object.dim_kind_datasource",
         "err.table_object.dim_sequence_required",
+        "err.table_object.key_model_datasource",
         "err.ddl.datasource_kind",
         "err.ddl.table_unregistered",
         "err.ddl.columns_missing",
@@ -691,6 +741,7 @@ mod tests {
         "err.ddl.key_model_mismatch",
         "err.ddl.execute_failed",
         "err.ddl.schema_conflict",
+        "err.ddl.partial_update_active",
         "err.backfill.not_published",
         "err.backfill.statement_index",
         "err.backfill.dim_unsupported",
@@ -700,5 +751,6 @@ mod tests {
         "err.backfill.sink_unsupported",
         "err.backfill.source_unsupported",
         "err.backfill.no_credential",
+        "err.backfill.partial_declaration",
     ];
 }

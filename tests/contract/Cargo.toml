@@ -9,7 +9,10 @@ homepage.workspace = true
 documentation.workspace = true
 # Workspace-internal test suite — never published (T26 ④).
 publish = false
-description = "In-process /v1 protocol contract tests + deterministic executor main-loop tests (file→file, zero external deps)"
+description = "In-process /v1 protocol contract tests + deterministic executor main-loop tests (file→file, zero external deps) + sink capability contract (G4)"
+
+[lints]
+workspace = true
 
 [dependencies]
 anyhow = "1"
@@ -27,3 +30,16 @@ tailrace-connector = { workspace = true }
 # `cargo test -p tests-contract --locked` builds a zero-connector runtime
 # and every executor_loop case fails with 源类型未支持：file.
 tailrace-runtime = { workspace = true, features = ["connector-file"] }
+# Sink capability contract (R7 G4, blueprint §7.7 G4 row): the three
+# production sinks' declarations are asserted directly on the concrete
+# types (construction only — doris builds no client, kafka's producer
+# never contacts the dummy bootstrap, file touches no path). This pulls
+# the doris/kafka connector stacks into the test build graph; they are
+# workspace members anyway, so `cargo test --workspace` already builds
+# them.
+tailrace-conn-doris = { workspace = true }
+tailrace-conn-file = { workspace = true }
+tailrace-conn-kafka = { workspace = true }
+# Sink trait signatures speak RecordBatch; already in the build graph via
+# tailrace-runtime (datafusion), declaring it adds no build cost.
+datafusion = { workspace = true }

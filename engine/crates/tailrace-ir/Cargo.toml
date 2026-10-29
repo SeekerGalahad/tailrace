@@ -11,6 +11,9 @@ description = "Plan IR: datafusion-proto serialized LogicalPlan statements plus 
 keywords = ["ir", "datafusion", "logical-plan", "cursor", "arrow"]
 categories = ["database"]
 
+[lints]
+workspace = true
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"

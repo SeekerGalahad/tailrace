@@ -1,0 +1,77 @@
+=== A2: UNIQUE MoW, full load then partial WITH columns header ===
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 2,
+order_no	qty	note	price	flag
+A-1	1	first	1.5	1
+A-2	2	first	2.5	0
+--- partial + columns: order_no,qty ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 2,
+order_no	qty	note	price	flag
+A-1	100	first	1.5	1
+A-2	200	first	2.5	0
+--- partial + columns header but JSON carries an EXTRA key (note) not in columns → ignored? ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 1,
+order_no	qty	note	price	flag
+A-1	1000	first	1.5	1
+A-2	200	first	2.5	0
+--- columns header WITHOUT partial_columns → full replace (others NULL) ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 1,
+order_no	qty	note	price	flag
+A-1	1000	first	1.5	1
+A-2	2000	NULL	NULL	NULL
+=== C2: sequence_col table, partial WITH columns header incl seq ===
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 1,
+order_no	seq	qty	note
+C-1	10	1	first
+--- partial seq=20 + columns: order_no,seq,qty + sequence_column: seq ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 1,
+order_no	seq	qty	note
+C-1	20	100	first
+--- partial LOWER seq=5 + columns + sequence_column → should be discarded ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 1,
+order_no	seq	qty	note
+C-1	20	100	first
+--- partial, columns WITHOUT seq (order_no,qty) on a sequence_col table → Doris verdict ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 1,
+order_no	seq	qty	note
+C-1	20	777	first
+--- partial, columns incl seq, NO sequence_column header → does seq ordering still apply? (seq=5 lower) ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 1,
+order_no	seq	qty	note
+C-1	20	777	first
+=== D2: NO sequence_col property; A1-generator shape (seq is a plain column) + engine headers ===
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 1,
+order_no	seq	qty	note
+C-1	10	1	first
+--- partial seq=20 + columns + sequence_column header (table has no sequence_col) ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 1,
+order_no	seq	qty	note
+C-1	20	100	first
+--- partial LOWER seq=5 (no sequence_col property → ordering NOT enforced? expect overwrite) ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 1,
+order_no	seq	qty	note
+C-1	5	555	first
+=== DONE ===

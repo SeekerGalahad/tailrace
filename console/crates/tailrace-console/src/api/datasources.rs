@@ -298,11 +298,34 @@ pub struct TableRegisterBody {
     /// pagination key); also stored for jdbc streaming tables and doris
     /// UNIQUE KEY sequence columns. Rides the plan's table metadata.
     pub sequence_column: Option<String>,
+    /// Doris key model on record (T-A7): `unique` / `duplicate`, doris and
+    /// starrocks datasources only. A partial-column declaration (INSERT
+    /// column list) needs `unique` at publish — Doris partial update is
+    /// UNIQUE KEY merge-on-write only. The T-A1 execute step records it
+    /// automatically for tables the console creates; a table that pre-exists
+    /// the console declares it here or via `PUT /api/datasources/tables/{id}`.
+    pub key_model: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TableRegistered {
     pub id: i64,
+}
+
+/// `PUT /api/datasources/tables/{id}` body (T-A7): the one editable
+/// registration field today — the Doris key model.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TableKeyModelBody {
+    /// `unique` / `duplicate`.
+    pub key_model: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TableKeyModelSet {
+    pub id: i64,
+    pub key_model: String,
 }
 
 /// List-tables row. `columns_json` (wire `columnsJson`) carries the
@@ -325,6 +348,9 @@ pub struct TableObjectItem {
     /// Declared key column (T-D1; null = not declared) — dim full-table
     /// load pagination key / doris UNIQUE KEY dedup basis / jdbc cursor.
     pub sequence_column: Option<String>,
+    /// Doris key model on record (T-A7; null = not declared): `unique` /
+    /// `duplicate`.
+    pub key_model: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -980,7 +1006,7 @@ fn jdbc_endpoint(url: &str) -> Option<(String, u16, Option<String>)> {
 
 /// Datasource row → metadata-client ConnSpec (T14): connJson shape plus the
 /// unsealed credential. Err(Response) = 400-shaped shape problems.
-fn conn_spec(
+pub(crate) fn conn_spec(
     state: &AppState,
     ds: &console_store::Datasource,
 ) -> Result<tailrace_metadata::ConnSpec, Response> {
@@ -1053,7 +1079,7 @@ fn conn_spec(
 
 /// 502 for backend-side failures (unreachable broker / auth refused) — the
 /// request was well-formed, the datasource is not answering.
-fn unavailable(context: &str, e: anyhow::Error) -> Response {
+pub(crate) fn unavailable(context: &str, e: anyhow::Error) -> Response {
     ApiError::new(
         axum::http::StatusCode::BAD_GATEWAY,
         "UNAVAILABLE",
@@ -1268,6 +1294,13 @@ pub async fn register_table(
         )
         .into_response();
     }
+    // key model (T-A7): a Doris concept — unique/duplicate on doris/starrocks
+    // datasources only; the publish gate reads it under a partial-column
+    // declaration
+    let key_model = match validated_key_model(&ds, body.key_model.as_deref()) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
     let columns_json = body
         .columns_json
         .as_ref()
@@ -1280,6 +1313,7 @@ pub async fn register_table(
         body.format.as_deref(),
         columns_json.as_deref(),
         sequence_column,
+        key_model.as_deref(),
     ) {
         Ok(tid) => tid,
         Err(e) => return conflict_or_internal(&e, "该库表已登记（datasource+db+table 唯一）"),
@@ -1349,6 +1383,7 @@ pub async fn list_tables(
                 source: t.source,
                 columns_json,
                 sequence_column: t.sequence_column,
+                key_model: t.key_model,
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()
@@ -1413,6 +1448,99 @@ pub async fn remove_table(
     axum::http::StatusCode::NO_CONTENT.into_response()
 }
 
+/// Key-model input gate (T-A7): `unique` / `duplicate` (case-insensitive,
+/// normalized to lowercase), and only on a doris/starrocks datasource — the
+/// concept has no meaning for a kafka topic or a file. Absent = `None`.
+fn validated_key_model(
+    ds: &console_store::Datasource,
+    raw: Option<&str>,
+) -> Result<Option<String>, Response> {
+    let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    if !matches!(ds.ds_type.as_str(), "doris" | "starrocks") {
+        return Err(super::messages::bad_request(
+            "err.table_object.key_model_datasource",
+            &[&ds.ds_type],
+        ));
+    }
+    match parse_key_model(s) {
+        Some(m) => Ok(Some(m.name().to_string())),
+        None => Err(super::messages::bad_request(
+            "err.ddl.key_model_unknown",
+            &[s],
+        )),
+    }
+}
+
+/// `PUT /api/datasources/tables/{id}` — record the Doris key model of a
+/// registered table (T-A7): the declaration a partial-column pipeline needs
+/// at publish when the table pre-exists the console (the T-A1 execute step
+/// records it automatically for tables the console creates). The one
+/// editable field of a registration today; audited.
+#[utoipa::path(
+    put,
+    path = "/api/datasources/tables/{id}",
+    request_body = TableKeyModelBody,
+    params(("id" = i64, Path)),
+    responses(
+        (status = 200, body = TableKeyModelSet),
+        (status = 400, body = ErrorResponse, description = "keyModel missing / not unique|duplicate / not a doris|starrocks table"),
+        (status = 404, body = ErrorResponse),
+    )
+)]
+pub async fn set_table_key_model(
+    State(state): State<AppState>,
+    axum::Extension(ctx): axum::Extension<AuthContext>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<i64>,
+    body: Bytes,
+) -> Response {
+    let body: TableKeyModelBody = match parse_body(&body) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let store = state.store();
+    let Some(t) = store.table_object(id).ok().flatten() else {
+        return super::messages::not_found("err.table_object.not_found", &[&id.to_string()])
+            .into_response();
+    };
+    let Some(ds) = store.datasource(t.datasource_id).ok().flatten() else {
+        return super::messages::not_found(
+            "err.datasource.not_found",
+            &[&t.datasource_id.to_string()],
+        )
+        .into_response();
+    };
+    let key_model = match validated_key_model(&ds, body.key_model.as_deref()) {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return super::messages::bad_request("err.ddl.key_model_required", &[]).into_response()
+        }
+        Err(r) => return r,
+    };
+    match store.set_table_key_model(id, &key_model) {
+        Ok(true) => {}
+        Ok(false) => {
+            return super::messages::not_found("err.table_object.not_found", &[&id.to_string()])
+                .into_response()
+        }
+        Err(e) => return ApiError::internal(&e).into_response(),
+    }
+    audit(
+        store,
+        &operator_of(&ctx, &headers),
+        "TABLE_KEY_MODEL",
+        "table_object",
+        Some(id.to_string()),
+        Some(
+            json!({"datasourceId": t.datasource_id, "dbName": t.db_name, "tableName": t.table_name, "keyModel": key_model})
+                .to_string(),
+        ),
+    );
+    Json(TableKeyModelSet { id, key_model }).into_response()
+}
+
 // ---------------- DDL closed loop (T-A1, blueprint §7.2) ----------------
 //
 // Four steps: infer (the registered columns_json) → draft (pure generator,
@@ -1423,11 +1551,15 @@ pub async fn remove_table(
 // `ADD COLUMN` (Light Schema Change); anything else — a retyped or dropped
 // column — is a suggestion, never executed.
 
-/// T-A1 ⑤ / blueprint red line: Doris rejects partial-column updates on a
-/// table with a schema change in flight. Rides every evolve response (and
-/// the 409 refs) so the wizard and the future T-A7 partial-update toggle
-/// surface the same exclusivity rule from one place.
-const PARTIAL_UPDATE_NOTICE: &str = "Doris 限制：Schema Change 进行中的表不支持部分列更新（partial update）。本次 ADD COLUMN 变更完成前（SHOW ALTER TABLE COLUMN 状态为 FINISHED）请勿对该表启用部分列更新写入；部分列更新（T-A7）落地后同样遵守此互斥规则。";
+/// T-A1 ⑤ / blueprint red line, both directions since T-A7: Doris rejects
+/// partial-column updates on a table with a schema change in flight. The
+/// console enforces the pair — evolve refuses while a partial-update
+/// pipeline is deployed on the table (409 PARTIAL_UPDATE_ACTIVE), and a
+/// partial-update deploy refuses while the table's ADD COLUMN job is not
+/// FINISHED (409 SCHEMA_CHANGE_IN_PROGRESS, `SHOW ALTER TABLE COLUMN`).
+/// Rides every evolve response (and the 409 refs) so the wizard surfaces the
+/// rule from one place.
+const PARTIAL_UPDATE_NOTICE: &str = "Doris 限制：Schema Change 进行中的表不支持部分列更新（partial update）。双向互斥：本次 ADD COLUMN 完成前（SHOW ALTER TABLE COLUMN 状态为 FINISHED）对该表的部分列更新管道（INSERT 带列清单）部署会被拒绝（409 SCHEMA_CHANGE_IN_PROGRESS）；反之，该表上有已部署的部分列更新管道时 evolve 拒绝执行（409 PARTIAL_UPDATE_ACTIVE，先停止管道）。";
 
 /// Wizard round-two hints fed back into the draft generator — all optional:
 /// the first call sends `{}` (or no body) and gets the heuristic draft with
@@ -1514,8 +1646,14 @@ pub struct DdlEvolveResponse {
     pub statements: Vec<String>,
     pub added: Vec<(String, String)>,
     pub elapsed_ms: u64,
-    /// Doris partial-update exclusivity (T-A1 ⑤ / T-A7).
+    /// Doris partial-update exclusivity (T-A1 ⑤ / T-A7), both directions.
     pub partial_update_notice: String,
+    /// Pipelines whose published SQL declares a partial-column write
+    /// (INSERT column list) on this table, any status (T-A7). None of them
+    /// is deployed — a deployed one makes evolve refuse (409
+    /// PARTIAL_UPDATE_ACTIVE) — so this is the redeploy checklist: each must
+    /// wait for the ADD COLUMN job to reach FINISHED (its deploy checks).
+    pub partial_update_pipelines: Vec<crate::api::pipelines::PartialUpdatePipeline>,
 }
 
 /// Four-type vocabulary → Doris column type for evolve's ALTER text. Mirrors
@@ -1917,6 +2055,12 @@ pub async fn ddl_execute(
     match tailrace_metadata::mysql_exec(&spec, &[&ddl]).await {
         Ok(outcome) => {
             let (elapsed_ms, rows_affected) = exec_totals(&outcome);
+            // T-A7: the console created the table and knows its key model —
+            // record it, so a partial-column pipeline on this sink can pass
+            // the publish gate without a separate declaration
+            if let Err(e) = store.set_table_key_model(t.id, key_model.name()) {
+                tracing::warn!(table = t.id, error = %e, "key_model write after CREATE TABLE failed");
+            }
             audit(
                 store,
                 &operator,
@@ -1974,6 +2118,15 @@ pub async fn ddl_execute(
 /// the full suggestion text in `refs.suggestedDdl`, nothing executed. Every
 /// outcome carries the partial-update exclusivity notice (T-A1 ⑤). No
 /// request body.
+///
+/// T-A7 mutex, evolve side: a partial-update pipeline deployed on the table
+/// (its INSERT column list makes every load a partial load, which Doris
+/// refuses mid-schema-change) → 409 PARTIAL_UPDATE_ACTIVE naming the
+/// pipelines, before anything touches Doris — stop them first. The gate is
+/// on the TABLE, not on the diff: it fires even when the live table would
+/// turn out to need nothing, because telling a no-op from an ADD takes the
+/// DESC, and the conservative answer costs one stop/redeploy while the
+/// other answer costs a pipeline failing at 3am.
 #[utoipa::path(
     post,
     path = "/api/datasources/{id}/tables/{db}/{table}/ddl/evolve",
@@ -1982,7 +2135,7 @@ pub async fn ddl_execute(
         (status = 200, body = DdlEvolveResponse, description = "ADD COLUMN statements ran (changed:true) or nothing to do (changed:false)"),
         (status = 400, body = ErrorResponse, description = "not a doris/starrocks datasource / no registered columns / column type outside the vocabulary"),
         (status = 404, body = ErrorResponse),
-        (status = 409, body = ErrorResponse, description = "SCHEMA_CHANGE_UNSUPPORTED — retype/drop detected; refs.suggestedDdl / retyped / removed / added / partialUpdateNotice, nothing executed"),
+        (status = 409, body = ErrorResponse, description = "PARTIAL_UPDATE_ACTIVE — a partial-update pipeline is deployed on the table (refs.pipelines), nothing executed; SCHEMA_CHANGE_UNSUPPORTED — retype/drop detected; refs.suggestedDdl / retyped / removed / added / partialUpdateNotice, nothing executed"),
         (status = 502, body = ErrorResponse, description = "UNAVAILABLE (DESC failed) / DDL_FAILED (Doris refused an ADD COLUMN)"),
     )
 )]
@@ -2007,6 +2160,34 @@ pub async fn ddl_evolve(
         .find(|(_, ty)| doris_column_type(ty).is_none())
     {
         return super::messages::bad_request("err.ddl.column_unknown_type", &[name, ty]);
+    }
+    // T-A7 mutex (evolve side): console-only knowledge, checked before the
+    // live DESC so a refusal never depends on Doris being reachable
+    let partial_pipelines =
+        match crate::api::pipelines::partial_update_pipelines_on(state.store(), &t) {
+            Ok(v) => v,
+            Err(e) => return ApiError::internal(&e).into_response(),
+        };
+    let deployed: Vec<&crate::api::pipelines::PartialUpdatePipeline> =
+        partial_pipelines.iter().filter(|p| p.deployed).collect();
+    if !deployed.is_empty() {
+        let names: Vec<String> = deployed
+            .iter()
+            .map(|p| format!("#{} {}", p.id, p.name))
+            .collect();
+        let mut refs = Map::new();
+        refs.insert("pipelines".into(), json!(deployed));
+        refs.insert("partialUpdateNotice".into(), json!(PARTIAL_UPDATE_NOTICE));
+        return super::messages::respond_with_refs(
+            axum::http::StatusCode::CONFLICT,
+            "PARTIAL_UPDATE_ACTIVE",
+            "err.ddl.partial_update_active",
+            &[
+                &format!("{}.{}", t.db_name, t.table_name),
+                &names.join("、"),
+            ],
+            refs,
+        );
     }
     let spec = match conn_spec(&state, &ds) {
         Ok(s) => s,
@@ -2054,6 +2235,7 @@ pub async fn ddl_evolve(
             added: Vec::new(),
             elapsed_ms: 0,
             partial_update_notice: PARTIAL_UPDATE_NOTICE.to_string(),
+            partial_update_pipelines: partial_pipelines,
         })
         .into_response();
     }
@@ -2088,6 +2270,7 @@ pub async fn ddl_evolve(
                 added: plan.added,
                 elapsed_ms,
                 partial_update_notice: PARTIAL_UPDATE_NOTICE.to_string(),
+                partial_update_pipelines: partial_pipelines,
             })
             .into_response()
         }

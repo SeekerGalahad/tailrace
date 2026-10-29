@@ -22,7 +22,7 @@ use sqlx_core::sql_str::AssertSqlSafe;
 use sqlx_mysql::{MySqlConnectOptions, MySqlConnection, MySqlRow, MySqlSslMode};
 use sqlx_postgres::{PgConnectOptions, PgConnection, PgRow, Postgres};
 
-use crate::{ConnSpec, ExecOutcome, StatementOutcome};
+use crate::{AlterColumnJob, ConnSpec, ExecOutcome, StatementOutcome};
 
 /// System schemas hidden from discovery (MySQL's four + Doris's
 /// `__internal_schema`; Postgres filters its own set in SQL).
@@ -163,6 +163,49 @@ fn quote_ident(name: &str) -> anyhow::Result<String> {
         anyhow::bail!("非法标识符（含 NUL）");
     }
     Ok(name.replace('`', "``"))
+}
+
+/// Single-quoted string literal body (MySQL dialect): backslashes and
+/// quotes escaped, NUL rejected — for the one place a user-supplied name
+/// goes into a WHERE value instead of an identifier position.
+fn quote_str(value: &str) -> anyhow::Result<String> {
+    if value.contains('\0') {
+        anyhow::bail!("非法字符串（含 NUL）");
+    }
+    Ok(value.replace('\\', "\\\\").replace('\'', "''"))
+}
+
+/// Doris FE: `SHOW ALTER TABLE COLUMN FROM db WHERE TableName = 'table'` →
+/// every schema-change job the FE still lists for the table, all states.
+/// Zero rows = no job on record (none ever ran, or the history was purged)
+/// — not an error. Columns are read by NAME (`JobId`, `State`): the SHOW
+/// column order is version-dependent, the names are documented.
+pub(crate) async fn doris_alter_column_jobs(
+    spec: &ConnSpec,
+    db: &str,
+    table: &str,
+) -> anyhow::Result<Vec<AlterColumnJob>> {
+    let (mut conn, _) = mysql_connect(spec).await?;
+    let sql = format!(
+        "SHOW ALTER TABLE COLUMN FROM `{}` WHERE TableName = '{}'",
+        quote_ident(db)?,
+        quote_str(table)?
+    );
+    let rows: Vec<MySqlRow> = conn
+        .fetch_all(raw_sql(AssertSqlSafe(sql)))
+        .await
+        .map_err(|e| anyhow::anyhow!("SHOW ALTER TABLE COLUMN 失败（{db}.{table}）: {e}"))?;
+    rows.iter()
+        .map(|r| {
+            let job_id = r
+                .try_get::<String, _>("JobId")
+                .map_err(|e| anyhow::anyhow!("SHOW ALTER TABLE COLUMN 解码失败（JobId）: {e}"))?;
+            let state = r
+                .try_get::<String, _>("State")
+                .map_err(|e| anyhow::anyhow!("SHOW ALTER TABLE COLUMN 解码失败（State）: {e}"))?;
+            Ok(AlterColumnJob { job_id, state })
+        })
+        .collect()
 }
 
 /// Execute statements sequentially on one connection (T-A1 step ④). The
