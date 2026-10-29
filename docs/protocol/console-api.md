@@ -9,7 +9,7 @@
 - **Base** `/api`；**认证** `POST /api/auth/login` 签发不透明 token（24h），经 `Cookie: tr_session=…`（HttpOnly; SameSite=Lax；SSE/EventSource 唯一免手工凭据通道）或 `Authorization: Bearer …` 携带。例外免会话端点：`POST /api/auth/login`、`POST /api/nodes/register`、`POST /api/nodes/heartbeat`（m2m，bootstrap/节点 token 在 JSON body 自证）。
 - **信封**：成功直返资源 JSON；失败 `HTTP 4xx/5xx + {"error":{"code","message"}}`。唯一例外：`POST /api/pipelines/compile` 的 400 按其自带 diagnostics 形态（`{"ok":false,"statements":[],"diagnostics":[…]}`），前端从 error body 读 diagnostics。
 - **操作人**：请求头 `X-Operator` 可选覆盖（默认会话用户名），落审计。
-- **错误码语义**：400 INVALID_ARGUMENT / 401 UNAUTHENTICATED·BAD_NODE_TOKEN / 404 NOT_FOUND / 409 CONFLICT·IN_USE·GENERATION_CONFLICT·SCHEMA_CHANGE_UNSUPPORTED·PARTIAL_UPDATE_ACTIVE·SCHEMA_CHANGE_IN_PROGRESS（T-A7 互斥双向：evolve 遇该表已部署的部分列更新管道 / 部分列更新管道部署遇该表 Schema Change 进行中——详见语义裁决 10）/ 413 PAYLOAD_TOO_LARGE / 422 KEY_MODEL_REQUIRED·DDL_REQUIRED·KEY_MODEL_MISMATCH（T-A1 建表确认门：确认要素缺失或自相矛盾，未触碰 Doris）·BACKFILL_SINK_UNSUPPORTED·BACKFILL_SOURCE_UNSUPPORTED·BACKFILL_DIM_UNSUPPORTED·BACKFILL_NO_CREDENTIAL·BOUNDS_TYPE_UNSUPPORTED·BOUNDS_INVALID·STATEMENT_INDEX_RANGE（T-A2 回填能力门：详见语义裁决 9，一律在创建任何 job 行之前拒绝）/ 501 NOT_IMPLEMENTED / 502 ENGINE_UNREACHABLE·ENGINE_REJECTED·UNAVAILABLE·DDL_FAILED。
+- **错误码语义**：400 INVALID_ARGUMENT / 401 UNAUTHENTICATED·BAD_NODE_TOKEN / 404 NOT_FOUND / 409 CONFLICT·IN_USE·GENERATION_CONFLICT·SCHEMA_CHANGE_UNSUPPORTED·PARTIAL_UPDATE_ACTIVE·SCHEMA_CHANGE_IN_PROGRESS（T-A7 互斥双向：evolve 遇该表已部署的部分列更新管道 / 部分列更新管道部署遇该表 Schema Change 进行中——详见语义裁决 10）/ 413 PAYLOAD_TOO_LARGE / 422 KEY_MODEL_REQUIRED·DDL_REQUIRED·KEY_MODEL_MISMATCH（T-A1 建表确认门：确认要素缺失或自相矛盾，未触碰 Doris）·BACKFILL_SINK_UNSUPPORTED·BACKFILL_SOURCE_UNSUPPORTED·BACKFILL_DIM_UNSUPPORTED·BACKFILL_NO_CREDENTIAL·BOUNDS_TYPE_UNSUPPORTED·BOUNDS_INVALID·STATEMENT_INDEX_RANGE（T-A2 回填能力门：详见语义裁决 9，一律在创建任何 job 行之前拒绝）·PARTIAL_DECLARATION_INVALID（T-A7 部分列发布门在回填 accept 重跑未过——裁决 10「推送侧重门」）/ 501 NOT_IMPLEMENTED / 502 ENGINE_UNREACHABLE·ENGINE_REJECTED·UNAVAILABLE·DDL_FAILED。
 - **时间戳**：ISO-8601 UTC（`2026-10-11T08:00:00Z`；存储层 SQLite `datetime('now')` 序列化时转换）。
 - **审计**：所有管理面变更操作写 `audit_log`（DATASOURCE_CREATE/UPDATE/DELETE/TEST、TABLE_CREATE/DELETE、TABLE_KEY_MODEL（T-A7：keyModel PUT）、TABLE_DDL_EXECUTE/EVOLVE（T-A1：detail_json 带 DDL 全文 + elapsedMs + ok；执行被 Doris 拒绝同样落行，ok:false + error 原文——拒绝也是审计证据）、NODE_MANUAL_REGISTER/REVOKE/DELETE/DEPLOY/ACTION、ARTIFACT_UPLOAD/DELETE、PIPELINE_CREATE/UPDATE/DELETE/PUBLISH/DEPLOY/RECOVER/ACTION/BACKFILL（T-A2：detail 带 jobId/statementIndex/from/to/labelPrefix；dryRun 只读不审计）；LOGIN/NODE_REGISTER 沿用 P0；MCP 面 MCP_INITIALIZE/MCP_TOOL_CALL 见 §五）。
 
@@ -39,13 +39,13 @@
 | ✅ | GET /api/pipelines?page&pageSize · POST /api/pipelines · GET/PUT/DELETE /api/pipelines/{id}（detail 回 `config`（五段 PlanOptions 原文，null 段序列化为 null——编辑页据此原样回传，保存不清空高级配置）；非 DRAFT 保存→PENDING_CHANGES；RUNNING 删除先自动 stop，引擎不可达 502 阻断） |
 | ✅ | POST /api/pipelines/compile（console 内嵌 tailrace-parser 本地编译；`db.table`×dsMapping→`${ds:id.db.table}` 物化后编译；diagnostics 走 400 自带形态。**T-A7 部分列更新开关（2026-10-28）**：`INSERT INTO sink (col, …) SELECT …` 的 **INSERT 列清单即语句级部分列声明**——`statements[].partialColumns` 回声明顺序的列名数组，不带列清单的语句为 `null`（全行写入，历史默认，语句其余形态逐字节不变）；列清单含重复列由 parser 拒绝（400 diagnostics「duplicate column」）） |
 | ✅ | POST /api/pipelines/{id}/publish（门禁：语句引用表对象全部可解析→version+1→`pipeline_version` 快照。**T-A7 部分列门禁**：带列清单的语句其汇须 ①登记 kind=doris（kafka/file 无部分更新语义、starrocks 的 partial update 是另一套装载契约引擎未接——`err.pipeline.partial_sink_kind`）②键模型已登记且为 unique（Doris 部分列更新仅对 UNIQUE KEY merge-on-write 表合法，DUPLICATE 表的 partial load 会被 Doris 拒载——未登记 `err.pipeline.partial_key_model_missing`、非 unique `err.pipeline.partial_key_model_wrong`）③列清单 ⊆ 登记 columnsJson（`err.pipeline.partial_column_unknown`）④同一汇的所有语句声明一致——同带同列或都不带（plan 一汇一条表项，`err.pipeline.partial_sink_conflict`）；任一不满足 400 diagnostics，不带列清单的管道完全不受影响） |
-| ✅ | POST /api/pipelines/{id}/deploy（plan 下推：nodeId 缺省自动分配——preferred 合格优先→运行管道最少→id 升序；引擎 ok:false→DEPLOY_FAILED+502。**T-A7**：声明了部分列的汇其 plan `tables[]` 表项多带 `partial_columns:[…]`（snake_case，引擎 PlanTableObject 同名字段、DorisSink 据此开 `partial_columns=true` 装载模式）——**未声明的表项不带该键**，与 A7 前形态逐字节一致；**部署侧互斥（蓝图红线 T-A1 ⑤ 双向化）**：推送前对每个部分列汇实时查 `SHOW ALTER TABLE COLUMN FROM db WHERE TableName=…`，存在非 FINISHED/CANCELLED 的作业 → **409 SCHEMA_CHANGE_IN_PROGRESS**（`refs.{sink,table,jobs[{jobId,state}]}`，不推送、管道状态不动），FE 不可达/查询失败 → **502 UNAVAILABLE**（与 DDL 端点「DESC 不可达」同口径——前置检查答不出就不部署，不猜）；无部分列汇的管道零 FE 往返） · POST /api/pipelines/{id}/recover（重推当前 plan 到指派节点；同一部署侧互斥前置检查） |
+| ✅ | POST /api/pipelines/{id}/deploy（plan 下推：nodeId 缺省自动分配——preferred 合格优先→运行管道最少→id 升序；引擎 ok:false→DEPLOY_FAILED+502。**T-A7**：声明了部分列的汇其 plan `tables[]` 表项多带 `partial_columns:[…]`（snake_case，引擎 PlanTableObject 同名字段、DorisSink 据此开 `partial_columns=true` 装载模式）——**未声明的表项不带该键**，与 A7 前形态逐字节一致；**推送侧重门（R7 评审修复轮）**：推送前对 spec 快照**重跑 publish 的部分列门禁**（kind=doris / keyModel=unique / 列清单 ⊆ 登记列），任一不满足 → 400 diagnostics（与 publish 同形，不推送、状态不动）——A7 前发布的带列清单快照（当时 parser 忽略列清单=全行写、无门）与发布后键模型被改登记的快照都在此被拦，而非无声翻成 partial 模式后被 Doris 逐批拒载；**部署侧互斥（蓝图红线 T-A1 ⑤ 双向化）**：推送前对每个部分列汇实时查 `SHOW ALTER TABLE COLUMN FROM db WHERE TableName=…`，存在非 FINISHED/CANCELLED 的作业 → **409 SCHEMA_CHANGE_IN_PROGRESS**（`refs.{sink,table,jobs[{jobId,state}]}`，不推送、管道状态不动），FE 不可达/查询失败 → **502 UNAVAILABLE**（与 DDL 端点「DESC 不可达」同口径——前置检查答不出就不部署，不猜）；无部分列汇的管道零 FE 往返） · POST /api/pipelines/{id}/recover（重推当前 plan 到指派节点；同一部署侧互斥前置检查） |
 | ✅ | POST /api/pipelines/{id}/pause · resume · stop（代理引擎 POST /v1/pipelines/{id}/{action}；stop 回 PUBLISHED 并清指派） |
 | ✅ | GET /api/pipelines/{id}/stats · GET /api/pipelines/{id}/offsets（引擎透传，ok:false 也 200；不可达 502） |
 | ✅ | GET /api/pipelines/{id}/logs?lines=200（SSE 桥：首屏 tail=1&limit 钳 50..500 → 1.5s after_seq 增量轮询；15s keepalive；300s 会话上限；引擎瞬断连续 5 次发 eof） |
 | ✅ | GET /api/pipelines/{id}/metrics/trend?hours=24（5 分钟桶；速率=相邻桶差分/300s） |
 | ✅ | GET /api/pipelines/templates（SQL 模板内嵌） |
-| ✅ | **回填（T-A2，2026-10-28；蓝图 §7.3）** `POST /api/pipelines/{id}/backfill`（body `{statementIndex?,from:{"type":"offset","value":N},to:{…},dryRun?}`——from/to 当前仅 offset 边界，file 源按字节位、kafka 源暂不支持【见语义裁决 9】；`dryRun:true` → 200 `{jobId:null,estimatedRows:null,labelPrefix}` **零副作用**——不建 job 行、不落审计、零执行；`dryRun:false` → 202 `{jobId,state:"pending",estimatedRows:null,labelPrefix}` + 审计 PIPELINE_BACKFILL + 后台执行（**控制面进程内执行**：W2 引擎 `run_bounded` + `bf-{jobId}` 台账命名空间 + Deterministic label——见语义裁决 9）；能力门 422：汇非 doris/starrocks（BACKFILL_SINK_UNSUPPORTED）/ 源非 file（BACKFILL_SOURCE_UNSUPPORTED）/ 语句含维表 JOIN（BACKFILL_DIM_UNSUPPORTED）/ 汇数据源未存凭据（BACKFILL_NO_CREDENTIAL）/ timestamp 边界（BOUNDS_TYPE_UNSUPPORTED）/ from≥to 或非整数值（BOUNDS_INVALID）/ statementIndex 越界（STATEMENT_INDEX_RANGE）——全部在创建 job 行之前拒绝；**T-A7**：目标语句带 INSERT 列清单时，accept 路径（非 dryRun）先走与 deploy 相同的部署侧互斥前置检查（409 SCHEMA_CHANGE_IN_PROGRESS / 502 UNAVAILABLE，同样在建 job 行之前），执行器 `bounded_plan` 把列清单投影到汇表项、`backfill_doris_sink` 据此以 `partial_columns=true` 装载——与常驻引擎的 sink_factory 同两跳） · `GET /api/pipelines/{id}/backfill/jobs`（该管道的 job 进度列表，新到旧：`{jobs:[{jobId,statementIndex,from,to,state,rowsWritten,error,createdAt,finishedAt}]}`，state 机 pending→running→done\|failed，终态不可变） |
+| ✅ | **回填（T-A2，2026-10-28；蓝图 §7.3）** `POST /api/pipelines/{id}/backfill`（body `{statementIndex?,from:{"type":"offset","value":N},to:{…},dryRun?}`——from/to 当前仅 offset 边界，file 源按字节位、kafka 源暂不支持【见语义裁决 9】；`dryRun:true` → 200 `{jobId:null,estimatedRows:null,labelPrefix}` **零副作用**——不建 job 行、不落审计、零执行；`dryRun:false` → 202 `{jobId,state:"pending",estimatedRows:null,labelPrefix}` + 审计 PIPELINE_BACKFILL + 后台执行（**控制面进程内执行**：W2 引擎 `run_bounded` + `bf-{jobId}` 台账命名空间 + Deterministic label——见语义裁决 9）；能力门 422：汇非 doris/starrocks（BACKFILL_SINK_UNSUPPORTED）/ 源非 file（BACKFILL_SOURCE_UNSUPPORTED）/ 语句含维表 JOIN（BACKFILL_DIM_UNSUPPORTED）/ 汇数据源未存凭据（BACKFILL_NO_CREDENTIAL）/ timestamp 边界（BOUNDS_TYPE_UNSUPPORTED）/ from≥to 或非整数值（BOUNDS_INVALID）/ statementIndex 越界（STATEMENT_INDEX_RANGE）——全部在创建 job 行之前拒绝；**T-A7**：目标语句带 INSERT 列清单时，accept 路径（非 dryRun）先**重跑 publish 的部分列门禁**（kind=doris / keyModel=unique / 列清单 ⊆ 登记列；未过 → 422 PARTIAL_DECLARATION_INVALID，message 内嵌发布门诊断原文，R7 评审修复轮），再走与 deploy 相同的部署侧互斥前置检查（409 SCHEMA_CHANGE_IN_PROGRESS / 502 UNAVAILABLE，同样在建 job 行之前），执行器 `bounded_plan` 把列清单投影到汇表项、`backfill_doris_sink` 据此以 `partial_columns=true` 装载——与常驻引擎的 sink_factory 同两跳） · `GET /api/pipelines/{id}/backfill/jobs`（该管道的 job 进度列表，新到旧：`{jobs:[{jobId,statementIndex,from,to,state,rowsWritten,error,createdAt,finishedAt}]}`，state 机 pending→running→done\|failed，终态不可变） |
 | ⛔ 501 | POST /api/nodes/ticket（票据链——依赖凭据加密与引擎侧 CredentialProvider，未在本阶段交付） |
 
 ## 三、关键语义裁决
@@ -144,6 +144,17 @@
      `TableObject.partial_columns` → `DorisSink::with_partial_columns`），语句字段是编译期
      记录；两者由 console 从同一条 SQL 推导，不会不一致。不带列清单 = 全行写入，plan 表项
      不带该键，与 A7 前逐字节一致（契约测试钉住）。
+   - **存量列清单快照的语义变化与推送侧重门**（R7 评审修复轮，2026-10-29）：A7 之前 parser
+     **忽略** INSERT 列清单（`INSERT INTO sink (a,b) SELECT …` 与裸 INSERT 等价、全行写入），
+     A7 起同一条 SQL 的列清单成了部分列开关——这对已发布快照（`spec_json`）是**语义反转**：
+     快照不重编译就不会被 publish 门禁再看一眼。因此 deploy / recover / backfill-accept 在推送前
+     **重跑 publish 的部分列门禁**（同一函数、同一诊断：kind=doris / keyModel=unique / 列清单 ⊆
+     登记列；deploy/recover 400 diagnostics，backfill 422 PARTIAL_DECLARATION_INVALID）——
+     升级后存量快照首次推送若落在 DUPLICATE/未登记键模型的表上在此被拦并指向 PUT keyModel 或
+     去掉列清单重发布，而不是无声进入 partial 模式后被 Doris 逐批拒载（"Only unique key merge
+     on write support partial update"）；落在已登记 unique 的表上则按 A7 语义进入部分列写入
+     （publish 本就会放行的形态）。门禁对无列清单的管道零成本、零变化。仓内模板/文档/测试无
+     带列清单的存量用法（`git grep` 零命中），影响面限用户库。
    - **为什么要登记键模型**：Doris 的 partial update 仅对 UNIQUE KEY merge-on-write 表合法，
      DUPLICATE 表的 partial load 在装载时才被拒——那是部署之后、管道运行中的失败。console
      把这条约束前移到 publish：表对象新增 `keyModel`（迁移 03，`unique`/`duplicate`/null），
@@ -159,14 +170,23 @@
      SCHEMA_CHANGE_IN_PROGRESS；**FE 不可达走 502 UNAVAILABLE 而非放行**——与 DDL 端点
      「DESC 不可达」同口径：前置检查答不出时部署等于赌一把，拒绝比猜稳。代价：部分列管道的
      部署多一次 FE 往返并依赖 FE 可达（全行管道零影响）；CI 无 Doris，因此集成测试锚的是
-     「前置检查先于引擎推送/先于建 job 行」与 502 口径，进行中→409 与 MoW「未写列保值」
-     语义由 W4 e2e 对在役 Doris 实跑。
+     「前置检查先于引擎推送/先于建 job 行」与 502 口径，进行中→409 的**响应形状**（code /
+     message 点名 `id=STATE` / `refs.{sink,table,jobs[{jobId,state}]}`）由纯函数单测钉住
+     （R7 评审修复轮，`schema_change_refusal`），进行中的**触发**与 MoW「未写列保值」
+     语义由 W4 e2e 对在役 Doris 实跑（空表 Light Schema Change 瞬时完成，在飞作业尚未能
+     在 e2e 构造——dogfooding 报告如实记录）。
    - **starrocks 在 publish 即拒**（`err.pipeline.partial_sink_kind`）：引擎 W2 的 sink_factory
      对 starrocks + partial_columns 拒绝装配（StarRocks 的 partial update 是主键表 +
      `partial_update` 头的另一套契约，T12 矩阵未接），console 把这一拒绝前移到发布。
+     **引擎侧通用兜底**（R7 评审修复轮）：runtime 装配时对任何声明了 `partial_columns` 的汇检查
+     G4 `capabilities().partial_update`——为 false（file/kafka 及未来任何未实现部分更新的汇）即
+     拒绝装配并点名能力缺失，而不是把投影收窄后无声写出缺列的行；console 之外的独立路径（TOML
+     FileCatalog、手工 plan body）由此与 publish 门同一口径。
    - **回填执行器同样接线**：`bounded_plan` 投影 + `backfill_doris_sink` 应用
      `with_partial_columns`（镜像引擎工厂，含 starrocks 拒绝）——契约测试直接驱动
-     `backfill::run_job` 对 header 捕获型 mock BE 断言 `partial_columns: true` 且 JSON 行仅含
+     `backfill::run_job` 对 header 捕获型 mock BE 断言 `partial_columns: true` **与 `columns:
+     <子集>` 双头**（后者缺失时 Doris 2.1.7 会把 json partial load 解析为全列、未写列置 NULL 且
+     Status Success——W4 实探结论，R7 评审修复轮把该头纳入契约锁定）且 JSON 行仅含
      声明列（HTTP accept 路径在 CI 里被 FE 前置检查挡在 502，故绕过 handler 直驱执行器）。
 
 ## 四、未决 / 后续

@@ -343,6 +343,36 @@ fn partial_declaration_diags(
     Ok(out)
 }
 
+/// The partial-declaration gate over a whole compiled statement set: every
+/// statement carrying an INSERT column list is checked against its
+/// registered sink (`partial_declaration_diags`). Run at publish AND again
+/// at every plan push (deploy / recover) and backfill accept — the spec
+/// snapshot is what gets pushed, and two things can make a snapshot's
+/// declaration invalid after it was published: the sink's record moved
+/// (key model re-registered), or the snapshot predates T-A7, when the
+/// parser ignored the column list (full-row writes) and no gate ran at all.
+/// Re-gating keeps such a snapshot from silently flipping into partial mode
+/// on its first post-upgrade push (a DUPLICATE KEY table would then fail
+/// every stream load — "Only unique key merge on write support partial
+/// update"). Unregistered sinks are skipped here: the callers report them
+/// as missing table objects. Undeclared statements cost nothing.
+fn partial_declarations_gate(
+    store: &console_store::Store,
+    statements: &[StatementOut],
+) -> anyhow::Result<Vec<CompileDiag>> {
+    let mut out = Vec::new();
+    for (idx, st) in statements.iter().enumerate() {
+        if st.partial_columns.is_none() {
+            continue;
+        }
+        let Some(sink) = store.table_object_for_reference(&st.sink)? else {
+            continue;
+        };
+        out.extend(partial_declaration_diags(store, idx, st, &sink)?);
+    }
+    Ok(out)
+}
+
 /// Pipelines whose published SQL declares a partial-column write on
 /// `table` (T-A7 mutex, evolve side — console knowledge only, no Doris
 /// round trip): every pipeline referencing the table, recompiled from its
@@ -405,6 +435,41 @@ fn alter_jobs_in_flight(
         .collect()
 }
 
+/// The 409 SCHEMA_CHANGE_IN_PROGRESS refusal for one partial-column sink
+/// whose table has schema-change jobs in flight: names the table and the
+/// jobs in the message, carries `refs.{sink,table,jobs[{jobId,state}]}`
+/// (the shape the deploy / recover / backfill OpenAPI descriptions promise).
+/// Pure — the live `SHOW ALTER TABLE COLUMN` answer is the caller's; CI has
+/// no Doris to put a job in flight, so this is where the response shape is
+/// locked (unit test below).
+fn schema_change_refusal(
+    sink_ref: &str,
+    table: &str,
+    in_flight: &[&tailrace_metadata::AlterColumnJob],
+) -> Response {
+    let states: Vec<String> = in_flight
+        .iter()
+        .map(|j| format!("{}={}", j.job_id, j.state))
+        .collect();
+    let mut refs = Map::new();
+    refs.insert("sink".into(), json!(sink_ref));
+    refs.insert("table".into(), json!(table));
+    refs.insert(
+        "jobs".into(),
+        json!(in_flight
+            .iter()
+            .map(|j| json!({"jobId": j.job_id, "state": j.state}))
+            .collect::<Vec<_>>()),
+    );
+    super::messages::respond_with_refs(
+        axum::http::StatusCode::CONFLICT,
+        "SCHEMA_CHANGE_IN_PROGRESS",
+        "err.pipeline.partial_schema_change",
+        &[table, &states.join("、")],
+        refs,
+    )
+}
+
 /// T-A7 mutex, deploy side: before a plan with partial-column sinks is
 /// pushed (deploy / recover — and a backfill accepted), every such sink is
 /// checked live for a schema-change job in flight — Doris would refuse the
@@ -445,27 +510,7 @@ async fn schema_change_gate(
             })?;
         let in_flight = alter_jobs_in_flight(&jobs);
         if !in_flight.is_empty() {
-            let states: Vec<String> = in_flight
-                .iter()
-                .map(|j| format!("{}={}", j.job_id, j.state))
-                .collect();
-            let mut refs = Map::new();
-            refs.insert("sink".into(), json!(sink_ref));
-            refs.insert("table".into(), json!(table));
-            refs.insert(
-                "jobs".into(),
-                json!(in_flight
-                    .iter()
-                    .map(|j| json!({"jobId": j.job_id, "state": j.state}))
-                    .collect::<Vec<_>>()),
-            );
-            return Err(super::messages::respond_with_refs(
-                axum::http::StatusCode::CONFLICT,
-                "SCHEMA_CHANGE_IN_PROGRESS",
-                "err.pipeline.partial_schema_change",
-                &[&table, &states.join("、")],
-                refs,
-            ));
+            return Err(schema_change_refusal(sink_ref, &table, &in_flight));
         }
     }
     Ok(())
@@ -853,16 +898,6 @@ pub async fn publish(
                 });
             }
         }
-        if st.partial_columns.is_some() {
-            match store.table_object_for_reference(&st.sink) {
-                Ok(Some(sink)) => match partial_declaration_diags(store, idx, st, &sink) {
-                    Ok(d) => gate.extend(d),
-                    Err(e) => return ApiError::internal(&e).into_response(),
-                },
-                Ok(None) => {} // reported as missing above
-                Err(e) => return ApiError::internal(&e).into_response(),
-            }
-        }
         for d in &st.dims {
             match store.table_object_for_dim_reference(&d.reference) {
                 Ok(Some(t)) => {
@@ -900,6 +935,12 @@ pub async fn publish(
                 Err(e) => return ApiError::internal(&e).into_response(),
             }
         }
+    }
+    // partial declarations against their registered sinks (unregistered
+    // sinks were reported as missing above)
+    match partial_declarations_gate(store, &statements) {
+        Ok(d) => gate.extend(d),
+        Err(e) => return ApiError::internal(&e).into_response(),
     }
     // one partial declaration per sink across statements (the plan carries
     // one table entry per sink)
@@ -943,8 +984,11 @@ pub async fn publish(
 /// `POST /api/pipelines/{id}/deploy` — plan push-down with auto-assignment
 /// (preferred eligible → fewest running → lowest id, §4.5) and the full plan
 /// body per §4.5/engine B.2. Engine `ok:false` records DEPLOY_FAILED and
-/// returns 502. T-A7: a plan with partial-column sinks is first checked
-/// live for a schema change in flight on each such sink (409
+/// returns 502. T-A7: the snapshot's partial-column declarations are
+/// re-gated against their registered sinks (400 diagnostics, same as
+/// publish — a pre-A7 snapshot or a moved key model never flips into partial
+/// mode unchecked), then a plan with partial-column sinks is checked live
+/// for a schema change in flight on each such sink (409
 /// SCHEMA_CHANGE_IN_PROGRESS; FE unreachable → 502 UNAVAILABLE).
 #[utoipa::path(
     post,
@@ -953,7 +997,7 @@ pub async fn publish(
     params(("id" = i64, Path)),
     responses(
         (status = 200, description = "engine verdict JSON (ok:true + statement count)"),
-        (status = 400, body = crate::api::ErrorResponse),
+        (status = 400, body = crate::api::ErrorResponse, description = "compile diagnostics of the spec snapshot — including the T-A7 partial-declaration gate re-run at push (kind=doris, keyModel=unique, declared ⊆ registered)"),
         (status = 404, body = crate::api::ErrorResponse),
         (status = 409, body = crate::api::ErrorResponse, description = "NO_ELIGIBLE_NODE — no eligible node; SCHEMA_CHANGE_IN_PROGRESS — a partial-column sink has an ADD COLUMN job in flight (refs.table / jobs), nothing pushed"),
         (status = 502, body = crate::api::ErrorResponse, description = "ENGINE_UNREACHABLE / ENGINE_REJECTED (ok:false); UNAVAILABLE — the partial-update precheck could not ask the Doris FE"),
@@ -1028,7 +1072,8 @@ pub async fn recover(
 // ---------------- plan construction + push ----------------
 
 /// Build and push the plan (§4.5 deploy / recover shared path). Steps:
-/// compile the materialized spec → resolve every ref against registered
+/// compile the materialized spec → re-run the T-A7 partial-declaration gate
+/// against the registered sinks → resolve every ref against registered
 /// table objects (+ datasource connection params) → pick the node → PUT the
 /// plan → record the outcome.
 async fn push_plan(
@@ -1081,6 +1126,26 @@ async fn push_plan(
                 .into_response()
         }
     };
+    // T-A7 re-gate: the snapshot's declarations must still fit their
+    // registered sinks at push time — the publish gate's diagnostics, so a
+    // snapshot published before the gate existed (pre-A7: column list
+    // ignored, full-row writes) or whose sink record moved since cannot
+    // flip into partial mode unchecked
+    match partial_declarations_gate(store, &statements) {
+        Ok(d) if d.is_empty() => {}
+        Ok(d) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(CompileResponse {
+                    ok: false,
+                    statements: Vec::new(),
+                    diagnostics: d,
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => return ApiError::internal(&e).into_response(),
+    }
     let mut refs: Vec<String> = Vec::new();
     for st in &statements {
         for r in [&st.source, &st.sink] {
@@ -1975,8 +2040,8 @@ fn backfill_target(
     // label idempotency (the replay-dedup mechanism) lives in the stream-load
     // label space; file/kafka sinks would double-write every replay.
     let store = state.store();
-    let resolve_kind = |reference: &str| -> Result<(String, i64), Response> {
-        let t = store
+    let resolve = |reference: &str| -> Result<console_store::TableObject, Response> {
+        store
             .table_object_for_reference(reference)
             .ok()
             .flatten()
@@ -1987,11 +2052,12 @@ fn backfill_target(
                     "err.pipeline.statement_table_missing",
                     &[&(idx + 1).to_string(), "源/汇", reference],
                 )
-            })?;
-        Ok((tailrace_catalog::normalize_kind(&t.kind), t.datasource_id))
+            })
     };
-    let (source_kind, _) = resolve_kind(&st.source)?;
-    let (sink_kind, sink_ds) = resolve_kind(&st.sink)?;
+    let source_kind = tailrace_catalog::normalize_kind(&resolve(&st.source)?.kind);
+    let sink_table = resolve(&st.sink)?;
+    let sink_kind = tailrace_catalog::normalize_kind(&sink_table.kind);
+    let sink_ds = sink_table.datasource_id;
     if !matches!(sink_kind.as_str(), "doris" | "starrocks") {
         return Err(super::messages::respond(
             axum::http::StatusCode::UNPROCESSABLE_ENTITY,
@@ -1999,6 +2065,23 @@ fn backfill_target(
             "err.backfill.sink_unsupported",
             &[&(idx + 1).to_string(), &st.sink, &sink_kind],
         ));
+    }
+    // T-A7 re-gate (backfill flavour): a bounded replay writes the same
+    // partial loads a deploy would, so the declaration must still fit the
+    // registered sink — the publish gate's diagnostics, before any job row
+    // exists (a pre-A7 snapshot or a moved key model is refused here, not by
+    // Doris mid-replay)
+    if st.partial_columns.is_some() {
+        let diags = partial_declaration_diags(store, idx as usize, st, &sink_table)
+            .map_err(|e| ApiError::internal(&e).into_response())?;
+        if let Some(d) = diags.first() {
+            return Err(super::messages::respond(
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PARTIAL_DECLARATION_INVALID",
+                "err.backfill.partial_declaration",
+                &[&d.message],
+            ));
+        }
     }
     // source gate: file only this wave. A scalar `from` cannot address a
     // kafka partition map (engine W2 warns and would silently replay from the
@@ -2050,7 +2133,7 @@ fn backfill_target(
         (status = 202, body = BackfillAccepted, description = "job row created (pending), executor spawned"),
         (status = 404, body = crate::api::ErrorResponse),
         (status = 409, body = crate::api::ErrorResponse, description = "SCHEMA_CHANGE_IN_PROGRESS — the statement declares a partial-column write and its sink has an ADD COLUMN job in flight (T-A7; dryRun skips the precheck)"),
-        (status = 422, body = crate::api::ErrorResponse, description = "capability gate: BACKFILL_SINK_UNSUPPORTED (non doris/starrocks sink), BACKFILL_SOURCE_UNSUPPORTED, BACKFILL_DIM_UNSUPPORTED, BACKFILL_NO_CREDENTIAL, BOUNDS_TYPE_UNSUPPORTED, BOUNDS_INVALID, STATEMENT_INDEX_RANGE"),
+        (status = 422, body = crate::api::ErrorResponse, description = "capability gate: BACKFILL_SINK_UNSUPPORTED (non doris/starrocks sink), BACKFILL_SOURCE_UNSUPPORTED, BACKFILL_DIM_UNSUPPORTED, BACKFILL_NO_CREDENTIAL, BOUNDS_TYPE_UNSUPPORTED, BOUNDS_INVALID, STATEMENT_INDEX_RANGE; PARTIAL_DECLARATION_INVALID — the statement's INSERT column list no longer passes the T-A7 publish gate against its registered sink (re-run here)"),
         (status = 502, body = crate::api::ErrorResponse, description = "UNAVAILABLE — the partial-update precheck could not ask the Doris FE"),
     )
 )]
@@ -2306,5 +2389,104 @@ mod tests {
         let mut on_sans = on.clone();
         on_sans.as_object_mut().unwrap().remove("partial_columns");
         assert_eq!(on_sans, off);
+    }
+
+    /// T-A7 re-gate (R7 review): the gate over a statement set follows the
+    /// sink's CURRENT record — a declaration that passed at publish is
+    /// refused once the key model on record is no longer `unique` (the
+    /// pre-A7 snapshot case is the same shape: a list the gate never saw).
+    /// Undeclared statements and unregistered sinks contribute nothing.
+    #[test]
+    fn partial_declarations_gate_follows_the_sink_record() {
+        let store = console_store::Store::open_in_memory().unwrap();
+        let ds = store
+            .insert_datasource(
+                "d",
+                "doris",
+                r#"{"jdbcUrl":"jdbc:mysql://127.0.0.1:1/x","streamLoadUrl":"http://127.0.0.1:1"}"#,
+            )
+            .unwrap();
+        let table = store
+            .insert_table_object(
+                ds,
+                "ods",
+                "orders",
+                "doris",
+                None,
+                Some(r#"[["k","utf8"],["a","utf8"],["b","utf8"]]"#),
+                None,
+                Some("unique"),
+            )
+            .unwrap();
+        let sink = format!("{ds}.ods.orders");
+        let declared = [stmt(&sink, Some(&["k", "a"])), stmt(&sink, None)];
+        assert!(
+            partial_declarations_gate(&store, &declared)
+                .unwrap()
+                .is_empty(),
+            "unique on record + declared ⊆ registered passes"
+        );
+        // the record moves under the snapshot → the same statements are refused
+        store.set_table_key_model(table, "duplicate").unwrap();
+        let diags = partial_declarations_gate(&store, &declared).unwrap();
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].line, 1);
+        assert!(
+            diags[0].message.contains("keyModel=duplicate"),
+            "{}",
+            diags[0].message
+        );
+        // an unregistered sink is not this gate's business (reported as a
+        // missing table object by the callers)
+        assert!(
+            partial_declarations_gate(&store, &[stmt("9.nowhere.t", Some(&["k"]))])
+                .unwrap()
+                .is_empty()
+        );
+        // no declaration anywhere = no lookups, no diagnostics
+        assert!(partial_declarations_gate(&store, &[stmt(&sink, None)])
+            .unwrap()
+            .is_empty());
+    }
+
+    /// T-A7 deploy-side mutex, the 409 shape (R7 review: CI has no Doris
+    /// to put an ALTER job in flight, so the refusal is locked here):
+    /// SCHEMA_CHANGE_IN_PROGRESS, message naming the table and every
+    /// in-flight job as `id=STATE`, `refs.{sink,table,jobs[{jobId,state}]}`.
+    #[tokio::test]
+    async fn schema_change_refusal_carries_table_and_jobs_refs() {
+        let job = |id: &str, st: &str| tailrace_metadata::AlterColumnJob {
+            job_id: id.into(),
+            state: st.into(),
+        };
+        let jobs = [job("1001", "RUNNING"), job("1002", "WAITING_TXN")];
+        let in_flight: Vec<&tailrace_metadata::AlterColumnJob> = jobs.iter().collect();
+        let resp = schema_change_refusal("4.ods.orders", "ods.orders", &in_flight);
+        assert_eq!(resp.status(), axum::http::StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let b: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(b["error"]["code"], "SCHEMA_CHANGE_IN_PROGRESS", "{b}");
+        assert_eq!(
+            b["error"]["message_key"],
+            "err.pipeline.partial_schema_change"
+        );
+        let msg = b["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("ods.orders") && msg.contains("1001=RUNNING、1002=WAITING_TXN"),
+            "{msg}"
+        );
+        let refs = &b["error"]["refs"];
+        assert_eq!(refs["sink"], "4.ods.orders", "{refs}");
+        assert_eq!(refs["table"], "ods.orders");
+        assert_eq!(
+            refs["jobs"],
+            json!([
+                {"jobId": "1001", "state": "RUNNING"},
+                {"jobId": "1002", "state": "WAITING_TXN"}
+            ]),
+            "{refs}"
+        );
     }
 }

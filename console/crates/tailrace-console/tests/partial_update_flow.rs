@@ -361,6 +361,129 @@ async fn deploy_prechecks_schema_change_before_the_engine_push() {
     assert_eq!(b["error"]["code"], "UNAVAILABLE");
 }
 
+/// Push-side re-gate (R7 review): what gets pushed is the spec snapshot, and
+/// a snapshot's declaration can be invalid without publish ever saying so —
+/// ① a snapshot published before T-A7 (the parser then ignored the INSERT
+/// column list = full-row writes; no gate ran) now carries a list on a table
+/// with no key model on record; ② the key model is re-registered after a
+/// valid publish. Both must be refused at deploy / recover with the publish
+/// gate's 400 diagnostics — before the FE precheck, before the mock engine
+/// sees a plan, pipeline status untouched — instead of silently flipping the
+/// sink into partial mode (a DUPLICATE KEY table would then fail every
+/// load). A backfill accept refuses the same way (422
+/// PARTIAL_DECLARATION_INVALID, no job row). A record set back to `unique`
+/// reopens the path: the precheck's 502 is the next stop.
+#[tokio::test]
+async fn push_regates_the_declaration_against_the_registered_sink() {
+    let app = app().await;
+    let (st, port) = spawn_mock_engine().await;
+    let (kafka, doris, _, doris_table) = seed_datasources(&app).await;
+    online_node(&app, port, "n1").await;
+
+    // ① the pre-A7 snapshot: published bare (no list, no gate), then the
+    // stored spec is what an old console left behind for a list-bearing
+    // SQL — materialized form, column list in place, key model never asked
+    let legacy = published_pipeline(&app, kafka, doris).await;
+    let legacy_spec = format!(
+        "INSERT INTO ${{ds:{doris}.ods.orders}} (id, payload) SELECT id, payload \
+         FROM ${{ds:{kafka}.shop.orders}} WHERE op_type IN ('I','U')"
+    );
+    app.store
+        .set_pipeline_published(legacy, &legacy_spec, PARTIAL_SQL, "legacy")
+        .unwrap();
+    let (s, b) = req(
+        &app,
+        "POST",
+        &format!("/api/pipelines/{legacy}/deploy"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert_eq!(b["ok"], false);
+    assert!(
+        diag_text(&b).contains("未登记键模型"),
+        "the list the gate never saw is gated at push: {}",
+        diag_text(&b)
+    );
+    assert!(
+        st.plans.lock().unwrap().is_empty(),
+        "the engine never sees a plan the gate refused"
+    );
+
+    // ② a valid publish whose premise moves afterwards
+    set_key_model(&app, doris_table, "unique").await;
+    let pid = pipeline(&app, "partial", PARTIAL_SQL, kafka, doris).await;
+    let (s, b) = publish(&app, pid).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (s, _) = set_key_model(&app, doris_table, "duplicate").await;
+    assert_eq!(s, StatusCode::OK);
+    for action in ["deploy", "recover"] {
+        let (s, b) = req(
+            &app,
+            "POST",
+            &format!("/api/pipelines/{pid}/{action}"),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{action}: {b}");
+        assert_eq!(b["ok"], false, "{action}: compile-shaped refusal");
+        assert!(
+            diag_text(&b).contains("keyModel=duplicate"),
+            "{action}: {}",
+            diag_text(&b)
+        );
+    }
+    assert!(st.plans.lock().unwrap().is_empty(), "nothing pushed");
+    let (_, b) = req(&app, "GET", &format!("/api/pipelines/{pid}"), None).await;
+    assert_eq!(
+        b["status"], "PUBLISHED",
+        "a gate refusal is not DEPLOY_FAILED: {b}"
+    );
+
+    // backfill accept: same gate, the envelope shape of the other capability
+    // gates, refused before any job row (the source gate — kafka, 422 — would
+    // otherwise be the answer; the sink's declaration is judged first)
+    let (s, b) = req(
+        &app,
+        "POST",
+        &format!("/api/pipelines/{pid}/backfill"),
+        Some(json!({
+            "statementIndex": 0,
+            "from": {"type": "offset", "value": 0},
+            "to": {"type": "offset", "value": 10}
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{b}");
+    assert_eq!(b["error"]["code"], "PARTIAL_DECLARATION_INVALID", "{b}");
+    assert_eq!(
+        b["error"]["message_key"],
+        "err.backfill.partial_declaration"
+    );
+    assert!(
+        b["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("keyModel=duplicate"),
+        "the publish diagnostic rides inside: {b}"
+    );
+    let (_, b) = req(
+        &app,
+        "GET",
+        &format!("/api/pipelines/{pid}/backfill/jobs"),
+        None,
+    )
+    .await;
+    assert_eq!(b["jobs"].as_array().unwrap().len(), 0, "no job row");
+
+    // the record back to unique → the gate reopens and the FE precheck is
+    // the next stop (unreachable here: 502, as the test above pins)
+    set_key_model(&app, doris_table, "unique").await;
+    let (s, b) = req(&app, "POST", &format!("/api/pipelines/{pid}/deploy"), None).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{b}");
+    assert_eq!(b["error"]["code"], "UNAVAILABLE", "{b}");
+}
+
 /// Evolve side of the mutex: while a partial-update pipeline is deployed
 /// (RUNNING or PAUSED) on the table, evolve refuses up front with 409
 /// PARTIAL_UPDATE_ACTIVE naming it — before the live DESC, so the refusal
@@ -653,6 +776,15 @@ async fn backfill_executor_writes_the_declared_subset_as_a_partial_load() {
         headers.get("partial_columns").map(String::as_str),
         Some("true"),
         "the declared subset rides as a partial load: {headers:?}"
+    );
+    // the second header of the pair is NOT optional: without `columns`
+    // naming the subset Doris 2.1.7 resolves a json partial load to every
+    // table column and silently NULLs the unlisted ones (Status Success) —
+    // live-probed in W4 (scripts/e2e/evidence/partial_update-probe-2026-10-28)
+    assert_eq!(
+        headers.get("columns").map(String::as_str),
+        Some("order_no,qty"),
+        "the subset must be named on the wire: {headers:?}"
     );
     let first: Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
     assert_eq!(first["order_no"], "ORD-1");

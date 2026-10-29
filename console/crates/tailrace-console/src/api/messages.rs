@@ -11,16 +11,16 @@
 //!
 //! 规模口径（T39 ③ 勘正，2026-10-23 实测；T35 增补；T-D1 dim join +6 key；
 //! T-A1 建表闭环 +10 key；T-A2 回填 +9 key；T-A7 部分列更新 +9 key，
-//! 2026-10-28 实测）：字典
-//! **73 key**（[`tests::KEY_LIST`] 与 `template` 同步，长度由
+//! 2026-10-28 实测；R7 评审修复轮 +1 key——回填 accept 重跑部分列发布门）：字典
+//! **74 key**（[`tests::KEY_LIST`] 与 `template` 同步，长度由
 //! [`tests::templates_use_only_positional_placeholders`]
-//! 钉住）/ **105 调用点**（`grep -rn 'messages::' src/ --include='*.rs'`
+//! 钉住）/ **106 调用点**（`grep -rn 'messages::' src/ --include='*.rs'`
 //! 排除本模块；T35 部署链 +3 key/+7 站点；T-D1 +6 站点——发布门禁 3 + 维表登记 3；
 //! T-A1 +14 站点——draft/execute/evolve 三端点的 400/404/422/409/502 信封全部走字典，
 //! 改前实测 66，此前登记的 63 为 T-D1 后未同步的旧值；T-A2 回填 +11 站点，
 //! 2026-10-28 实测——backfill 请求门禁 9 + jobs 404 1 + 未发布 400 1；
 //! T-A7 +14 站点——发布门禁 6 + 部署侧互斥 2 + evolve 侧互斥 1 + keyModel
-//! 登记/PUT 5，改前实测 91）。
+//! 登记/PUT 5，改前实测 91；R7 评审修复轮 +1 站点——backfill 部分列重门 422）。
 //! T34 首提交 3cf738b 的「37 key/51 调用点」为双 off-by-one
 //! 误记，ffb1d55 勘正、本次落为模块事实。
 //!
@@ -227,6 +227,10 @@ fn template(key: &str) -> Option<&'static str> {
         "err.backfill.no_credential" => {
             "汇数据源 #{0} 未存储凭据（回填由控制面直连 stream load，需要已登记凭据）"
         }
+        // T-A7 re-gate at backfill accept (the publish-gate diagnostic rides as {0})
+        "err.backfill.partial_declaration" => {
+            "部分列声明未通过发布门禁，拒绝回填：{0}"
+        }
         _ => return None,
     })
 }
@@ -319,7 +323,7 @@ mod tests {
     }
 
     /// 字典自洽：模板只含 {数字} 占位，且插值后无残留花括号。
-    /// 另钉字典规模 = 73 key（模块文档「规模口径」的机器锚点，T39 ③；T35 +3；
+    /// 另钉字典规模 = 74 key（模块文档「规模口径」的机器锚点，T39 ③；T35 +3；
     /// T-D1 dim join +6：发布门禁 3 + 维表登记 3；T-A1 建表闭环 +10；
     /// T-A2 回填 +9：not_published/statement_index/dim_unsupported/
     /// bounds_type/bounds_value/bounds_order/sink_unsupported/
@@ -327,12 +331,13 @@ mod tests {
     /// （sink_conflict/sink_kind/key_model_missing/key_model_wrong/
     /// column_unknown）+ 部署侧互斥 2（schema_change/precheck_failed）+
     /// evolve 侧互斥 1（partial_update_active）+ keyModel 登记 1
-    /// （key_model_datasource））：加 key 时同步改此数与 KEY_LIST。
+    /// （key_model_datasource）；R7 评审修复轮 +1：backfill 部分列重门
+    /// （partial_declaration））：加 key 时同步改此数与 KEY_LIST。
     #[test]
     fn templates_use_only_positional_placeholders() {
         let keys: Vec<&str> = KEY_LIST.to_vec();
         assert!(!keys.is_empty());
-        assert_eq!(keys.len(), 73, "字典规模漂移：同步模块文档「规模口径」");
+        assert_eq!(keys.len(), 74, "字典规模漂移：同步模块文档「规模口径」");
         for key in keys {
             let tpl = template(key).expect("listed key resolves");
             let mut rest = tpl;
@@ -746,5 +751,6 @@ mod tests {
         "err.backfill.sink_unsupported",
         "err.backfill.source_unsupported",
         "err.backfill.no_credential",
+        "err.backfill.partial_declaration",
     ];
 }

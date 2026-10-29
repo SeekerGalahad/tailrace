@@ -32,7 +32,10 @@ pub struct SinkCapabilities {
     pub overwrite: bool,
     /// Writing a column subset preserves the unlisted columns' existing
     /// row values (Doris UNIQUE KEY partial_columns; flipped per-instance
-    /// by DorisSink's A7 partial mode, off on default construction).
+    /// by DorisSink's A7 partial mode, off on default construction). The
+    /// runtime branches on this flag: a plan declaring `partial_columns` on
+    /// a sink whose flag is false is refused at assembly instead of
+    /// silently writing subset rows under full-row semantics.
     pub partial_update: bool,
     /// The sink itself routes writes per data partition (target-side
     /// auto-partitioning does not count).

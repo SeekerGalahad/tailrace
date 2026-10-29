@@ -1,10 +1,14 @@
 //! Sink capability contract (R7 G4, blueprint §7.7 G4 row): the three
 //! production sinks declare what they can really do, and the declarations
 //! are locked here. Flipping any flag must land together with the behavior
-//! it names — A7 flips doris `partial_update` when column-subset writes
-//! ship, T36③ flips `transactional` when 2PC staging ships. Zero external
-//! dependencies: sinks are constructed (no client built, no broker
-//! contact, no path touched) and only the static declaration is read.
+//! it names — A7 (shipped) flips doris `partial_update` per instance, only
+//! when `with_partial_columns` narrowed the carrier to a declared subset;
+//! T36③ flips `transactional` when 2PC staging ships. The flags are
+//! load-bearing: the runtime refuses a `partial_columns` declaration on any
+//! sink whose `partial_update` is false (tailrace-runtime
+//! partial_capability_gate tests). Zero external dependencies: sinks are
+//! constructed (no client built, no broker contact, no path touched) and
+//! only the static declaration is read.
 
 use datafusion::arrow::record_batch::RecordBatch;
 use tailrace_conn_doris::DorisSink;
@@ -24,11 +28,12 @@ fn floor() -> SinkCapabilities {
     }
 }
 
-/// doris: label idempotency only — every flush carries a stream load
-/// label Doris deduplicates globally ("label already exists" converges to
-/// success). 2PC staging, partial-column writes, overwrite and sink-side
-/// partition routing are not implemented (T36③ / A7 will flip their
-/// flags here when they land).
+/// doris, default construction: label idempotency only — every flush
+/// carries a stream load label Doris deduplicates globally ("label already
+/// exists" converges to success). 2PC staging, overwrite and sink-side
+/// partition routing are not implemented (T36③ will flip `transactional`
+/// here when it lands); partial-column writes exist (A7) but are off until
+/// a subset is declared — see the next test.
 #[test]
 fn doris_sink_declares_label_idempotency_only() {
     let sink = DorisSink::new(
@@ -41,6 +46,31 @@ fn doris_sink_declares_label_idempotency_only() {
         sink.capabilities(),
         SinkCapabilities {
             idempotent_label: true,
+            ..floor()
+        }
+    );
+}
+
+/// doris, A7 partial mode: `with_partial_columns` (a validated subset of
+/// the sink's columns) flips `partial_update` on THAT instance and nothing
+/// else — the declaration follows the behavior, per instance, not per type.
+/// The builder is pure (subset validation only), so the on-state is locked
+/// here without a BE.
+#[test]
+fn doris_sink_flips_partial_update_per_instance() {
+    let sink = DorisSink::new(
+        "http://127.0.0.1:1/api/ct/db/_stream_load",
+        "Basic ct:never-used",
+        vec!["k".into(), "a".into(), "b".into()],
+        "ct-doris-caps-partial",
+    )
+    .with_partial_columns(vec!["k".into(), "a".into()])
+    .expect("a subset of the declared columns is a valid declaration");
+    assert_eq!(
+        sink.capabilities(),
+        SinkCapabilities {
+            idempotent_label: true,
+            partial_update: true,
             ..floor()
         }
     );
