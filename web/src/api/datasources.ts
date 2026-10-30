@@ -154,6 +154,10 @@ export interface DdlDraftInput {
    * stays a guess; `true` = confirmed (guess flag clears); `false` = dropped —
    * no `PARTITION BY` clause and no `dynamic_partition.*` properties. */
   partition?: boolean
+  /** Per-column type overrides from the wizard's column step (A3): `[name,
+   * vocabulary type]` pairs steering THIS draft only — the registration is
+   * never rewritten. A name outside the registered set → 400. */
+  columnTypes?: [string, string][]
 }
 
 export interface DdlPartition {
@@ -174,7 +178,8 @@ export interface DdlDraftResponse {
   keyColumnGuessed: boolean
   partition: DdlPartition | null
   notes: string[]
-  /** Registered `[name, type]` pairs the draft was built from. */
+  /** `[name, type]` pairs the draft was built from — the registered
+   * columnsJson with any `columnTypes` overrides applied (A3). */
   columns: [string, string][]
   sequenceColumn: string | null
 }

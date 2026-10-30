@@ -8,15 +8,21 @@
 //! Purity is what makes the snapshot tests (given schema → fixed DDL text)
 //! meaningful — the whole §7.2 rule table lives here and nowhere else.
 //!
-//! Vocabulary boundary (until G2): columns carry the engine's established
-//! four-type vocabulary — `utf8` / `int64` / `float64` / `bool` — mapped per
-//! blueprint §7.1's retained rows. Anything else is an explicit error, not a
-//! silent fold: a draft built on a folded type would lie about the table
-//! (G2's hard-error direction, applied early to the one place that emits
-//! DDL). For the same reason the partition heuristic is **name**-based —
-//! the current vocabulary has no timestamp/date type to key on, so
-//! time-shaped *names* stand in until G2 lands real types (then detection
-//! switches to the column type; see [`partition_candidate`]). A candidate is
+//! Vocabulary surface (G2 words landed, A3 widened the mapping): columns
+//! carry the 16-word vocabulary; the generator maps the 13 scalar words —
+//! the four legacy ones (`utf8` / `int64` / `float64` / `bool`) plus
+//! `string` / `int8` / `int16` / `int32` / `float32` / `decimal(p,s)` /
+//! `timestamp(unit)` / `date` / `binary` — per blueprint §7.1's mapping
+//! column. `list<float32>` / `variant` / `null` stay outside this round
+//! (ARRAY/VARIANT/NULL_TYPE column shapes want their own live probe, the
+//! W5 e2e pass — writing assertions before that probe is the R7 lesson).
+//! Anything unmapped is an explicit error, not a silent fold: a draft built
+//! on a folded type would lie about the table. For the same reason the
+//! partition heuristic is **type**-based since A3 — timestamp/date columns
+//! are real time types now, so they take the RANGE key directly (probed on
+//! 2.1.7: dynamic DAY partitions on a DATETIME/DATE column generate true
+//! date bounds, no yyyyMMdd convention needed — that caveat stays
+//! BIGINT-only), and a candidate is
 //! only offered when Doris would actually accept the clause (type and
 //! key-model rules probed live on 2.1.7 — an unexecutable draft is a lie
 //! too), and the human can drop it through [`KeyHints::partition`].
@@ -152,7 +158,7 @@ pub struct DraftDdl {
 /// Generate a CREATE TABLE draft (§7.2 steps ①+② — pure; execution is step
 /// ④ and lives elsewhere). Errors on anything that would make the draft a
 /// lie: empty/invalid identifiers, duplicate columns, types outside the
-/// four-type vocabulary, hints naming columns that do not exist.
+/// generator's vocabulary surface, hints naming columns that do not exist.
 pub fn generate_draft(schema: &Schema, hints: &KeyHints) -> anyhow::Result<DraftDdl> {
     if schema.db.trim().is_empty() {
         bail!("db 名为空，无法生成 DDL（无点 Kafka 主题需先指定目标库）");
@@ -170,8 +176,10 @@ pub fn generate_draft(schema: &Schema, hints: &KeyHints) -> anyhow::Result<Draft
         }
         if doris_type(ty).is_none() {
             bail!(
-                "列 {name:?} 的类型 {ty:?} 不在受支持词汇内（utf8/int64/float64/bool）——\
-                 G2 扩表前不静默折叠未知类型"
+                "列 {name:?} 的类型 {ty:?} 不在 DDL 生成器支持面内\
+                 （utf8/string/int8/int16/int32/int64/float32/float64/decimal(p,s)/\
+                 timestamp(s|ms|us|ns)/date/bool/binary；list<float32>/variant/null 待 W5 探针后开放）\
+                 ——不静默折叠未知类型"
             );
         }
     }
@@ -225,16 +233,27 @@ pub fn generate_draft(schema: &Schema, hints: &KeyHints) -> anyhow::Result<Draft
     let partition = match partition_candidate(&schema.columns, key_model, &key_column) {
         PartitionPick::Candidate(_) if hints.partition == Some(false) => None,
         PartitionPick::Candidate(c) => {
-            // Doris derives DAY dynamic partitions on an integer column as
-            // yyyyMMdd bounds (probed: p20261027 = [20261027, 20261028)) —
-            // an epoch column lands outside every partition and the load is
-            // refused. The vocabulary cannot tell the two apart; say so.
-            notes.push(format!(
-                "分区列 `{}` 为 BIGINT：按天动态分区生成 yyyyMMdd 整数区间（如 p20261027 = \
-                 [20261027, 20261028)），该列的值须为 yyyyMMdd 形式的整数日期，epoch 秒/毫秒值会\
-                 落在所有分区之外被拒载——不确定时请取消分区",
-                c.column
-            ));
+            // BIGINT keeps the yyyyMMdd caveat: Doris derives DAY dynamic
+            // partitions on an integer column as yyyyMMdd bounds (probed:
+            // p20261027 = [20261027, 20261028)) — an epoch column lands
+            // outside every partition and the load is refused. A DATETIME/
+            // DATE candidate needs no such caveat: its dynamic DAY bounds
+            // are true dates (probed: p20261030 onward), which is exactly
+            // why the time types take the RANGE key since A3.
+            let is_integer = schema
+                .columns
+                .iter()
+                .find(|(n, _)| n == &c.column)
+                .map(|(_, ty)| ty == "int64")
+                .unwrap_or(false);
+            if is_integer {
+                notes.push(format!(
+                    "分区列 `{}` 为 BIGINT：按天动态分区生成 yyyyMMdd 整数区间（如 p20261027 = \
+                     [20261027, 20261028)），该列的值须为 yyyyMMdd 形式的整数日期，epoch 秒/毫秒值会\
+                     落在所有分区之外被拒载——不确定时请取消分区",
+                    c.column
+                ));
+            }
             Some(PartitionCandidate {
                 guessed: c.guessed && hints.partition != Some(true),
                 ..c
@@ -320,15 +339,58 @@ pub fn generate_draft(schema: &Schema, hints: &KeyHints) -> anyhow::Result<Draft
     })
 }
 
-/// Four-type vocabulary → Doris column types (§7.1's retained rows; G2 will
-/// grow this table, until then unknown is `None` → explicit error).
-fn doris_type(vocab: &str) -> Option<&'static str> {
+/// Column-type vocabulary → Doris column DDL (blueprint §7.1 mapping column,
+/// the A3 widening — the same probe-backed rows the snapshot suite pins).
+/// The four legacy words keep their exact pre-A3 spellings; the new scalar
+/// words join them. Parametric words carry their parameters: `decimal(p,s)`
+/// round-trips p,s (bounds checked here, same 1..=38 / s≤p contract as
+/// `ColumnType::parse` — kept local so this pure-text crate does not grow a
+/// datafusion dependency through tailrace-ir), every `timestamp(unit)`
+/// lands `DATETIME(6)` (Doris has no timezone and one time precision, so
+/// the unit is a decode-side concern only). `binary` lands STRING with the
+/// base64 convention as a column COMMENT — Doris has no native binary, and
+/// a comment rides the table (SHOW CREATE TABLE keeps it visible) where a
+/// generator note would only ride the wizard. `list<float32>` / `variant`
+/// / `null` return `None` this round (see the crate doc).
+///
+/// Public since A3: the console's evolve side (ALTER TABLE … ADD/MODIFY
+/// COLUMN texts) reuses this one mapping instead of keeping a second
+/// hand-synced copy — the pre-A3 copy had to be widened in lockstep, which
+/// is exactly how the two sides drift.
+pub fn doris_type(vocab: &str) -> Option<String> {
     match vocab {
-        "utf8" => Some("VARCHAR(65533)"),
-        "int64" => Some("BIGINT"),
-        "float64" => Some("DOUBLE"),
-        "bool" => Some("BOOLEAN"),
-        _ => None,
+        "utf8" => Some("VARCHAR(65533)".to_string()),
+        "string" => Some("STRING".to_string()),
+        "int8" => Some("TINYINT".to_string()),
+        "int16" => Some("SMALLINT".to_string()),
+        "int32" => Some("INT".to_string()),
+        "int64" => Some("BIGINT".to_string()),
+        "float32" => Some("FLOAT".to_string()),
+        "float64" => Some("DOUBLE".to_string()),
+        "date" => Some("DATE".to_string()),
+        "bool" => Some("BOOLEAN".to_string()),
+        "binary" => Some("STRING COMMENT 'base64-encoded binary'".to_string()),
+        _ => {
+            if let Some(rest) = vocab.strip_prefix("decimal(") {
+                let params = rest.strip_suffix(')')?;
+                let (p, s) = params.split_once(',')?;
+                let (p, s): (u32, u32) = (p.trim().parse().ok()?, s.trim().parse().ok()?);
+                if !(1..=38).contains(&p) || s > p {
+                    return None;
+                }
+                Some(format!("DECIMAL({p},{s})"))
+            } else if let Some(unit) = vocab
+                .strip_prefix("timestamp(")
+                .and_then(|rest| rest.strip_suffix(')'))
+            {
+                match unit {
+                    "s" | "ms" | "us" | "ns" => Some("DATETIME(6)".to_string()),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -352,19 +414,33 @@ fn guess_key_column(columns: &[Column]) -> &str {
     &columns[0].0
 }
 
+/// Whether a vocabulary word can carry a RANGE partition key (executability
+/// rules probed live on Doris 2.1.7, re-probed for the A3 widening): the
+/// real time types (`timestamp(any unit)` → DATETIME, `date` → DATE) take
+/// the RANGE key natively — dynamic DAY partitions on them generate true
+/// date bounds; `int64` works through the yyyyMMdd integer convention (see
+/// the caveat note in [`generate_draft`]). Everything else is refused by
+/// the FE: VARCHAR / STRING ("cannot be a range partition key"), BOOLEAN,
+/// DOUBLE / FLOAT ("Floating point type column can not be partition
+/// column"), and DECIMAL alike.
+fn range_key_capable(vocab: &str) -> bool {
+    vocab == "int64"
+        || vocab == "date"
+        || vocab
+            .strip_prefix("timestamp(")
+            .is_some_and(|rest| rest.ends_with(')'))
+}
+
 /// Partition heuristic: the first time-shaped column that Doris would accept
-/// as a RANGE partition key. Name-based only because the four-type vocabulary
-/// cannot carry a timestamp/date type (such columns fold to utf8 upstream) —
-/// G2 replaces the name match with a type match and the guess flag with
-/// evidence. Executability rules (each one an FE refusal probed live on
-/// Doris 2.1.7, so the draft never walks into them):
-/// - only `int64` → BIGINT can be a RANGE key: VARCHAR / BOOLEAN ("cannot be
-///   a range partition key") and DOUBLE ("Floating point type column can not
-///   be partition column") are refused;
+/// as a RANGE partition key. A3 switched the executability test from
+/// name-only to name × **type** — the time-shaped *name* still picks the
+/// candidates (a column named `event_ts` but typed utf8 is text about time,
+/// not time), and among those the type decides executability:
 /// - a merge-on-write UNIQUE KEY table's partition column must be a KEY
 ///   column ("Merge-on-Write table's partition column must be KEY column") —
 ///   with the single-column key clause emitted here, that is the key column
-///   itself.
+///   itself;
+/// - non-range-key types are skipped with the reason as a note.
 ///
 /// Time-shaped columns are scanned in declaration order; the first executable
 /// one wins. If every one of them had to be skipped, the first one's reason
@@ -378,11 +454,11 @@ fn partition_candidate(columns: &[Column], key_model: KeyModel, key_column: &str
     };
     let mut first_skip: Option<String> = None;
     for (name, ty) in columns.iter().filter(|(n, _)| time_shaped(n)) {
-        let skip = if ty != "int64" {
+        let skip = if !range_key_capable(ty) {
             format!(
-                "时间形列 `{name}` 为 {ty}（{}），Doris RANGE 分区键仅接受整数/日期类型——未生成分区\
-                 子句（G2 落地真实时间类型后可自动分区）",
-                doris_type(ty).unwrap_or("?")
+                "时间形列 `{name}` 为 {ty}（{}），Doris RANGE 分区键仅接受整数/日期时间类型——\
+                 未生成分区子句（如需按该列分区请改为 timestamp/date/int64）",
+                doris_type(ty).unwrap_or_else(|| "?".to_string())
             )
         } else if key_model == KeyModel::Unique && name != key_column {
             format!(
@@ -415,11 +491,12 @@ fn quote_ident(name: &str) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     //! Snapshot suite (§7.7 A1 row: 给定 schema → 固定 DDL 文本). Full-text
-    //! assertions against the generator's exact output; the matrix runs
-    //! 4-type vocabulary × UNIQUE/DUPLICATE × partitioned/plain, and every
+    //! assertions against the generator's exact output; the matrix runs the
+    //! generator's vocabulary × UNIQUE/DUPLICATE × partitioned/plain, and every
     //! partitioned shape asserted here was created successfully on a live
-    //! Doris 2.1.7 (R6 review round) — the skipped shapes are the ones the
-    //! FE refused.
+    //! Doris 2.1.7 (R6 review round; the A3 shapes — new column types,
+    //! DATETIME/DATE RANGE keys, the binary COMMENT — re-probed 2026-10-30)
+    //! — the skipped shapes are the ones the FE refused.
 
     use super::*;
 
@@ -600,7 +677,8 @@ DISTRIBUTED BY HASH(`user_id`) BUCKETS AUTO;"#
         assert!(
             d.notes[0].contains("`event_time`")
                 && d.notes[0].contains("utf8（VARCHAR(65533)）")
-                && d.notes[0].contains("仅接受整数/日期类型"),
+                && d.notes[0].contains("仅接受整数/日期时间类型")
+                && d.notes[0].contains("timestamp/date/int64"),
             "{}",
             d.notes[0]
         );
@@ -898,6 +976,175 @@ DISTRIBUTED BY HASH(`id`) BUCKETS AUTO;"#
         );
     }
 
+    // ⑧ A3 widening — every newly mapped word on one table (probed live on
+    // 2.1.7 as probe_a3.new_vocab, 2026-10-30): the four int widths, FLOAT,
+    // STRING, DECIMAL(18,2), DATETIME(6) and DATE all create; binary lands
+    // STRING with the base64 convention as a column COMMENT (Doris has no
+    // native binary). The timestamp column is time-shaped AND a real time
+    // type, so it takes the RANGE key — and as a DATETIME candidate it
+    // carries NO yyyyMMdd caveat (dynamic DAY partitions on a time column
+    // generate true date bounds; that caveat is the BIGINT convention's).
+    #[test]
+    fn snapshot_new_vocabulary_partitioned_timestamp() {
+        let s = schema(
+            "shop",
+            "typed",
+            &[
+                ("id", "int64"),
+                ("rank", "int8"),
+                ("grade", "int16"),
+                ("qty", "int32"),
+                ("score", "float32"),
+                ("memo", "string"),
+                ("amount", "decimal(18,2)"),
+                ("created_at", "timestamp(ms)"),
+                ("biz_day", "date"),
+                ("payload", "binary"),
+            ],
+        );
+        let d = generate_draft(&s, &KeyHints::default()).unwrap();
+        assert_eq!(
+            d.ddl,
+            r#"CREATE TABLE IF NOT EXISTS `shop`.`typed` (
+    `id` BIGINT,
+    `rank` TINYINT,
+    `grade` SMALLINT,
+    `qty` INT,
+    `score` FLOAT,
+    `memo` STRING,
+    `amount` DECIMAL(18,2),
+    `created_at` DATETIME(6),
+    `biz_day` DATE,
+    `payload` STRING COMMENT 'base64-encoded binary'
+)
+DUPLICATE KEY(`id`)
+PARTITION BY RANGE(`created_at`) ()
+DISTRIBUTED BY HASH(`id`) BUCKETS AUTO
+PROPERTIES (
+    "dynamic_partition.enable" = "true",
+    "dynamic_partition.time_unit" = "DAY",
+    "dynamic_partition.start" = "-30",
+    "dynamic_partition.end" = "3",
+    "dynamic_partition.prefix" = "p"
+);"#
+        );
+        assert_eq!(d.key_model, KeyModel::Duplicate);
+        assert_eq!(d.key_column, "id");
+        assert!(d
+            .partition
+            .as_ref()
+            .is_some_and(|p| p.column == "created_at"));
+        // a DATETIME candidate needs no yyyyMMdd warning — true date bounds
+        assert!(
+            d.notes.is_empty(),
+            "time-typed candidate carries no integer-date caveat: {:?}",
+            d.notes
+        );
+    }
+
+    // ⑨ date as a non-key RANGE candidate on a DUPLICATE table (probed:
+    // probe_a3.date_part — DUPLICATE + RANGE(d DATE) non-key + dynamic DAY
+    // creates fine). Same shape as ⑥'s BIGINT candidate minus the yyyyMMdd
+    // caveat.
+    #[test]
+    fn snapshot_date_partitioned_duplicate_non_key() {
+        let s = schema(
+            "shop",
+            "daily",
+            &[("user_id", "int64"), ("dt", "date"), ("v", "float64")],
+        );
+        let d = generate_draft(&s, &KeyHints::default()).unwrap();
+        assert_eq!(
+            d.ddl,
+            r#"CREATE TABLE IF NOT EXISTS `shop`.`daily` (
+    `user_id` BIGINT,
+    `dt` DATE,
+    `v` DOUBLE
+)
+DUPLICATE KEY(`user_id`)
+PARTITION BY RANGE(`dt`) ()
+DISTRIBUTED BY HASH(`user_id`) BUCKETS AUTO
+PROPERTIES (
+    "dynamic_partition.enable" = "true",
+    "dynamic_partition.time_unit" = "DAY",
+    "dynamic_partition.start" = "-30",
+    "dynamic_partition.end" = "3",
+    "dynamic_partition.prefix" = "p"
+);"#
+        );
+        assert!(d.partition.as_ref().is_some_and(|p| p.column == "dt"));
+        assert!(d.notes.is_empty(), "{:?}", d.notes);
+    }
+
+    // ⑩ UNIQUE (MoW) with the human-confirmed timestamp column as key — the
+    // MoW-accepted partition shape on a real time type (probed:
+    // probe_a3.mow_ts_key — UNIQUE KEY(event_ts DATETIME(6)) PARTITION BY
+    // RANGE(event_ts) + MoW + dynamic DAY creates fine). DECIMAL rides along
+    // as a value column.
+    #[test]
+    fn snapshot_unique_mow_timestamp_key_partitioned() {
+        let s = schema(
+            "shop",
+            "cdc_amounts",
+            &[
+                ("op_type", "utf8"),
+                ("order_id", "utf8"),
+                ("event_ts", "timestamp(us)"),
+                ("amount", "decimal(18,2)"),
+            ],
+        );
+        let hints = KeyHints {
+            key_column: Some("event_ts".into()),
+            ..KeyHints::default()
+        };
+        let d = generate_draft(&s, &hints).unwrap();
+        assert_eq!(
+            d.ddl,
+            r#"CREATE TABLE IF NOT EXISTS `shop`.`cdc_amounts` (
+    `event_ts` DATETIME(6),
+    `op_type` VARCHAR(65533),
+    `order_id` VARCHAR(65533),
+    `amount` DECIMAL(18,2)
+)
+UNIQUE KEY(`event_ts`)
+PARTITION BY RANGE(`event_ts`) ()
+DISTRIBUTED BY HASH(`event_ts`) BUCKETS AUTO
+PROPERTIES (
+    "enable_unique_key_merge_on_write" = "true",
+    "dynamic_partition.enable" = "true",
+    "dynamic_partition.time_unit" = "DAY",
+    "dynamic_partition.start" = "-30",
+    "dynamic_partition.end" = "3",
+    "dynamic_partition.prefix" = "p"
+);"#
+        );
+        assert_eq!(d.key_model, KeyModel::Unique);
+        assert!(!d.key_column_guessed);
+        assert!(d.partition.as_ref().is_some_and(|p| p.column == "event_ts"));
+        assert!(d.notes.is_empty(), "{:?}", d.notes);
+    }
+
+    // ⑪ type-aware pick, the A3 version of ⑥e: among time-shaped names the
+    // utf8 one is skipped (text about time, not time) and the real timestamp
+    // column wins — and because a candidate was found, no skip note.
+    #[test]
+    fn partition_prefers_time_typed_column_over_text_named() {
+        let s = schema(
+            "m",
+            "t",
+            &[
+                ("logged_at", "utf8"),
+                ("ts", "timestamp(s)"),
+                ("v", "int64"),
+            ],
+        );
+        let d = generate_draft(&s, &KeyHints::default()).unwrap();
+        assert!(d.ddl.contains("PARTITION BY RANGE(`ts`) ()"), "{}", d.ddl);
+        assert!(!d.ddl.contains("logged_at`) ()"));
+        assert_eq!(d.partition.as_ref().map(|p| p.column.as_str()), Some("ts"));
+        assert!(d.notes.is_empty(), "{:?}", d.notes);
+    }
+
     #[test]
     fn rejects_bad_inputs() {
         // empty db (dot-less Kafka topic) / empty table / no columns
@@ -919,17 +1166,47 @@ DISTRIBUTED BY HASH(`id`) BUCKETS AUTO;"#
         .unwrap_err()
         .to_string();
         assert!(e.contains("列名重复"), "{e}");
-        // outside the four-type vocabulary — explicit, no silent fold
+        // outside the generator's vocabulary — explicit, no silent fold.
+        // Two distinct refusals: a word the 16-vocabulary itself rejects
+        // (external spelling), and a legal word whose Doris mapping is not
+        // open this round (list/variant/null — the W5 probe pass).
         let e = generate_draft(
-            &schema("db", "t", &[("id", "int64"), ("ts", "timestamp")]),
+            &schema("db", "t", &[("id", "int64"), ("name", "varchar(64)")]),
             &KeyHints::default(),
         )
         .unwrap_err()
         .to_string();
         assert!(
-            e.contains("timestamp") && e.contains("utf8/int64/float64/bool"),
+            e.contains("varchar(64)") && e.contains("不在 DDL 生成器支持面内"),
             "{e}"
         );
+        let e = generate_draft(
+            &schema("db", "t", &[("id", "int64"), ("tags", "list<float32>")]),
+            &KeyHints::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("list<float32>") && e.contains("待 W5 探针后开放"),
+            "{e}"
+        );
+        // parametric bounds mirror the vocabulary contract (p ≤ 38, s ≤ p)
+        assert!(generate_draft(
+            &schema("db", "t", &[("id", "int64"), ("amt", "decimal(39,1)")]),
+            &KeyHints::default(),
+        )
+        .is_err());
+        assert!(generate_draft(
+            &schema("db", "t", &[("id", "int64"), ("amt", "decimal(18,19)")]),
+            &KeyHints::default(),
+        )
+        .is_err());
+        // a bare / malformed timestamp word is not a vocabulary word either
+        assert!(generate_draft(
+            &schema("db", "t", &[("id", "int64"), ("ts", "timestamp")]),
+            &KeyHints::default(),
+        )
+        .is_err());
         // hints naming unknown columns
         let e = generate_draft(
             &schema("db", "t", &[("id", "int64")]),

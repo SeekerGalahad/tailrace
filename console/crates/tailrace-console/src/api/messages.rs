@@ -181,7 +181,10 @@ fn template(key: &str) -> Option<&'static str> {
             "表对象 {0}.{1} 未登记列清单（先 infer-schema 或登记时带 columnsJson），无法生成/演进 DDL"
         }
         "err.ddl.column_unknown_type" => {
-            "列 {0} 的类型 {1} 不在受支持词汇内（utf8/int64/float64/bool），G2 扩表前不静默折叠"
+            "列 {0} 的类型 {1} 不在 DDL 生成器支持面内（utf8/string/int8/int16/int32/int64/float32/float64/decimal(p,s)/timestamp(s|ms|us|ns)/date/bool/binary）——不静默折叠"
+        }
+        "err.ddl.override_column_unknown" => {
+            "列类型覆盖 {0} 不在登记列清单中（覆盖仅允许改已登记列的类型，不能新增列）"
         }
         "err.ddl.key_model_required" => {
             "缺少键模型确认：keyModel 必填（unique=UNIQUE KEY 去重 / duplicate=DUPLICATE KEY 追加）——未确认键模型不执行 DDL"

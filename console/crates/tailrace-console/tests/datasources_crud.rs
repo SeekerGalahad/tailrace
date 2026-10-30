@@ -480,6 +480,17 @@ async fn discover_and_infer_schema_error_paths() {
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    // A3: debezium-json passes the format gate (the engine-side walk exists
+    // now) — it dies at the broker dial like any kafka infer, 502 not 400
+    let (s, b) = req(
+        &app,
+        "POST",
+        &format!("/api/datasources/{kafka_id}/infer-schema"),
+        Some(json!({"dbName": "shop", "tableName": "orders", "format": "debezium-json"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{b}");
+    assert_eq!(b["error"]["code"], "UNAVAILABLE");
     // missing identifiers → 400
     let (s, b) = req(
         &app,

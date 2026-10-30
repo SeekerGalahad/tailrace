@@ -184,7 +184,7 @@ pub async fn infer_schema(
             Ok(InferredSchema {
                 columns: cols
                     .into_iter()
-                    .map(|(name, ty)| (name, infer::ddl_arrow_type(&ty).to_string()))
+                    .map(|(name, ty)| (name, infer::ddl_arrow_type(&ty)))
                     .collect(),
                 format: None,
             })
@@ -196,7 +196,7 @@ pub async fn infer_schema(
             Ok(InferredSchema {
                 columns: cols
                     .into_iter()
-                    .map(|(name, ty)| (name, infer::pg_arrow_type(&ty).to_string()))
+                    .map(|(name, ty)| (name, infer::pg_arrow_type(&ty)))
                     .collect(),
                 format: None,
             })

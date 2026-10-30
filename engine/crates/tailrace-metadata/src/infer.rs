@@ -1,9 +1,18 @@
 //! Pure inference: JSON samples → columns (mirrors the decode chain's typed
-//! extraction) and DDL type names → the engine's arrow vocabulary.
+//! extraction) and DDL type names → the engine's 16-word type vocabulary.
 //!
-//! Vocabulary = `tailrace-runtime::arrow_type`'s accepted set — `int64`,
-//! `float64`, `bool`, everything else `utf8` — so what infer-schema hands
-//! back is exactly what the runtime builds its target schema from.
+//! JSON-family inference (ogg / json / jsonl / debezium-json) stays on the
+//! four evidence-bearing words — a JSON sample carries no width or
+//! precision, so `int64`/`float64` are the honest integer/float picks and
+//! anything wider would be invented. DDL type names (MySQL / Doris `DESC`,
+//! PG `information_schema`) DO carry width/precision, and A3 narrowed the
+//! fold: `tinyint` keeps its width as `int8`, `decimal(18,2)` keeps its
+//! parameters, `datetime`/`date` land `timestamp(us)`/`date` — before A3
+//! all of those folded to `int64`/`utf8`, which made evolve's registered-vs-
+//! live diff deaf to real type differences on them (console-api 裁决 8:
+//! 「G2 扩词汇后收窄」). Doris DESC prints a `STRING` column back as `text`
+//! (live-probed 2.1.7, 2026-10-30), so `text` maps to `string` — that keeps
+//! the draft→DESC round trip stable for evolve.
 
 use std::collections::HashMap;
 
@@ -96,12 +105,23 @@ const OGG_ENVELOPE: [(&str, &str); 3] = [
     ("ogg_ts", "int64"),
 ];
 
+/// The three JSON-family sample shapes inference walks (A3 added
+/// debezium-json — the decode chain's fourth format finally gets its
+/// console discover counterpart, the Debezium decoder's own doc note).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fmt {
+    Ogg,
+    Json,
+    Debezium,
+}
+
 /// Infer from raw JSON samples. `format` = explicit `ogg` / `json` /
-/// `jsonl`, or `None` to detect: the first parseable sample with an `after`
-/// object means OGG, otherwise plain JSON. Columns come out sorted by name
-/// (deterministic regardless of message order — contract snapshots stay
-/// stable; `preserve_order` is not enabled workspace-wide anyway), with the
-/// three OGG envelope slots first for OGG.
+/// `jsonl` / `debezium-json`, or `None` to detect: the first parseable
+/// object sample with an `after` object means OGG (or Debezium when it
+/// carries `op` without `op_type`), otherwise plain JSON. Columns come out
+/// sorted by name (deterministic regardless of message order — contract
+/// snapshots stay stable; `preserve_order` is not enabled workspace-wide
+/// anyway), with the three OGG envelope slots first for OGG.
 pub(crate) fn infer_from_json_samples(
     samples: &[Vec<u8>],
     format: Option<&str>,
@@ -116,14 +136,11 @@ pub(crate) fn infer_from_json_samples(
             samples.len()
         );
     }
-    let ogg = match format {
-        Some("ogg") => true,
-        Some("json") | Some("jsonl") => false,
-        _ => parsed
-            .iter()
-            .find(|v| v.is_object())
-            .map(|v| v.get("after").map(Value::is_object).unwrap_or(false))
-            .unwrap_or(false),
+    let fmt = match format {
+        Some("ogg") => Fmt::Ogg,
+        Some("json") | Some("jsonl") => Fmt::Json,
+        Some("debezium-json") => Fmt::Debezium,
+        _ => detect(&parsed),
     };
     let mut cols = Columns::default();
     let mut used = 0usize;
@@ -131,25 +148,49 @@ pub(crate) fn infer_from_json_samples(
         let Some(root) = v.as_object() else {
             continue; // scalars/arrays at the root are not row shapes
         };
-        if ogg {
-            match root.get("after").and_then(Value::as_object) {
+        match fmt {
+            Fmt::Ogg => match root.get("after").and_then(Value::as_object) {
                 Some(after) => cols.observe(after),
                 None => continue, // OggDecoder marks such a message Bad
+            },
+            Fmt::Json => cols.observe(root),
+            // Mirrors DebeziumJsonDecoder::walk sample-for-sample: unwrap
+            // the schemas.enable=true wrapper, skip deletes (op=d), missing
+            // / null `after` (tombstones), and never surface the envelope
+            // keys (before/op/ts_ms/source) as columns — the decoder does
+            // not decode them, so neither does inference.
+            Fmt::Debezium => {
+                let env = if root.get("schema").is_some() && root.get("payload").is_some() {
+                    match root.get("payload") {
+                        Some(p) if p.is_object() => p,
+                        _ => continue, // degenerate wrapper / null payload
+                    }
+                } else {
+                    v
+                };
+                let Some(env) = env.as_object() else {
+                    continue;
+                };
+                if env.get("op").and_then(Value::as_str) == Some("d") {
+                    continue;
+                }
+                match env.get("after").and_then(Value::as_object) {
+                    Some(after) => cols.observe(after),
+                    None => continue,
+                }
             }
-        } else {
-            cols.observe(root);
         }
         used += 1;
     }
     if used == 0 {
-        anyhow::bail!(if ogg {
-            "样本无 `after` 对象，不是 OGG 形态（或改用 format=json）"
-        } else {
-            "样本根节点不是 JSON 对象，无法推断列"
+        anyhow::bail!(match fmt {
+            Fmt::Ogg => "样本无 `after` 对象，不是 OGG 形态（或改用 format=json）",
+            Fmt::Debezium => "样本无有效 Debezium 事件（均缺 `after` 或为 delete/tombstone）",
+            Fmt::Json => "样本根节点不是 JSON 对象，无法推断列",
         });
     }
     let mut columns: Vec<(String, String)> = Vec::new();
-    if ogg {
+    if fmt == Fmt::Ogg {
         columns.extend(
             OGG_ENVELOPE
                 .iter()
@@ -166,38 +207,104 @@ pub(crate) fn infer_from_json_samples(
     }
     Ok(InferredSchema {
         columns,
-        format: Some(if ogg { "ogg" } else { "json" }.to_string()),
+        format: Some(
+            match fmt {
+                Fmt::Ogg => "ogg",
+                Fmt::Debezium => "debezium-json",
+                Fmt::Json => "json",
+            }
+            .to_string(),
+        ),
     })
 }
 
+/// Shape detection from the first object sample: an `after` object means a
+/// CDC envelope — `op` without `op_type` is Debezium, `op_type` (or neither
+/// marker, the pre-A3 tie) is OGG; no `after` at all is plain JSON. The
+/// OGG-first tie keeps the pre-A3 detection byte-stable for envelopes that
+/// carry `after` alone.
+fn detect(parsed: &[Value]) -> Fmt {
+    let Some(first) = parsed.iter().find(|v| v.is_object()) else {
+        return Fmt::Json;
+    };
+    let after_is_object = first.get("after").map(Value::is_object).unwrap_or(false);
+    if !after_is_object {
+        return Fmt::Json;
+    }
+    let has_op = first.get("op").map(Value::is_string).unwrap_or(false);
+    let has_op_type = first.get("op_type").map(Value::is_string).unwrap_or(false);
+    if has_op && !has_op_type {
+        Fmt::Debezium
+    } else {
+        Fmt::Ogg
+    }
+}
+
 /// MySQL / Doris DDL type (as `DESC` prints it: `bigint`, `int(11)`,
-/// `varchar(64)`, `decimalv3(10,2)`, `largeint`, `tinyint(1)` …) → arrow
-/// vocabulary. Integers of every width → int64 (LARGEINT/BIGINT UNSIGNED
-/// beyond i64 are the documented overflow edge); DECIMAL stays utf8 —
-/// text preserves precision, matching conn-jdbc's no-decimal stance.
-pub(crate) fn ddl_arrow_type(ddl: &str) -> &'static str {
+/// `varchar(64)`, `decimalv3(10,2)`, `largeint`, `tinyint(1)`, Doris
+/// `datetimev2(3)` / `datev2` / `text` …) → the type vocabulary. A3
+/// narrowing: the integer widths survive (`tinyint`→`int8` …, so a
+/// registered int8 column still reads back int8 from DESC and evolve's
+/// diff stays quiet), `float`→`float32`, DECIMAL keeps its parameters
+/// (within the vocabulary's 1..=38 / s≤p bounds — outside them the honest
+/// carrier is still utf8, matching conn-jdbc's no-decimal stance), the
+/// datetime family lands `timestamp(us)` (Doris DATETIME(6) is the DDL
+/// side of every unit, so us is the round-trip-stable spelling), `date`/
+/// `datev2` → `date`, and the `text` family → `string` (Doris prints its
+/// STRING columns back as `text` — live-probed 2.1.7 — so string is what
+/// keeps draft→DESC→diff stable; MySQL TEXT lands the same, a strictly
+/// wider carrier than VARCHAR(65533)).
+pub(crate) fn ddl_arrow_type(ddl: &str) -> String {
     let lower = ddl.trim().to_ascii_lowercase();
     let head: String = lower
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
         .collect();
+    // `decimal_params()` = the (p,s) of a decimal-ish type, when present
+    // and vocabulary-legal (1..=38, s≤p)
+    let decimal_params = || -> Option<String> {
+        let open = lower.find('(')?;
+        let close = lower.rfind(')')?;
+        let (p, s) = lower[open + 1..close].split_once(',')?;
+        let (p, s): (u32, u32) = (p.trim().parse().ok()?, s.trim().parse().ok()?);
+        ((1..=38).contains(&p) && s <= p).then(|| format!("decimal({p},{s})"))
+    };
     match head.as_str() {
-        "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" | "largeint" => "int64",
-        "boolean" | "bool" => "bool",
-        "float" | "double" | "real" => "float64",
-        _ => "utf8",
+        "tinyint" => "int8".to_string(),
+        "smallint" => "int16".to_string(),
+        "mediumint" | "int" | "integer" => "int32".to_string(),
+        "bigint" | "largeint" => "int64".to_string(),
+        "boolean" | "bool" => "bool".to_string(),
+        "float" => "float32".to_string(),
+        "double" | "real" => "float64".to_string(),
+        "decimal" | "decimalv3" => decimal_params().unwrap_or_else(|| "utf8".to_string()),
+        "datetime" | "datetimev2" | "timestamp" => "timestamp(us)".to_string(),
+        "date" | "datev2" => "date".to_string(),
+        "text" | "tinytext" | "mediumtext" | "longtext" | "string" => "string".to_string(),
+        _ => "utf8".to_string(),
     }
 }
 
 /// PostgreSQL `information_schema.columns.data_type` (`integer`, `bigint`,
 /// `double precision`, `character varying`, `timestamp without time zone`
-/// …) → arrow vocabulary.
-pub(crate) fn pg_arrow_type(pg: &str) -> &'static str {
+/// …) → the type vocabulary, same A3 narrowing as [`ddl_arrow_type`]:
+/// widths survive, `real`→`float32`, time-of-day stays utf8 (a duration is
+/// not a timestamp), `timestamptz` stays utf8 (Doris has no timezone for
+/// it to land in), `numeric` stays utf8 (information_schema reports it
+/// without precision — the parameters would be invented). PG prints
+/// unbounded text as `text`, hence `string` like the MySQL side.
+pub(crate) fn pg_arrow_type(pg: &str) -> String {
     match pg.trim().to_ascii_lowercase().as_str() {
-        "smallint" | "integer" | "bigint" => "int64",
-        "boolean" => "bool",
-        "real" | "double precision" => "float64",
-        _ => "utf8",
+        "smallint" => "int16".to_string(),
+        "integer" => "int32".to_string(),
+        "bigint" => "int64".to_string(),
+        "boolean" => "bool".to_string(),
+        "real" => "float32".to_string(),
+        "double precision" => "float64".to_string(),
+        "date" => "date".to_string(),
+        "timestamp without time zone" => "timestamp(us)".to_string(),
+        "text" => "string".to_string(),
+        _ => "utf8".to_string(),
     }
 }
 
@@ -277,29 +384,81 @@ mod tests {
         assert!(e.to_string().contains("根节点"), "{e}");
     }
 
+    /// A3: debezium-json walks `after.*` exactly the way
+    /// DebeziumJsonDecoder decodes it — envelope keys (before/op/ts_ms/
+    /// source) never become columns, deletes and tombstones are skipped,
+    /// and the schemas.enable=true wrapper is unwrapped. Detection picks
+    /// Debezium when an `after` object carries `op` without `op_type`.
+    #[test]
+    fn debezium_explicit_detected_and_skips() {
+        // explicit format: c/r/u observed, delete skipped, envelope invisible
+        let s = raws(&[
+            r#"{"before":null,"after":{"id":1,"qty":5,"price":1.5,"ok":true},"op":"c","ts_ms":1700000000000,"source":{"db":"shop"}}"#,
+            r#"{"before":{"id":1},"after":{"id":1,"qty":6,"price":1.5,"ok":false},"op":"u","ts_ms":1700000000001}"#,
+            r#"{"before":{"id":1},"after":null,"op":"d","ts_ms":1700000000002}"#,
+            r#"{"schema":{"type":"struct"},"payload":{"after":{"id":2,"qty":1},"op":"r","ts_ms":1700000000003}}"#,
+        ]);
+        let out = infer_from_json_samples(&s, Some("debezium-json")).unwrap();
+        assert_eq!(out.format.as_deref(), Some("debezium-json"));
+        assert_eq!(
+            out.columns,
+            vec![
+                ("id".into(), "int64".into()),
+                ("ok".into(), "bool".into()),
+                ("price".into(), "float64".into()),
+                ("qty".into(), "int64".into()),
+            ]
+        );
+        // detection (no explicit format): op + after without op_type → debezium
+        let out = infer_from_json_samples(&s, None).unwrap();
+        assert_eq!(out.format.as_deref(), Some("debezium-json"));
+        assert_eq!(out.columns.len(), 4);
+        // OGG tie unchanged: after without op → still OGG (pre-A3 anchor)
+        let ogg_shaped = raws(&[r#"{"table":"T","ts":1,"after":{"x":1}}"#]);
+        let out = infer_from_json_samples(&ogg_shaped, None).unwrap();
+        assert_eq!(out.format.as_deref(), Some("ogg"));
+        // all-delete / no-after samples → the dedicated error, not a fold
+        let e = infer_from_json_samples(
+            &raws(&[r#"{"before":null,"after":null,"op":"d"}"#]),
+            Some("debezium-json"),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("Debezium"), "{e}");
+    }
+
     #[test]
     fn ddl_type_mapping_mysql_and_doris() {
+        // A3 narrowing: widths survive, decimals keep their params, the
+        // datetime family lands timestamp(us), Doris STRING prints back as
+        // `text` (live-probed 2.1.7) and maps to `string`.
         for (ddl, want) in [
             ("bigint", "int64"),
             ("BIGINT(20) UNSIGNED", "int64"),
-            ("int(11)", "int64"),
-            ("tinyint(1)", "int64"),
-            ("smallint", "int64"),
-            ("mediumint", "int64"),
+            ("int(11)", "int32"),
+            ("tinyint", "int8"),
+            ("tinyint(1)", "int8"),
+            ("smallint", "int16"),
+            ("mediumint", "int32"),
             ("largeint", "int64"), // Doris
             ("boolean", "bool"),   // Doris
             ("bool", "bool"),
             ("double", "float64"),
-            ("float", "float64"),
-            ("decimal(10,2)", "utf8"),
-            ("decimalv3(10,2)", "utf8"), // Doris
+            ("float", "float32"),
+            ("decimal(10,2)", "decimal(10,2)"),
+            ("decimalv3(18,2)", "decimal(18,2)"), // Doris
+            ("decimal(39,0)", "utf8"),            // p > 38: no legal vocabulary word
+            ("decimal", "utf8"),                  // bare: parameters would be invented
             ("varchar(64)", "utf8"),
             ("char(2)", "utf8"),
-            ("text", "utf8"),
-            ("string", "utf8"), // Doris
-            ("datetime", "utf8"),
-            ("datetimev2(3)", "utf8"), // Doris
-            ("datev2", "utf8"),        // Doris
+            ("text", "string"), // Doris STRING prints back as text (probed)
+            ("longtext", "string"),
+            ("string", "string"), // Doris / StarRocks spelling when present
+            ("datetime", "timestamp(us)"),
+            ("datetime(6)", "timestamp(us)"),
+            ("datetimev2(3)", "timestamp(us)"), // Doris
+            ("timestamp", "timestamp(us)"),     // MySQL TIMESTAMP (no tz payload read)
+            ("datev2", "date"),                 // Doris
+            ("date", "date"),
             ("json", "utf8"),
             ("array<int>", "utf8"), // Doris
             ("hll", "utf8"),        // Doris
@@ -311,17 +470,22 @@ mod tests {
 
     #[test]
     fn pg_type_mapping() {
+        // Same A3 narrowing as the MySQL side: widths, float32, date, and
+        // us-precision timestamps; numeric/timestamptz stay utf8 (no legal
+        // vocabulary word without inventing parameters / a timezone).
         for (pg, want) in [
-            ("integer", "int64"),
+            ("integer", "int32"),
             ("bigint", "int64"),
-            ("smallint", "int64"),
+            ("smallint", "int16"),
             ("boolean", "bool"),
-            ("real", "float64"),
+            ("real", "float32"),
             ("double precision", "float64"),
             ("numeric", "utf8"),
             ("character varying", "utf8"),
-            ("text", "utf8"),
-            ("timestamp without time zone", "utf8"),
+            ("text", "string"),
+            ("timestamp without time zone", "timestamp(us)"),
+            ("timestamp with time zone", "utf8"),
+            ("date", "date"),
             ("jsonb", "utf8"),
             ("uuid", "utf8"),
         ] {

@@ -39,14 +39,17 @@ import MonoField from '../../../components/MonoField.vue'
 
 /**
  * Create-table wizard (T-A1 ④, blueprint §7.2): three steps over the
- * draft/execute/evolve endpoints — ① column confirm (the registered
- * columnsJson the generator builds from) → ② key model, MANDATORY, with the
- * heuristic key column carrying its 「猜测」 badge (next stays disabled until
- * a model is picked) and the partition candidate, when the generator offered
- * one, as a keep/drop checkbox → ③ read-only DDL preview + execute / evolve
- * entries. No DDL hand-editor on purpose (task-card 风险登记): confirm
- * differently and regenerate instead of editing text. Doris/StarRocks
- * datasources only — the caller hides the entry otherwise.
+ * draft/execute/evolve endpoints — ① column confirm with per-column type
+ * overrides (A3: the inferred type is a dropdown over the generator's
+ * vocabulary — inference saying utf8 while the human knows the column is
+ * money gets fixed here, steering this draft only, never the registration)
+ * → ② key model, MANDATORY, with the heuristic key column carrying its
+ * 「猜测」 badge (next stays disabled until a model is picked) and the
+ * partition candidate, when the generator offered one, as a keep/drop
+ * checkbox → ③ read-only DDL preview + execute / evolve entries. No DDL
+ * hand-editor on purpose (task-card 风险登记): confirm differently and
+ * regenerate instead of editing text. Doris/StarRocks datasources only —
+ * the caller hides the entry otherwise.
  */
 
 const props = defineProps<{
@@ -100,6 +103,7 @@ function reset(): void {
   keyColumn.value = null
   replicationNum.value = null
   keepPartition.value = null
+  columnTypeOverrides.value = {}
   execResult.value = null
   execError.value = null
   evolveState.value = { kind: 'idle' }
@@ -116,7 +120,8 @@ watch(
 )
 
 /** First round: empty body = pure heuristics. Round two feeds the confirmed
- * hints back so the previewed DDL matches exactly what step ② shows. */
+ * hints back so the previewed DDL matches exactly what step ② shows —
+ * including any column-type overrides typed in step ① (A3). */
 async function runDraft(withHints: boolean): Promise<boolean> {
   const ds = props.datasource
   const t = props.table
@@ -124,6 +129,7 @@ async function runDraft(withHints: boolean): Promise<boolean> {
   drafting.value = true
   draftError.value = null
   try {
+    const overrides = Object.entries(columnTypeOverrides.value).map(([name, type]) => [name, type] as [string, string])
     const res = await datasourcesApi.ddlDraft(
       ds.id,
       t.dbName,
@@ -134,6 +140,7 @@ async function runDraft(withHints: boolean): Promise<boolean> {
             keyColumn: keyColumn.value ?? undefined,
             replicationNum: replicationNum.value ?? undefined,
             partition: keepPartition.value ?? undefined,
+            columnTypes: overrides.length > 0 ? overrides : undefined,
           }
         : undefined,
       { silent: true },
@@ -180,16 +187,70 @@ const columnRows = computed<ColumnRow[]>(() =>
   (draft.value?.columns ?? []).map(([name, type]) => ({ name, type })),
 )
 
+/**
+ * Column-type dropdown options (A3): the 13 words the DDL generator maps.
+ * The parametric words appear as common presets and the select is
+ * tag+filterable, so `decimal(20,4)` can be typed directly.
+ * list<float32>/variant/null are deliberately absent — the generator
+ * refuses them until the W5 probe pass opens them.
+ */
+const COLUMN_TYPE_OPTIONS: SelectOption[] = [
+  'utf8',
+  'string',
+  'bool',
+  'int8',
+  'int16',
+  'int32',
+  'int64',
+  'float32',
+  'float64',
+  'decimal(18,2)',
+  'decimal(38,9)',
+  'timestamp(s)',
+  'timestamp(ms)',
+  'timestamp(us)',
+  'timestamp(ns)',
+  'date',
+  'binary',
+].map((v) => ({ label: v, value: v }))
+
+/** Per-column type overrides typed in step ① (A3): `name → vocabulary
+ * type`. They steer every regenerate of THIS wizard session only — the
+ * registered columnsJson is never rewritten (the console applies them as
+ * DdlDraftInput.columnTypes). */
+const columnTypeOverrides = ref<Record<string, string>>({})
+
+function onTypeChange(name: string, ty: string): void {
+  if (!draft.value) return
+  const col = draft.value.columns.find(([n]) => n === name)
+  if (!col || col[1] === ty) return
+  col[1] = ty
+  columnTypeOverrides.value[name] = ty
+}
+
 const columnCols = computed<DataTableColumns<ColumnRow>>(() => {
   const d = draft.value
   return [
     { title: '#', key: 'idx', width: 44, render: (_, i) => String(i + 1) },
     { title: '列名', key: 'name', render: (r) => h(MonoField, { value: r.name, copyable: false }) },
-    { title: '登记类型', key: 'type', width: 110, render: (r) => h(NTag, { size: 'small', bordered: false }, { default: () => r.type }) },
+    {
+      title: '类型',
+      key: 'type',
+      width: 168,
+      render: (r) =>
+        h(NSelect, {
+          value: r.type,
+          options: COLUMN_TYPE_OPTIONS,
+          size: 'small',
+          filterable: true,
+          tag: true,
+          'onUpdate:value': (v: string) => onTypeChange(r.name, v),
+        }),
+    },
     {
       title: '角色',
       key: 'role',
-      width: 300,
+      width: 260,
       render: (r) => {
         const tags: ReturnType<typeof h>[] = []
         if (d && r.name === d.keyColumn) {
@@ -234,6 +295,16 @@ const keyColumnStillGuessed = computed(
   () => draft.value != null && draft.value.keyColumnGuessed && keyColumn.value === draft.value.keyColumn,
 )
 
+/** The partition caveat is type-dependent (A3): a BIGINT partition column
+ * carries the yyyyMMdd warning; a timestamp/date column partitions on true
+ * date bounds and carries none. */
+const partitionColumnIsInteger = computed(() => {
+  const d = draft.value
+  const p = d?.partition
+  if (!d || !p) return false
+  return (d.columns.find(([n]) => n === p.column)?.[1] ?? '') === 'int64'
+})
+
 async function runExecute(): Promise<void> {
   const ds = props.datasource
   const t = props.table
@@ -251,6 +322,12 @@ async function runExecute(): Promise<void> {
       { silent: true },
     )
     message.success('建表成功（已入审计 TABLE_DDL_EXECUTE）')
+    // Overrides steered only this draft (A3): the registration keeps the
+    // inferred types, so evolve may later suggest a retype — say so now
+    // instead of leaving that as a surprise 409.
+    if (Object.keys(columnTypeOverrides.value).length > 0) {
+      message.info('类型改判仅作用于本次建表，未写回登记列——后续 evolve 比对可能建议改类型')
+    }
   } catch (e) {
     // 502 DDL_FAILED carries the Doris error verbatim — show it inline
     execResult.value = null
@@ -330,7 +407,7 @@ function close(): void {
         <!-- ① column confirm -->
         <template v-if="step === 1">
           <NAlert type="info" :bordered="false" class="step-alert">
-            草稿将由以下已登记列生成（与 DDL 预览逐列对应）。列清单来自表对象登记的 columnsJson——如需增删列，请先在登记处更新。
+            草稿将由以下列生成（与 DDL 预览逐列对应）。列清单来自表对象登记的 columnsJson——如需增删列，请先在登记处更新；类型可在此直接改判（如推断为 utf8 的金额列改为 decimal(18,2)）——仅影响本次草稿，不写回登记。
           </NAlert>
           <NDataTable
             size="small"
@@ -386,7 +463,11 @@ function close(): void {
               </NCheckbox>
               <NTag v-if="draft.partition.guessed && keepPartition !== false" size="small" type="warning" :bordered="false">猜测</NTag>
               <NText depth="3" class="desc-hint">
-                ——分区列须为 yyyyMMdd 形式的整数日期（epoch 秒/毫秒值会落在所有分区之外被拒载）；取消勾选则不生成 PARTITION 子句
+                ——{{
+                  partitionColumnIsInteger
+                    ? '分区列须为 yyyyMMdd 形式的整数日期（epoch 秒/毫秒值会落在所有分区之外被拒载）'
+                    : '分区列按真实日期边界生成按天动态分区'
+                }}；取消勾选则不生成 PARTITION 子句
               </NText>
             </div>
           </NFormItem>
