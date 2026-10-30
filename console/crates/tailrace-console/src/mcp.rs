@@ -7,13 +7,21 @@
 //! client's declared `clientInfo.name`; clients that do not echo it fall
 //! back to `X-MCP-Client` / `User-Agent` labelling.
 //!
-//! Tools: the ten §7.5 entries, each a thin adapter over the REST handler
+//! Tools: fourteen entries (the §7.5 ten plus the R8 four — DDL
+//! draft/execute/evolve and backfill status; `trigger_backfill` already
+//! covered create-with-dryRun), each a thin adapter over the REST handler
 //! it maps to — same DTOs, same error envelopes, invoked in-process (no
 //! HTTP hop, no session middleware; `/mcp` follows the MCP convention of no
 //! console auth, only a global fixed-window rate limit). Read tools are
-//! always on. The four write tools need BOTH the process-level switch
+//! always on. The six write tools need BOTH the process-level switch
 //! (`--mcp-allow-write` / `MCP_ALLOW_WRITE=1`) AND `"confirm": true` in the
 //! call arguments.
+//!
+//! Tool descriptions are GENERATED from the OpenAPI document (R8): each
+//! tool names its `(method, path)` and the description text is the
+//! operation's — the same utoipa annotations that serve /swagger-ui. There
+//! is no second hand-written description to drift; the unit tests pin that
+//! every tool's route resolves in the document.
 //!
 //! Audit (§7.5): every tool call — ok, failed or rejected — lands in
 //! `audit_log` as `MCP_TOOL_CALL` with `actor = mcp:<client>`, including
@@ -40,6 +48,7 @@ use axum::routing::post;
 use axum::{Extension, Json, Router};
 use console_auth::{AuthContext, AuthUser, M2mState};
 use serde_json::{json, Map, Value};
+use utoipa::OpenApi;
 
 use crate::api::{self, audit};
 use crate::state::AppState;
@@ -72,9 +81,12 @@ pub const WRITE_DISABLED: i64 = -32001;
 /// Implementation-defined: global rate limit exceeded.
 pub const RATE_LIMITED: i64 = -32002;
 
-/// The §7.5 table, in `tools/list` order: `(name, is_write)`. The pause and
-/// resume routes share one tool (`action` selects) so the exposed surface is
-/// exactly the blueprint's ten.
+/// The tool table, in `tools/list` order: `(name, is_write)`. The §7.5 ten
+/// (pause and resume routes share one tool — `action` selects) plus the R8
+/// four: the DDL closed loop (`ddl_draft` read — it composes text only;
+/// `ddl_execute` / `ddl_evolve` write — they run DDL on Doris) and
+/// `backfill_status` (read — the job progress list; `trigger_backfill`
+/// already covers create, dryRun included). Fourteen of the ≤16 budget.
 pub const TOOLS: &[(&str, bool)] = &[
     ("list_datasources", false),
     ("list_pipelines", false),
@@ -86,6 +98,10 @@ pub const TOOLS: &[(&str, bool)] = &[
     ("deploy_pipeline", true),
     ("pause_resume_pipeline", true),
     ("trigger_backfill", true),
+    ("ddl_draft", false),
+    ("ddl_execute", true),
+    ("ddl_evolve", true),
+    ("backfill_status", false),
 ];
 
 // ---------------- state / router ----------------
@@ -341,10 +357,11 @@ fn instructions(allow_write: bool) -> String {
         "DISABLED (start tailrace-console with --mcp-allow-write or MCP_ALLOW_WRITE=1 to enable them)"
     };
     format!(
-        "Tailrace console management plane. Read tools (list/get/compile) are always available. \
-         Write tools (create_pipeline, deploy_pipeline, pause_resume_pipeline, trigger_backfill) \
-         are {writes}; every write call must also pass \"confirm\": true. All calls are audited \
-         as actor mcp:<client>."
+        "Tailrace console management plane. Read tools (list/get/compile, ddl_draft, \
+         backfill_status) are always available. Write tools (create_pipeline, \
+         deploy_pipeline, pause_resume_pipeline, trigger_backfill, ddl_execute, ddl_evolve) \
+         are {writes}; every write call must also pass \"confirm\": true. All calls are \
+         audited as actor mcp:<client>."
     )
 }
 
@@ -576,9 +593,53 @@ async fn execute(
             );
             api::pipelines::backfill(st, identity(), HeaderMap::new(), Path(id), body).await
         }
+        // R8: the DDL closed loop (T-A1) and the backfill job surface
+        // (T-A2 ⑤) as tools. ddl_draft is read-only (text composition);
+        // execute / evolve run DDL on Doris and ride the write gates; the
+        // body args pass through verbatim after the path triple and
+        // `confirm` are lifted out.
+        "ddl_draft" => {
+            let target = ddl_target(args)?;
+            let body = ddl_body(args);
+            api::datasources::ddl_draft(st, Path(target), body).await
+        }
+        "ddl_execute" => {
+            let target = ddl_target(args)?;
+            req_str(args, "ddl")?;
+            req_str(args, "keyModel")?;
+            let body = ddl_body(args);
+            api::datasources::ddl_execute(st, identity(), HeaderMap::new(), Path(target), body)
+                .await
+        }
+        "ddl_evolve" => {
+            let target = ddl_target(args)?;
+            api::datasources::ddl_evolve(st, identity(), HeaderMap::new(), Path(target)).await
+        }
+        "backfill_status" => api::pipelines::backfill_jobs(st, Path(req_i64(args, "id")?)).await,
         other => return Err(RpcErr::invalid_params(format!("unknown tool: {other}"))),
     };
     Ok(response)
+}
+
+/// The DDL tools' path triple: `(datasourceId, db, table)` — required, typed.
+fn ddl_target(args: &Map<String, Value>) -> Result<(i64, String, String), RpcErr> {
+    Ok((
+        req_i64(args, "datasourceId")?,
+        req_str(args, "db")?.to_string(),
+        req_str(args, "table")?.to_string(),
+    ))
+}
+
+/// DDL request body: the args minus the path triple and `confirm` — the
+/// DdlDraftBody / DdlExecuteBody fields (keyModel, keyColumn, replicationNum,
+/// partition, columnTypes, ddl) pass through verbatim.
+fn ddl_body(args: &Map<String, Value>) -> Bytes {
+    let mut body = args.clone();
+    body.remove("confirm");
+    for key in ["datasourceId", "db", "table"] {
+        body.remove(key);
+    }
+    json_bytes(&body)
 }
 
 /// `get_pipeline_logs` for a request/response tool: the REST route is an
@@ -639,6 +700,72 @@ fn tool_definitions() -> Vec<Value> {
         .collect()
 }
 
+/// The `(method, path)` of the REST operation each tool maps to — exactly
+/// the routes registered in the OpenAPI document (the same utoipa
+/// annotations that serve /swagger-ui). The pause/resume pair shares the
+/// pause route (its `action` argument selects); descriptions name the route
+/// they came from.
+fn tool_route(name: &str) -> (&'static str, &'static str) {
+    match name {
+        "list_datasources" => ("GET", "/api/datasources"),
+        "list_pipelines" => ("GET", "/api/pipelines"),
+        "get_pipeline" => ("GET", "/api/pipelines/{id}"),
+        "get_pipeline_stats" => ("GET", "/api/pipelines/{id}/stats"),
+        "get_pipeline_logs" => ("GET", "/api/pipelines/{id}/logs"),
+        "compile_sql" => ("POST", "/api/pipelines/compile"),
+        "create_pipeline" => ("POST", "/api/pipelines"),
+        "deploy_pipeline" => ("POST", "/api/pipelines/{id}/deploy"),
+        "pause_resume_pipeline" => ("POST", "/api/pipelines/{id}/pause"),
+        "trigger_backfill" => ("POST", "/api/pipelines/{id}/backfill"),
+        "ddl_draft" => (
+            "POST",
+            "/api/datasources/{id}/tables/{db}/{table}/ddl/draft",
+        ),
+        "ddl_execute" => (
+            "POST",
+            "/api/datasources/{id}/tables/{db}/{table}/ddl/execute",
+        ),
+        "ddl_evolve" => (
+            "POST",
+            "/api/datasources/{id}/tables/{db}/{table}/ddl/evolve",
+        ),
+        "backfill_status" => ("GET", "/api/pipelines/{id}/backfill/jobs"),
+        other => unreachable!("tool_route called with unregistered tool {other:?}"),
+    }
+}
+
+/// The OpenAPI document the tool descriptions are generated from — the
+/// same derive that serves /swagger-ui, built once.
+static OPENAPI: std::sync::LazyLock<utoipa::openapi::OpenApi> =
+    std::sync::LazyLock::new(crate::openapi::ApiDoc::openapi);
+
+/// One tool's description, generated from the OpenAPI document (R8: one
+/// source — dropping a handler's doc comment breaks the unit test, not a
+/// silently stale copy here). The text is the operation's description (the
+/// handler doc comment; its first paragraph when there is only one),
+/// prefixed with the route so the tool's path-shaped arguments are readable
+/// in context.
+fn openapi_tool_description(name: &str) -> String {
+    let (method, path) = tool_route(name);
+    let item = OPENAPI
+        .paths
+        .paths
+        .get(path)
+        .unwrap_or_else(|| panic!("tool route {path} is missing from the OpenAPI document"));
+    let operation = match method {
+        "GET" => item.get.as_ref(),
+        "POST" => item.post.as_ref(),
+        other => unreachable!("tool_route produced method {other:?}"),
+    }
+    .unwrap_or_else(|| panic!("{method} {path} is missing from the OpenAPI document"));
+    let text = operation
+        .description
+        .clone()
+        .or_else(|| operation.summary.clone())
+        .unwrap_or_default();
+    format!("{method} {path} — {text}")
+}
+
 fn tool_definition(name: &str, write: bool) -> Value {
     let id_prop = json!({ "type": "integer", "description": "Pipeline id" });
     let ds_mapping = json!({
@@ -646,136 +773,147 @@ fn tool_definition(name: &str, write: bool) -> Value {
         "description": "Database alias -> datasource id, e.g. {\"shop\": 3}; resolves db.table references",
         "additionalProperties": { "type": ["integer", "string"] }
     });
-    let (description, mut schema) = match name {
-        "list_datasources" => (
-            "List registered datasources (GET /api/datasources). Optional `type` filters by \
-             registry type (kafka, doris, mysql, postgresql, file, ...).",
-            json!({
-                "type": "object",
-                "properties": { "type": { "type": "string", "description": "Registry type filter; omit for all" } },
-                "additionalProperties": false
-            }),
-        ),
-        "list_pipelines" => (
-            "List pipelines with paging (GET /api/pipelines).",
-            json!({
-                "type": "object",
-                "properties": {
-                    "page": { "type": "integer", "minimum": 1, "default": 1 },
-                    "pageSize": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
-                },
-                "additionalProperties": false
-            }),
-        ),
-        "get_pipeline" => (
-            "Get one pipeline's full detail: sql, spec snapshot, dsMapping, status, config \
-             (GET /api/pipelines/{id}).",
-            json!({
-                "type": "object",
-                "properties": { "id": id_prop },
-                "required": ["id"],
-                "additionalProperties": false
-            }),
-        ),
-        "get_pipeline_stats" => (
-            "Get a deployed pipeline's engine stats: totals (consumed/flushed/skipped/bad), \
-             per-statement rows (GET /api/pipelines/{id}/stats; proxied from the assigned node).",
-            json!({
-                "type": "object",
-                "properties": { "id": id_prop },
-                "required": ["id"],
-                "additionalProperties": false
-            }),
-        ),
-        "get_pipeline_logs" => (
-            "Get the last pipeline log lines as one snapshot (GET /api/pipelines/{id}/logs is an \
-             SSE stream; this tool returns the same engine tail pull once, `lines` clamped \
-             50..500, default 200).",
-            json!({
-                "type": "object",
-                "properties": {
-                    "id": id_prop,
-                    "lines": { "type": "integer", "minimum": 50, "maximum": 500, "default": 200 }
-                },
-                "required": ["id"],
-                "additionalProperties": false
-            }),
-        ),
-        "compile_sql" => (
-            "Compile SQL locally and return statements + diagnostics — pure, no side effects \
-             (POST /api/pipelines/compile; the embedded tailrace-parser, §4.6).",
-            json!({
-                "type": "object",
-                "properties": {
-                    "sql": { "type": "string", "description": "One or more INSERT INTO ... SELECT ... statements" },
-                    "dsMapping": ds_mapping,
-                    "pipelineId": { "type": "integer", "description": "Group naming uses tr.p{id}.s{n}; 0/omitted for unsaved drafts" }
-                },
-                "required": ["sql"],
-                "additionalProperties": false
-            }),
-        ),
-        "create_pipeline" => (
-            "Create a pipeline draft (POST /api/pipelines). Deploy it afterwards with \
-             deploy_pipeline.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string" },
-                    "sqlContent": { "type": "string" },
-                    "dsMapping": ds_mapping,
-                    "checkpointMs": { "type": "integer", "default": 10000 },
-                    "preferredNodeId": { "type": "integer" },
-                    "config": { "type": "object", "description": "Advanced options: reliability/recovery/tuning/groupPrefix/startOffset" }
-                },
-                "required": ["name", "sqlContent"],
-                "additionalProperties": false
-            }),
-        ),
-        "deploy_pipeline" => (
-            "Deploy a published pipeline: compile the spec, resolve table objects, push the plan \
-             to a node and start it (POST /api/pipelines/{id}/deploy). The pipeline must be \
-             published first; nodeId omitted means auto-assignment.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "id": id_prop,
-                    "nodeId": { "type": "integer", "description": "Target node; omit for auto-assignment" }
-                },
-                "required": ["id"],
-                "additionalProperties": false
-            }),
-        ),
-        "pause_resume_pipeline" => (
-            "Pause or resume a deployed pipeline (POST /api/pipelines/{id}/pause|resume; \
-             proxied to the assigned node).",
-            json!({
-                "type": "object",
-                "properties": {
-                    "id": id_prop,
-                    "action": { "type": "string", "enum": ["pause", "resume"] }
-                },
-                "required": ["id", "action"],
-                "additionalProperties": false
-            }),
-        ),
-        "trigger_backfill" => (
-            "Trigger a bounded backfill run (POST /api/pipelines/{id}/backfill, blueprint T-A2). \
-             `from`/`to` are {\"type\":\"offset\",\"value\":N} bounds; `dryRun` defaults to true \
-             (label/estimate preview with zero side effects).",
-            json!({
-                "type": "object",
-                "properties": {
-                    "id": id_prop,
-                    "statementIndex": { "type": "integer", "minimum": 0, "default": 0 },
-                    "from": { "type": "object", "description": "{\"type\":\"offset\",\"value\":N}" },
-                    "to": { "type": "object", "description": "{\"type\":\"offset\",\"value\":N}" },
-                    "dryRun": { "type": "boolean", "default": true, "description": "Plan only; defaults to true" }
-                },
-                "required": ["id", "from", "to"],
-                "additionalProperties": false
-            }),
-        ),
+    let ddl_target_props = json!({
+        "datasourceId": { "type": "integer", "description": "Doris/StarRocks datasource id" },
+        "db": { "type": "string" },
+        "table": { "type": "string" }
+    });
+    let description = openapi_tool_description(name);
+    let mut schema = match name {
+        "list_datasources" => json!({
+            "type": "object",
+            "properties": { "type": { "type": "string", "description": "Registry type filter; omit for all" } },
+            "additionalProperties": false
+        }),
+        "list_pipelines" => json!({
+            "type": "object",
+            "properties": {
+                "page": { "type": "integer", "minimum": 1, "default": 1 },
+                "pageSize": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+            },
+            "additionalProperties": false
+        }),
+        "get_pipeline" => json!({
+            "type": "object",
+            "properties": { "id": id_prop },
+            "required": ["id"],
+            "additionalProperties": false
+        }),
+        "get_pipeline_stats" => json!({
+            "type": "object",
+            "properties": { "id": id_prop },
+            "required": ["id"],
+            "additionalProperties": false
+        }),
+        "get_pipeline_logs" => json!({
+            "type": "object",
+            "properties": {
+                "id": id_prop,
+                "lines": { "type": "integer", "minimum": 50, "maximum": 500, "default": 200 }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        }),
+        "compile_sql" => json!({
+            "type": "object",
+            "properties": {
+                "sql": { "type": "string", "description": "One or more INSERT INTO ... SELECT ... statements" },
+                "dsMapping": ds_mapping,
+                "pipelineId": { "type": "integer", "description": "Group naming uses tr.p{id}.s{n}; 0/omitted for unsaved drafts" }
+            },
+            "required": ["sql"],
+            "additionalProperties": false
+        }),
+        "create_pipeline" => json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" },
+                "sqlContent": { "type": "string" },
+                "dsMapping": ds_mapping,
+                "checkpointMs": { "type": "integer", "default": 10000 },
+                "preferredNodeId": { "type": "integer" },
+                "config": { "type": "object", "description": "Advanced options: reliability/recovery/tuning/groupPrefix/startOffset" }
+            },
+            "required": ["name", "sqlContent"],
+            "additionalProperties": false
+        }),
+        "deploy_pipeline" => json!({
+            "type": "object",
+            "properties": {
+                "id": id_prop,
+                "nodeId": { "type": "integer", "description": "Target node; omit for auto-assignment" }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        }),
+        "pause_resume_pipeline" => json!({
+            "type": "object",
+            "properties": {
+                "id": id_prop,
+                "action": { "type": "string", "enum": ["pause", "resume"] }
+            },
+            "required": ["id", "action"],
+            "additionalProperties": false
+        }),
+        "trigger_backfill" => json!({
+            "type": "object",
+            "properties": {
+                "id": id_prop,
+                "statementIndex": { "type": "integer", "minimum": 0, "default": 0 },
+                "from": { "type": "object", "description": "{\"type\":\"offset\",\"value\":N}" },
+                "to": { "type": "object", "description": "{\"type\":\"offset\",\"value\":N}" },
+                "dryRun": { "type": "boolean", "default": true, "description": "Plan only; defaults to true" }
+            },
+            "required": ["id", "from", "to"],
+            "additionalProperties": false
+        }),
+        "ddl_draft" => json!({
+            "type": "object",
+            "properties": {
+                "datasourceId": ddl_target_props["datasourceId"].clone(),
+                "db": ddl_target_props["db"].clone(),
+                "table": ddl_target_props["table"].clone(),
+                "keyColumn": { "type": "string", "description": "Confirmed key column; clears keyColumnGuessed" },
+                "keyModel": { "type": "string", "enum": ["unique", "duplicate"], "description": "Key-model override; the recommendation stands when absent" },
+                "replicationNum": { "type": "integer", "minimum": 1, "description": "\"replication_num\" property; 1 on a single-BE cluster" },
+                "partition": { "type": "boolean", "description": "true = confirmed candidate; false = dropped (no PARTITION BY)" },
+                "columnTypes": {
+                    "type": "array",
+                    "description": "Per-column type overrides [name, vocabulary type]; steers this draft only",
+                    "items": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "string" } }
+                }
+            },
+            "required": ["datasourceId", "db", "table"],
+            "additionalProperties": false
+        }),
+        "ddl_execute" => json!({
+            "type": "object",
+            "properties": {
+                "datasourceId": ddl_target_props["datasourceId"].clone(),
+                "db": ddl_target_props["db"].clone(),
+                "table": ddl_target_props["table"].clone(),
+                "ddl": { "type": "string", "description": "The draft text echoed back verbatim" },
+                "keyModel": { "type": "string", "enum": ["unique", "duplicate"] }
+            },
+            "required": ["datasourceId", "db", "table", "ddl", "keyModel"],
+            "additionalProperties": false
+        }),
+        "ddl_evolve" => json!({
+            "type": "object",
+            "properties": {
+                "datasourceId": ddl_target_props["datasourceId"].clone(),
+                "db": ddl_target_props["db"].clone(),
+                "table": ddl_target_props["table"].clone()
+            },
+            "required": ["datasourceId", "db", "table"],
+            "additionalProperties": false
+        }),
+        "backfill_status" => json!({
+            "type": "object",
+            "properties": { "id": id_prop },
+            "required": ["id"],
+            "additionalProperties": false
+        }),
         other => unreachable!("tool_definition called with unregistered tool {other:?}"),
     };
     if write {
@@ -1067,14 +1205,20 @@ impl RateLimiter {
 mod tests {
     use super::*;
 
-    /// §7.5 surface guard: exactly ten tools, six read + four write, unique
-    /// names, every definition well-formed, `confirm` required on writes.
+    /// §7.5 + R8 surface guard: exactly fourteen tools (the blueprint ten
+    /// plus the DDL closed loop and backfill status — within the ≤16
+    /// budget), eight read + six write, unique names, every definition
+    /// well-formed, `confirm` required on writes, and every description
+    /// GENERATED from the OpenAPI document (route prefix + the operation's
+    /// text — the same-source rule; a handler losing its doc comment turns
+    /// this red, not a silently stale hand-written copy).
     #[test]
-    fn tool_table_matches_blueprint_7_5() {
-        assert_eq!(TOOLS.len(), 10, "exactly ten tools");
+    fn tool_table_matches_the_registered_surface() {
+        assert_eq!(TOOLS.len(), 14, "fourteen tools (≤16 budget)");
+        assert!(TOOLS.len() <= 16, "the R8 tool-face budget");
         let reads = TOOLS.iter().filter(|(_, w)| !w).count();
         let writes = TOOLS.iter().filter(|(_, w)| *w).count();
-        assert_eq!((reads, writes), (6, 4));
+        assert_eq!((reads, writes), (8, 6));
         let names: Vec<&str> = TOOLS.iter().map(|(n, _)| *n).collect();
         let mut unique = names.clone();
         unique.sort_unstable();
@@ -1083,9 +1227,26 @@ mod tests {
         for (name, write) in TOOLS {
             let def = tool_definition(name, *write);
             assert_eq!(def["name"], *name);
+            let description = def["description"].as_str().unwrap_or("");
             assert!(
-                def["description"].as_str().unwrap_or("").len() > 20,
+                description.len() > 20,
                 "{name}: description must be non-trivial"
+            );
+            let (method, path) = tool_route(name);
+            assert!(
+                description.starts_with(&format!("{method} {path}")),
+                "{name}: description is route-prefixed: {description}"
+            );
+            // same-source: the text after the route prefix IS the OpenAPI
+            // operation's, not a second hand-written copy
+            assert_eq!(
+                description,
+                openapi_tool_description(name),
+                "{name}: description must be the generated one"
+            );
+            assert!(
+                description.contains('\u{4e00}') || description.len() > 40,
+                "{name}: the OpenAPI doc comments carry the handlers' text"
             );
             assert_eq!(def["inputSchema"]["type"], "object");
             assert_eq!(def["annotations"]["readOnlyHint"], !*write);

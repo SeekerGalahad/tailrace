@@ -1,11 +1,13 @@
 //! T-A7 partial-column update, control-plane contract (R7 W3): the
 //! statement-level switch (INSERT column list) through compile → publish
 //! gate → plan projection → the evolve × deploy mutex, against the mock
-//! engine / a header-capturing mock BE. No live Doris: the FE side
-//! (`jdbc:mysql://127.0.0.1:19030`) is unreachable by construction, which is
-//! exactly the UNAVAILABLE path the deploy-side precheck must take; the
-//! in-flight 409 and the MoW "unwritten column keeps its value" semantics are
-//! the W4 e2e's.
+//! engine / a header-capturing mock BE. No live Doris: the FE side is the
+//! MockFe below — a real MySQL-wire server answering SHOW CREATE TABLE from
+//! a script (LOW-5, R8: the publish gate asks the live table once the
+//! registration gate passes) and refusing every other query, which keeps
+//! the deploy-side precheck (SHOW ALTER TABLE COLUMN) on its 502 path; the
+//! in-flight 409 and the MoW "unwrapped column keeps its value" semantics
+//! are the W4 e2e's.
 
 mod common;
 
@@ -22,6 +24,14 @@ use tailrace_console::state::AppState;
 
 const PARTIAL_SQL: &str =
     "INSERT INTO ods.orders (id, payload) SELECT id, payload FROM shop.orders WHERE op_type IN ('I','U')";
+
+/// Live SHOW CREATE TABLE answers, the shapes e2e S4.2/S4.3 asserted on
+/// real Doris 2.1.7 / 3.1.4 (scripts/e2e/partial_update.sh): UNIQUE MoW
+/// carries the explicit property, DUPLICATE has no MoW story, MoR carries
+/// the explicit false.
+const LIVE_MOW: &str = "CREATE TABLE `orders` (\n  `order_no` varchar(65533) NOT NULL,\n  `id` bigint NULL,\n  `payload` varchar(65533) NULL\n) ENGINE=OLAP\nUNIQUE KEY(`order_no`)\nCOMMENT 'OLAP'\nDISTRIBUTED BY HASH(`order_no`) BUCKETS 1\nPROPERTIES (\n\"replication_num\" = \"1\",\n\"enable_unique_key_merge_on_write\" = \"true\"\n);";
+const LIVE_DUP: &str = "CREATE TABLE `orders` (\n  `order_no` varchar(65533) NOT NULL,\n  `id` bigint NULL,\n  `payload` varchar(65533) NULL\n) ENGINE=OLAP\nDUPLICATE KEY(`order_no`, `id`)\nDISTRIBUTED BY HASH(`order_no`) BUCKETS 1\nPROPERTIES (\n\"replication_num\" = \"1\"\n);";
+const LIVE_MOR: &str = "CREATE TABLE `orders` (\n  `order_no` varchar(65533) NOT NULL,\n  `id` bigint NULL\n) ENGINE=OLAP\nUNIQUE KEY(`order_no`)\nDISTRIBUTED BY HASH(`order_no`) BUCKETS 1\nPROPERTIES (\n\"replication_allocation\" = \"tag.location.default: 1\",\n\"enable_unique_key_merge_on_write\" = \"false\"\n);";
 
 /// Create a pipeline over the seeded datasources (not published).
 async fn pipeline(app: &TestApp, name: &str, sql: &str, kafka: i64, doris: i64) -> i64 {
@@ -64,6 +74,41 @@ async fn set_key_model(app: &TestApp, table: i64, model: &str) -> (StatusCode, V
         Some(json!({"keyModel": model})),
     )
     .await
+}
+
+/// A fresh doris datasource + ods.orders table (keyModel=unique at
+/// registration) with its jdbcUrl at `jdbc_port` — 19030 is nothing
+/// listening, i.e. the unreachable-FE path; a MockFe port is the live one.
+async fn doris_ds_at(app: &TestApp, jdbc_port: u16, name: &str) -> (i64, i64) {
+    let (s, b) = req(
+        app,
+        "POST",
+        "/api/datasources",
+        Some(json!({
+            "name": name, "type": "doris",
+            "connJson": {
+                "jdbcUrl": format!("jdbc:mysql://127.0.0.1:{jdbc_port}/shop"),
+                "streamLoadUrl": "http://127.0.0.1:18040"
+            },
+            "username": "loader", "password": "pw"
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let ds = b["id"].as_i64().unwrap();
+    let (s, b) = req(
+        app,
+        "POST",
+        &format!("/api/datasources/{ds}/tables"),
+        Some(json!({
+            "dbName": "ods", "tableName": "orders", "format": null,
+            "columnsJson": [["id", "int64"], ["payload", "utf8"]],
+            "keyModel": "unique"
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    (ds, b["id"].as_i64().unwrap())
 }
 
 /// The switch through the console compile endpoint, both states: no column
@@ -134,7 +179,13 @@ async fn compile_exposes_the_partial_columns_switch() {
 #[tokio::test]
 async fn publish_gate_enforces_doris_partial_update_semantics() {
     let app = app().await;
-    let (kafka, doris, kafka_table, doris_table) = seed_datasources(&app).await;
+    // LOW-5: the gate's second half asks the live FE once registration
+    // passes — a MockFe answering SHOW CREATE TABLE with a MoW UNIQUE table
+    // keeps the ③ "gate opens" leg meaningful; the refusals ①②④⑤⑥ never
+    // reach the FE
+    let fe = MockFe::default();
+    let fe_port = fe.clone().serve(LIVE_MOW).await;
+    let (kafka, doris, kafka_table, doris_table) = seed_datasources_at_fe(&app, fe_port).await;
 
     // the regression anchor: no declaration, no key model needed
     let plain = pipeline(&app, "plain", PIPELINE_SQL, kafka, doris).await;
@@ -177,7 +228,8 @@ async fn publish_gate_enforces_doris_partial_update_semantics() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(b["items"][0]["keyModel"], "duplicate", "{b}");
 
-    // ③ UNIQUE on record → the gate opens
+    // ③ UNIQUE on record → the registration gate passes and the live gate
+    // (MockFe: MoW UNIQUE) agrees → publish
     let (s, _) = set_key_model(&app, doris_table, "Unique").await;
     assert_eq!(s, StatusCode::OK, "case-insensitive input");
     let (s, b) = publish(&app, pid).await;
@@ -292,6 +344,77 @@ async fn publish_gate_enforces_doris_partial_update_semantics() {
     assert_eq!(s, StatusCode::NOT_FOUND);
 }
 
+/// LOW-5 (R8): the key model on record is not the last word — once the
+/// registration gate passes (kind=doris, keyModel=unique on record),
+/// publish asks the LIVE table: `SHOW CREATE TABLE` over the MySQL wire
+/// (the MockFe speaks the protocol the embedded sqlx client needs).
+/// Registered unique but live DUPLICATE / MoR → 400 naming the live
+/// verdict; the FE unreachable → fail-closed 502 (the DDL endpoints' /
+/// deploy precheck's stance), nothing published; live MoW → the gate
+/// opens; an undeclared pipeline never asks the FE (regression anchor).
+#[tokio::test]
+async fn publish_gate_verifies_the_live_key_model() {
+    let app = app().await;
+    let fe = MockFe::default();
+    let fe_port = fe.clone().serve(LIVE_DUP).await;
+    let (kafka, doris, _, doris_table) = seed_datasources_at_fe(&app, fe_port).await;
+    set_key_model(&app, doris_table, "unique").await;
+    let pid = pipeline(&app, "live-dup", PARTIAL_SQL, kafka, doris).await;
+
+    // registered unique, live DUPLICATE → 400 with the live verdict named
+    let (s, b) = publish(&app, pid).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert!(
+        diag_text(&b).contains("活表 SHOW CREATE TABLE 核实为 DUPLICATE KEY"),
+        "{}",
+        diag_text(&b)
+    );
+    // the wire shape: one fully-qualified backticked query per sink
+    assert_eq!(
+        fe.queries.lock().unwrap().last().cloned(),
+        Some("SHOW CREATE TABLE `ods`.`orders`".to_string()),
+        "{:?}",
+        fe.queries.lock().unwrap()
+    );
+    let (_, b) = req(&app, "GET", &format!("/api/pipelines/{pid}"), None).await;
+    assert_eq!(b["status"], "DRAFT", "nothing published on a refusal");
+
+    // live UNIQUE but merge-on-read → same refusal, the MoR verdict
+    fe.set_ddl(LIVE_MOR);
+    let (s, b) = publish(&app, pid).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert!(diag_text(&b).contains("merge-on-read"), "{}", diag_text(&b));
+
+    // live UNIQUE merge-on-write → the gate opens
+    fe.set_ddl(LIVE_MOW);
+    let (s, b) = publish(&app, pid).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+
+    // FE unreachable (nothing listens on 19030) → fail-closed 502 naming
+    // the check, nothing published — the record says unique, but a 3am
+    // load failure is not an acceptable substitute for an answer
+    let (doris_off, _) = doris_ds_at(&app, 19030, "doris-off").await;
+    let off = pipeline(&app, "fe-off", PARTIAL_SQL, kafka, doris_off).await;
+    let (s, b) = publish(&app, off).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{b}");
+    assert_eq!(b["error"]["code"], "UNAVAILABLE", "{b}");
+    assert!(
+        b["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("SHOW CREATE TABLE"),
+        "{b}"
+    );
+    let (_, b) = req(&app, "GET", &format!("/api/pipelines/{off}"), None).await;
+    assert_eq!(b["status"], "DRAFT", "{b}");
+
+    // regression anchor: no declaration → no FE round trip, unreachable or
+    // not — the pre-LOW-5 publish shape
+    let plain = pipeline(&app, "plain-off", PIPELINE_SQL, kafka, doris_off).await;
+    let (s, b) = publish(&app, plain).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+}
+
 /// Deploy side of the mutex: a plan with a partial-column sink is prechecked
 /// live (`SHOW ALTER TABLE COLUMN`) BEFORE anything reaches the engine —
 /// here the FE is unreachable, so the answer is 502 UNAVAILABLE naming the
@@ -303,7 +426,12 @@ async fn publish_gate_enforces_doris_partial_update_semantics() {
 async fn deploy_prechecks_schema_change_before_the_engine_push() {
     let app = app().await;
     let (st, port) = spawn_mock_engine().await;
-    let (kafka, doris, _, doris_table) = seed_datasources(&app).await;
+    // the FE is a MockFe serving a MoW UNIQUE SHOW CREATE (publish's LOW-5
+    // live gate needs an answerable FE) that refuses everything else — the
+    // deploy-side SHOW ALTER precheck keeps its 502 path
+    let fe = MockFe::default();
+    let fe_port = fe.clone().serve(LIVE_MOW).await;
+    let (kafka, doris, _, doris_table) = seed_datasources_at_fe(&app, fe_port).await;
     online_node(&app, port, "n1").await;
 
     // undeclared pipeline: deploys, no partial_columns anywhere in the plan
@@ -377,7 +505,12 @@ async fn deploy_prechecks_schema_change_before_the_engine_push() {
 async fn push_regates_the_declaration_against_the_registered_sink() {
     let app = app().await;
     let (st, port) = spawn_mock_engine().await;
-    let (kafka, doris, _, doris_table) = seed_datasources(&app).await;
+    // MockFe (MoW UNIQUE) so the valid publish below passes LOW-5's live
+    // gate; its refusal of non-SHOW-CREATE queries keeps the final deploy
+    // leg on the precheck's 502
+    let fe = MockFe::default();
+    let fe_port = fe.clone().serve(LIVE_MOW).await;
+    let (kafka, doris, _, doris_table) = seed_datasources_at_fe(&app, fe_port).await;
     online_node(&app, port, "n1").await;
 
     // ① the pre-A7 snapshot: published bare (no list, no gate), then the
@@ -494,7 +627,11 @@ async fn push_regates_the_declaration_against_the_registered_sink() {
 async fn evolve_refuses_while_a_partial_update_pipeline_is_deployed() {
     let app = app().await;
     let (_, port) = spawn_mock_engine().await;
-    let (kafka, doris, _, doris_table) = seed_datasources(&app).await;
+    // MockFe (MoW UNIQUE) for the partial pipeline's publish (LOW-5); the
+    // evolve legs below expect the DESC failure — the MockFe refuses it
+    let fe = MockFe::default();
+    let fe_port = fe.clone().serve(LIVE_MOW).await;
+    let (kafka, doris, _, doris_table) = seed_datasources_at_fe(&app, fe_port).await;
     let (node_id, _, _) = online_node(&app, port, "n1").await;
     set_key_model(&app, doris_table, "unique").await;
     let pid = pipeline(&app, "partial", PARTIAL_SQL, kafka, doris).await;
@@ -612,6 +749,10 @@ async fn backfill_executor_writes_the_declared_subset_as_a_partial_load() {
     let app = app().await;
     let be = CaptureBe::default();
     let be_port = be.clone().serve().await;
+    // MockFe (MoW UNIQUE): the publish below needs the LOW-5 live answer,
+    // and the backfill accept's precheck (SHOW ALTER) keeps its 502
+    let fe = MockFe::default();
+    let fe_port = fe.clone().serve(LIVE_MOW).await;
 
     // file source: three columns in the file, two declared for the write
     let dir = std::env::temp_dir().join(format!(
@@ -653,7 +794,7 @@ async fn backfill_executor_writes_the_declared_subset_as_a_partial_load() {
         Some(json!({
             "name": "pu-doris", "type": "doris",
             "connJson": {
-                "jdbcUrl": "jdbc:mysql://127.0.0.1:1/shop",
+                "jdbcUrl": format!("jdbc:mysql://127.0.0.1:{fe_port}/shop"),
                 "streamLoadUrl": format!("http://127.0.0.1:{be_port}")
             },
             "username": "loader", "password": "pw"

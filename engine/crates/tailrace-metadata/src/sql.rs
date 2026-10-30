@@ -156,6 +156,37 @@ pub(crate) async fn mysql_describe(
         .collect()
 }
 
+/// Doris FE: `SHOW CREATE TABLE \`db\`.\`table\`` → the live CREATE TABLE
+/// text (column `Create Table`). Used by the console's partial-update
+/// publish gate (LOW-5): the key model on record can drift from what the
+/// table actually is — this is the table's own answer. Read by column NAME
+/// with an index fallback: MySQL-convention column order (Table, Create
+/// Table) is stable, but the SHOW-column-order lesson from
+/// [`doris_alter_column_jobs`] (version-dependent order, documented names)
+/// applies here too.
+pub(crate) async fn doris_show_create(
+    spec: &ConnSpec,
+    db: &str,
+    table: &str,
+) -> anyhow::Result<String> {
+    let (mut conn, _) = mysql_connect(spec).await?;
+    let sql = format!(
+        "SHOW CREATE TABLE `{}`.`{}`",
+        quote_ident(db)?,
+        quote_ident(table)?
+    );
+    let rows: Vec<MySqlRow> = conn
+        .fetch_all(raw_sql(AssertSqlSafe(sql)))
+        .await
+        .map_err(|e| anyhow::anyhow!("SHOW CREATE TABLE 失败（{db}.{table}）: {e}"))?;
+    let row = rows
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("SHOW CREATE TABLE 无结果（表不存在？）: {db}.{table}"))?;
+    row.try_get::<String, _>("Create Table")
+        .or_else(|_| row.try_get::<String, _>(1))
+        .map_err(|e| anyhow::anyhow!("SHOW CREATE TABLE 解码失败（{db}.{table}）: {e}"))
+}
+
 /// Backtick-quote body for one identifier: backticks doubled, NUL (which a
 /// JSON string can smuggle) rejected.
 fn quote_ident(name: &str) -> anyhow::Result<String> {

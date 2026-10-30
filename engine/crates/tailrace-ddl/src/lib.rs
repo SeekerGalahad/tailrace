@@ -33,6 +33,13 @@
 //! confirm step; a partition candidate that had to be skipped says why in
 //! [`DraftDdl::notes`]. Nothing here executes anything; `tailrace-metadata`'s
 //! `mysql_exec` is the exec side of the closed loop.
+//!
+//! Sequence-column semantics (dogfooding #3, R8): under UNIQUE KEY a
+//! declared `sequence_column` is emitted as the table-level
+//! `function_column.sequence_col` property — without it Doris silently
+//! ignores the engine's `sequence_column` stream-load header and the
+//! ordering protection the declaration promises does not exist (probed live
+//! on 2.1.7 and 3.1.4; the W5 e2e wave locks the load-side behaviour).
 
 use anyhow::bail;
 
@@ -300,11 +307,29 @@ pub fn generate_draft(schema: &Schema, hints: &KeyHints) -> anyhow::Result<Draft
         quote_ident(&key_column)?
     ));
 
-    // Fixed property order keeps snapshots stable: MoW → dynamic partition →
-    // replication.
+    // Fixed property order keeps snapshots stable: MoW → sequence_col →
+    // dynamic partition → replication.
     let mut props: Vec<String> = Vec::new();
     if key_model == KeyModel::Unique {
         props.push(r#""enable_unique_key_merge_on_write" = "true""#.to_string());
+    }
+    // Dogfooding #3 (R8): a UNIQUE table with a declared sequence column
+    // must carry the table-level property. Without it the engine's
+    // `sequence_column` stream-load header is silently ignored by Doris
+    // (Status Success) and a low-seq write clobbers a high-seq row — the
+    // exact ordering protection the declaration promises, probed live on
+    // both stacks (probe2.out D2 vs C2: the property-less table accepts the
+    // seq=5 overwrite, the attributed table drops it). The column itself
+    // stays a plain declared column (Doris hides the sequence role); under
+    // DUPLICATE KEY there is no dedup story, so the plain-column note in
+    // `notes` remains the only effect.
+    if key_model == KeyModel::Unique {
+        if let Some(seq) = &hints.sequence_column {
+            props.push(format!(
+                r#""function_column.sequence_col" = "{}""#,
+                quote_ident(seq)?
+            ));
+        }
     }
     if partition.is_some() {
         props.extend(
@@ -588,7 +613,11 @@ PROPERTIES (
     // merge-on-write table's partition column must be a key column (Doris
     // 2.1.7: "Merge-on-Write table's partition column must be KEY column")
     // — the candidate is skipped and the draft says why instead of emitting
-    // a clause the FE refuses.
+    // a clause the FE refuses. Dogfooding #3 (R8): the declared sequence
+    // column rides as `function_column.sequence_col` — the table-level
+    // property without which Doris silently ignores the engine's
+    // `sequence_column` load header (the attr'd shape is the live-probed
+    // C2 table of probe2.out, created on 2.1.7 and 3.1.4 alike).
     #[test]
     fn snapshot_unique_ogg_replication_1_partition_skipped_non_key() {
         let s = schema(
@@ -623,6 +652,7 @@ UNIQUE KEY(`order_id`)
 DISTRIBUTED BY HASH(`order_id`) BUCKETS AUTO
 PROPERTIES (
     "enable_unique_key_merge_on_write" = "true",
+    "function_column.sequence_col" = "seq",
     "replication_num" = "1"
 );"#
         );
@@ -763,6 +793,11 @@ PROPERTIES (
         );
         assert_eq!(d.key_model, KeyModel::Duplicate);
         assert!(!d.ddl.contains("enable_unique_key_merge_on_write"));
+        // the two-state pair with ③: under DUPLICATE KEY the sequence
+        // column never becomes a table property — no dedup story to order
+        // (dogfooding #3's other edge: a property on a DUPLICATE table
+        // would be refused by the FE outright)
+        assert!(!d.ddl.contains("function_column.sequence_col"));
         let p = d.partition.clone().unwrap();
         assert_eq!(p.column, "ogg_ts");
         assert!(p.guessed, "unconfirmed candidate keeps the guess flag");
