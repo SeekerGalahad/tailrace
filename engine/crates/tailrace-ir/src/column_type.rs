@@ -580,4 +580,56 @@ mod tests {
             );
         }
     }
+
+    /// Review fix (R8 acceptance "迁移窗 warn 有日志样例"): the migration
+    /// window's warn actually REACHES a tracing subscriber — install a
+    /// thread-default fmt subscriber over a captured buffer, fold one
+    /// unknown word, and assert the WARN line carries the message, the
+    /// column name and the offending vocabulary. This is the runnable,
+    /// regression-proof form of the acceptance's "log sample" (no runtime
+    /// artifact is committed).
+    #[test]
+    fn migration_window_warn_actually_logs() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::util::SubscriberInitExt as _;
+
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().write(buf)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Capture;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = Capture(Arc::new(Mutex::new(Vec::new())));
+        let guard = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+            .set_default();
+        let folded = arrow_type_or_utf8("amount", "varchar(64)").unwrap();
+        drop(guard);
+        assert_eq!(folded, DataType::Utf8);
+        let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("WARN"), "expected a WARN event, got: {text}");
+        assert!(
+            text.contains("unknown column type vocabulary folds to utf8"),
+            "the migration-window message must reach the subscriber, got: {text}"
+        );
+        assert!(
+            text.contains("amount") && text.contains("varchar(64)"),
+            "column name + offending vocabulary ride the event, got: {text}"
+        );
+    }
 }

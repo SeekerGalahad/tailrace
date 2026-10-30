@@ -90,12 +90,12 @@ pub struct TableObject {
     /// (debezium-json = Debezium CDC envelope consumed from Kafka, blueprint
     /// C narrow path; `after.*` is the row data, deletes/tombstones skip,
     /// schema/payload-wrapped and bare converter envelopes both accepted.
-    /// The runtime dispatch arm HAS landed (`build_decoder` decodes it), so
-    /// hand-declared table objects can select it; the console discover path
-    /// still rejects the value (kafka infer-schema accepts ogg/json/jsonl
-    /// only — a debezium-json table cannot be discovered, only written into
-    /// a catalog by hand or via table registration, which does not validate
-    /// format names)
+    /// The runtime dispatch arm has landed (`build_decoder` decodes it) and
+    /// R8 A3 widened the console kafka infer-schema gate to accept it too
+    /// (ogg/json/jsonl/debezium-json — the engine-side metadata client
+    /// already walked the envelope; the console gate had lagged behind), so
+    /// a debezium-json table can now be discovered as well as hand-declared
+    /// or registered (table registration does not validate format names)
     pub format: Option<String>,
     /// Column definitions [name, arrow type] (v1 flat; discover output is the
     /// same shape)
@@ -1351,6 +1351,102 @@ select_sql = "SELECT order_no, seq, qty FROM src"
         });
         let m: PlanTableObject = serde_json::from_value(mixed).unwrap();
         assert_eq!(m.option_str(option_keys::BOOTSTRAP), Some("options-value"));
+    }
+
+    /// R8 risk table row 1 (review fix): the CROSS state of the two
+    /// migration windows — a plan body whose field names are pre-G1 legacy
+    /// (a console from before the options fold wrote it) but whose column
+    /// types are post-G2 NEW vocabulary (a G2-aware operator declared
+    /// decimal/timestamp/list columns in it). The windows must not
+    /// interfere: the serde fold still lands every legacy field in
+    /// `options`, the new words ride `columns` byte-identical (serde never
+    /// parses them), and each parses through the schema-construction entry
+    /// on the far side of the fold — plus the dual-write round trip keeps
+    /// the new vocabulary intact.
+    #[test]
+    fn legacy_field_names_carry_new_vocabulary_columns() {
+        use datafusion::arrow::datatypes::DataType;
+        use datafusion::arrow::datatypes::Field;
+        use datafusion::arrow::datatypes::TimeUnit;
+
+        let body = serde_json::json!({
+            "reference": "5.ods.wide",
+            "kind": "doris",
+            "format": "ogg",
+            "columns": [
+                ["k", "utf8"],
+                ["amount", "decimal(18,2)"],
+                ["event_ts", "timestamp(us)"],
+                ["payload", "string"],
+                ["day", "date"],
+                ["embedding", "list<float32,768>"]
+            ],
+            "bootstrap": null,
+            "stream_load_url": "http://127.0.0.1:8040/api/ods/wide/_stream_load",
+            "auth_env": "TAILRACE_DS_5",
+            "sequence_column": "event_ts",
+            "partial_columns": ["k", "event_ts"]
+        });
+        let t: PlanTableObject = serde_json::from_value(body).expect("cross-window body parses");
+        // G1 half: legacy names still fold into options, null bootstrap = unset
+        assert_eq!(t.option_str(option_keys::BOOTSTRAP), None);
+        assert_eq!(
+            t.option_str(option_keys::STREAM_LOAD_URL),
+            Some("http://127.0.0.1:8040/api/ods/wide/_stream_load")
+        );
+        assert_eq!(t.option_str(option_keys::AUTH_ENV), Some("TAILRACE_DS_5"));
+        assert_eq!(
+            t.option_str(option_keys::SEQUENCE_COLUMN),
+            Some("event_ts"),
+            "a new-vocabulary column can be the sequence column (both windows overlap)"
+        );
+        assert_eq!(
+            t.option_str_list(option_keys::PARTIAL_COLUMNS),
+            Some(vec!["k".to_string(), "event_ts".to_string()])
+        );
+        // G2 half: the new words ride columns byte-identical and each
+        // resolves through the schema-construction entry the runtime uses
+        // (arrow_type_or_utf8) — the fold must not have touched them
+        assert_eq!(
+            t.columns,
+            vec![
+                ("k".to_string(), "utf8".to_string()),
+                ("amount".to_string(), "decimal(18,2)".to_string()),
+                ("event_ts".to_string(), "timestamp(us)".to_string()),
+                ("payload".to_string(), "string".to_string()),
+                ("day".to_string(), "date".to_string()),
+                ("embedding".to_string(), "list<float32,768>".to_string()),
+            ]
+        );
+        let arrow: Vec<_> = t
+            .columns
+            .iter()
+            .map(|(n, ty)| arrow_type_or_utf8(n, ty).unwrap())
+            .collect();
+        assert_eq!(arrow[0], DataType::Utf8);
+        assert_eq!(arrow[1], DataType::Decimal128(18, 2));
+        assert_eq!(arrow[2], DataType::Timestamp(TimeUnit::Microsecond, None));
+        assert_eq!(arrow[3], DataType::LargeUtf8);
+        assert_eq!(arrow[4], DataType::Date32);
+        assert_eq!(
+            arrow[5],
+            DataType::List(std::sync::Arc::new(Field::new(
+                "item",
+                DataType::Float32,
+                true
+            )))
+        );
+        // dual-write round trip keeps the new vocabulary intact (a pre-G1
+        // engine reads the legacy spellings; re-parsing reproduces columns)
+        let v = serde_json::to_value(&t).unwrap();
+        assert_eq!(v["sequence_column"], "event_ts");
+        assert_eq!(
+            v["columns"][1],
+            serde_json::json!(["amount", "decimal(18,2)"])
+        );
+        let back: PlanTableObject = serde_json::from_value(v).unwrap();
+        assert_eq!(back.columns, t.columns);
+        assert_eq!(back.options, t.options);
     }
 
     /// The dual-write half: a serialized post-G1 PlanTableObject carries the
