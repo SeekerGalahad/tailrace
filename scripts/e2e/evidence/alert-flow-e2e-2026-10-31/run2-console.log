@@ -1,0 +1,10 @@
+2026-10-30T20:32:54.824725Z  INFO rusqlite_migration: Database migrated to version 5
+──────────────────────────────────────────────────────────────
+[Tailrace] 首次启动：初始管理员已创建
+[Tailrace]   用户名：admin
+[Tailrace]   （仅此一次显示，请妥善保存）
+──────────────────────────────────────────────────────────────
+2026-10-30T20:32:54.847176Z  INFO tailrace_console::alerting: alert evaluator started interval_secs=2
+2026-10-30T20:32:54.855768Z  INFO tailrace_console: tailrace-console 1.1.0 listening on http://127.0.0.1:18088
+2026-10-30T20:32:54.855944Z  INFO tailrace_console: data dir: /tmp/tailrace-af-e2e/run | swagger: http://127.0.0.1:18088/swagger-ui | api doc: http://127.0.0.1:18088/api-docs/openapi.json
+2026-10-30T20:32:54.855948Z  INFO tailrace_console: mcp: http://127.0.0.1:18088/mcp (write tools disabled)

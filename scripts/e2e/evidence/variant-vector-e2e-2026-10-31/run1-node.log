@@ -1,0 +1,14 @@
+2026-10-30T19:25:59.720268Z  INFO tailrace_node: /v1 node token source (value not logged) origin=BootstrapFlag
+heartbeat enabled: control-plane=http://127.0.0.1:18087 advertise=127.0.0.1:18107 state_dir=/tmp/tailrace-vv-e2e/node-state secs=2
+tailrace-node serve mode: http://127.0.0.1:18107 (/healthz open; /v1 requires the node token)
+2026-10-30T19:25:59.722631Z  INFO tailrace_api::heartbeat: identity ready node_key=sn-f2abb1c337f47bc6 name=engine-node control_plane="http://127.0.0.1:18087"
+2026-10-30T19:25:59.724439Z  INFO tailrace_api::heartbeat: adopted console-issued per-node token (persisted, m2m + /v1 rotated)
+2026-10-30T19:25:59.724451Z  INFO tailrace_api::heartbeat: self-registration ok node_key=sn-f2abb1c337f47bc6
+2026-10-30T19:26:02.693882Z  INFO tailrace_runtime::registry: pipeline started (serve) pipeline_id=1 statements=1 dispatch_id=1793388362688000 bad_row_policy=dlq
+2026-10-30T19:26:19.398178Z  INFO tailrace_runtime::registry: pipeline started (serve) pipeline_id=2 statements=1 dispatch_id=1793388379397001 bad_row_policy=dlq
+2026-10-30T19:29:10.509825Z  INFO tailrace_runtime::registry: pipeline started (serve) pipeline_id=3 statements=1 dispatch_id=1793388550508002 bad_row_policy=dlq
+2026-10-30T19:29:13.042194Z  INFO tailrace_api::heartbeat: heartbeat shut down
+2026-10-30T19:29:13.134346Z  INFO tailrace_runtime::registry: pipeline stopped (final flush + cursor commit done in the statement threads) pipeline_id=2
+2026-10-30T19:29:13.176284Z  INFO tailrace_runtime::registry: pipeline stopped (final flush + cursor commit done in the statement threads) pipeline_id=3
+2026-10-30T19:29:13.209432Z  INFO tailrace_runtime::registry: pipeline stopped (final flush + cursor commit done in the statement threads) pipeline_id=1
+serve shut down gracefully, exiting

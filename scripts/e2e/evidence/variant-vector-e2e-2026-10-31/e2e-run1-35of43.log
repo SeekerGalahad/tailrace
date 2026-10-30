@@ -1,0 +1,57 @@
+== variant_vector e2e: work=/tmp/tailrace-vv-e2e fe=127.0.0.1:9030 be=127.0.0.1:8040 db=tailrace_vv_e2e console=127.0.0.1:18087 ==
+  ok    S0.1 console binary /Users/wagic/GLMProjects/tailrace/target/release/tailrace-console
+  ok    S0.2 engine node binary /Users/wagic/GLMProjects/tailrace/target/release/tailrace-node
+  ok    S0.4 compose override generated: BE swap check neutralized for the e2e stack only (/tmp/tailrace-vv-e2e/compose-be-swap-override.yml)
+  ok    S1.1 external standing doris via TAILRACE_E2E_DORIS_MYSQL (compose skipped; fe=127.0.0.1:9030 be=127.0.0.1:8040)
+  ok    S2.0 backend Alive=true (heartbeat-driven availability)
+  ok    S2.1 database tailrace_vv_e2e empty (DROP FORCE + CREATE)
+  ok    S2.2 server version under test: doris-3.1.4-rc02-7f5ba43de6 (SHOW FRONTENDS; SELECT VERSION() only reports the mysql protocol)
+  ok    P0.1 probe_mix created (VARIANT + ARRAY<FLOAT> side by side, hand-DDLed on purpose — this tier pins Doris, not the engine)
+  ok    P1.1 both engine emission shapes land on the MIXED table, equal to the bare forms: variant JSON-string literal → v['a']['b']=42, vector display string '[0.1, 0.2, 0.3]' → elements 0.1/0.3, size 3 (variant probe B2 + vector probe B3 re-pinned side by side)
+  ok    P2.1 f32 edges survive the string→FLOAT cast: 1e-7 → 1e-07, 0.33333334 kept, f32::MAX 3.4028235e38 → 3.4028235e+38 (vector probe README W4 note 1 — asserted, not assumed)
+  ok    S3.1 console booted (fresh data-dir)
+  ok    S3.2 login → 200 + token
+  ok    S3.3 datasources: doris direct (d=1) + doris via carrier proxy (d=2) + file (f=3)
+  ok    S3.4 engine node up (serve)
+  ok    S3.5 node ONLINE
+  ok    T1.1 draft maps the mixed vocabulary: meta/content→VARIANT, emb→ARRAY<FLOAT> COMMENT 'vector dim=3' (the dim annotation), scores→bare ARRAY<FLOAT> (no dim, no comment)
+  ok    T1.2 execute → live SHOW CREATE TABLE: meta/content variant, emb array<float> with the 'vector dim=3' comment, scores array<float> (real Doris types, zero hand DDL)
+  ok    T1.3 evolve on the BARE vector table reports changed=false (DESC array<float> folds back to list<float32> — round-trip stable)
+  ok    T1.4 observation: evolve on the DIMMED table → http=409 retyped=none (dim is declaration-only; vector probe README W4 note 2 — recorded, not asserted)
+  ok    T2.1 keyColumn=meta (variant) → 400 naming VARIANT (the generator refuses a draft the FE would refuse; variant probe A3)
+  ok    T2.2 keyColumn=emb (vector) → 400 naming ARRAY (FE: 'Array can only be used in the non-key column'; vector probe A3)
+  ok    T3.1 file table local.docs_in (jsonl, the mixed vocabulary)
+  ok    T3.2 seeds: 5 rows (nested docs incl. null/{}/array-root/string-scalar; vectors incl. ints/negatives/zero/1e-7; scores 3/1/null/[]/absent)
+  ok    T3.3 pipeline full-column file→docs_emb deployed → RUNNING
+  ok    T3.4 COUNT=5/5 through the engine chain
+  FAIL  T3.5 nested sub-columns  sub1=0
+  FAIL  T3.6 variant shapes  sub2=3
+  FAIL  T3.7 vector elements  got= want=DOC-1=0.1,0.2,0.3#3;DOC-2=1,2,3#3;DOC-3=-0.5,0,0.5#3;DOC-4=1e-07,1,0.33333334#3;DOC-5=0.25,0.5,0.75#3
+  FAIL  T3.8 dimless scores  sc= s2=8
+  ok    T4.1 emb_bad created (emb declared dim=3)
+  ok    T4.2 seeds: GOOD-1, then wrong-length [1,2] / scalar 42 / non-numeric element "x" (the guard's kill shapes — Doris would degrade each silently), then GOOD-2
+  ok    T4.3 pipeline file→emb_bad deployed → RUNNING (default badRowPolicy=dlq, pipeline #2)
+  FAIL  T4.4 guard filtered  n=2 goods=
+  FAIL  T4.5 DLQ quarantine  rows=9 files=p2-s0.jsonl 
+  FAIL  T4.6 DLQ bytes  DIFF got=[b'{"doc_id":"BAD-DIM","emb":[1,2]}', b'{"doc_id":"BAD-SCALAR","emb":42}', b'{"doc_id":"BAD-ELEM","emb":[1,"x",3]}', b'{"doc_id":"BAD-DIM","emb":[1,2]}', b'{"doc_id":"BAD-SCALAR","emb":42}', b'{"doc_id":"BAD-ELEM","emb":[1,"x",3]}', b'{"doc_id":"BAD-DIM","emb":[1,2]}', b'{"doc_id":"BAD-SCAL
+  FAIL  T4.7 dlq metric  metric=9
+  ok    C0.1 carrier proxy up: 127.0.0.1:18180 → BE 127.0.0.1:8040 (tees the engine's stream-load bytes)
+  ok    C0.2 carrier pipeline deployed → RUNNING (sink table object on the proxy-fronted datasource)
+  ok    C0.3 the carrier row landed through the proxy (meta.nested.b=42 — the relay is transparent to correctness)
+  ok    C1.0 captured: PUT /api/tailrace_vv_e2e/docs_emb/_stream_load HTTP/1.1 with the CAR-1 body line
+  ok    C1.1 CARRIER (review focus): meta/content ride as JSON STRING literals holding the WHOLE sub-document (nested object + inner array, structurally equal to the source) — no leaf parsing, no flattening; Doris does the sub-column inference server-side. Wire form: meta="{\"source\":\"carrier\",\"nested\":{\"b\":42,\"arr\":[1,2]}}"
+  ok    C1.2 CARRIER vectors ride as the arrow display STRING (emb="[0.1, 0.2, 0.3]", scores="[1.0, 2.0]") — the ArrayFormatter catch-all arm, the exact shape P1.1 proved the server parses
+scripts/e2e/variant_vector.sh: line 153: 17745 Terminated: 15          TAILRACE_BOOTSTRAP_TOKEN="tr_b_vv_e2e_00112233445566778899aabbccddeeff" "$CONSOLE_BIN" --addr "$CONSOLE_ADDR" --data-dir "$WORK/run" > "$WORK/console.log" 2>&1
+scripts/e2e/variant_vector.sh: line 153: 18851 Terminated: 15          python3 "$WORK/proxy.py" "$PROXY_PORT" "127.0.0.1:$BE_PORT" "$WORK/carrier.txt" > "$WORK/proxy.log" 2>&1
+  ok    S4.1 external doris cleanup: DROP DATABASE tailrace_vv_e2e FORCE (standing stack untouched)
+== variant_vector e2e summary: 35/43 steps passed ==
+failed steps:
+  - T3.5 nested sub-columns
+  - T3.6 variant shapes
+  - T3.7 vector elements
+  - T3.8 dimless scores
+  - T4.4 guard filtered
+  - T4.5 DLQ quarantine
+  - T4.6 DLQ bytes
+  - T4.7 dlq metric
+work dir kept for post-mortem: /tmp/tailrace-vv-e2e

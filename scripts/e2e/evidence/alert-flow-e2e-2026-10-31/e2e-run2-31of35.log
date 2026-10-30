@@ -1,0 +1,47 @@
+== alert_flow e2e: work=/tmp/tailrace-af-e2e console=127.0.0.1:18088 node=127.0.0.1:18108 webhook=127.0.0.1:18190 ==
+  ok    S0.1 console binary /Users/wagic/GLMProjects/tailrace/target/release/tailrace-console
+  ok    S0.2 engine node binary /Users/wagic/GLMProjects/tailrace/target/release/tailrace-node
+  ok    S1.1 mock webhook listening on 127.0.0.1:18190 (records every POST to hook.jsonl)
+  ok    S2.1 console booted (fresh data-dir, TAILRACE_ALERT_INTERVAL_SECS=2)
+  ok    S2.2 login → 200 + token
+  ok    S2.3 file datasource (f=1) — the whole e2e is file→file, no third-party server in the path
+  ok    S2.4 engine node up (serve)
+  ok    S2.5 node ONLINE
+  ok    S2.6 console log carries 'alert evaluator started' (the periodic task is live)
+  ok    R0.1 GET /api/alerts: ruleTypes=5 kinds, intervalSecs=2, empty rule set
+  ok    R0.2 lag rule created (threshold=6s, webhook → mock) id=1
+  ok    R0.3 negative: threshold=0 → 400 (strictly positive required)
+  ok    R0.4 negative: unknown ruleType → 400
+  ok    P1.1 file→file pipeline af-lag-pipe deployed → RUNNING (pipeline #1)
+  ok    P1.2 first row flushed to the sink file (last_data_ms stamped — the lag gauge's basis)
+  ok    P1.3 console /metrics: lag series tailrace_pipeline_lag_seconds{pipeline="1",statement="0"} 1.023 with the SLO target beside it tailrace_slo_lag_target_seconds{node="engine-node",pipeline="1",statement="0"} 6 (same labels — T-E2 SLO v1)
+  ok    P1.4 rule state inactive while the data flows (lag ≈ 0 < 6)
+  ok    L0.1 pipeline paused via the console proxy (engine verdict PAUSED — pulling stops, last_data_ms freezes)
+  ok    L1.1 CORE REAL lag fired the rule: state=firing ~7-10s after the pause (engine gauge climbs with wall time; strict > 6)
+  ok    L2.1 CORE webhook notice #1: POST x-tailrace-event=firing, sample.value=6.639 > 6 (a NUMBER, from the real gauge)
+  ok    L3.1 alert_event row landed in state firing (open episode id=1 — one row, transition-only)
+  ok    R2.0 pipeline resumed (fresh row appended before the resume — the next flush re-stamps last_data_ms)
+  ok    R2.1 CORE recovered: state back to inactive once data flows again (lag ≈ 0)
+  ok    R2.2 CORE the SAME episode row flipped to resolved (id=1 unchanged, resolvedAt set, resolvedSample.value=0.722) — no second row
+  FAIL  W1 anti-flood  n=3 hook={"path": "/hook", "event_header": "firing", "body": "{\"event\":\"firing\",\"eventId\":1,\"ruleId\":1,\"ruleName\":\"af-lag\",\"ruleType\":\"lag_seconds\",\"params\":{\"threshold\":6},\"sample\":{\"labels\":{\"node\":\"engine-node\",\"pipeline\":\"1\",\"statement\":\"0\"},\"metric\":\"tailrace_pipel
+  ok    F0.1 poison seed: one good row + one malformed JSON row (badRowPolicy=fail makes the bad row a statement error)
+  ok    F0.2 poison pipeline deployed → RUNNING (pipeline #2, badRowPolicy=fail, recovery.autoRestart=false)
+  FAIL  F1.1 failed state  state=0 node.log=[2m2026-10-30T20:32:55.913656Z[0m [32m INFO[0m [2mtailrace_api::heartbeat[0m[2m:[0m identity ready [3mnode_key[0m[2m=[0msn-58e2ffd45469de0f [3mname[0m[2m=[0mengine-node [3mcontrol_plane[0m[2m=[0m"http://127.0.0.1:18088"
+[2m2026-10-30T20:32:55.918199Z[0m [32m INFO[0m [2mtailrace_api::heartbeat[0m[2m:[0m adopted console-issued per-node token (persisted, m2m + /v1 rotated)
+[2m2026-10-30T20:32:55.918203Z[0m [32m INFO[0m [2mtailrace_api::heartbeat[0m[2m:[0m self-registration ok [3mnode_key[0m[2m=[0msn-58e2ffd45469de0f
+[2m2026-10-30T20:32:58.155390Z[0m [32m INFO[0m [2mtailrace_runtime::registry[0m[2m:[0m pipeline started (serve) [3mpipeline_id[0m[2m=[0m1 [3mstatements[0m[2m=[0m1 [3mdispatch_id[0m[2m=[0m1793392378106000 [3mbad_row_policy[0m[2m=[0mdlq
+[2m2026-10-30T20:35:10.876198Z[0m [32m INFO[0m [2mtailrace_runtime::registry[0m[2m:[0m pipeline started (serve) [3mpipeline_id[0m[2m=[0m2 [3mstatements[0m[2m=[0m1 [3mdispatch_id[0m[2m=[0m1793392510875001 [3mbad_row_policy[0m[2m=[0mdlq events=0
+  ok    F1.2 state_failed rule created (no threshold; webhook → mock) id=2
+  FAIL  F2.1 failed firing  state=inactive
+  ok    F2.2 webhook notice #3 received (state_failed firing)
+  ok    F3.0 poison pipeline stopped (registry entry gone → the state series disappears from /metrics)
+  ok    F3.1 CORE resolved the honest way: an ABSENT series never fires (the engine is down to the alert exactly as long as it is down)
+  FAIL  F3.2 webhook #4  n=3 last={"path": "/hook", "event_header": "firing", "body": "{\"event\":\"firing\",\"eventId\":2,\"ruleId\":1,\"ruleName\":\"af-lag\",\"ruleType\":\"lag_seconds\",\"params\":{\"threshold\":6},\"sample\":{\"la
+  ok    S3.1 rules deleted (204 ×2) → empty rule set (episodes cascade; a firing rule resolves via reason=disabled first — none was firing here)
+== alert_flow e2e summary: 31/35 steps passed ==
+failed steps:
+  - W1 anti-flood
+  - F1.1 failed state
+  - F2.1 failed firing
+  - F3.2 webhook #4
+work dir kept for post-mortem: /tmp/tailrace-af-e2e
