@@ -1,0 +1,254 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus scraping the tailrace console /metrics (console-local series + every node block re-labelled with node=\"<name>\")",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    { "type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0" },
+    { "type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0" },
+    { "type": "panel", "id": "timeseries", "name": "Time series", "version": "" },
+    { "type": "panel", "id": "stat", "name": "Stat", "version": "" },
+    { "type": "panel", "id": "table", "name": "Table", "version": "" }
+  ],
+  "title": "Tailrace — pipelines (A6 nine-metric surface + E2 SLO)",
+  "uid": "tailrace-a6",
+  "description": "Out-of-the-box panels over the nine blueprint §7.4 series exposed by `GET /metrics` of tailrace-console (T-E2 companion deliverable). Scrape the console, not the nodes: the console proxies every node block and injects node=\"<name>\". Panel 1 overlays tailrace_slo_lag_target_seconds (the lag alert rule's threshold, same label set as the lag series) on the current lag.",
+  "tags": ["tailrace"],
+  "timezone": "browser",
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "node",
+        "label": "Node",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "query": "label_values(tailrace_pipeline_state, node)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": { "selected": true, "text": "All", "value": "$__all" }
+      },
+      {
+        "name": "pipeline",
+        "label": "Pipeline",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "query": "label_values(tailrace_pipeline_state{node=~\"$node\"}, pipeline)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": { "selected": true, "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Pipeline lag vs SLO target (tailrace_pipeline_lag_seconds / tailrace_slo_lag_target_seconds)",
+      "description": "Lag = wall time since the last data-carrying flush (A6 v1 basis). The dashed target lines are the enabled lag_seconds alert rules' thresholds, emitted by the console under the SAME labels as the lag series (T-E2 SLO v1) — a solid line crossing its dashed twin is exactly the condition the console alert fires on.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2, "fillOpacity": 5 } },
+        "overrides": [
+          {
+            "matcher": { "id": "byFrameRefID", "options": "B" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
+              { "id": "custom.fillOpacity", "value": 0 },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }
+            ]
+          }
+        ]
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "tailrace_pipeline_lag_seconds{node=~\"$node\",pipeline=~\"$pipeline\"}",
+          "legendFormat": "lag {{node}} p{{pipeline}} s{{statement}}"
+        },
+        {
+          "refId": "B",
+          "expr": "tailrace_slo_lag_target_seconds{node=~\"$node\",pipeline=~\"$pipeline\"}",
+          "legendFormat": "target {{node}} p{{pipeline}} s{{statement}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Pipeline state (tailrace_pipeline_state)",
+      "description": "ControlFlags verbatim: 0 RUNNING · 1 PAUSED · 2 STOPPED · 3 FAILED (the state_failed alert rule fires on 3).",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "RUNNING", "color": "green" },
+                "1": { "text": "PAUSED", "color": "yellow" },
+                "2": { "text": "STOPPED", "color": "blue" },
+                "3": { "text": "FAILED", "color": "red" }
+              }
+            }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "tailrace_pipeline_state{node=~\"$node\",pipeline=~\"$pipeline\"}",
+          "legendFormat": "{{node}} p{{pipeline}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Rows / s by result (tailrace_pipeline_rows_total)",
+      "description": "result=\"ok\" = flushed rows, result=\"dlq\" = decoded bad rows quarantined.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "fieldConfig": { "defaults": { "unit": "rowsps", "custom": { "fillOpacity": 10 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (node, pipeline, result) (rate(tailrace_pipeline_rows_total{node=~\"$node\",pipeline=~\"$pipeline\"}[5m]))",
+          "legendFormat": "{{node}} p{{pipeline}} {{result}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Flushes / s by result (tailrace_flush_total)",
+      "description": "v1 flushes are single-state (result=\"success\"); the error result lands with the A2 deterministic labels and feeds the flush_errors_window alert rule.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (node, pipeline, result) (rate(tailrace_flush_total{node=~\"$node\",pipeline=~\"$pipeline\"}[5m]))",
+          "legendFormat": "{{node}} p{{pipeline}} {{result}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Last flush duration (tailrace_flush_duration_seconds)",
+      "description": "Gauge = duration of the most recent flush per statement (§7.4 histogram simplified to gauge+counter for v1).",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 17 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "tailrace_flush_duration_seconds{node=~\"$node\",pipeline=~\"$pipeline\"}",
+          "legendFormat": "{{node}} p{{pipeline}} s{{statement}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "DLQ rows — 10m increase (tailrace_dlq_rows_total)",
+      "description": "Same window arithmetic as the console dlq_window alert rule (increment over a sliding window, counter resets credited as the post-reset value).",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 17 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "bars", "fillOpacity": 60 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "increase(tailrace_dlq_rows_total{node=~\"$node\",pipeline=~\"$pipeline\"}[10m])",
+          "legendFormat": "{{node}} p{{pipeline}} s{{statement}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Node heartbeat age (tailrace_node_heartbeat_age_seconds)",
+      "description": "Seconds since the node's last heartbeat note, computed at scrape time. The console marks a node OFFLINE at 90s; the heartbeat_age alert rule defaults to the same threshold in the example rules file.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 25 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 90 }] },
+          "custom": { "thresholdsStyle": { "mode": "line" } }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "tailrace_node_heartbeat_age_seconds{node=~\"$node\"}",
+          "legendFormat": "{{node}} ({{node_id}})"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Console SQLite write latency (tailrace_console_db_write_seconds)",
+      "description": "Console-local: op=\"tx_last\" = most recent transaction, op=\"tx_avg\" = mean, over the with_tx chokepoint (heartbeats, event batches, publishes).",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 25 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "expr": "tailrace_console_db_write_seconds", "legendFormat": "{{op}}" }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Bytes / s (tailrace_pipeline_bytes_total — declared, not yet fed in v1)",
+      "description": "Part of the §7.4 nine-metric surface; the engine declares the family but v1 sinks report only in-flight buffered_bytes, so this panel reads 'No data' until a sink ack byte count is wired (A6 note). Kept so the dashboard mirrors the declared surface one to one.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 33 },
+      "fieldConfig": { "defaults": { "unit": "Bps", "noValue": "not fed in v1" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (node, pipeline) (rate(tailrace_pipeline_bytes_total{node=~\"$node\",pipeline=~\"$pipeline\"}[5m]))",
+          "legendFormat": "{{node}} p{{pipeline}}"
+        }
+      ]
+    }
+  ]
+}

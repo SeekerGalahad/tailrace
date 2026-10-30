@@ -33,6 +33,10 @@ pub struct TestApp {
     /// The app's artifact dir (`<data>/artifacts`); T-A2 tests derive the
     /// sibling `<data>/backfill` ledger root from its parent.
     pub artifact_dir: std::path::PathBuf,
+    /// The router's own AppState (T-E2: contract tests drive the alert
+    /// evaluator directly against it with mock snapshots and subscribe to
+    /// its SSE hub — no spawned periodic loop in tests).
+    pub state: AppState,
 }
 
 pub async fn app() -> TestApp {
@@ -88,8 +92,8 @@ async fn build(cipher: CredentialCipher, mcp: Option<McpState>) -> TestApp {
         cipher.clone(),
     );
     let router = match mcp {
-        Some(m) => build_router_with_mcp(state, m),
-        None => build_router(state),
+        Some(m) => build_router_with_mcp(state.clone(), m),
+        None => build_router(state.clone()),
     };
     let cookie = login(&router).await;
     TestApp {
@@ -98,6 +102,7 @@ async fn build(cipher: CredentialCipher, mcp: Option<McpState>) -> TestApp {
         store,
         cipher,
         artifact_dir: artifact_dir.clone(),
+        state,
     }
 }
 

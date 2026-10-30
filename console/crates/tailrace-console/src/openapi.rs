@@ -2,6 +2,9 @@
 
 use utoipa::OpenApi;
 
+use crate::api::alerts::{
+    AlertEventItem, AlertRuleBody, AlertRuleCreated, AlertRuleItem, AlertsResponse,
+};
 use crate::api::artifacts::{ArtifactItem, ArtifactUploaded, ArtifactsResponse};
 use crate::api::auth::{LoginRequest, LoginResponse, MeResponse, UserInfo};
 use crate::api::datasources::{
@@ -107,6 +110,12 @@ use crate::compile::{CompileDiag, DimJoinOut, StatementOut};
         // T-A2 backfill (§7.3): bounded replay + job progress surface
         crate::api::pipelines::backfill,
         crate::api::pipelines::backfill_jobs,
+        // T-E2 alerting: rules + state + episodes, audited CRUD, SSE stream
+        crate::api::alerts::list,
+        crate::api::alerts::create,
+        crate::api::alerts::update,
+        crate::api::alerts::remove,
+        crate::api::alerts::stream,
     ),
     components(schemas(
         // auth
@@ -146,6 +155,8 @@ use crate::compile::{CompileDiag, DimJoinOut, StatementOut};
         // T-A2 backfill DTOs (§7.3)
         BackfillBody, BackfillBound, BackfillDryRunOut, BackfillAccepted, BackfillJobItem,
         BackfillJobsResponse,
+        // T-E2 alerting DTOs
+        AlertsResponse, AlertRuleItem, AlertEventItem, AlertRuleBody, AlertRuleCreated,
         // shared
         ErrorResponse, ErrorBody,
     )))]
@@ -425,6 +436,81 @@ mod tests {
                 "SCHEMA_CHANGE_IN_PROGRESS"
             };
             assert!(desc.contains(expect), "{what} 409 must name {expect}: {desc}");
+        }
+    }
+
+    /// T-E2: the alert surface is published end to end — the combined read,
+    /// the audited CRUD trio (POST declares its 409 name conflict), the SSE
+    /// stream, and the DTOs carry the fields the client reads (rule state +
+    /// open episode, episode first/last/resolved times + samples).
+    #[test]
+    fn alert_surface_is_published() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("openapi serializes");
+        for (path, method) in [
+            ("/paths/~1api~1alerts", "get"),
+            ("/paths/~1api~1alerts~1rules", "post"),
+            ("/paths/~1api~1alerts~1rules~1{id}", "put"),
+            ("/paths/~1api~1alerts~1rules~1{id}", "delete"),
+            ("/paths/~1api~1alerts~1stream", "get"),
+        ] {
+            assert!(
+                doc.pointer(&format!("{path}/{method}")).is_some(),
+                "missing {method} {path}"
+            );
+        }
+        assert!(
+            doc.pointer("/paths/~1api~1alerts~1rules/post/responses/409")
+                .is_some(),
+            "rule create must declare the 409 name conflict"
+        );
+        let props = |schema: &str| {
+            doc.pointer(&format!("/components/schemas/{schema}/properties"))
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_else(|| panic!("{schema}.properties"))
+        };
+        for k in ["ruleTypes", "intervalSecs", "rules", "events"] {
+            assert!(
+                props("AlertsResponse").contains_key(k),
+                "AlertsResponse missing {k}"
+            );
+        }
+        for k in [
+            "id",
+            "name",
+            "ruleType",
+            "params",
+            "enabled",
+            "webhookUrl",
+            "state",
+            "openEvent",
+        ] {
+            assert!(
+                props("AlertRuleItem").contains_key(k),
+                "AlertRuleItem missing {k}"
+            );
+        }
+        for k in [
+            "id",
+            "ruleId",
+            "ruleName",
+            "state",
+            "firstSeenAt",
+            "lastSeenAt",
+            "resolvedAt",
+            "sample",
+            "resolvedSample",
+        ] {
+            assert!(
+                props("AlertEventItem").contains_key(k),
+                "AlertEventItem missing {k}"
+            );
+        }
+        for k in ["name", "ruleType", "params", "enabled", "webhookUrl"] {
+            assert!(
+                props("AlertRuleBody").contains_key(k),
+                "AlertRuleBody missing {k}"
+            );
         }
     }
 }

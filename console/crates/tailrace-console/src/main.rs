@@ -44,6 +44,8 @@ fn usage() {
          \x20 TAILRACE_CONSOLE_ADVERTISE_URL  base URL engines use for --control-plane\n\
          \x20                             (default http://127.0.0.1:8080)\n\
          \x20 TAILRACE_DEPLOY_HEALTH_TIMEOUT_SECS  deploy health/register window (default 90)\n\
+         \x20 TAILRACE_ALERT_INTERVAL_SECS  alert evaluator period in seconds (default 15, min 1;\n\
+         \x20                             T-E2 rules engine over the aggregated node /metrics)\n\
          \x20 RUST_LOG                   tracing filter (default info)"
     );
 }
@@ -170,6 +172,13 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&artifact_dir)
         .with_context(|| format!("create {}", artifact_dir.display()))?;
     let state = AppState::new_full(store, bootstrap, artifact_dir, cipher);
+    // T-E2: the alert evaluator is a console-side periodic task (the node
+    // has no rules engine) — one pass per interval over the same aggregated
+    // /metrics snapshot the scrape serves; transitions land in
+    // alert_event and fan out to webhooks + the SSE hub. Started here,
+    // next to the other startup side effects, before the listener binds.
+    let alert_interval = tailrace_console::alerting::interval_from_env();
+    tailrace_console::alerting::spawn_evaluator(state.clone(), alert_interval);
     // T-E4 §7.5: write tools on only by explicit flag or env — never by default.
     let mcp_allow_write =
         args.mcp_allow_write || env_truthy(std::env::var(ALLOW_WRITE_ENV).ok().as_deref());

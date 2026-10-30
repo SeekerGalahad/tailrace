@@ -6,6 +6,7 @@
 //! short synchronous statements (sub-millisecond) and never hold the lock
 //! across an await point.
 
+mod alerts;
 mod artifacts;
 mod audit;
 mod backfill;
@@ -27,12 +28,14 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use rusqlite_migration::{Migrations, M};
 
+pub use alerts::AlertRuleWrite;
 pub use artifacts::ArtifactInsert;
 pub use datasources::DatasourceUpdate;
 pub use models::{
-    Artifact, AuditEntry, BackfillJob, Datasource, DatasourceCredential, DeployLogRow,
-    NewDeployedNode, NewNodeEvent, NewNodeMetrics, NewPipelineMetrics, Node, NodeEventRow,
-    NodeMetricPoint, Pipeline, PipelineTrendPoint, PipelineVersion, TableObject, User,
+    AlertEvent, AlertRule, Artifact, AuditEntry, BackfillJob, Datasource, DatasourceCredential,
+    DeployLogRow, NewDeployedNode, NewNodeEvent, NewNodeMetrics, NewPipelineMetrics, Node,
+    NodeEventRow, NodeMetricPoint, Pipeline, PipelineTrendPoint, PipelineVersion, TableObject,
+    User,
 };
 pub use password::{hash_password, verify_password};
 pub use pipelines::{PipelineFull, PipelineWrite};
@@ -51,6 +54,9 @@ fn migrations() -> Migrations<'static> {
         // T-A7: table_object.key_model (unique/duplicate) — the publish-gate
         // basis for partial-column declarations (Doris: UNIQUE MoW only).
         M::up(include_str!("../migrations/03_table_key_model.sql")),
+        // T-E2: alert_rule + alert_event — evaluator rules and their
+        // episodes (rows land on state transitions only).
+        M::up(include_str!("../migrations/04_alert.sql")),
     ])
 }
 
@@ -238,6 +244,10 @@ mod tests {
                     // T-A2 (migration 02)
                     "backfill_job",
                     "idx_backfill_job_pipe",
+                    // T-E2 (migration 04)
+                    "alert_rule",
+                    "alert_event",
+                    "idx_alert_event_rule",
                 ] {
                     assert!(
                         names.contains(&expected.to_string()),
@@ -246,8 +256,8 @@ mod tests {
                 }
                 let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
                 assert_eq!(
-                    version, 4,
-                    "user_version must be 4 after 00_init + 01_sequence + 02_backfill_job + 03_key_model"
+                    version, 5,
+                    "user_version must be 5 after 00_init + 01_sequence + 02_backfill_job + 03_key_model + 04_alert"
                 );
                 Ok(())
             })

@@ -1,0 +1,98 @@
+# Tailrace — Prometheus alerting rules (T-E2 companion deliverable).
+#
+# Equivalent of the console-side alert engine's five v1 rule kinds, for
+# users who already run a Prometheus stack: scrape the tailrace console's
+# `GET /metrics` (it proxies every node and injects node="<name>"), then
+# load this file through `rule_files:`. Each alert mirrors one console rule
+# kind (see docs/protocol/console-api.md §三 裁决 11): thresholds below are
+# the examples the console rules would also take; adjust per pipeline.
+#
+# Differences from the console engine, on purpose:
+#   * `for:` adds Prometheus-side hysteresis; the console evaluates on every
+#     pass (15s default) and de-floods at the episode level instead (one
+#     alert_event row per firing episode, never per tick).
+#   * The window rules use `increase()`, which extrapolates across the
+#     window; the console computes a plain latest − base over its in-memory
+#     sample history (no extrapolation, counter resets credited as the
+#     post-reset value).
+#   * `TailracePipelineLagOverSlo` has no console twin by design: the
+#     console's lag rule threshold IS the SLO target it exposes as
+#     `tailrace_slo_lag_target_seconds` (same labels as the lag series), so a
+#     Prometheus user compares the two series directly.
+groups:
+  - name: tailrace
+    rules:
+      # ---- lag_seconds: tailrace_pipeline_lag_seconds > threshold ----
+      - alert: TailracePipelineLagHigh
+        expr: tailrace_pipeline_lag_seconds > 30
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "pipeline {{ $labels.pipeline }} statement {{ $labels.statement }} on {{ $labels.node }} lags {{ $value | humanizeDuration }}"
+          description: "Wall time since the last data-carrying flush exceeds 30s (A6 lag basis is last_data_ms, not payload event time)."
+
+      # ---- SLO v1: current lag vs the console-exposed target (same labels) ----
+      - alert: TailracePipelineLagOverSlo
+        expr: >
+          tailrace_pipeline_lag_seconds
+            > on (node, pipeline, statement)
+          tailrace_slo_lag_target_seconds
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "pipeline {{ $labels.pipeline }} on {{ $labels.node }} is over its lag SLO target"
+          description: "tailrace_slo_lag_target_seconds is the enabled lag_seconds console rule's threshold, emitted under the lag series' own label set."
+
+      # ---- state_failed: tailrace_pipeline_state == 3 (ControlFlags FAILED) ----
+      - alert: TailracePipelineFailed
+        expr: tailrace_pipeline_state == 3
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "pipeline {{ $labels.pipeline }} on {{ $labels.node }} is FAILED"
+          description: "ControlFlags 0=RUNNING 1=PAUSED 2=STOPPED 3=FAILED. Recover via POST /api/pipelines/{id}/recover after fixing the cause (engine logs: GET /api/pipelines/{id}/logs)."
+
+      # ---- heartbeat_age: tailrace_node_heartbeat_age_seconds > threshold ----
+      - alert: TailraceNodeHeartbeatStale
+        expr: tailrace_node_heartbeat_age_seconds > 90
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "node {{ $labels.node }} ({{ $labels.node_id }}) last heartbeat {{ $value | humanizeDuration }} ago"
+          description: "90s is the console's OFFLINE threshold (GET /api/nodes). Also fires when the node is still exposing /metrics but its control-plane heartbeat loop is stuck."
+
+      # ---- dlq_window: increase(tailrace_dlq_rows_total) over the window > N ----
+      - alert: TailraceDlqBurst
+        expr: increase(tailrace_dlq_rows_total[10m]) > 100
+        labels:
+          severity: warning
+        annotations:
+          summary: "pipeline {{ $labels.pipeline }} statement {{ $labels.statement }} on {{ $labels.node }} quarantined {{ $value | humanize }} bad rows in 10m"
+          description: "Decoded rows that failed the schema/decoder and went to the DLQ. Inspect the DLQ sink or the engine logs for the first bad record."
+
+      # ---- flush_errors_window: increase(tailrace_flush_total{result="error"}) > N ----
+      # The engine currently emits result="success" only (A6: the
+      # Dedup/Retry/Error split lands with the A2 deterministic labels), so
+      # this alert stays silent until that lands — same dormancy as the
+      # console's flush_errors_window rule.
+      - alert: TailraceFlushErrors
+        expr: increase(tailrace_flush_total{result="error"}[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "pipeline {{ $labels.pipeline }} statement {{ $labels.statement }} on {{ $labels.node }} had {{ $value | humanize }} failed flushes in 10m"
+          description: "A failed flush means a batch did not land in the sink; the engine retries per its reliability settings and surfaces a FAILED state when it gives up."
+
+      # ---- scrape health (no console twin: the console IS the scrape target) ----
+      - alert: TailraceConsoleScrapeDown
+        expr: up{job=~".*tailrace.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "tailrace console /metrics scrape failing ({{ $labels.instance }})"
+          description: "Every node series arrives through the console proxy; with the console down no pipeline alert above can fire."

@@ -1,8 +1,8 @@
 # Console API — console-api
 
 > 管理面 REST 协议正典（`tailrace-console` 二进制）。随 utoipa 注解同步维护；
-> 机器可读正典 = 运行时 `/api-docs/openapi.json`（58 路径，`tailrace-console/src/openapi.rs` `paths(…)` 登记数，2026-10-30 实测），Swagger UI 在 `/swagger-ui/`。
-> 首版 2026-10-11；鉴权协议安全修复改版 2026-10-13；MCP 面正典化 + 维表（T-D1）动线增补 2026-10-27；建表闭环（T-A1）三端点增补 2026-10-28；回填（T-A2）两端点增补 2026-10-28；部分列更新（T-A7）控制面开关 + evolve 双向互斥 + keyModel 登记增补 2026-10-28；R8 类型地基轮同步 2026-10-30（MCP 10→14 工具 + 工具描述 OpenAPI 同源；建表闭环词汇映射 4→13（A3）；infer-schema 收 `debezium-json` + 列型按十六词词汇收窄；draft body 增 `columnTypes`）；R8.5 评审修复轮 2026-10-30（三处 pre-A3 时态残留清偿：openapi 路径计数 49→58、evolve 比对词汇「4 类」→十六词、分区候选规则改为 A3 名称×类型双判——`int64`/`date`/`timestamp` 皆可取 RANGE 键）。
+> 机器可读正典 = 运行时 `/api-docs/openapi.json`（63 路径，`tailrace-console/src/openapi.rs` `paths(…)` 登记数，2026-10-31 实测），Swagger UI 在 `/swagger-ui/`。
+> 首版 2026-10-11；鉴权协议安全修复改版 2026-10-13；MCP 面正典化 + 维表（T-D1）动线增补 2026-10-27；建表闭环（T-A1）三端点增补 2026-10-28；回填（T-A2）两端点增补 2026-10-28；部分列更新（T-A7）控制面开关 + evolve 双向互斥 + keyModel 登记增补 2026-10-28；R8 类型地基轮同步 2026-10-30（MCP 10→14 工具 + 工具描述 OpenAPI 同源；建表闭环词汇映射 4→13（A3）；infer-schema 收 `debezium-json` + 列型按十六词词汇收窄；draft body 增 `columnTypes`）；R8.5 评审修复轮 2026-10-30（三处 pre-A3 时态残留清偿：openapi 路径计数 49→58、evolve 比对词汇「4 类」→十六词、分区候选规则改为 A3 名称×类型双判——`int64`/`date`/`timestamp` 皆可取 RANGE 键）；告警/SLO（T-E2）五端点增补 2026-10-31（openapi 路径计数 58→63；规则引擎在 console、五类规则、事件只在状态迁移落行、webhook+SSE 投递、`/metrics` 增 `tailrace_slo_lag_target_seconds`——详见语义裁决 11）。
 
 ## 一、通用约定
 
@@ -11,7 +11,7 @@
 - **操作人**：请求头 `X-Operator` 可选覆盖（默认会话用户名），落审计。
 - **错误码语义**：400 INVALID_ARGUMENT / 401 UNAUTHENTICATED·BAD_NODE_TOKEN / 404 NOT_FOUND / 409 CONFLICT·IN_USE·GENERATION_CONFLICT·SCHEMA_CHANGE_UNSUPPORTED·PARTIAL_UPDATE_ACTIVE·SCHEMA_CHANGE_IN_PROGRESS（T-A7 互斥双向：evolve 遇该表已部署的部分列更新管道 / 部分列更新管道部署遇该表 Schema Change 进行中——详见语义裁决 10）/ 413 PAYLOAD_TOO_LARGE / 422 KEY_MODEL_REQUIRED·DDL_REQUIRED·KEY_MODEL_MISMATCH（T-A1 建表确认门：确认要素缺失或自相矛盾，未触碰 Doris）·BACKFILL_SINK_UNSUPPORTED·BACKFILL_SOURCE_UNSUPPORTED·BACKFILL_DIM_UNSUPPORTED·BACKFILL_NO_CREDENTIAL·BOUNDS_TYPE_UNSUPPORTED·BOUNDS_INVALID·STATEMENT_INDEX_RANGE（T-A2 回填能力门：详见语义裁决 9，一律在创建任何 job 行之前拒绝）·PARTIAL_DECLARATION_INVALID（T-A7 部分列发布门在回填 accept 重跑未过——裁决 10「推送侧重门」）/ 501 NOT_IMPLEMENTED / 502 ENGINE_UNREACHABLE·ENGINE_REJECTED·UNAVAILABLE·DDL_FAILED。
 - **时间戳**：ISO-8601 UTC（`2026-10-11T08:00:00Z`；存储层 SQLite `datetime('now')` 序列化时转换）。
-- **审计**：所有管理面变更操作写 `audit_log`（DATASOURCE_CREATE/UPDATE/DELETE/TEST、TABLE_CREATE/DELETE、TABLE_KEY_MODEL（T-A7：keyModel PUT）、TABLE_DDL_EXECUTE/EVOLVE（T-A1：detail_json 带 DDL 全文 + elapsedMs + ok；执行被 Doris 拒绝同样落行，ok:false + error 原文——拒绝也是审计证据）、NODE_MANUAL_REGISTER/REVOKE/DELETE/DEPLOY/ACTION、ARTIFACT_UPLOAD/DELETE、PIPELINE_CREATE/UPDATE/DELETE/PUBLISH/DEPLOY/RECOVER/ACTION/BACKFILL（T-A2：detail 带 jobId/statementIndex/from/to/labelPrefix；dryRun 只读不审计）；LOGIN/NODE_REGISTER 沿用 P0；MCP 面 MCP_INITIALIZE/MCP_TOOL_CALL 见 §五）。
+- **审计**：所有管理面变更操作写 `audit_log`（DATASOURCE_CREATE/UPDATE/DELETE/TEST、TABLE_CREATE/DELETE、TABLE_KEY_MODEL（T-A7：keyModel PUT）、TABLE_DDL_EXECUTE/EVOLVE（T-A1：detail_json 带 DDL 全文 + elapsedMs + ok；执行被 Doris 拒绝同样落行，ok:false + error 原文——拒绝也是审计证据）、NODE_MANUAL_REGISTER/REVOKE/DELETE/DEPLOY/ACTION、ARTIFACT_UPLOAD/DELETE、PIPELINE_CREATE/UPDATE/DELETE/PUBLISH/DEPLOY/RECOVER/ACTION/BACKFILL（T-A2：detail 带 jobId/statementIndex/from/to/labelPrefix；dryRun 只读不审计）、ALERT_RULE_CREATE/UPDATE/DELETE（T-E2：detail 带 name/ruleType/params/enabled/webhookUrl；被 400/409 拒绝的写不审计，评估器产生的告警事件走 `alert_event` 表而非审计）；LOGIN/NODE_REGISTER 沿用 P0；MCP 面 MCP_INITIALIZE/MCP_TOOL_CALL 见 §五）。
 
 ## 二、端点清单（P1 实装状态）
 
@@ -47,6 +47,7 @@
 | ✅ | GET /api/pipelines/templates（SQL 模板内嵌） |
 | ✅ | **回填（T-A2，2026-10-28；蓝图 §7.3）** `POST /api/pipelines/{id}/backfill`（body `{statementIndex?,from:{"type":"offset","value":N},to:{…},dryRun?}`——from/to 当前仅 offset 边界，file 源按字节位、kafka 源暂不支持【见语义裁决 9】；`dryRun:true` → 200 `{jobId:null,estimatedRows:null,labelPrefix}` **零副作用**——不建 job 行、不落审计、零执行；`dryRun:false` → 202 `{jobId,state:"pending",estimatedRows:null,labelPrefix}` + 审计 PIPELINE_BACKFILL + 后台执行（**控制面进程内执行**：W2 引擎 `run_bounded` + `bf-{jobId}` 台账命名空间 + Deterministic label——见语义裁决 9）；能力门 422：汇非 doris/starrocks（BACKFILL_SINK_UNSUPPORTED）/ 源非 file（BACKFILL_SOURCE_UNSUPPORTED）/ 语句含维表 JOIN（BACKFILL_DIM_UNSUPPORTED）/ 汇数据源未存凭据（BACKFILL_NO_CREDENTIAL）/ timestamp 边界（BOUNDS_TYPE_UNSUPPORTED）/ from≥to 或非整数值（BOUNDS_INVALID）/ statementIndex 越界（STATEMENT_INDEX_RANGE）——全部在创建 job 行之前拒绝；**T-A7**：目标语句带 INSERT 列清单时，accept 路径（非 dryRun）先**重跑 publish 的部分列门禁**（kind=doris / keyModel=unique / 列清单 ⊆ 登记列；未过 → 422 PARTIAL_DECLARATION_INVALID，message 内嵌发布门诊断原文，R7 评审修复轮），再走与 deploy 相同的部署侧互斥前置检查（409 SCHEMA_CHANGE_IN_PROGRESS / 502 UNAVAILABLE，同样在建 job 行之前），执行器 `bounded_plan` 把列清单投影到汇表项、`backfill_doris_sink` 据此以 `partial_columns=true` 装载——与常驻引擎的 sink_factory 同两跳） · `GET /api/pipelines/{id}/backfill/jobs`（该管道的 job 进度列表，新到旧：`{jobs:[{jobId,statementIndex,from,to,state,rowsWritten,error,createdAt,finishedAt}]}`，state 机 pending→running→done\|failed，终态不可变） |
 | ⛔ 501 | POST /api/nodes/ticket（票据链——依赖凭据加密与引擎侧 CredentialProvider，未在本阶段交付） |
+| ✅ | **告警/SLO（T-E2，2026-10-31；规则引擎在 console——详见语义裁决 11）** `GET /api/alerts`（`{ruleTypes[5],intervalSecs,rules[],events[]}`：rules 行 `{id,name,ruleType,params,enabled,webhookUrl,state:"inactive"\|"firing",openEvent\|null,createdAt,updatedAt}`——`state` 为评估器所有的当前态，`openEvent` 为进行中的告警事件；events 为跨规则最近 50 条事件（新到旧）`{id,ruleId,ruleName,state:"firing"\|"resolved",firstSeenAt,lastSeenAt,resolvedAt,sample,resolvedSample}`） · `POST /api/alerts/rules`（body `{name,ruleType,params,enabled?=true,webhookUrl?}`；`ruleType` ∈ lag_seconds / state_failed / heartbeat_age / dlq_window / flush_errors_window；`params` 按类型校验：lag/heartbeat 要 `threshold>0`（秒）、两窗口类要 `threshold>=1`（行数）+ `windowSecs` 1..=3600、state_failed 无必填，三类可选过滤 `pipeline`/`statement`/`node`（匹配 console 聚合后的同名标签，过滤到序列不带的标签即不匹配）；`webhookUrl` 须 http(s)；201 `{id}`、400 `err.alert.*`、重名 409 CONFLICT；审计 ALERT_RULE_CREATE） · `PUT /api/alerts/rules/{id}`（整体替换可编辑字段，**评估器状态保留**——改参数不会把正在触发的告警无声丢掉，下一轮按新参数重评；200 规则行、404、重名 409；审计 ALERT_RULE_UPDATE） · `DELETE /api/alerts/rules/{id}`（204，事件级联删除；审计 ALERT_RULE_DELETE） · `GET /api/alerts/stream`（SSE，Cookie 鉴权：每次 firing/resolved 迁移一条 `event: alert`，data = 与 webhook 同一份通知 JSON `{event,eventId,ruleId,ruleName,ruleType,params,sample,tsMs}`；订阅方落后于 64 条缓冲时收 `event: lagged` `{skipped}`；15s `: keepalive`） · **`GET /metrics` 增 `tailrace_slo_lag_target_seconds`**（gauge：每条启用的 lag_seconds 规则的阈值，**与其监视的 `tailrace_pipeline_lag_seconds` 序列同一标签集**（node/pipeline/statement）逐序列暴露——多规则命中同一序列取最紧阈值；无规则监视的 lag 序列不出目标线；无规则时整个 family 不出现） |
 
 ## 三、关键语义裁决
 
@@ -196,12 +197,44 @@
      Status Success——W4 实探结论，R7 评审修复轮把该头纳入契约锁定）且 JSON 行仅含
      声明列（HTTP accept 路径在 CI 里被 FE 前置检查挡在 502，故绕过 handler 直驱执行器）。
 
+11. **告警/SLO（T-E2）的评估位置、状态机与投递**（2026-10-31 增补，R9 详案设计裁决照实施）：
+   - **规则引擎在 console、不在 node**：console 已代理聚合全部节点 `/metrics`（A6，`metrics.rs` 注入 `node="<name>"`），评估器
+     （`tailrace-console/src/alerting.rs`）以周期任务（`TAILRACE_ALERT_INTERVAL_SECS`，默认 15s，`main.rs` 与回填孤儿清扫同一启动
+     槽位拉起）拉**同一份** `metrics::gather` 快照评估——scrape 看到什么、评估器就评什么，不存在第二条采样路径。单机边缘、无
+     Prometheus 栈也能告警是定位；有 Prometheus 的用户用 `docs/ops/prometheus-alerts.yaml` 等价规则 + `docs/ops/grafana-dashboard.json`。
+   - **五类规则 v1**：`lag_seconds`（`tailrace_pipeline_lag_seconds > threshold`）、`state_failed`（`tailrace_pipeline_state == 3`）、
+     `heartbeat_age`（`tailrace_node_heartbeat_age_seconds > threshold`）、`dlq_window`（`tailrace_dlq_rows_total` 窗口增量 > threshold）、
+     `flush_errors_window`（`tailrace_flush_total{result="error"}` 窗口增量 > threshold）。**比较一律严格 `>`**（等于阈值不触发——
+     边界由单测钉住）；规则可匹配多条序列，由最差（最大）序列定裁决，sample 记录该序列标签与 `violating` 计数；**序列缺失不算违规**
+     （节点停止暴露某序列即按条件不成立处理，节点掉线由 heartbeat_age 覆盖）。`flush_errors_window` 在引擎只发 `result="success"` 的
+     现状下处于**休眠**（A6 注明 Dedup/Retry/Error 拆分随 A2 确定性标签落地）——评估契约由 mock 快照单测钉住，不是空实现。
+   - **窗口算法**（两窗口类）：增量 = 最新值 − 「`now − windowSecs` 时点或之前最近一个样本」；样本史只在评估器内存
+     （`CounterWindows`，上限 `MAX_WINDOW_SECS`=3600，无样本存储——蓝图「不做历史 p95」裁决，记 v1.3 候选）；**窗口内没有基线样本则不评估**
+     （console 刚重启的前 windowSecs 内绝不误报——代价是重启前正在触发的窗口类告警会先 resolved、窗口填满后再 firing）；计数器重置
+     （最新值 < 基线）按重置后值计——它是窗口内真实增量的下界，不会误报。
+   - **事件只在状态迁移时落行**（防刷屏）：`alert_rule.state` 为评估器所有的当前态；inactive→firing **插入一行** `alert_event`
+     （state=firing、sample）；持续 firing 的每一轮只 **更新**该行的 `last_seen_at`/`sample`（不加行）；firing→inactive 把**同一行**翻为
+     resolved（`resolved_at`、`resolved_sample`）。三种迁移写都在一个事务里（规则态与事件行永不打架）。**resolved 必达**：条件消失、
+     序列消失、规则被 PUT 为 `enabled:false`（sample 记 `reason:"disabled"`）三种情形都会关闭进行中的事件；PUT 改参数**不**重置状态
+     （下一轮按新参数重评，正在触发的告警不会被编辑无声吞掉）。
+   - **投递**：webhook `POST <webhookUrl>`，body = 通知 JSON `{event,eventId,ruleId,ruleName,ruleType,params,sample,tsMs}`（header
+     `x-tailrace-event: firing|resolved`），**v1 失败只记日志不重试**（投递失败不影响迁移落库与 SSE）；SSE 复用既有 `axum::response::sse`
+     桥接模式，源是 AppState 内的 `tokio::sync::broadcast`（64）事件枢纽——`GET /api/alerts/stream` 订阅，评估器每次迁移 `send`。
+   - **SLO v1（克制）**：lag 规则的阈值即 lag_target——`/metrics` 对每条启用的 lag 规则命中的每条 lag 序列，以**同一标签集**
+     （node/pipeline/statement，按代理重标签后的顺序）暴露 `tailrace_slo_lag_target_seconds`；多规则命中同一序列取最紧阈值
+     （文本格式不许重复序列）；规则禁用即目标线消失。Grafana 面板 1 据此在同一标签下叠画现值与目标，Prometheus 规则示例给出
+     `lag > on(node,pipeline,statement) target` 的对照写法。
+   - **验收**（R9 评审重点）：契约测试 `tests/alerts_flow.rs` 6 例——CRUD+审计、阈值边界/迁移才落行/resolved 必达/禁用即关闭、
+     窗口对齐（无基线不评、基线滑动、重置下界）、webhook 收到两次迁移且不可达 webhook 不影响迁移、SSE 枢纽广播 + 流端点鉴权、
+     mock 节点 → `/metrics` 目标线与 lag 序列同标签 + 评估器消费同一快照并触发；评估器纯函数单测另钉解析/五类裁决/窗口/参数校验。
+     真告警触发 + webhook 收到的 dogfooding 验证属 R9 W4。
+
 ## 四、未决 / 后续
 
 - web 客户端类型（`web/src/api/datasources.ts` 的 `DdlEvolveResponse`、pipelines 的 `StatementOut`/表对象 DTO）尚未同步 T-A7 新字段（`partialUpdatePipelines`、`partialColumns`、`keyModel`）与新端点 PUT /tables/{id}——TS 类型非穷尽校验，运行时忽略多出字段不致破坏，但向导/编辑器尚无 UI 呈现；web 不在 W3 文件域，留后续波。
 - ticket 端点（票据链，600s 单次票据）仍未交付——凭据加密静态半边已落地（见「关键语义裁决」3），票据链为 v1.x 结构性修复。
 - ~~SSH 部署链八步 + 节点进程动作~~（T35 已交付，见端点清单；「逐条暂停→执行→自动恢复」的管道级暂停编排仍留 v1.x——当前动作直接作用于进程，不自动暂停在跑管道）。
-- catalog 快照浏览 / 样本预览 / lag 告警规则 / SQL 片段助手（后续版本族；discover / infer-schema 已于 T14 交付）。~~jdbc 管道 console 端到端未通~~（T-D1 2026-10-27 清偿大半：plan 下推对 dim/jdbc 表由 connJson `jdbcUrl`（去 `jdbc:` 前缀）填 `bootstrap`、由表对象 `sequence_column` 列填 `sequence_column`——正是 jdbc 源工厂必填两键；维表动线有 console e2e 测试钉住，jdbc 流式批源动线仍未有 console 侧 e2e 覆盖，留后续补）。
+- catalog 快照浏览 / 样本预览 / ~~lag 告警规则~~（T-E2 2026-10-31 交付五类规则引擎 + webhook/SSE + SLO 暴露，见端点清单与裁决 11；web 告警页与历史 p95 不在本波——前者留 web 波，后者记 v1.3 候选）/ SQL 片段助手（后续版本族；discover / infer-schema 已于 T14 交付）。~~jdbc 管道 console 端到端未通~~（T-D1 2026-10-27 清偿大半：plan 下推对 dim/jdbc 表由 connJson `jdbcUrl`（去 `jdbc:` 前缀）填 `bootstrap`、由表对象 `sequence_column` 列填 `sequence_column`——正是 jdbc 源工厂必填两键；维表动线有 console e2e 测试钉住，jdbc 流式批源动线仍未有 console 侧 e2e 覆盖，留后续补）。
 - 90s OFFLINE 目前为读时计算；未做后台定时器回写。
 - 回填（T-A2）kafka 源暂 422（分区级 from 寻址未做，见语义裁决 9）；同区间重放
   行数不变（DUPLICATE KEY 实表）与「回填期间主管道持续写入」两条验收由

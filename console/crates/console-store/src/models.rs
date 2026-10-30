@@ -226,3 +226,35 @@ pub struct BackfillJob {
     pub created_at: String,
     pub finished_at: Option<String>,
 }
+
+/// An `alert_rule` row (T-E2): one evaluator rule. `rule_type` is one of
+/// the five v1 kinds (`lag_seconds` / `state_failed` / `heartbeat_age` /
+/// `dlq_window` / `flush_errors_window`), `params_json` the type-dependent
+/// parameter object, `state` the evaluator-owned current state
+/// (`inactive` / `firing`).
+#[derive(Debug, Clone)]
+pub struct AlertRule {
+    pub id: i64,
+    pub name: String,
+    pub rule_type: String,
+    pub params_json: String,
+    pub enabled: bool,
+    pub webhook_url: Option<String>,
+    pub state: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// An `alert_event` row (T-E2): one alert episode — inserted on the
+/// inactive → firing transition, flipped to `resolved` on the way back.
+#[derive(Debug, Clone)]
+pub struct AlertEvent {
+    pub id: i64,
+    pub rule_id: i64,
+    pub state: String,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+    pub resolved_at: Option<String>,
+    pub sample_json: String,
+    pub resolved_sample_json: Option<String>,
+}
