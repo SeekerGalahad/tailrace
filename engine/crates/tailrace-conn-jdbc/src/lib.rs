@@ -65,7 +65,7 @@ use sqlx_core::statement::Statement;
 use sqlx_core::type_info::TypeInfo;
 use sqlx_mysql::{MySql, MySqlArguments, MySqlConnection, MySqlRow};
 use sqlx_postgres::{PgArguments, PgConnection, PgRow, Postgres};
-use tailrace_catalog::{ReliabilityOptions, StatementSpec, TableObject};
+use tailrace_catalog::{option_keys, ReliabilityOptions, StatementSpec, TableObject};
 use tailrace_connector::registry::ConnectorRegistry;
 use tailrace_connector::{Cursor, Source, SourceChunk};
 
@@ -74,19 +74,41 @@ pub fn register(reg: &mut ConnectorRegistry) {
     reg.register_source("jdbc", source_factory);
 }
 
+/// JDBC-side typed view of [`TableObject`] options (R8 G1). The pre-G1
+/// struct fields the connector read, restored as named accessors over the
+/// options map.
+pub trait JdbcTableExt {
+    /// Database URL (`mysql://` / `postgres://` — dialect selection input;
+    /// the console strips the `jdbc:` prefix before it rides the plan).
+    fn url(&self) -> Option<&str>;
+    /// Incremental cursor column: PK or a UNIQUE time column (must be
+    /// unique by itself). Doubles as the dim-table full-table load
+    /// pagination key when the dim bridge rewrites kind=dim → jdbc.
+    fn cursor_column(&self) -> Option<&str>;
+}
+
+impl JdbcTableExt for TableObject {
+    fn url(&self) -> Option<&str> {
+        self.option_str(option_keys::BOOTSTRAP)
+    }
+    fn cursor_column(&self) -> Option<&str> {
+        self.option_str(option_keys::SEQUENCE_COLUMN)
+    }
+}
+
 fn source_factory(
     obj: &TableObject,
     _spec: &StatementSpec,
     _rel: Option<&ReliabilityOptions>,
 ) -> anyhow::Result<Box<dyn Source>> {
-    let url = obj.bootstrap.as_deref().ok_or_else(|| {
+    let url = obj.url().ok_or_else(|| {
         anyhow::anyhow!(
             "jdbc source {} requires `bootstrap` = database URL",
             obj.name
         )
     })?;
     let dialect = Dialect::from_url(url)?;
-    let cursor_col = obj.sequence_column.as_deref().ok_or_else(|| {
+    let cursor_col = obj.cursor_column().ok_or_else(|| {
         anyhow::anyhow!(
             "jdbc source {} requires `sequence_column` (incremental cursor column: PK or a UNIQUE time column — must be unique by itself)",
             obj.name
@@ -949,18 +971,18 @@ mod tests {
 
     #[test]
     fn factory_requires_url_and_cursor_column() {
-        let obj = |bootstrap: Option<&str>, seq: Option<&str>| TableObject {
-            datasource: "ds".into(),
-            name: "orders".into(),
-            kind: "jdbc".into(),
-            format: Some("json".into()),
-            columns: vec![],
-            bootstrap: bootstrap.map(str::to_string),
-            stream_load_url: None,
-            auth_env: None,
-            label_prefix: None,
-            sequence_column: seq.map(str::to_string),
-            partial_columns: None,
+        let obj = |bootstrap: Option<&str>, seq: Option<&str>| {
+            let o = TableObject::new("ds", "orders", "jdbc")
+                .with_format("json")
+                .with_columns(Vec::new());
+            let o = match bootstrap {
+                Some(b) => o.with_option(option_keys::BOOTSTRAP, b),
+                None => o,
+            };
+            match seq {
+                Some(q) => o.with_option(option_keys::SEQUENCE_COLUMN, q),
+                None => o,
+            }
         };
         let spec = StatementSpec {
             source: "ds.orders".into(),

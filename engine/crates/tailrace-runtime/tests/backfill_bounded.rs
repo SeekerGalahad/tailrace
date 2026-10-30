@@ -96,28 +96,12 @@ fn bf_tables(sink_name: &str) -> Vec<PlanTableObject> {
         ("qty".to_string(), "int64".to_string()),
     ];
     vec![
-        PlanTableObject {
-            reference: "1.local.orders_in".into(),
-            kind: "file".into(),
-            format: Some("json".into()),
-            columns: cols.clone(),
-            bootstrap: None,
-            stream_load_url: None,
-            auth_env: None,
-            sequence_column: None,
-            partial_columns: None,
-        },
-        PlanTableObject {
-            reference: format!("1.local.{sink_name}"),
-            kind: "file".into(),
-            format: Some("jsonl".into()),
-            columns: cols,
-            bootstrap: None,
-            stream_load_url: None,
-            auth_env: None,
-            sequence_column: None,
-            partial_columns: None,
-        },
+        PlanTableObject::new("1.local.orders_in", "file")
+            .with_format("json")
+            .with_columns(cols.clone()),
+        PlanTableObject::new(format!("1.local.{sink_name}"), "file")
+            .with_format("jsonl")
+            .with_columns(cols),
     ]
 }
 

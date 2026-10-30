@@ -21,3 +21,10 @@ toml = { workspace = true }
 tailrace-ir = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# G2 (R8): the vocabulary tests assert the arrow mapping of re-exported
+# ColumnType / arrow_type_or_utf8 — dev-only (the dependency graph already
+# carries datafusion transitively via tailrace-ir, so this declares no new
+# compilation unit)
+datafusion = { workspace = true }

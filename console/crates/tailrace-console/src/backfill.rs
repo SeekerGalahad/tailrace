@@ -36,7 +36,7 @@ use std::collections::HashMap;
 
 use anyhow::{Context as _, Result};
 use base64::Engine as _;
-use tailrace_conn_doris::{DorisSink, LabelMode, SinkFlavor};
+use tailrace_conn_doris::{DorisSink, DorisTableExt as _, LabelMode, SinkFlavor};
 use tailrace_connector::{ConnectorRegistry, Sink, SinkFactory};
 use tailrace_runtime::dlq::BadRowPolicy;
 use tailrace_runtime::{backfill_state_dir, PipelineRunner, RunOptions};
@@ -112,8 +112,7 @@ fn backfill_doris_sink(
         })?
         .clone();
     let url = obj
-        .stream_load_url
-        .as_deref()
+        .stream_load_url()
         .context("doris sink must declare stream_load_url (BE direct)")?;
     let columns = obj.columns.iter().map(|(n, _)| n.clone()).collect();
     let flavor = if obj.kind == "starrocks" {
@@ -126,7 +125,7 @@ fn backfill_doris_sink(
         auth.clone(),
         columns,
         ctx.label_prefix.clone(),
-        obj.sequence_column.clone(),
+        obj.sequence_column().map(str::to_string),
     )
     .with_flavor(flavor)
     .with_label_mode(LabelMode::Deterministic {
@@ -139,7 +138,7 @@ fn backfill_doris_sink(
     // write exactly that subset under partial_columns=true — a full-row
     // sink here would mismatch the transform's column count. Doris-only, as
     // there (StarRocks partial update is a different load contract).
-    if let Some(subset) = &obj.partial_columns {
+    if let Some(subset) = obj.partial_columns() {
         anyhow::ensure!(
             flavor != SinkFlavor::StarRocks,
             "partial_columns is Doris-only (kind={}); StarRocks partial update \

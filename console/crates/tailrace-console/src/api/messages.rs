@@ -11,11 +11,14 @@
 //!
 //! 规模口径（T39 ③ 勘正，2026-10-23 实测；T35 增补；T-D1 dim join +6 key；
 //! T-A1 建表闭环 +10 key；T-A2 回填 +9 key；T-A7 部分列更新 +9 key，
-//! 2026-10-28 实测；R7 评审修复轮 +1 key——回填 accept 重跑部分列发布门）：字典
-//! **74 key**（[`tests::KEY_LIST`] 与 `template` 同步，长度由
+//! 2026-10-28 实测；R7 评审修复轮 +1 key——回填 accept 重跑部分列发布门；
+//! LOW-5 R8 +2 key——publish 活表核实 2）：字典
+//! **76 key**（[`tests::KEY_LIST`] 与 `template` 同步，长度由
 //! [`tests::templates_use_only_positional_placeholders`]
-//! 钉住）/ **106 调用点**（`grep -rn 'messages::' src/ --include='*.rs'`
-//! 排除本模块；T35 部署链 +3 key/+7 站点；T-D1 +6 站点——发布门禁 3 + 维表登记 3；
+//! 钉住）/ **109 调用点**（`grep -rn 'messages::' src/ --include='*.rs'`
+//! 排除本模块，2026-10-30 LOW-5 改前实测 107——原记 106 为旧值——+2：
+//! publish 活表核实 2）；
+//! T35 部署链 +3 key/+7 站点；T-D1 +6 站点——发布门禁 3 + 维表登记 3；
 //! T-A1 +14 站点——draft/execute/evolve 三端点的 400/404/422/409/502 信封全部走字典，
 //! 改前实测 66，此前登记的 63 为 T-D1 后未同步的旧值；T-A2 回填 +11 站点，
 //! 2026-10-28 实测——backfill 请求门禁 9 + jobs 404 1 + 未发布 400 1；
@@ -133,6 +136,13 @@ fn template(key: &str) -> Option<&'static str> {
         "err.pipeline.partial_precheck_failed" => {
             "部分列更新前置检查失败（{0} 的 SHOW ALTER TABLE COLUMN）"
         }
+        // LOW-5 (R8): live SHOW CREATE TABLE verdict at publish
+        "err.pipeline.partial_live_key_model" => {
+            "语句 {0} 对汇 {1} 声明了部分列更新，登记 keyModel=unique 但活表 SHOW CREATE TABLE 核实为 {2}——部分列更新仅对 UNIQUE KEY（merge-on-write）表合法，请核对活表（或以建表向导重建后重新登记）"
+        }
+        "err.pipeline.partial_live_precheck_failed" => {
+            "部分列更新活表核实失败（{0} 的 SHOW CREATE TABLE）"
+        }
         // ---- datasources ----
         "err.datasource.not_found" => "数据源 #{0} 不存在",
         "err.datasource.unknown_type" => "未知数据源类型 {0}",
@@ -181,7 +191,10 @@ fn template(key: &str) -> Option<&'static str> {
             "表对象 {0}.{1} 未登记列清单（先 infer-schema 或登记时带 columnsJson），无法生成/演进 DDL"
         }
         "err.ddl.column_unknown_type" => {
-            "列 {0} 的类型 {1} 不在受支持词汇内（utf8/int64/float64/bool），G2 扩表前不静默折叠"
+            "列 {0} 的类型 {1} 不在 DDL 生成器支持面内（utf8/string/int8/int16/int32/int64/float32/float64/decimal(p,s)/timestamp(s|ms|us|ns)/date/bool/binary）——不静默折叠"
+        }
+        "err.ddl.override_column_unknown" => {
+            "列类型覆盖 {0} 不在登记列清单中（覆盖仅允许改已登记列的类型，不能新增列）"
         }
         "err.ddl.key_model_required" => {
             "缺少键模型确认：keyModel 必填（unique=UNIQUE KEY 去重 / duplicate=DUPLICATE KEY 追加）——未确认键模型不执行 DDL"
@@ -323,7 +336,7 @@ mod tests {
     }
 
     /// 字典自洽：模板只含 {数字} 占位，且插值后无残留花括号。
-    /// 另钉字典规模 = 74 key（模块文档「规模口径」的机器锚点，T39 ③；T35 +3；
+    /// 另钉字典规模 = 76 key（模块文档「规模口径」的机器锚点，T39 ③；T35 +3；
     /// T-D1 dim join +6：发布门禁 3 + 维表登记 3；T-A1 建表闭环 +10；
     /// T-A2 回填 +9：not_published/statement_index/dim_unsupported/
     /// bounds_type/bounds_value/bounds_order/sink_unsupported/
@@ -332,12 +345,13 @@ mod tests {
     /// column_unknown）+ 部署侧互斥 2（schema_change/precheck_failed）+
     /// evolve 侧互斥 1（partial_update_active）+ keyModel 登记 1
     /// （key_model_datasource）；R7 评审修复轮 +1：backfill 部分列重门
-    /// （partial_declaration））：加 key 时同步改此数与 KEY_LIST。
+    /// （partial_declaration）；LOW-5 +2：publish 活表核实 2
+    /// （live_key_model/live_precheck_failed））：加 key 时同步改此数与 KEY_LIST。
     #[test]
     fn templates_use_only_positional_placeholders() {
         let keys: Vec<&str> = KEY_LIST.to_vec();
         assert!(!keys.is_empty());
-        assert_eq!(keys.len(), 74, "字典规模漂移：同步模块文档「规模口径」");
+        assert_eq!(keys.len(), 76, "字典规模漂移：同步模块文档「规模口径」");
         for key in keys {
             let tpl = template(key).expect("listed key resolves");
             let mut rest = tpl;
@@ -713,6 +727,8 @@ mod tests {
         "err.pipeline.partial_column_unknown",
         "err.pipeline.partial_schema_change",
         "err.pipeline.partial_precheck_failed",
+        "err.pipeline.partial_live_key_model",
+        "err.pipeline.partial_live_precheck_failed",
         "err.datasource.not_found",
         "err.datasource.unknown_type",
         "err.datasource.unknown_type_registry",

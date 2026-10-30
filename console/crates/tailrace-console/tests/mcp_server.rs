@@ -14,9 +14,10 @@ use serde_json::{json, Value};
 use tailrace_console::mcp::McpState;
 use tower::ServiceExt;
 
-/// §7.5 table order — `tools/list` must expose exactly these ten (the pause
-/// and resume routes share the `pause_resume_pipeline` slot).
-const ALL_TOOLS: [&str; 10] = [
+/// §7.5 table order + the R8 four — `tools/list` must expose exactly these
+/// fourteen (the pause and resume routes share the `pause_resume_pipeline`
+/// slot; the DDL closed loop and backfill status ride at the end).
+const ALL_TOOLS: [&str; 14] = [
     "list_datasources",
     "list_pipelines",
     "get_pipeline",
@@ -27,12 +28,18 @@ const ALL_TOOLS: [&str; 10] = [
     "deploy_pipeline",
     "pause_resume_pipeline",
     "trigger_backfill",
+    "ddl_draft",
+    "ddl_execute",
+    "ddl_evolve",
+    "backfill_status",
 ];
-const WRITE_TOOLS: [&str; 4] = [
+const WRITE_TOOLS: [&str; 6] = [
     "create_pipeline",
     "deploy_pipeline",
     "pause_resume_pipeline",
     "trigger_backfill",
+    "ddl_execute",
+    "ddl_evolve",
 ];
 
 // ---------------- helpers ----------------
@@ -134,7 +141,7 @@ fn audit_rows(store: &Store, action: &str) -> Vec<(String, Option<String>, Value
 // ---------------- initialize / tools/list ----------------
 
 #[tokio::test]
-async fn initialize_and_tools_list_expose_the_ten_blueprint_tools() {
+async fn initialize_and_tools_list_expose_the_fourteen_tools() {
     let app = app_with_mcp(false).await;
 
     // initialize: negotiation, server info, session id, instructions
@@ -190,21 +197,34 @@ async fn initialize_and_tools_list_expose_the_ten_blueprint_tools() {
     let b = rpc(&app, &[], "ping", json!({})).await;
     assert_eq!(b["result"], json!({}));
 
-    // tools/list: exactly the §7.5 ten, in table order, well-formed
+    // tools/list: exactly the fourteen (§7.5 ten + R8 four), in table
+    // order, well-formed; descriptions are route-prefixed (the OpenAPI
+    // same-source generation)
     let b = rpc(&app, &[], "tools/list", json!({})).await;
     let tools = b["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 10, "{tools:#?}");
+    assert_eq!(tools.len(), 14, "{tools:#?}");
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(names, ALL_TOOLS);
     assert!(
         b["result"].get("nextCursor").is_none(),
-        "all ten in one page"
+        "all fourteen in one page"
     );
     for t in tools {
         let name = t["name"].as_str().unwrap();
+        let description = t["description"].as_str().unwrap();
+        assert!(description.len() > 20, "{name}: non-trivial description");
+        // the route prefix is the same-source fingerprint: the description
+        // is generated from the OpenAPI document, not hand-written here
+        let route = match name {
+            "ddl_draft" => "POST /api/datasources/{id}/tables/{db}/{table}/ddl/draft",
+            "ddl_execute" => "POST /api/datasources/{id}/tables/{db}/{table}/ddl/execute",
+            "ddl_evolve" => "POST /api/datasources/{id}/tables/{db}/{table}/ddl/evolve",
+            "backfill_status" => "GET /api/pipelines/{id}/backfill/jobs",
+            _ => continue,
+        };
         assert!(
-            t["description"].as_str().unwrap().len() > 20,
-            "{name}: non-trivial description"
+            description.starts_with(route),
+            "{name}: OpenAPI-sourced description is route-prefixed: {description}"
         );
         assert_eq!(t["inputSchema"]["type"], "object", "{name}: schema type");
         let is_write = WRITE_TOOLS.contains(&name);
@@ -258,6 +278,15 @@ async fn write_tools_are_rejected_while_the_switch_is_off() {
             json!({"confirm": true, "id": 1, "action": "pause"}),
         ),
         ("trigger_backfill", json!({"confirm": true, "id": 1})),
+        (
+            "ddl_execute",
+            json!({"confirm": true, "datasourceId": 1, "db": "ods", "table": "orders",
+                    "ddl": "CREATE TABLE …", "keyModel": "unique"}),
+        ),
+        (
+            "ddl_evolve",
+            json!({"confirm": true, "datasourceId": 1, "db": "ods", "table": "orders"}),
+        ),
     ];
     for (name, args) in &calls {
         let b = tool(&app, &hdr, name, args.clone()).await;
@@ -282,7 +311,7 @@ async fn write_tools_are_rejected_while_the_switch_is_off() {
         .iter()
         .filter(|(_, _, d)| d["code"] == "WRITE_DISABLED")
         .collect();
-    assert_eq!(rejected.len(), 4, "{rows:#?}");
+    assert_eq!(rejected.len(), 6, "{rows:#?}");
     for (actor, entity, detail) in &rejected {
         assert_eq!(actor, "mcp:gate-test");
         assert!(
@@ -292,9 +321,13 @@ async fn write_tools_are_rejected_while_the_switch_is_off() {
         assert_eq!(detail["outcome"], "rejected");
         assert_eq!(detail["tool"], entity.as_deref().unwrap());
     }
-    // 4 rejected + 1 ok read = the complete MCP audit trail
-    assert_eq!(rows.len(), 5, "{rows:#?}");
+    // 6 rejected + 1 ok read = the complete MCP audit trail
+    assert_eq!(rows.len(), 7, "{rows:#?}");
     assert!(audit_rows(&app.store, "PIPELINE_CREATE").is_empty());
+    assert!(
+        audit_rows(&app.store, "TABLE_DDL_EXECUTE").is_empty(),
+        "the DDL write never reached its handler"
+    );
 }
 
 // ---------------- write gate 2: confirm:true ----------------
@@ -364,6 +397,171 @@ async fn write_tools_require_confirm_true_even_with_the_switch_on() {
     assert_eq!(domain.len(), 1, "handler's own audit row");
     assert_eq!(domain[0].0, "mcp:confirm-test");
     assert_eq!(domain[0].1.as_deref(), Some(pid.to_string().as_str()));
+}
+
+// ---------------- R8: DDL closed loop + backfill status ----------------
+
+/// The R8 tool quartet: ddl_draft / backfill_status are read tools (no
+/// confirm, no switch — draft is pure text composition, status is a list);
+/// ddl_execute / ddl_evolve ride both write gates and leave the handler's
+/// own domain audit row under the MCP actor. FE-less assertions only:
+/// draft is pure, execute and evolve fail against the unreachable FE
+/// (their 502 envelopes), which is exactly the side the gates live on.
+/// The draft leg also crosses into dogfooding #3: a table registered with
+/// a sequenceColumn surfaces the R8 `function_column.sequence_col`
+/// attribute through the tool (and not under a duplicate override).
+#[tokio::test]
+async fn ddl_and_backfill_tools_round_trip_the_r8_surface() {
+    let app = app_with_mcp(true).await;
+    let hdr = [("x-mcp-client", "ddl-mcp")];
+    let (_kafka, doris, _, _) = seed_datasources(&app).await;
+    let (s, b) = req(
+        &app,
+        "POST",
+        &format!("/api/datasources/{doris}/tables"),
+        Some(json!({
+            "dbName": "ods", "tableName": "orders_seq", "format": null,
+            "columnsJson": [["order_no", "utf8"], ["qty", "int64"], ["seq", "int64"]],
+            "sequenceColumn": "seq"
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let tid = b["id"].as_i64().unwrap();
+
+    // ddl_draft: read tool, no confirm needed — the generator's two states
+    // ride through (CDC evidence recommends UNIQUE; the declared seq column
+    // becomes the table-level attribute)
+    let (status, body) = tool_ok(
+        &tool(
+            &app,
+            &hdr,
+            "ddl_draft",
+            json!({"datasourceId": doris, "db": "ods", "table": "orders_seq"}),
+        )
+        .await,
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["keyModel"], "unique", "{body}");
+    let ddl = body["ddl"].as_str().unwrap();
+    assert!(ddl.contains("UNIQUE KEY(`order_no`)"), "{ddl}");
+    assert!(
+        ddl.contains(r#""function_column.sequence_col" = "seq""#),
+        "dogfooding #3: the attribute is part of the draft: {ddl}"
+    );
+    // the duplicate override drops the attribute (no dedup story)
+    let (_, body) = tool_ok(
+        &tool(
+            &app,
+            &hdr,
+            "ddl_draft",
+            json!({"datasourceId": doris, "db": "ods", "table": "orders_seq",
+                    "keyModel": "duplicate", "keyColumn": "order_no"}),
+        )
+        .await,
+    );
+    let ddl = body["ddl"].as_str().unwrap();
+    assert!(ddl.contains("DUPLICATE KEY(`order_no`)"), "{ddl}");
+    assert!(!ddl.contains("function_column.sequence_col"), "{ddl}");
+    // a kafka table is not a DDL target — the REST 400 rides as a tool error
+    let (status, body) = tool_err(
+        &tool(
+            &app,
+            &hdr,
+            "ddl_draft",
+            json!({"datasourceId": _kafka, "db": "shop", "table": "orders"}),
+        )
+        .await,
+    );
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"]["message_key"], "err.ddl.datasource_kind");
+
+    // ddl_execute without confirm → CONFIRM_REQUIRED, audited, no handler row
+    let b = tool(
+        &app,
+        &hdr,
+        "ddl_execute",
+        json!({"datasourceId": doris, "db": "ods", "table": "orders_seq",
+                "ddl": "CREATE TABLE `ods`.`orders` (… UNIQUE KEY …);", "keyModel": "unique"}),
+    )
+    .await;
+    assert_eq!(b["error"]["data"]["code"], "CONFIRM_REQUIRED", "{b}");
+
+    // ddl_execute with confirm: the FE is unreachable → the REST 502
+    // DDL_FAILED surfaces as a tool error AND the attempt is audit
+    // evidence (handler domain row ok:false under the MCP actor)
+    let (status, body) = tool_err(
+        &tool(
+            &app,
+            &hdr,
+            "ddl_execute",
+            json!({"confirm": true, "datasourceId": doris, "db": "ods", "table": "orders_seq",
+                    "ddl": "CREATE TABLE IF NOT EXISTS `ods`.`orders_seq` (\n  `order_no` VARCHAR(65533)\n)\nUNIQUE KEY(`order_no`)\nDISTRIBUTED BY HASH(`order_no`) BUCKETS AUTO;",
+                    "keyModel": "unique"}),
+        )
+        .await,
+    );
+    assert_eq!(status, 502, "{body}");
+    assert_eq!(body["error"]["code"], "DDL_FAILED", "{body}");
+    let rows = audit_rows(&app.store, "TABLE_DDL_EXECUTE");
+    assert_eq!(rows.len(), 1, "the handler's own audit row: {rows:#?}");
+    assert_eq!(rows[0].0, "mcp:ddl-mcp");
+    assert_eq!(rows[0].1.as_deref(), Some(tid.to_string().as_str()));
+    assert_eq!(rows[0].2["ok"], false);
+    assert_eq!(rows[0].2["keyModel"], "unique");
+
+    // ddl_evolve with confirm: same gates, the DESC against the dead FE is
+    // the 502 UNAVAILABLE
+    let (status, body) = tool_err(
+        &tool(
+            &app,
+            &hdr,
+            "ddl_evolve",
+            json!({"confirm": true, "datasourceId": doris, "db": "ods", "table": "orders_seq"}),
+        )
+        .await,
+    );
+    assert_eq!(status, 502, "{body}");
+    assert_eq!(body["error"]["code"], "UNAVAILABLE", "{body}");
+    assert_eq!(
+        audit_rows(&app.store, "TABLE_DDL_EVOLVE").len(),
+        0,
+        "a DESC failure executes nothing, audits nothing on the domain side"
+    );
+
+    // backfill_status: read tool over an unpublishable-but-existing
+    // pipeline draft — the job list, empty until a run is accepted
+    let (s, b) = req(
+        &app,
+        "POST",
+        "/api/pipelines",
+        Some(json!({"name": "mcp-bf", "sqlContent": PIPELINE_SQL,
+                    "dsMapping": {"shop": _kafka, "ods": doris}, "checkpointMs": 10000})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let pid = b["id"].as_i64().unwrap();
+    let (status, body) = tool_ok(&tool(&app, &hdr, "backfill_status", json!({"id": pid})).await);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["jobs"].as_array().unwrap().len(), 0, "{body}");
+
+    // the MCP envelope rows carry the whole story: the reads ok (draft ×3
+    // — unique, duplicate override, kafka refusal), the confirm rejection
+    // rejected, execute+evolve error
+    let rows = audit_rows(&app.store, "MCP_TOOL_CALL");
+    let by = |tool: &str| {
+        rows.iter()
+            .filter(|(_, e, _)| e.as_deref() == Some(tool))
+            .count()
+    };
+    assert_eq!(
+        by("ddl_draft"),
+        3,
+        "unique + duplicate + kafka refusal: {rows:#?}"
+    );
+    assert_eq!(by("ddl_execute"), 2, "confirm rejection + 502: {rows:#?}");
+    assert_eq!(by("ddl_evolve"), 1, "{rows:#?}");
+    assert_eq!(by("backfill_status"), 1, "{rows:#?}");
 }
 
 // ---------------- read tools + actions (mock engine) ----------------

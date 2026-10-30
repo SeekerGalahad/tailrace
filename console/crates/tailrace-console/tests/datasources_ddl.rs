@@ -363,6 +363,108 @@ async fn ddl_draft_guards() {
 }
 
 #[tokio::test]
+async fn ddl_draft_column_type_overrides() {
+    let (app, ds, _tid) = ddl_app().await;
+    let path = format!("/api/datasources/{ds}/tables/shop/orders/ddl/draft");
+
+    // A3: the wizard's column step steers the draft without touching the
+    // registration — amount becomes money (decimal), event_ts becomes a
+    // real timestamp, and the partition heuristic follows the new type:
+    // event_ts is now an executable RANGE candidate on the DUPLICATE
+    // override (no more utf8 skip note).
+    let (s, b) = req(
+        &app,
+        "POST",
+        &path,
+        Some(json!({
+            "keyModel": "duplicate",
+            "columnTypes": [
+                ["amount", "decimal(18,2)"],
+                ["event_ts", "timestamp(ms)"]
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert!(
+        b["ddl"]
+            .as_str()
+            .unwrap()
+            .contains("`amount` DECIMAL(18,2)"),
+        "{}",
+        b["ddl"]
+    );
+    assert!(
+        b["ddl"]
+            .as_str()
+            .unwrap()
+            .contains("`event_ts` DATETIME(6)"),
+        "{}",
+        b["ddl"]
+    );
+    assert!(
+        b["ddl"]
+            .as_str()
+            .unwrap()
+            .contains("PARTITION BY RANGE(`event_ts`)"),
+        "{}",
+        b["ddl"]
+    );
+    // the response's columns are the effective set (overrides applied) —
+    // what the wizard's column step must show
+    assert_eq!(
+        b["columns"],
+        json!([
+            ["op_type", "utf8"],
+            ["order_id", "utf8"],
+            ["amount", "decimal(18,2)"],
+            ["event_ts", "timestamp(ms)"],
+            ["seq", "int64"]
+        ]),
+        "{b}"
+    );
+
+    // an override naming an unregistered column is a 400 (a typo must not
+    // pass as an override)
+    let (s, b) = req(
+        &app,
+        "POST",
+        &path,
+        Some(json!({"columnTypes": [["ghost", "int32"]]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert_eq!(b["error"]["message_key"], "err.ddl.override_column_unknown");
+
+    // a type the generator cannot map is refused by the generator itself
+    // (same refusal shape as an unmappable registered type)
+    let (s, b) = req(
+        &app,
+        "POST",
+        &path,
+        Some(json!({"columnTypes": [["amount", "list<float32>"]]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+
+    // the registration was never rewritten: a fresh draft still sees the
+    // original types
+    let (s, b) = req(&app, "POST", &path, None).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(
+        b["columns"],
+        json!([
+            ["op_type", "utf8"],
+            ["order_id", "utf8"],
+            ["amount", "float64"],
+            ["event_ts", "utf8"],
+            ["seq", "int64"]
+        ]),
+        "{b}"
+    );
+}
+
+#[tokio::test]
 async fn ddl_execute_rejects_unconfirmed_key_model() {
     let (app, ds, _tid) = ddl_app().await;
     let path = format!("/api/datasources/{ds}/tables/shop/orders/ddl/execute");
@@ -505,14 +607,17 @@ async fn ddl_evolve_guards() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
     assert_eq!(b["error"]["message_key"], "err.ddl.columns_missing");
 
-    // a registered column outside the vocabulary is refused, not folded
+    // a registered column outside the generator's vocabulary is refused,
+    // not folded — `binary` became a mapped word in A3, so the refusal
+    // sample is a word the 16-vocabulary knows but the DDL surface does
+    // not open yet (list<float32>, the W5 probe pass)
     let (s, b) = req(
         &app,
         "POST",
         &format!("/api/datasources/{ds}/tables"),
         Some(json!({
             "dbName": "shop", "tableName": "odd",
-            "columnsJson": [["id", "int64"], ["blob", "binary"]]
+            "columnsJson": [["id", "int64"], ["emb", "list<float32>"]]
         })),
     )
     .await;

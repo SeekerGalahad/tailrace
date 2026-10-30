@@ -184,7 +184,7 @@ pub async fn infer_schema(
             Ok(InferredSchema {
                 columns: cols
                     .into_iter()
-                    .map(|(name, ty)| (name, infer::ddl_arrow_type(&ty).to_string()))
+                    .map(|(name, ty)| (name, infer::ddl_arrow_type(&ty)))
                     .collect(),
                 format: None,
             })
@@ -196,7 +196,7 @@ pub async fn infer_schema(
             Ok(InferredSchema {
                 columns: cols
                     .into_iter()
-                    .map(|(name, ty)| (name, infer::pg_arrow_type(&ty).to_string()))
+                    .map(|(name, ty)| (name, infer::pg_arrow_type(&ty)))
                     .collect(),
                 format: None,
             })
@@ -267,6 +267,22 @@ pub async fn doris_alter_column_jobs(
     tokio::time::timeout(CALL_TIMEOUT, sql::doris_alter_column_jobs(spec, db, table))
         .await
         .map_err(|_| anyhow::anyhow!("SHOW ALTER TABLE COLUMN 超时 (>{CALL_TIMEOUT:?})"))?
+}
+
+/// The live CREATE TABLE text of one Doris table as `SHOW CREATE TABLE`
+/// returns it (LOW-5, R8): the console's partial-update publish gate no
+/// longer trusts the key model on record alone — it asks the table. The
+/// MoW/MoR verdict is parsed on the console side; this returns the raw
+/// text. Same connection path as [`doris_alter_column_jobs`]; a
+/// MySQL-protocol spec is required (Doris FE 9030).
+pub async fn doris_show_create(spec: &ConnSpec, db: &str, table: &str) -> anyhow::Result<String> {
+    match spec {
+        ConnSpec::MySql { .. } => {}
+        _ => anyhow::bail!("doris_show_create 仅支持 MySQL 协议数据源"),
+    }
+    tokio::time::timeout(CALL_TIMEOUT, sql::doris_show_create(spec, db, table))
+        .await
+        .map_err(|_| anyhow::anyhow!("SHOW CREATE TABLE 超时 (>{CALL_TIMEOUT:?})"))?
 }
 
 /// `"a.b"` → (`"a"`, `"b"`); `"flat"` → (`""`, `"flat"`) (first-dot split;

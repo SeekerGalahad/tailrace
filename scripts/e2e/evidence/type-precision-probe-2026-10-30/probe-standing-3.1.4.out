@@ -1,0 +1,52 @@
+### probe target: standing-3.1.4 (fe=127.0.0.1:9030 be=127.0.0.1:8040)
+5.7.99
+=== A: DECIMAL(18,2) conservation (bare json stream load) ===
+--- A1 json NUMBER payloads (12.34 / 0.10 / -5.01 / 18,2-ceiling / 12.345) ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 5,
+1	12.34	12.34
+2	0.10	0.1
+3	-5.01	-5.01
+4	100000000000000.00	100000000000000
+5	12.35	12.35
+--- A2 json STRING payloads (the engine's exact emission shape) ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 5,
+11	12.34
+12	0.10
+13	-5.01
+14	99999999999999.99
+15	12.35
+--- A3 exactness: per-row 0.01-level conservation check in SQL ---
+1
+=== B: sequence_col ordering (dogfooding #3 contrast) ===
+--- B1 attr'd table: full write seq=10 ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 1,
+K1	10	1	first
+--- B1 attr'd table: partial LOWER seq=5 (with sequence_column header) ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 1,
+K1	10	1	first
+--- B2 attribute-less table (pre-R8 generator shape): full write seq=10 ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 1,
+K1	10	1	first
+--- B2 attribute-less table: partial LOWER seq=5 → expect OVERWRITE (the failure form) ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 1,
+K1	5	555	first
+=== C: DATETIME(6)/DATE round trip (engine string shape) ===
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 1,
+1	2026-10-30 12:34:56.789012	2026-10-30
+=== cleanup ===
+standing-3.1.4: dropped tp_probe
+### probe done: standing-3.1.4

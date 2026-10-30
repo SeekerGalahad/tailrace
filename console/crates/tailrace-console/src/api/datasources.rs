@@ -1192,9 +1192,12 @@ pub async fn infer_schema(
     };
     if matches!(spec, tailrace_metadata::ConnSpec::Kafka { .. }) {
         // client-input format problems 400 before any backend is touched
-        // (csv/parquet have no self-describing samples; unknown names too)
+        // (csv/parquet have no self-describing samples; unknown names too).
+        // A3 widened the gate to debezium-json — the engine-side metadata
+        // client already walks it, the console gate had just never caught
+        // up (the engine gate and this one list the same names).
         match body.format.as_deref() {
-            Some("ogg") | Some("json") | Some("jsonl") | None => {}
+            Some("ogg") | Some("json") | Some("jsonl") | Some("debezium-json") | None => {}
             Some(other) => {
                 return super::messages::bad_request(
                     "err.datasource.kafka_format_unsupported",
@@ -1581,6 +1584,14 @@ pub struct DdlDraftBody {
     /// clears); `false` = dropped — no `PARTITION BY` clause, no
     /// `dynamic_partition.*` properties.
     pub partition: Option<bool>,
+    /// Per-column type overrides from the wizard's column step (A3):
+    /// `[name, vocabulary type]` pairs, same wire shape as `columnsJson`.
+    /// The registered columnsJson is NOT rewritten — these steer only this
+    /// draft (inference said `utf8`, the human knows the column is money
+    /// and picks `decimal(18,2)`). A name outside the registered set is a
+    /// 400 (a typo must not pass silently); the type itself is validated by
+    /// the generator's vocabulary check.
+    pub column_types: Option<Vec<(String, String)>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1611,7 +1622,9 @@ pub struct DdlDraftResponse {
     pub key_column_guessed: bool,
     pub partition: Option<DdlPartitionDto>,
     pub notes: Vec<String>,
-    /// Registered `[name, type]` pairs (the `columnsJson` wire shape).
+    /// The `[name, type]` pairs this draft was built from — the registered
+    /// columnsJson with any `DdlDraftBody.columnTypes` overrides applied
+    /// (the wizard's column step shows exactly these).
     pub columns: Vec<(String, String)>,
     pub sequence_column: Option<String>,
 }
@@ -1656,21 +1669,6 @@ pub struct DdlEvolveResponse {
     pub partial_update_pipelines: Vec<crate::api::pipelines::PartialUpdatePipeline>,
 }
 
-/// Four-type vocabulary → Doris column type for evolve's ALTER text. Mirrors
-/// `tailrace_ddl`'s private `doris_type` (same §7.1 rows: the generator owns
-/// the CREATE TABLE side, this is the ALTER side — keep the two in step
-/// until G2 widens the vocabulary). Unknown → `None`: explicit 400, no
-/// silent fold.
-fn doris_column_type(vocab: &str) -> Option<&'static str> {
-    match vocab {
-        "utf8" => Some("VARCHAR(65533)"),
-        "int64" => Some("BIGINT"),
-        "float64" => Some("DOUBLE"),
-        "bool" => Some("BOOLEAN"),
-        _ => None,
-    }
-}
-
 /// Backtick-quote body for one identifier: backticks doubled, empty and NUL
 /// rejected (the metadata / ddl crates' discipline).
 fn ddl_ident(name: &str) -> anyhow::Result<String> {
@@ -1705,9 +1703,10 @@ fn ddl_key_clause(ddl: &str) -> Option<tailrace_ddl::KeyModel> {
 }
 
 /// Column-set diff behind evolve (pure, unit-tested): `current` = `DESC`
-/// folded through the four-type vocabulary, `target` = registered
-/// columns_json. Names compare case-insensitively (Doris column names are),
-/// types exactly.
+/// folded through the type vocabulary (A3-narrowed — widths/decimals/time
+/// types survive the fold, so the diff sees real type differences),
+/// `target` = registered columns_json. Names compare case-insensitively
+/// (Doris column names are), types exactly.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct EvolvePlan {
     /// In target, not in current — the only change evolve executes.
@@ -1745,6 +1744,13 @@ fn diff_columns(current: &[(String, String)], target: &[(String, String)]) -> Ev
 /// Schema Change): the first rides after the table's current last column,
 /// each next after the one before it — declaration order preserved, every
 /// statement individually reported by `mysql_exec`.
+///
+/// The vocabulary→Doris mapping is the generator's own
+/// [`tailrace_ddl::doris_type`] (§7.1, A3-widened: decimal and timestamp
+/// parametric, binary STRING + base64 COMMENT). Since A3 there is exactly
+/// one mapping — the pre-A3 hand-synced ALTER-side copy is gone, so CREATE
+/// TABLE and ADD/MODIFY COLUMN can no longer drift. Unknown type →
+/// explicit error, no silent fold.
 fn add_column_statements(
     db: &str,
     table: &str,
@@ -1754,7 +1760,7 @@ fn add_column_statements(
     let mut out = Vec::with_capacity(added.len());
     let mut after = current_last.to_string();
     for (name, ty) in added {
-        let doris = doris_column_type(ty).ok_or_else(|| {
+        let doris = tailrace_ddl::doris_type(ty).ok_or_else(|| {
             anyhow::anyhow!("column {name:?}: type {ty:?} outside the vocabulary")
         })?;
         out.push(format!(
@@ -1782,7 +1788,7 @@ fn suggested_statements(
 ) -> anyhow::Result<Vec<String>> {
     let mut out = add_column_statements(db, table, current_last, &plan.added)?;
     for (name, want, _have) in &plan.retyped {
-        let doris = doris_column_type(want).ok_or_else(|| {
+        let doris = tailrace_ddl::doris_type(want).ok_or_else(|| {
             anyhow::anyhow!("column {name:?}: type {want:?} outside the vocabulary")
         })?;
         out.push(format!(
@@ -1908,6 +1914,29 @@ pub async fn ddl_draft(
     let columns = match registered_columns(&state, &t) {
         Ok(v) => v,
         Err(r) => return r,
+    };
+    // A3: the wizard's per-column type overrides steer this draft only
+    // (the registration stays untouched — the response says which columns
+    // the DDL was actually built from). Doris column names are
+    // case-insensitive, so the override match is too (diff_columns'
+    // discipline).
+    let columns = match body.column_types {
+        None => columns,
+        Some(overrides) => {
+            let mut cols = columns;
+            for (name, ty) in overrides {
+                match cols.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+                    Some(slot) => slot.1 = ty,
+                    None => {
+                        return super::messages::bad_request(
+                            "err.ddl.override_column_unknown",
+                            &[&name],
+                        )
+                    }
+                }
+            }
+            cols
+        }
     };
     let key_model = match body
         .key_model
@@ -2111,8 +2140,9 @@ pub async fn ddl_execute(
 
 /// `POST /api/datasources/{id}/tables/{db}/{table}/ddl/evolve` (T-A1 ③
 /// evolve): `DESC` the live table (through the same metadata client
-/// infer-schema uses, so Doris types fold to the four-type vocabulary and
-/// the diff compares like with like) against the registered columns.
+/// infer-schema uses, so Doris types fold through the same A3-narrowed
+/// vocabulary mapping and the diff compares like with like) against the
+/// registered columns.
 /// Registered-but-missing columns become chained `ADD COLUMN … AFTER`
 /// statements, executed and audited. A retyped or dropped column → 409 with
 /// the full suggestion text in `refs.suggestedDdl`, nothing executed. Every
@@ -2157,7 +2187,7 @@ pub async fn ddl_evolve(
     // is composed (no silent fold — the generator's stance)
     if let Some((name, ty)) = target
         .iter()
-        .find(|(_, ty)| doris_column_type(ty).is_none())
+        .find(|(_, ty)| tailrace_ddl::doris_type(ty).is_none())
     {
         return super::messages::bad_request("err.ddl.column_unknown_type", &[name, ty]);
     }

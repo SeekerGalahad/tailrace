@@ -408,9 +408,222 @@ pub async fn heartbeat_with_totals(app: &TestApp, node_key: &str, token: &str, p
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+// ---------------- mock Doris FE (MySQL wire protocol) ----------------
+
+/// A mock Doris FE speaking just enough of the MySQL wire protocol for the
+/// sqlx client tailrace-metadata embeds: protocol-41 greeting with
+/// mysql_native_password and no TLS (the console connects with
+/// ssl_mode=Disabled, and this server advertises no extra capabilities so
+/// the negotiated set drops DEPRECATE_EOF — classic EOF-framed text
+/// resultsets). `SHOW CREATE TABLE` is answered from the scripted DDL text
+/// (the LOW-5 live key-model gate's dependency); every other query gets an
+/// ERR packet naming the refusal, so FE-side failure paths (the deploy
+/// precheck's SHOW ALTER TABLE COLUMN, evolve's DESC, ddl execute) keep
+/// their 502s against this server instead of an unreachable port. Queries
+/// are recorded for assertions.
+#[derive(Clone, Default)]
+pub struct MockFe {
+    pub queries: Arc<Mutex<Vec<String>>>,
+    ddl: Arc<Mutex<String>>,
+}
+
+impl MockFe {
+    /// Swap the SHOW CREATE TABLE answer of a running server (one verdict
+    /// per publish-gate scenario without re-wiring datasources).
+    pub fn set_ddl(&self, ddl: &str) {
+        *self.ddl.lock().unwrap() = ddl.to_string();
+    }
+
+    /// Serve on an ephemeral loopback port; `ddl` is what SHOW CREATE TABLE
+    /// returns for any db.table. Returns the port (jdbcUrl
+    /// `jdbc:mysql://127.0.0.1:<port>/shop`).
+    pub async fn serve(self, ddl: &str) -> u16 {
+        *self.ddl.lock().unwrap() = ddl.to_string();
+        let fe = self.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (socket, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let fe = fe.clone();
+                tokio::spawn(async move { fe.session(socket).await });
+            }
+        });
+        port
+    }
+
+    /// One connection: greeting → (any) handshake response → OK → COM_QUERY
+    /// loop. Sequence numbers follow the wire rule: replies continue from
+    /// the last received packet's id + 1.
+    async fn session(self, mut socket: tokio::net::TcpStream) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // greeting: protocol 10, version, 20-byte seed split across the two
+        // auth-plugin-data fields, capabilities = PROTOCOL_41 |
+        // SECURE_CONNECTION | PLUGIN_AUTH only (no SSL, no DEPRECATE_EOF),
+        // mysql_native_password
+        let mut greeting = Vec::new();
+        greeting.push(0x0a);
+        greeting.extend_from_slice(b"8.0.32-mock\0");
+        greeting.extend_from_slice(&1u32.to_le_bytes());
+        greeting.extend_from_slice(b"12345678");
+        greeting.push(0x00);
+        greeting.extend_from_slice(&0x8200u16.to_le_bytes()); // caps low
+        greeting.push(0x21); // charset
+        greeting.extend_from_slice(&0x0002u16.to_le_bytes()); // AUTOCOMMIT
+        greeting.extend_from_slice(&0x0008u16.to_le_bytes()); // caps high
+        greeting.push(21); // auth-plugin-data length
+        greeting.extend_from_slice(&[0u8; 10]);
+        greeting.extend_from_slice(b"123456789012\0");
+        greeting.extend_from_slice(b"mysql_native_password\0");
+        let mut seq = 0u8;
+        write_frame(&mut socket, seq, &greeting).await;
+        // handshake response (auth scramble whatever) → accept
+        let Some((_payload, s)) = read_frame(&mut socket).await else {
+            return;
+        };
+        seq = s + 1;
+        write_frame(
+            &mut socket,
+            seq,
+            &[0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00],
+        )
+        .await; // OK
+        loop {
+            let Some((payload, s)) = read_frame(&mut socket).await else {
+                return;
+            };
+            if payload.first() != Some(&0x03) {
+                // not COM_QUERY (ping etc.) → OK
+                write_frame(
+                    &mut socket,
+                    s + 1,
+                    &[0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00],
+                )
+                .await;
+                continue;
+            }
+            let sql = String::from_utf8_lossy(&payload[1..]).to_string();
+            self.queries.lock().unwrap().push(sql.clone());
+            let mut seq = s + 1;
+            let upper = sql.to_ascii_uppercase();
+            if upper.starts_with("SHOW CREATE TABLE") {
+                // "… `db`.`table`" → the segment before the trailing backtick
+                let table = sql
+                    .trim()
+                    .strip_suffix('`')
+                    .and_then(|rest| rest.rsplit('`').next())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("t")
+                    .to_string();
+                let ddl = self.ddl.lock().unwrap().clone();
+                // resultset: 2 columns, 1 row, EOF-framed (no DEPRECATE_EOF)
+                write_frame(&mut socket, seq, &[0x02]).await;
+                seq += 1;
+                write_frame(&mut socket, seq, &column_def("Table")).await;
+                seq += 1;
+                write_frame(&mut socket, seq, &column_def("Create Table")).await;
+                seq += 1;
+                write_frame(&mut socket, seq, &[0xfe, 0x00, 0x00, 0x02, 0x00]).await;
+                seq += 1;
+                let mut row = Vec::new();
+                row.extend(lenenc_str(&table));
+                row.extend(lenenc_str(&ddl));
+                write_frame(&mut socket, seq, &row).await;
+                seq += 1;
+                write_frame(&mut socket, seq, &[0xfe, 0x00, 0x00, 0x02, 0x00]).await;
+            } else if upper.starts_with("SET ") {
+                // sqlx's connect-time session setup
+                // (`SET time_zone='+00:00',NAMES utf8mb4`) — accept silently
+                write_frame(
+                    &mut socket,
+                    seq,
+                    &[0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00],
+                )
+                .await;
+            } else {
+                let msg = format!("mock FE: only SHOW CREATE TABLE is scripted, got: {sql}");
+                let mut err = vec![0xff];
+                err.extend_from_slice(&1064u16.to_le_bytes()); // ER_PARSE_ERROR
+                err.push(b'#');
+                err.extend_from_slice(b"HY000");
+                err.extend_from_slice(msg.as_bytes());
+                write_frame(&mut socket, seq, &err).await;
+            }
+        }
+
+        async fn write_frame(socket: &mut tokio::net::TcpStream, seq: u8, payload: &[u8]) {
+            let mut frame = Vec::with_capacity(payload.len() + 4);
+            frame.extend_from_slice(&(payload.len() as u32).to_le_bytes()[..3]);
+            frame.push(seq);
+            frame.extend_from_slice(payload);
+            let _ = socket.write_all(&frame).await;
+            let _ = socket.flush().await;
+        }
+
+        async fn read_frame(socket: &mut tokio::net::TcpStream) -> Option<(Vec<u8>, u8)> {
+            let mut header = [0u8; 4];
+            socket.read_exact(&mut header).await.ok()?;
+            let len =
+                (header[0] as usize) | ((header[1] as usize) << 8) | ((header[2] as usize) << 16);
+            let mut payload = vec![0u8; len];
+            socket.read_exact(&mut payload).await.ok()?;
+            Some((payload, header[3]))
+        }
+
+        /// lenenc string bytes (handles the ≥251-byte two-byte length form
+        /// a real SHOW CREATE text needs).
+        fn lenenc_str(s: &str) -> Vec<u8> {
+            let b = s.as_bytes();
+            let mut v = Vec::with_capacity(b.len() + 3);
+            if b.len() < 251 {
+                v.push(b.len() as u8);
+            } else {
+                v.push(0xfc);
+                v.extend_from_slice(&(b.len() as u16).to_le_bytes());
+            }
+            v.extend_from_slice(b);
+            v
+        }
+
+        /// One column-definition payload (protocol 41): the six lenenc
+        /// strings (catalog/schema/table_alias/table/alias/org_name — the
+        /// result column rides the ALIAS slot), fixed-field length 0x0c,
+        /// utf8 charset, VAR_STRING type, no flags, 0 decimals.
+        fn column_def(name: &str) -> Vec<u8> {
+            let mut p = Vec::new();
+            for field in ["def", "", "", "", name, ""] {
+                p.extend(lenenc_str(field));
+            }
+            p.push(0x0c);
+            p.extend_from_slice(&33u16.to_le_bytes());
+            p.extend_from_slice(&65535u32.to_le_bytes());
+            p.push(0xfd); // MYSQL_TYPE_VAR_STRING
+            p.extend_from_slice(&0u16.to_le_bytes());
+            p.push(0);
+            p.extend_from_slice(&[0u8; 2]);
+            p
+        }
+    }
+}
+
+/// `seed_datasources` with the doris datasource's jdbcUrl pointed at a mock
+/// FE port (LOW-5: publish's live SHOW CREATE TABLE gate needs an
+/// answerable FE); 19030 in [`seed_datasources`] stays unreachable by
+/// construction.
+pub async fn seed_datasources_at_fe(app: &TestApp, fe_port: u16) -> (i64, i64, i64, i64) {
+    seed_datasources_with_jdbc(app, fe_port).await
+}
+
 /// Register a kafka (source) + doris (sink) datasource pair with their table
 /// objects; returns (kafka_ds_id, doris_ds_id, kafka_table_id, doris_table_id).
 pub async fn seed_datasources(app: &TestApp) -> (i64, i64, i64, i64) {
+    seed_datasources_with_jdbc(app, 19030).await
+}
+
+async fn seed_datasources_with_jdbc(app: &TestApp, jdbc_port: u16) -> (i64, i64, i64, i64) {
     let (s, b) = req(
         app,
         "POST",
@@ -429,7 +642,7 @@ pub async fn seed_datasources(app: &TestApp) -> (i64, i64, i64, i64) {
         "/api/datasources",
         Some(json!({
             "name": "shop-doris", "type": "doris",
-            "connJson": {"jdbcUrl": "jdbc:mysql://127.0.0.1:19030/shop", "streamLoadUrl": "http://127.0.0.1:18040"},
+            "connJson": {"jdbcUrl": format!("jdbc:mysql://127.0.0.1:{jdbc_port}/shop"), "streamLoadUrl": "http://127.0.0.1:18040"},
             "username": "loader", "password": "pw"
         })),
     )

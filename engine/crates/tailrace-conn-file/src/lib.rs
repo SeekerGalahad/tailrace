@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use datafusion::arrow::record_batch::RecordBatch;
 
-use tailrace_catalog::{ReliabilityOptions, TableObject};
+use tailrace_catalog::{option_keys, ReliabilityOptions, TableObject};
 use tailrace_connector::registry::ConnectorRegistry;
 use tailrace_connector::{Cursor, Sink, SinkAck, SinkCapabilities, Source, SourceChunk};
 
@@ -44,6 +44,23 @@ fn sink_factory(
     )))
 }
 
+/// File-side typed view of [`TableObject`] options (R8 G1): the file
+/// connector reuses the `bootstrap` option key as its resident directory.
+pub trait FileTableExt {
+    /// Datasource-registered directory the table name resolves against
+    /// (trimmed; empty string = no directory, bare-name resolution against
+    /// the cwd).
+    fn directory(&self) -> &str;
+}
+
+impl FileTableExt for TableObject {
+    fn directory(&self) -> &str {
+        self.option_str(option_keys::BOOTSTRAP)
+            .map(str::trim)
+            .unwrap_or_default()
+    }
+}
+
 /// Where a file table lives on disk. `bootstrap` carries the datasource's
 /// registered directory when the plan has one (the console fills it from the
 /// file datasource's `connJson.path`), and the table name is resolved against
@@ -54,14 +71,11 @@ fn sink_factory(
 /// before — standalone TOML catalogs declare no directory and keep working.
 /// An absolute table name wins over the directory (`Path::join` semantics).
 fn resolve_path(obj: &TableObject) -> PathBuf {
-    match obj
-        .bootstrap
-        .as_deref()
-        .map(str::trim)
-        .filter(|d| !d.is_empty())
-    {
-        Some(dir) => PathBuf::from(dir).join(&obj.name),
-        None => PathBuf::from(&obj.name),
+    let dir = obj.directory();
+    if dir.is_empty() {
+        PathBuf::from(&obj.name)
+    } else {
+        PathBuf::from(dir).join(&obj.name)
     }
 }
 
@@ -542,18 +556,10 @@ mod tests {
     use std::sync::Arc;
 
     fn table(name: &str, bootstrap: Option<&str>) -> TableObject {
-        TableObject {
-            datasource: "f".into(),
-            name: name.into(),
-            kind: "file".into(),
-            format: Some("jsonl".into()),
-            columns: vec![],
-            bootstrap: bootstrap.map(str::to_string),
-            stream_load_url: None,
-            auth_env: None,
-            label_prefix: None,
-            sequence_column: None,
-            partial_columns: None,
+        let obj = TableObject::new("f", name, "file").with_format("jsonl");
+        match bootstrap {
+            Some(b) => obj.with_option(option_keys::BOOTSTRAP, b),
+            None => obj,
         }
     }
 

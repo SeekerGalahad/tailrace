@@ -1,0 +1,8 @@
+--- compose-2.1.7: engine ArrayFormatter T-separator shape → DATETIME(6) ---
+    "Status": "Success",
+    "Message": "OK",
+1	2026-10-30 12:34:56.789012
+--- standing-3.1.4: engine ArrayFormatter T-separator shape → DATETIME(6) ---
+    "Status": "Success",
+    "Message": "OK",
+1	2026-10-30 12:34:56.789012

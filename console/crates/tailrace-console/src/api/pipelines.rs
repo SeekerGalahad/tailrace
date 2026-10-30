@@ -373,6 +373,147 @@ fn partial_declarations_gate(
     Ok(out)
 }
 
+/// What the live table's SHOW CREATE TABLE says about partial-update
+/// support (LOW-5, R8): Doris accepts partial loads on UNIQUE KEY
+/// merge-on-write tables only ("Only unique key merge on write support
+/// partial update" — live-probed on DUPLICATE and UNIQUE MoR alike,
+/// scripts/e2e/evidence/partial_update-2026-10-28). The parse works on a
+/// lowercased copy: the key clause (`UNIQUE KEY` / `DUPLICATE KEY`) names
+/// the model, and the MoW property decides the variant — `"true"` or
+/// ABSENT means merge-on-write (Doris ≥2.1 defaults MoW on; the A1
+/// generator always writes it explicitly, so absence means an out-of-band
+/// creation that took the default), `"false"` is merge-on-read. Anything
+/// else (AGGREGATE KEY, unrecognizable text) is not partial-capable — the
+/// gate refuses rather than guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LivePartialSupport {
+    /// UNIQUE KEY + merge-on-write — partial loads accepted.
+    UniqueMow,
+    /// DUPLICATE KEY — Doris refuses the partial load.
+    DuplicateKey,
+    /// UNIQUE KEY but merge-on-read — Doris refuses the partial load.
+    UniqueMergeOnRead,
+    /// No recognizable key clause — refuse rather than guess.
+    Unknown,
+}
+
+impl LivePartialSupport {
+    /// Diagnostic fragment naming the live verdict (rides the message).
+    fn as_str(self) -> &'static str {
+        match self {
+            LivePartialSupport::UniqueMow => "UNIQUE KEY（merge-on-write）",
+            LivePartialSupport::DuplicateKey => "DUPLICATE KEY",
+            LivePartialSupport::UniqueMergeOnRead => {
+                "UNIQUE KEY（merge-on-read，未开 enable_unique_key_merge_on_write）"
+            }
+            LivePartialSupport::Unknown => "无法识别的键模型",
+        }
+    }
+}
+
+fn live_partial_support(show_create: &str) -> LivePartialSupport {
+    let low = show_create.to_ascii_lowercase();
+    if low.contains("duplicate key") {
+        LivePartialSupport::DuplicateKey
+    } else if low.contains("unique key") {
+        // the MoW verdict = the property's value on ITS line (a later
+        // property could carry the string "false" for something else)
+        let mow = low
+            .find("enable_unique_key_merge_on_write")
+            .map(|at| {
+                let line_end = low[at..].find('\n').map(|n| at + n).unwrap_or(low.len());
+                !low[at..line_end].contains("\"false\"")
+            })
+            .unwrap_or(true);
+        if mow {
+            LivePartialSupport::UniqueMow
+        } else {
+            LivePartialSupport::UniqueMergeOnRead
+        }
+    } else {
+        LivePartialSupport::Unknown
+    }
+}
+
+/// LOW-5 (R8): the live half of the partial-declaration publish gate — for
+/// every statement whose sink already passed the registration gate (kind
+/// doris, keyModel=unique on record), `SHOW CREATE TABLE` the live table
+/// and refuse when the table itself is not a UNIQUE merge-on-write table.
+/// The registration gate alone trusts a record that can drift (the table
+/// re-created out of band, or hand-built): the record says unique, Doris
+/// says DUPLICATE, and every stream load of the pipeline fails at 3am. The
+/// FE verdict is fail-closed: `doris_show_create` erroring (unreachable /
+/// table gone) is a 502 UNAVAILABLE naming the check — the DDL endpoints'
+/// stance for a failed DESC, and the deploy-side
+/// [`schema_change_gate`]'s for a failed SHOW ALTER. Local refusals are
+/// diagnostics like the registration gate's (400, compile-shaped); only
+/// sinks that passed registration cost an FE round trip, and one sink is
+/// asked once whatever its statements' count.
+async fn live_key_model_gate(
+    state: &AppState,
+    statements: &[StatementOut],
+) -> Result<Vec<CompileDiag>, Response> {
+    let store = state.store();
+    let mut out = Vec::new();
+    let mut verdicts: HashMap<String, LivePartialSupport> = HashMap::new();
+    for (idx, st) in statements.iter().enumerate() {
+        if st.partial_columns.is_none() {
+            continue;
+        }
+        let Some(t) = store
+            .table_object_for_reference(&st.sink)
+            .map_err(|e| ApiError::internal(&e).into_response())?
+        else {
+            continue; // unregistered sinks are the caller's diagnostic
+        };
+        // only sinks that passed the registration gate get the FE trip — a
+        // kind/keyModel refusal is already decided, and must not turn into
+        // a 502 because the FE happens to be down
+        if tailrace_catalog::normalize_kind(&t.kind) != "doris"
+            || t.key_model.as_deref() != Some("unique")
+        {
+            continue;
+        }
+        let verdict = match verdicts.get(&st.sink) {
+            Some(v) => *v,
+            None => {
+                let Some(ds) = store
+                    .datasource(t.datasource_id)
+                    .map_err(|e| ApiError::internal(&e).into_response())?
+                else {
+                    continue;
+                };
+                let spec = crate::api::datasources::conn_spec(state, &ds)?;
+                let table = format!("{}.{}", t.db_name, t.table_name);
+                let show = tailrace_metadata::doris_show_create(&spec, &t.db_name, &t.table_name)
+                    .await
+                    .map_err(|e| {
+                        crate::api::datasources::unavailable(
+                            &super::messages::t(
+                                "err.pipeline.partial_live_precheck_failed",
+                                &[&table],
+                            ),
+                            e,
+                        )
+                    })?;
+                let v = live_partial_support(&show);
+                verdicts.insert(st.sink.clone(), v);
+                v
+            }
+        };
+        if verdict != LivePartialSupport::UniqueMow {
+            out.push(CompileDiag {
+                line: idx as i64 + 1,
+                message: super::messages::t(
+                    "err.pipeline.partial_live_key_model",
+                    &[&(idx + 1).to_string(), &st.sink, verdict.as_str()],
+                ),
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// Pipelines whose published SQL declares a partial-column write on
 /// `table` (T-A7 mutex, evolve side — console knowledge only, no Doris
 /// round trip): every pipeline referencing the table, recompiled from its
@@ -831,15 +972,19 @@ pub async fn compile(State(_state): State<AppState>, body: Bytes) -> Response {
 
 /// `POST /api/pipelines/{id}/publish` — gate: every referenced table object
 /// resolvable → materialize `${ds:id.db.table}` spec → version+1 → snapshot
-/// (§4.5).
+/// (§4.5). LOW-5 (R8): a partial-column declaration is additionally checked
+/// against the LIVE table (`SHOW CREATE TABLE`) once the registration gate
+/// passes — registered unique but live DUPLICATE/MoR is refused here; an
+/// unreachable FE fails closed.
 #[utoipa::path(
     post,
     path = "/api/pipelines/{id}/publish",
     params(("id" = i64, Path)),
     responses(
         (status = 200, body = PublishResponse),
-        (status = 400, body = CompileResponse, description = "gate failed: diagnostics"),
+        (status = 400, body = CompileResponse, description = "gate failed: diagnostics — including the LOW-5 live key-model verdict (registered unique, live table not merge-on-write UNIQUE)"),
         (status = 404, body = crate::api::ErrorResponse),
+        (status = 502, body = crate::api::ErrorResponse, description = "UNAVAILABLE — the partial-declaration live precheck (SHOW CREATE TABLE) could not ask the Doris FE"),
     )
 )]
 pub async fn publish(
@@ -946,6 +1091,18 @@ pub async fn publish(
     // one table entry per sink)
     if let Err(d) = sink_partial_declarations(&statements) {
         gate.push(d);
+    }
+    // LOW-5 (R8): local gate clean → the live table has the last word. A
+    // registered keyModel=unique whose live SHOW CREATE TABLE says
+    // otherwise (DUPLICATE, MoR) is a 400 here, not a 3am load failure;
+    // an unreachable FE is a fail-closed 502 (same stance as the deploy
+    // precheck). Runs only when the local gate found nothing — a local
+    // refusal is already decided and must not need the FE.
+    if gate.is_empty() {
+        match live_key_model_gate(&state, &statements).await {
+            Ok(d) => gate.extend(d),
+            Err(r) => return r,
+        }
     }
     if !gate.is_empty() {
         return (
@@ -1363,6 +1520,39 @@ pub(crate) fn build_plan_table(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    // R8 G1: connector params ride an `options` map (the engine folds it
+    // into TableObject.options); the legacy top-level spellings stay
+    // dual-written for one minor version so a pre-G1 engine reads the same
+    // plan body byte-for-byte (nulls included — the pre-G1 entry shape).
+    let mut options = serde_json::Map::new();
+    let mut opt = |k: &'static str, v: Option<&str>| {
+        if let Some(v) = v {
+            options.insert(k.into(), Value::String(v.to_string()));
+        }
+    };
+    opt("bootstrap", bootstrap.as_deref());
+    opt("stream_load_url", stream_load_url.as_deref());
+    opt("auth_env", auth_env.as_deref());
+    opt("sequence_column", sequence_column);
+    if let Some(cols) = partial_columns {
+        options.insert("partial_columns".into(), json!(cols));
+    }
+    // connJson pass-through (G1): unconsumed keys ride `options` verbatim,
+    // so a connector option added to the datasource form reaches the engine
+    // without console mapping code. The keys already consumed above are
+    // excluded (no double spelling), and credential-looking keys are
+    // dropped defensively — credentials never ride the plan body (they live
+    // in the encrypted store and reach engines as TAILRACE_DS_* env names).
+    const CONSUMED_CONN_KEYS: [&str; 4] = ["jdbcUrl", "streamLoadUrl", "bootstrap", "path"];
+    const CREDENTIAL_CONN_KEYS: [&str; 4] = ["username", "password", "token", "secret"];
+    for (k, v) in conn.as_object().into_iter().flatten() {
+        if !CONSUMED_CONN_KEYS.contains(&k.as_str())
+            && !CREDENTIAL_CONN_KEYS.contains(&k.as_str())
+            && !k.starts_with('_')
+        {
+            options.entry(k.clone()).or_insert_with(|| v.clone()); // an explicit option above wins
+        }
+    }
     let mut entry = json!({
         "reference": reference,
         "kind": kind,
@@ -1376,6 +1566,7 @@ pub(crate) fn build_plan_table(
         "stream_load_url": stream_load_url,
         "auth_env": auth_env,
         "sequence_column": sequence_column,
+        "options": options,
     });
     // T-A7: the declared subset rides only when declared (serde-default on
     // the engine side; absent key = full-row writes)
@@ -2338,8 +2529,9 @@ mod tests {
 
     /// T-A7 plan projection: the declared subset becomes the sink entry's
     /// `partial_columns` key (snake_case — the engine's PlanTableObject
-    /// field); without a declaration the key is ABSENT, not null, so an
-    /// undeclared entry is byte-identical to the pre-A7 shape.
+    /// field); without a declaration the key is ABSENT, not null — both at
+    /// the legacy top-level spelling and inside the G1 `options` map — so
+    /// an undeclared entry is byte-identical to the pre-A7 shape.
     #[test]
     fn build_plan_table_projects_the_declaration_only_when_declared() {
         let store = console_store::Store::open_in_memory().unwrap();
@@ -2383,12 +2575,79 @@ mod tests {
             .expect("registered");
         assert!(
             off.get("partial_columns").is_none(),
-            "no declaration = no key: {off}"
+            "no declaration = no legacy key: {off}"
+        );
+        assert!(
+            off["options"].get("partial_columns").is_none(),
+            "no declaration = no options key either: {off}"
         );
         // everything else is identical between the two shapes
         let mut on_sans = on.clone();
         on_sans.as_object_mut().unwrap().remove("partial_columns");
+        on_sans["options"]
+            .as_object_mut()
+            .unwrap()
+            .remove("partial_columns");
         assert_eq!(on_sans, off);
+    }
+
+    /// R8 G1 dual-write: the plan entry carries the connector params BOTH at
+    /// their legacy top-level spellings (a pre-G1 engine reads exactly the
+    /// pre-G1 shape, nulls included) and inside the `options` map (the
+    /// post-G1 engine folds options-first). Unconsumed connJson keys
+    /// pass through into `options`; credential-looking keys never do.
+    #[test]
+    fn build_plan_table_dual_writes_options_and_legacy_spellings() {
+        let store = console_store::Store::open_in_memory().unwrap();
+        let ds = store
+            .insert_datasource(
+                "d",
+                "doris",
+                r#"{"jdbcUrl":"jdbc:mysql://127.0.0.1:1/x","streamLoadUrl":"http://127.0.0.1:1","groupCommit":"off_mode","password":"leak"}"#,
+            )
+            .unwrap();
+        store
+            .insert_table_object(
+                ds,
+                "ods",
+                "orders",
+                "doris",
+                None,
+                Some(r#"[["k","utf8"]]"#),
+                None,
+                Some("unique"),
+            )
+            .unwrap();
+        // no stored credential → auth_env stays unset (the fold's null
+        // spelling); the consumed connJson keys do not double-spell
+        let entry = build_plan_table(&store, &format!("{ds}.ods.orders"), None)
+            .unwrap()
+            .expect("registered");
+        assert_eq!(
+            entry["stream_load_url"], "http://127.0.0.1:1/api/ods/orders/_stream_load",
+            "legacy top-level spelling intact (pre-G1 engines read this)"
+        );
+        assert_eq!(entry["auth_env"], Value::Null, "no credential = null");
+        assert_eq!(
+            entry["options"]["stream_load_url"], "http://127.0.0.1:1/api/ods/orders/_stream_load",
+            "options map carries the same value"
+        );
+        // connJson pass-through: unconsumed key rides options verbatim
+        assert_eq!(entry["options"]["groupCommit"], "off_mode");
+        // consumed keys are NOT passed through a second time
+        assert!(entry["options"].get("jdbcUrl").is_none());
+        assert!(entry["options"].get("streamLoadUrl").is_none());
+        // credential-looking keys never ride the plan body
+        assert!(entry["options"].get("password").is_none());
+        assert!(entry.get("password").is_none());
+        // and the entry parses into the engine's PlanTableObject with every
+        // option landing (the deploy path's own read-back)
+        let t: tailrace_catalog::PlanTableObject = serde_json::from_value(entry.clone()).unwrap();
+        assert_eq!(
+            t.option_str(tailrace_catalog::option_keys::STREAM_LOAD_URL),
+            Some("http://127.0.0.1:1/api/ods/orders/_stream_load")
+        );
+        assert_eq!(t.option_str("groupCommit"), Some("off_mode"));
     }
 
     /// T-A7 re-gate (R7 review): the gate over a statement set follows the
@@ -2487,6 +2746,46 @@ mod tests {
                 {"jobId": "1002", "state": "WAITING_TXN"}
             ]),
             "{refs}"
+        );
+    }
+
+    /// LOW-5: the SHOW CREATE TABLE verdict — the exact live-probed shapes
+    /// (e2e evidence scripts/e2e/partial_update-2026-10-28): MoW explicit,
+    /// MoW absent (Doris ≥2.1 default), MoR explicit false, DUPLICATE, and
+    /// the unrecognizable refuse-not-guess case.
+    #[test]
+    fn live_partial_support_verdicts() {
+        let mow = "CREATE TABLE `ods`.`orders` (\n  `order_no` varchar(65533) NOT NULL\n)\nUNIQUE KEY(`order_no`)\nDISTRIBUTED BY HASH(`order_no`) BUCKETS 1\nPROPERTIES (\n\"replication_num\" = \"1\",\n\"enable_unique_key_merge_on_write\" = \"true\"\n);";
+        assert_eq!(live_partial_support(mow), LivePartialSupport::UniqueMow);
+        // property absent → the ≥2.1 default is merge-on-write
+        let mow_default = "CREATE TABLE `ods`.`orders` (`order_no` varchar(65533) NOT NULL)\nUNIQUE KEY(`order_no`)\nDISTRIBUTED BY HASH(`order_no`) BUCKETS 1\nPROPERTIES (\"replication_num\" = \"1\");";
+        assert_eq!(
+            live_partial_support(mow_default),
+            LivePartialSupport::UniqueMow
+        );
+        // explicit false → merge-on-read; the "false" on a LATER line must
+        // not be mistaken for the MoW verdict
+        let mor = "CREATE TABLE `ods`.`orders` (`order_no` varchar(65533) NOT NULL)\nUNIQUE KEY(`order_no`)\nPROPERTIES (\n\"enable_unique_key_merge_on_write\" = \"false\",\n\"some_other_prop\" = \"false\"\n);";
+        assert_eq!(
+            live_partial_support(mor),
+            LivePartialSupport::UniqueMergeOnRead
+        );
+        let dup = "CREATE TABLE `ods`.`orders` (`order_no` varchar(65533) NOT NULL, `qty` bigint)\nDUPLICATE KEY(`order_no`, `qty`)\nDISTRIBUTED BY HASH(`order_no`) BUCKETS 1\nPROPERTIES (\"replication_num\" = \"1\");";
+        assert_eq!(live_partial_support(dup), LivePartialSupport::DuplicateKey);
+        // a DUPLICATE table whose properties mention the MoW key stays
+        // DUPLICATE — the key clause wins (checked first)
+        let dup_with_prop = dup.replace(
+            "\"replication_num\" = \"1\"",
+            "\"enable_unique_key_merge_on_write\" = \"true\"",
+        );
+        assert_eq!(
+            live_partial_support(&dup_with_prop),
+            LivePartialSupport::DuplicateKey
+        );
+        // no key clause at all → refuse rather than guess
+        assert_eq!(
+            live_partial_support("CREATE TABLE `t` (`a` int) DISTRIBUTED BY HASH(`a`);"),
+            LivePartialSupport::Unknown
         );
     }
 }

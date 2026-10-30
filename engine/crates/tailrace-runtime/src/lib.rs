@@ -22,7 +22,7 @@ use datafusion::logical_expr::LogicalPlan;
 
 use dlq::{BadRowPolicy, BadRowRecord};
 use pipeline_log::PipelineLogHub;
-use tailrace_catalog::{CatalogProvider, TableObject};
+use tailrace_catalog::{option_keys, CatalogProvider, TableObject};
 use tailrace_connector::ConnectorRegistry;
 use tailrace_decode::{
     ColBatch, CsvDecoder, DebeziumJsonDecoder, Decoded, Decoder, JsonDecoder, OggDecoder,
@@ -537,7 +537,9 @@ impl PipelineRunner {
             // nothing "preserved" anywhere) — refuse at assembly. The G4
             // capability flag is the branch point here, not the sink's
             // concrete type, so a future sink gets this check for free.
-            if sink_obj.partial_columns.is_some() && !sink.capabilities().partial_update {
+            if sink_obj.option(option_keys::PARTIAL_COLUMNS).is_some()
+                && !sink.capabilities().partial_update
+            {
                 anyhow::bail!(
                     "statement #{idx}: sink {} (kind={}) declares partial_columns but does \
                      not support partial update (capabilities().partial_update=false) — \
@@ -551,8 +553,8 @@ impl PipelineRunner {
                 src_obj
                     .columns
                     .iter()
-                    .map(|(n, t)| Field::new(n.clone(), arrow_type(t), true))
-                    .collect::<Vec<_>>(),
+                    .map(|(n, t)| Ok(Field::new(n.clone(), arrow_type(n, t)?, true)))
+                    .collect::<anyhow::Result<Vec<_>>>()?,
             ));
             // T-D1 broadcast join (blueprint D narrow path): dim tables load
             // FULL-TABLE over JDBC here — pipeline compile time, fail-fast
@@ -613,8 +615,7 @@ impl PipelineRunner {
                                           // doris factory validated the subset at build_sink time and the
                                           // capability gate (above) refused any sink that cannot honour it.
             let sink_cols = sink_obj
-                .partial_columns
-                .clone()
+                .option_str_list(option_keys::PARTIAL_COLUMNS)
                 .unwrap_or_else(|| sink_obj.columns.iter().map(|(n, _)| n.clone()).collect());
             let dlq = (bad_row_policy == BadRowPolicy::Dlq)
                 .then(|| dlq::BadRowDlq::new(state_dir, pipeline_id, idx));
@@ -1511,13 +1512,15 @@ fn run_statement_bounded(
     Ok(stats)
 }
 
-fn arrow_type(t: &str) -> DataType {
-    match t {
-        "int64" => DataType::Int64,
-        "float64" => DataType::Float64,
-        "bool" => DataType::Boolean,
-        _ => DataType::Utf8,
-    }
+/// G2 (R8, blueprint §7.1): column vocabulary → arrow DataType through
+/// `tailrace_catalog::ColumnType::parse` (16 words: 4 legacy kept
+/// byte-compatible + 12 new). Unknown words warn (column name + known
+/// vocabulary) and fold to Utf8 for one minor version (migration window,
+/// blueprint §7.6) — behavior-identical to the pre-G2 `_ => Utf8` fallback
+/// arm, only the warn is new. When the window const in tailrace-ir flips,
+/// this returns the hard error callers already propagate via `?`.
+fn arrow_type(column: &str, t: &str) -> anyhow::Result<DataType> {
+    tailrace_catalog::arrow_type_or_utf8(column, t)
 }
 
 fn build_decoder(obj: &TableObject) -> anyhow::Result<Box<dyn Decoder>> {
@@ -1619,8 +1622,8 @@ mod tests {
         ];
         let schema = Arc::new(Schema::new(
             cols.iter()
-                .map(|(n, t)| Field::new(n.clone(), arrow_type(t), true))
-                .collect::<Vec<_>>(),
+                .map(|(n, t)| Ok(Field::new(n.clone(), arrow_type(n, t)?, true)))
+                .collect::<anyhow::Result<Vec<_>>>()?,
         ));
         let n = 4096; // → decode_workers ≥ 2 (floor is 512×2)
         assert!(
@@ -1773,8 +1776,8 @@ mod tests {
             let schema = Arc::new(Schema::new(
                 cols_for_batches
                     .iter()
-                    .map(|(n, t)| Field::new(n.clone(), arrow_type(t), true))
-                    .collect::<Vec<_>>(),
+                    .map(|(n, t)| Ok(Field::new(n.clone(), arrow_type(n, t)?, true)))
+                    .collect::<anyhow::Result<Vec<_>>>()?,
             ));
             let ops: Vec<String> = (0..rows)
                 .map(|i| if i % 2 == 0 { "I" } else { "D" }.to_string())

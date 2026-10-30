@@ -66,19 +66,7 @@ pub type SinkFactory =
 /// reg.register_source("kafka", make_source);
 /// reg.register_sink("kafka", make_sink);
 ///
-/// let mut obj = TableObject {
-///     datasource: "ds".into(),
-///     name: "t".into(),
-///     kind: "kafka".into(),
-///     format: None,
-///     columns: vec![],
-///     bootstrap: None,
-///     stream_load_url: None,
-///     auth_env: None,
-///     label_prefix: None,
-///     sequence_column: None,
-///     partial_columns: None,
-/// };
+/// let mut obj = TableObject::new("ds", "t", "kafka");
 /// let spec = StatementSpec {
 ///     source: "ds.t".into(),
 ///     group: "tr.p1.s0".into(),
@@ -173,19 +161,7 @@ mod tests {
     #[test]
     fn unknown_kind_reports_unsupported() {
         let reg = ConnectorRegistry::new();
-        let mut obj = tailrace_catalog::TableObject {
-            datasource: "k".into(),
-            name: "t".into(),
-            kind: "mqtt".into(),
-            format: None,
-            columns: vec![],
-            bootstrap: None,
-            stream_load_url: None,
-            auth_env: None,
-            label_prefix: None,
-            sequence_column: None,
-            partial_columns: None,
-        };
+        let mut obj = tailrace_catalog::TableObject::new("k", "t", "mqtt");
         let err = match reg.build_source(&obj, &spec(), None) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("unsupported kind must fail"),
