@@ -1,0 +1,25 @@
+ok   1s  D0.1 standing doris reachable: FE doris-3.1.4-rc02-7f5ba43de6, BE alive=1
+ok   0s  D0.2 release binaries present
+ok   0s  D0.3 dedicated database tailrace_dogfood2 empty (DROP FORCE + CREATE)
+ok   0s  D1.1 console booted (--mcp-allow-write: MCP write tools enabled)
+ok   0s  D1.2 login (REST — auth is not an MCP tool)
+ok   0s  D1.3 MCP initialize handshake (serverInfo=tailrace-console, session=40f85857…) + tools/list → 14 tools
+ok   0s  D2.1 datasources via REST (doris id=1 + file id=2 — datasource registration is outside the 14-tool MCP face)
+ok   0s  D2.2 table object tailrace_dogfood2.df2_ledger registered: G2 columns (decimal(18,2)/timestamp(us)/date) + sequenceColumn=seq + keyModel=unique
+ok   0s  D3.1 MCP ddl_draft → DECIMAL(18,2) + DATETIME(6) + DATE + function_column.sequence_col=seq in the draft (read tool, no confirm needed)
+ok   0s  D3.2 ddl_execute without "confirm":true → JSON-RPC error (CONFIRM_REQUIRED, nothing ran)
+ok   0s  D3.3 MCP ddl_execute (confirm:true) → live table: amt decimal(18,2) + sequence_col property (zero hand DDL)
+ok   0s  D4.1 file table local.df2_in (jsonl, same G2 vocabulary)
+ok   0s  D4.2 batch1 seeded: 10 rows, decimal cells as strings (exactness), microsecond ts, seq=10 (1245 bytes)
+ok   0s  D4.3 engine node up
+ok   0s  D4.4 node ONLINE
+ok   0s  D5.1 MCP compile_sql (read tool) + create_pipeline (confirm) → id=1
+ok   0s  D5.2 REST publish (MCP face has no publish tool — friction) + MCP deploy_pipeline (confirm) → RUNNING
+ok   0s  D5.3 decimal conservation on the standing stack: 10 rows, SUM(amt)=100000000000024.12 exact, ceiling 99999999999999.99 and trailing-zero 0.10 row-exact
+ok   0s  D5.4 timestamp microseconds + date survive the round trip (10/10 each)
+ok   0s  D6.1 MCP trigger_backfill dryRun=true (confirm still required — write-classed tool, friction) → labelPrefix=tr-p1-s0-bf, jobId=null, table untouched
+ok   0s  D6.2 MCP trigger_backfill dryRun:false (confirm) → job=20261030-01
+ok   0s  D6.3 MCP backfill_status → job 20261030-01 done rowsWritten=10; replay absorbed by label dedup (table still 10 — UNIQUE + deterministic labels)
+ok   0s  D6.4 main pipeline still RUNNING
+ok   0s  D7.1 DROP DATABASE tailrace_dogfood2 FORCE (standing stack untouched otherwise)
+total 11s  24/24

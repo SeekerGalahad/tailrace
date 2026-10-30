@@ -1,0 +1,42 @@
+== type_precision e2e: work=/tmp/tailrace-tp-e2e fe=127.0.0.1:9030 be=127.0.0.1:8040 db=tailrace_tp_e2e console=127.0.0.1:18086 ==
+  ok    S0.1 console binary /Users/wagic/GLMProjects/tailrace/target/release/tailrace-console
+  ok    S0.2 engine node binary /Users/wagic/GLMProjects/tailrace/target/release/tailrace-node
+  ok    S0.4 compose override generated: BE swap check neutralized for the e2e stack only (/tmp/tailrace-tp-e2e/compose-be-swap-override.yml)
+  ok    S1.1 external standing doris via TAILRACE_E2E_DORIS_MYSQL (compose skipped; fe=127.0.0.1:9030 be=127.0.0.1:8040)
+  ok    S2.0 backend Alive=true (heartbeat-driven availability)
+  ok    S2.1 database tailrace_tp_e2e empty (DROP FORCE + CREATE)
+  ok    P0.1 probe_dec created (DECIMAL(18,2), hand-DDLed on purpose — this tier pins Doris, not the engine)
+  ok    P1.1 json STRING payloads (the engine's emission shape) round-trip DECIMAL(18,2) exactly — including the 18,2-ceiling 99999999999999.99 (the server contract the engine chain rides)
+  ok    P2.1 observation: json NUMBER 99999999999999.99 landed as 100000000000000.00 (2.1.7/3.1.4: 100000000000000.00 — the double trap; recorded, not asserted)
+  ok    S3.1 console booted (fresh data-dir)
+  ok    S3.2 login → 200 + token
+  ok    S3.3 doris+file datasources (d=1 f=2)
+  ok    S3.4 engine node up (serve)
+  ok    S3.5 node ONLINE
+  ok    T1.1 sink table object decimal_orders registered with the G2 vocabulary (amt decimal(18,2), ts timestamp(us), d date)
+  ok    T1.2 draft maps the new vocabulary: amt→DECIMAL(18,2), ts(timestamp(us))→DATETIME(6), d(date)→DATE (A3 mapping in the draft text)
+  ok    T1.3 execute → live SHOW CREATE TABLE carries amt decimal(18,2) / ts datetime(6) / d date (real Doris types, zero hand DDL)
+  ok    T2.1 file table local.dec_in (jsonl, same G2 vocabulary)
+  ok    T2.2 seeds: 10 rows incl. the 18,2-ceiling amount, microsecond timestamps
+  ok    T2.3 pipeline full-column file→decimal_orders deployed → RUNNING
+  ok    T2.4 CORE: 10/10 rows conserved to the cent through the engine chain — amt exact per-row (incl. 99999999999999.99), SUM(amt)=100000000000024.12 exact, ts microseconds intact, d intact (blueprint §7.7 G2 row)
+  ok    T3.1 table object orders_seq2 registered WITH sequenceColumn=seq + keyModel=unique (the declarations the generator reads)
+  ok    T3.2 draft carries the table-level property "function_column.sequence_col" = "seq" (W4 generator fix — pre-R8 drafts left it a plain column and Doris silently ignored the load header)
+  ok    T3.3 execute → live SHOW CREATE TABLE shows the sequence_col property on the table (the attribute exists in Doris, not just in the draft)
+  ok    T3.4 file tables seq2_full_in / seq2_delta_in
+  ok    T3.5 seeds: seq2_full_in 10×seq=10; seq2_delta_in 5×seq=20(new) + 5×seq=5(stale)
+  ok    T3.6 full-column pipeline → orders_seq2 RUNNING (sequence_column header rides every load)
+  ok    T3.7 first round in place: 10 rows at seq=10, SUM(qty)=45
+  ok    T3.8 partial pipeline 'INSERT INTO orders_seq2 (order_no, seq, qty)' deployed → RUNNING (partial × sequence)
+  ok    T3.9 CORE: low-seq partial overwrites REFUSED — 5 stale rows (seq=5, qty=500+i) discarded everywhere, 5 newer (seq=20) landed, unwritten note survived all 10 — the ordering protection the attribute buys (dogfooding #3 closed on the engine chain)
+  ok    T4.1 contrast table object orders_seq_bare registered WITHOUT sequenceColumn (pre-R8 shape)
+  ok    T4.2 draft for the bare table has NO sequence_col property (undeclared = not emitted)
+  ok    T4.3 bare table created
+  ok    T4.4 file tables bare_in / bare_delta (separate files — never rewrite a source under a live pipeline)
+  ok    T4.5 full-column pipeline → orders_seq_bare RUNNING (one row, seq=10)
+  ok    T4.6 first round in place (BR-0 at seq=10)
+  ok    T4.7 same stale partial (seq=5, qty=555) deployed against the attribute-less table
+  ok    T4.8 contrast: the SAME stale row overwrote the newer one on the attribute-less table (seq=5 qty=555 landed) — the exact dogfooding #3 failure form; T3's attribute is the only difference
+scripts/e2e/type_precision.sh: line 133: 92987 Terminated: 15          TAILRACE_BOOTSTRAP_TOKEN="tr_b_tp_e2e_00112233445566778899aabbccddeeff" "$CONSOLE_BIN" --addr "$CONSOLE_ADDR" --data-dir "$WORK/run" > "$WORK/console.log" 2>&1
+  ok    S4.1 external doris cleanup: DROP DATABASE tailrace_tp_e2e FORCE (standing stack untouched)
+== type_precision e2e summary: 39/39 steps passed ==

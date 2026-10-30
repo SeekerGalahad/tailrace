@@ -13,7 +13,9 @@
 //! into the target via `ColBatch::append_batch`.
 
 use datafusion::arrow::array::{
-    ArrayBuilder, BooleanBuilder, Date64Builder, Float64Builder, Int64Builder, StringBuilder,
+    ArrayBuilder, BooleanBuilder, Date32Builder, Date64Builder, Decimal128Builder, Float64Builder,
+    Int64Builder, StringBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
+    TimestampNanosecondBuilder, TimestampSecondBuilder,
 };
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::error::Result as ArrowResult;
@@ -40,6 +42,36 @@ impl ColBatch {
                 DataType::Float64 => Box::new(Float64Builder::with_capacity(rows)),
                 DataType::Boolean => Box::new(BooleanBuilder::with_capacity(rows)),
                 DataType::Date64 => Box::new(Date64Builder::with_capacity(rows)),
+                // G2 decimal(p,s) (found by the R8 type-precision e2e: this
+                // arm used to be the `unimplemented!` panic and took the
+                // node down on the first decimal row). The builder carries
+                // the declared (p,s) — without with_precision_and_scale,
+                // finish() would emit Decimal128(38,10) and the batch would
+                // fail schema validation. The scale also rides in every
+                // append path (append_decimal_json / the CSV arm); a
+                // scale-less append would corrupt silently
+                DataType::Decimal128(p, s) => Box::new(
+                    Decimal128Builder::with_capacity(rows)
+                        .with_precision_and_scale(*p, *s)
+                        .expect("schema-declared decimal(p,s) is G2-valid"),
+                ),
+                // G2 timestamp(unit) — arrow Timestamp(_, None): naive UTC.
+                // Four units = four concrete builder types (arrow has no
+                // unit-generic primitive builder)
+                DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Second, None) => {
+                    Box::new(TimestampSecondBuilder::with_capacity(rows))
+                }
+                DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Millisecond, None) => {
+                    Box::new(TimestampMillisecondBuilder::with_capacity(rows))
+                }
+                DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, None) => {
+                    Box::new(TimestampMicrosecondBuilder::with_capacity(rows))
+                }
+                DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, None) => {
+                    Box::new(TimestampNanosecondBuilder::with_capacity(rows))
+                }
+                // G2 date — arrow Date32 (days since epoch)
+                DataType::Date32 => Box::new(Date32Builder::with_capacity(rows)),
                 other => unimplemented!("decode column type {other:?}"),
             };
             builders.push(b);
@@ -115,8 +147,9 @@ impl ColBatch {
     }
 }
 
-/// Append per target column type (post-cast only five types:
-/// utf8/int64/float64/bool/date64).
+/// Append per target column type (post-cast: utf8/int64/float64/bool/date64
+/// plus the G2 shapes since R8 — the cast in `append_batch` already
+/// resolved scale/unit, so these are plain copies).
 fn append_array(b: &mut dyn ArrayBuilder, arr: &dyn datafusion::arrow::array::Array) {
     use datafusion::arrow::array::*;
     if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
@@ -151,10 +184,59 @@ fn append_array(b: &mut dyn ArrayBuilder, arr: &dyn datafusion::arrow::array::Ar
             return;
         }
     }
+    if let Some(a) = arr.as_any().downcast_ref::<Decimal128Array>() {
+        if let Some(db) = b.as_any_mut().downcast_mut::<Decimal128Builder>() {
+            for i in 0..a.len() {
+                db.append_option(if a.is_null(i) { None } else { Some(a.value(i)) });
+            }
+            return;
+        }
+    }
     if let Some(a) = arr.as_any().downcast_ref::<Date64Array>() {
         if let Some(db) = b.as_any_mut().downcast_mut::<Date64Builder>() {
             for i in 0..a.len() {
                 db.append_option(if a.is_null(i) { None } else { Some(a.value(i)) });
+            }
+        }
+    }
+    // G2: date32 + the four timestamp units (parquet/batch path — the cast
+    // in append_batch has already resolved the unit, this is a plain copy)
+    if let Some(a) = arr.as_any().downcast_ref::<Date32Array>() {
+        if let Some(db) = b.as_any_mut().downcast_mut::<Date32Builder>() {
+            for i in 0..a.len() {
+                db.append_option(if a.is_null(i) { None } else { Some(a.value(i)) });
+            }
+            return;
+        }
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<TimestampSecondArray>() {
+        if let Some(b2) = b.as_any_mut().downcast_mut::<TimestampSecondBuilder>() {
+            for i in 0..a.len() {
+                b2.append_option(if a.is_null(i) { None } else { Some(a.value(i)) });
+            }
+            return;
+        }
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<TimestampMillisecondArray>() {
+        if let Some(b2) = b.as_any_mut().downcast_mut::<TimestampMillisecondBuilder>() {
+            for i in 0..a.len() {
+                b2.append_option(if a.is_null(i) { None } else { Some(a.value(i)) });
+            }
+            return;
+        }
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+        if let Some(b2) = b.as_any_mut().downcast_mut::<TimestampMicrosecondBuilder>() {
+            for i in 0..a.len() {
+                b2.append_option(if a.is_null(i) { None } else { Some(a.value(i)) });
+            }
+            return;
+        }
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<TimestampNanosecondArray>() {
+        if let Some(b2) = b.as_any_mut().downcast_mut::<TimestampNanosecondBuilder>() {
+            for i in 0..a.len() {
+                b2.append_option(if a.is_null(i) { None } else { Some(a.value(i)) });
             }
         }
     }
@@ -185,6 +267,32 @@ fn append_nulls(b: &mut dyn ArrayBuilder, rows: usize) {
     } else if b.as_any_mut().downcast_mut::<Date64Builder>().is_some() {
         for _ in 0..rows {
             if let Some(db) = b.as_any_mut().downcast_mut::<Date64Builder>() {
+                db.append_null();
+            }
+        }
+    } else if b.as_any_mut().downcast_mut::<Decimal128Builder>().is_some() {
+        for _ in 0..rows {
+            if let Some(db) = b.as_any_mut().downcast_mut::<Decimal128Builder>() {
+                db.append_null();
+            }
+        }
+    } else if b.as_any_mut().downcast_mut::<Date32Builder>().is_some()
+        || b.as_any_mut()
+            .downcast_mut::<TimestampSecondBuilder>()
+            .is_some()
+        || b.as_any_mut()
+            .downcast_mut::<TimestampMillisecondBuilder>()
+            .is_some()
+        || b.as_any_mut()
+            .downcast_mut::<TimestampMicrosecondBuilder>()
+            .is_some()
+        || b.as_any_mut()
+            .downcast_mut::<TimestampNanosecondBuilder>()
+            .is_some()
+    {
+        for _ in 0..rows {
+            append_ts_null(b);
+            if let Some(db) = b.as_any_mut().downcast_mut::<Date32Builder>() {
                 db.append_null();
             }
         }
@@ -259,6 +367,342 @@ fn append_bool(b: &mut dyn ArrayBuilder, v: bool) {
         fb.append_value(if v { 1.0 } else { 0.0 });
     } else if let Some(db) = b.as_any_mut().downcast_mut::<Date64Builder>() {
         db.append_null();
+    }
+}
+
+// ==================== decimal(p,s) columns (G2) ====================
+//
+// Found by the R8 type-precision e2e: the json decoder met its first
+// decimal(18,2) column and died on `ColBatch::new`'s unimplemented arm.
+// The semantics below are the probed server contract
+// (scripts/e2e/evidence/type-precision-probe-2026-10-30/), mirrored on the
+// engine side:
+//
+//   * STRING cells parse as exact base-10 and NEVER pass through f64 — the
+//     18,2 ceiling 99999999999999.99 must survive bit-exact (probe P1: the
+//     string shape round-trips to the cent; that is the engine's own sink
+//     emission shape too, which is why the whole chain conserves).
+//   * NUMBER cells ride f64 (simd-json's parsed value; the original literal
+//     is gone). At the 18,2 ceiling the double has already drifted +0.01 —
+//     exactly what Doris itself does to a json NUMBER (probe P2), so the
+//     engine is consistent with the server, and operators who care write
+//     string cells (dogfooding round 2 friction note).
+//   * extra fraction digits round half-up ("12.345" at s=2 → 1235; the
+//     server rounds the same way).
+
+/// Exact base-10 → unscaled i128 at the column scale, half-up on extra
+/// fraction digits. Zero dependencies, overflow-checked (an i128 overflows
+/// only beyond decimal(38,0), outside the G2 vocabulary).
+fn parse_decimal_i128(s: &str, scale: u8) -> Option<i128> {
+    let s = s.trim();
+    let (neg, digits) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let (int_part, frac_part) = match digits.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (digits, ""),
+    };
+    if !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+        || (int_part.is_empty() && frac_part.is_empty())
+    {
+        return None;
+    }
+    let mut acc: i128 = 0;
+    for b in int_part
+        .bytes()
+        .chain(frac_part.bytes().take(scale as usize))
+    {
+        acc = acc.checked_mul(10)?.checked_add(i128::from(b - b'0'))?;
+    }
+    // pad a short fraction up to the scale (".5" at s=2 → 50)
+    for _ in (frac_part.len() as u8)..scale {
+        acc = acc.checked_mul(10)?;
+    }
+    // half-up on the first dropped fraction digit
+    if frac_part
+        .as_bytes()
+        .get(scale as usize)
+        .is_some_and(|b| b - b'0' >= 5)
+    {
+        acc = acc.checked_add(1)?;
+    }
+    Some(if neg { -acc } else { acc })
+}
+
+/// Append one JSON cell into a decimal column. Dispatched from every json
+/// walk (jsonl / ogg after / debezium after) where the field's scale is at
+/// hand; the generic append_* family cannot take it (their signatures are
+/// scale-less by design — that family serves the five legacy shapes).
+fn append_decimal_json(
+    b: &mut dyn ArrayBuilder,
+    v: Option<&simd_json::BorrowedValue<'_>>,
+    scale: u8,
+) {
+    let Some(db) = b.as_any_mut().downcast_mut::<Decimal128Builder>() else {
+        return;
+    };
+    let Some(v) = v else {
+        db.append_null();
+        return;
+    };
+    if let Some(s) = v.as_str() {
+        db.append_option(parse_decimal_i128(s, scale));
+    } else if let Some(iv) = v.as_i64() {
+        // scale ≤ 38 (G2 vocabulary), and 10^38 < i128::MAX — no overflow
+        db.append_option((iv as i128).checked_mul(10i128.pow(u32::from(scale))));
+    } else if let Some(fv) = v.as_f64() {
+        db.append_option(Some((fv * 10f64.powi(scale as i32)).round() as i128));
+    } else {
+        // JSON null / bool / nested — same treatment the typed chain gives
+        // the other numeric shapes
+        db.append_null();
+    }
+}
+
+// ==================== timestamp(unit) / date columns (G2) ====================
+//
+// The e2e that surfaced the decimal gap walks all THREE G2 words the R8
+// acceptance names (decimal/timestamp/date), so their decode face lands
+// together. Naive wall-clock semantics (arrow Timestamp(_, None)): the
+// parsed string is taken as UTC — Doris DATETIME has no timezone either,
+// and the sink emits the value back as a formatted string, so the round
+// trip is identity. Formats accepted: "YYYY-MM-DD[ HH:MM:SS[.frac]]" with
+// space or RFC3339 'T' separator (both parse on the server side too —
+// probed 2026-10-30); everything else is null, not a guess.
+
+/// Days since 1970-01-01 from a civil date (Howard Hinnant's algorithm —
+/// zero dependencies, exact for the proleptic Gregorian calendar).
+fn days_from_civil(y: i64, m: i64, d: i64) -> Option<i64> {
+    if !(1..=12).contains(&m) {
+        return None;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let dim = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if !(1..=dim).contains(&d) {
+        return None;
+    }
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146097 + doe - 719468)
+}
+
+fn unit_factor(unit: &datafusion::arrow::datatypes::TimeUnit) -> i64 {
+    match unit {
+        datafusion::arrow::datatypes::TimeUnit::Second => 1,
+        datafusion::arrow::datatypes::TimeUnit::Millisecond => 1_000,
+        datafusion::arrow::datatypes::TimeUnit::Microsecond => 1_000_000,
+        datafusion::arrow::datatypes::TimeUnit::Nanosecond => 1_000_000_000,
+    }
+}
+
+/// Narrow ISO parser → epoch value in the column's unit. Fraction digits
+/// pad with zeros / truncate at the unit's width (no rounding — a wider
+/// literal in a narrower column is a producer-side mismatch, and the server
+/// side keeps whatever fits too).
+fn parse_timestamp_i64(s: &str, unit: &datafusion::arrow::datatypes::TimeUnit) -> Option<i64> {
+    let s = s.trim();
+    let (date_part, time_part) = match s.split_once([' ', 'T', 't']) {
+        Some((d, t)) => (d, Some(t)),
+        None => (s, None),
+    };
+    let (y, rest) = date_part.split_once('-')?;
+    let (m, d) = rest.split_once('-')?; // exactly YYYY-M-D after two splits
+    let (y, m, d): (i64, i64, i64) = (y.parse().ok()?, m.parse().ok()?, d.parse().ok()?);
+    let days = days_from_civil(y, m, d)?;
+    let mut secs = days * 86_400;
+    let mut frac_units: i64 = 0;
+    if let Some(t) = time_part {
+        let (hms, frac) = match t.split_once('.') {
+            Some((h, f)) => (h, Some(f)),
+            None => (t, None),
+        };
+        let (h, rest) = hms.split_once(':')?;
+        let (mi, se) = rest.split_once(':')?;
+        let (h, mi, se): (i64, i64, i64) = (h.parse().ok()?, mi.parse().ok()?, se.parse().ok()?);
+        if !(0..24).contains(&h) || !(0..60).contains(&mi) || !(0..60).contains(&se) {
+            return None;
+        }
+        secs += h * 3_600 + mi * 60 + se;
+        if let Some(f) = frac {
+            if !f.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let width = match unit {
+                datafusion::arrow::datatypes::TimeUnit::Second => 0,
+                datafusion::arrow::datatypes::TimeUnit::Millisecond => 3,
+                datafusion::arrow::datatypes::TimeUnit::Microsecond => 6,
+                datafusion::arrow::datatypes::TimeUnit::Nanosecond => 9,
+            };
+            let mut padded = f.to_string();
+            if padded.len() > width {
+                padded.truncate(width);
+            }
+            while padded.len() < width {
+                padded.push('0');
+            }
+            if !padded.is_empty() {
+                frac_units = padded.parse().ok()?;
+            }
+        }
+    }
+    Some(secs * unit_factor(unit) + frac_units)
+}
+
+/// One JSON cell into a timestamp(unit) column: strings parse via the
+/// narrow ISO reader, integers ride through as epoch-in-unit, floats are
+/// seconds scaled.
+fn append_timestamp_json(
+    b: &mut dyn ArrayBuilder,
+    v: Option<&simd_json::BorrowedValue<'_>>,
+    unit: &datafusion::arrow::datatypes::TimeUnit,
+) {
+    use datafusion::arrow::array::{
+        TimestampMicrosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder,
+        TimestampSecondBuilder,
+    };
+    let Some(v) = v else { return append_ts_null(b) };
+    if v.is_null() {
+        return append_ts_null(b);
+    }
+    if let Some(s) = v.as_str() {
+        append_ts_str(b, Some(s), unit);
+        return;
+    }
+    let secs = if let Some(iv) = v.as_i64() {
+        iv // already in the column's unit
+    } else if let Some(fv) = v.as_f64() {
+        (fv * unit_factor(unit) as f64).round() as i64
+    } else {
+        return append_ts_null(b);
+    };
+    match unit {
+        datafusion::arrow::datatypes::TimeUnit::Second => b
+            .as_any_mut()
+            .downcast_mut::<TimestampSecondBuilder>()
+            .unwrap()
+            .append_value(secs),
+        datafusion::arrow::datatypes::TimeUnit::Millisecond => b
+            .as_any_mut()
+            .downcast_mut::<TimestampMillisecondBuilder>()
+            .unwrap()
+            .append_value(secs),
+        datafusion::arrow::datatypes::TimeUnit::Microsecond => b
+            .as_any_mut()
+            .downcast_mut::<TimestampMicrosecondBuilder>()
+            .unwrap()
+            .append_value(secs),
+        datafusion::arrow::datatypes::TimeUnit::Nanosecond => b
+            .as_any_mut()
+            .downcast_mut::<TimestampNanosecondBuilder>()
+            .unwrap()
+            .append_value(secs),
+    }
+}
+
+fn append_ts_null(b: &mut dyn ArrayBuilder) {
+    use datafusion::arrow::array::{
+        TimestampMicrosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder,
+        TimestampSecondBuilder,
+    };
+    if let Some(b) = b.as_any_mut().downcast_mut::<TimestampSecondBuilder>() {
+        b.append_null();
+    } else if let Some(b) = b.as_any_mut().downcast_mut::<TimestampMillisecondBuilder>() {
+        b.append_null();
+    } else if let Some(b) = b.as_any_mut().downcast_mut::<TimestampMicrosecondBuilder>() {
+        b.append_null();
+    } else if let Some(b) = b.as_any_mut().downcast_mut::<TimestampNanosecondBuilder>() {
+        b.append_null();
+    }
+}
+
+/// One JSON cell into a date column (Date32, days since epoch):
+/// "YYYY-MM-DD" strings, integers as days.
+fn append_date32_json(b: &mut dyn ArrayBuilder, v: Option<&simd_json::BorrowedValue<'_>>) {
+    let Some(db) = b.as_any_mut().downcast_mut::<Date32Builder>() else {
+        return;
+    };
+    let Some(v) = v else {
+        db.append_null();
+        return;
+    };
+    if let Some(s) = v.as_str() {
+        append_date32_str(b, Some(s));
+    } else if let Some(iv) = v.as_i64() {
+        db.append_option(i32::try_from(iv).ok());
+    } else {
+        db.append_null();
+    }
+}
+
+/// String → timestamp column (json string cells and CSV cells share it).
+fn append_ts_str(
+    b: &mut dyn ArrayBuilder,
+    v: Option<&str>,
+    unit: &datafusion::arrow::datatypes::TimeUnit,
+) {
+    use datafusion::arrow::array::{
+        TimestampMicrosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder,
+        TimestampSecondBuilder,
+    };
+    let parsed = v.and_then(|s| parse_timestamp_i64(s, unit));
+    if let Some(b) = b.as_any_mut().downcast_mut::<TimestampSecondBuilder>() {
+        b.append_option(parsed);
+    } else if let Some(b) = b.as_any_mut().downcast_mut::<TimestampMillisecondBuilder>() {
+        b.append_option(parsed);
+    } else if let Some(b) = b.as_any_mut().downcast_mut::<TimestampMicrosecondBuilder>() {
+        b.append_option(parsed);
+    } else if let Some(b) = b.as_any_mut().downcast_mut::<TimestampNanosecondBuilder>() {
+        b.append_option(parsed);
+    }
+}
+
+/// String → date column ("YYYY-MM-DD" → days since epoch).
+fn append_date32_str(b: &mut dyn ArrayBuilder, v: Option<&str>) {
+    let days = v.and_then(|s| {
+        let (y, rest) = s.trim().split_once('-')?;
+        let (m, d) = rest.split_once('-')?;
+        days_from_civil(y.parse().ok()?, m.parse().ok()?, d.parse().ok()?).map(|n| n as i32)
+    });
+    if let Some(db) = b.as_any_mut().downcast_mut::<Date32Builder>() {
+        db.append_option(days);
+    }
+}
+
+/// G2 typed cells (decimal/timestamp/date) — the shapes whose append needs
+/// the column's type parameters, dispatched from every json walk before the
+/// generic typed chain (which is shape-less). Returns false when the column
+/// is none of these and the caller falls through.
+fn append_g2_json(
+    b: &mut dyn ArrayBuilder,
+    dt: &DataType,
+    v: Option<&simd_json::BorrowedValue<'_>>,
+) -> bool {
+    match dt {
+        DataType::Decimal128(_, s) => {
+            append_decimal_json(b, v, u8::try_from(*s).unwrap_or(0));
+            true
+        }
+        DataType::Timestamp(unit, None) => {
+            append_timestamp_json(b, v, unit);
+            true
+        }
+        DataType::Date32 => {
+            append_date32_json(b, v);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -346,6 +790,11 @@ impl JsonDecoder {
         let (fields, builders) = batch.parts();
         for (i, f) in fields.iter().enumerate() {
             let name = f.name();
+            // G2 typed columns (decimal/timestamp/date) carry their type
+            // parameters — see append_g2_json
+            if append_g2_json(builders[i].as_mut(), f.data_type(), dom.get(name.as_str())) {
+                continue;
+            }
             match dom.get(name.as_str()).and_then(|v| v.as_str()) {
                 Some(s) => append_str(builders[i].as_mut(), Some(s)),
                 None => {
@@ -407,6 +856,15 @@ impl OggDecoder {
             }
         }
         for (i, f) in fields.iter().enumerate() {
+            // G2 typed columns (decimal/timestamp/date) carry their type
+            // parameters — see append_g2_json
+            if append_g2_json(
+                builders[i].as_mut(),
+                f.data_type(),
+                after.get(f.name().as_str()),
+            ) {
+                continue;
+            }
             match f.name().as_str() {
                 "op_type" => append_str(
                     builders[i].as_mut(),
@@ -542,6 +1000,15 @@ impl DebeziumJsonDecoder {
         let (fields, builders) = batch.parts();
         for (i, f) in fields.iter().enumerate() {
             let name = f.name();
+            // G2 typed columns (decimal/timestamp/date) carry their type
+            // parameters — see append_g2_json
+            if append_g2_json(
+                builders[i].as_mut(),
+                f.data_type(),
+                after.get(name.as_str()),
+            ) {
+                continue;
+            }
             match after.get(name.as_str()).and_then(|v| v.as_str()) {
                 Some(s) => append_str(builders[i].as_mut(), Some(s)),
                 None => {
@@ -622,6 +1089,24 @@ impl Decoder for CsvDecoder {
                     Ok(n) => append_i64(b, n),
                     Err(_) => append_i64_opt(b, None),
                 },
+                // decimal cells parse exact base-10 (see parse_decimal_i128)
+                DataType::Decimal128(_, s) => {
+                    if let Some(db) = b.as_any_mut().downcast_mut::<Decimal128Builder>() {
+                        db.append_option(if v.is_empty() {
+                            None
+                        } else {
+                            parse_decimal_i128(v, u8::try_from(*s).unwrap_or(0))
+                        });
+                    }
+                }
+                // G2 timestamp/date cells: the same narrow readers the json
+                // walks use
+                DataType::Timestamp(unit, None) => {
+                    append_ts_str(b, if v.is_empty() { None } else { Some(v) }, unit);
+                }
+                DataType::Date32 => {
+                    append_date32_str(b, if v.is_empty() { None } else { Some(v) });
+                }
                 DataType::Float64 => {
                     if let Some(fb) = b.as_any_mut().downcast_mut::<Float64Builder>() {
                         fb.append_option(v.parse::<f64>().ok());
@@ -733,6 +1218,149 @@ mod tests {
             .downcast_ref::<datafusion::arrow::array::Int64Array>()
             .unwrap();
         assert_eq!(seq.value(1), 8);
+    }
+
+    /// G2 decimal(p,s): exact base-10 parse and the probed server semantics.
+    /// Found live by the R8 type-precision e2e (the builder used to be the
+    /// `unimplemented!` panic).
+    #[test]
+    fn parse_decimal_exact_and_half_up() {
+        use super::parse_decimal_i128 as p;
+        // plain cents, trailing zero, negative, short fraction padding
+        assert_eq!(p("12.34", 2), Some(1234));
+        assert_eq!(p("0.10", 2), Some(10));
+        assert_eq!(p("-5.01", 2), Some(-501));
+        assert_eq!(p(".5", 2), Some(50));
+        assert_eq!(p("7", 2), Some(700));
+        // the 18,2 ceiling survives bit-exact — never through f64
+        assert_eq!(p("99999999999999.99", 2), Some(9999999999999999));
+        // extra digits round half-up, like the server does
+        assert_eq!(p("12.345", 2), Some(1235));
+        assert_eq!(p("12.344", 2), Some(1234));
+        // garbage is None (→ null), not a panic and not 0
+        assert_eq!(p("", 2), None);
+        assert_eq!(p("12,34", 2), None);
+        assert_eq!(p("1.2.3", 2), None);
+        assert_eq!(p("abc", 2), None);
+    }
+
+    #[test]
+    fn json_decode_decimal_column() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "amt",
+            DataType::Decimal128(18, 2),
+            true,
+        )]));
+        let mut batch = ColBatch::new(schema, 8);
+        for m in [
+            br#"{"amt":"99999999999999.99"}"#.as_slice(), // string: exact
+            br#"{"amt":"12.34"}"#.as_slice(),
+            br#"{"amt":12.34}"#.as_slice(), // number: f64 detour (fine at this magnitude)
+            br#"{"amt":7}"#.as_slice(),     // integer: scaled
+            br#"{"amt":null}"#.as_slice(),
+        ] {
+            assert_eq!(
+                JsonDecoder.decode(m.to_vec(), &mut batch, &Pushdown::default()),
+                Decoded::Append
+            );
+        }
+        let rb = batch.finish().unwrap();
+        let col = rb
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Decimal128Array>()
+            .unwrap();
+        assert_eq!(col.value(0), 9999999999999999, "ceiling survives exactly");
+        assert_eq!(col.value(1), 1234);
+        assert_eq!(col.value(2), 1234);
+        assert_eq!(col.value(3), 700, "integer scales by 10^s");
+        assert!(col.is_null(4));
+    }
+
+    /// G2 timestamp(unit)/date: narrow ISO reader + json round trip. The
+    /// space/T duality and microsecond retention mirror the probed server
+    /// behaviour (type-precision probe C / T-separator mini probe).
+    #[test]
+    fn parse_timestamp_shapes() {
+        use super::parse_timestamp_i64 as ts;
+        use datafusion::arrow::datatypes::TimeUnit as U;
+        // 2026-10-30 12:34:56.789012 in micros since epoch
+        let expect_us = 1_793_363_696_789_012i64;
+        assert_eq!(
+            ts("2026-10-30 12:34:56.789012", &U::Microsecond),
+            Some(expect_us)
+        );
+        assert_eq!(
+            ts("2026-10-30T12:34:56.789012", &U::Microsecond),
+            Some(expect_us),
+            "RFC3339 T separator"
+        );
+        // unit scaling: same instant, wider/narrower units
+        assert_eq!(
+            ts("2026-10-30 12:34:56", &U::Second),
+            Some(expect_us / 1_000_000)
+        );
+        assert_eq!(
+            ts("2026-10-30 12:34:56.789", &U::Millisecond),
+            Some(1_793_363_696_789)
+        );
+        // bare date = midnight; fraction pads/truncates at unit width
+        assert_eq!(ts("2026-10-30", &U::Second), Some(1_793_318_400));
+        assert_eq!(
+            ts("2026-10-30 12:34:56.7890125", &U::Microsecond),
+            Some(expect_us),
+            "7th digit truncated"
+        );
+        // pre-epoch date stays negative-exact
+        assert_eq!(ts("1969-12-31 23:59:59", &U::Second), Some(-1));
+        // garbage → None
+        assert_eq!(ts("2026-13-01 00:00:00", &U::Second), None, "month 13");
+        assert_eq!(ts("2026-02-30", &U::Second), None, "feb 30");
+        assert_eq!(ts("not a date", &U::Second), None);
+        assert_eq!(ts("2026-10-30 25:00:00", &U::Second), None, "hour 25");
+    }
+
+    #[test]
+    fn json_decode_timestamp_and_date_columns() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new("d", DataType::Date32, true),
+        ]));
+        let mut batch = ColBatch::new(schema, 4);
+        for m in [
+            br#"{"ts":"2026-10-30 12:34:56.789012","d":"2026-10-30"}"#.as_slice(),
+            br#"{"ts":"2026-10-30T00:00:00","d":"1970-01-01"}"#.as_slice(),
+            br#"{"ts":1793363696,"d":20756}"#.as_slice(), // epoch secs / days
+            br#"{"ts":null,"d":null}"#.as_slice(),
+        ] {
+            assert_eq!(
+                JsonDecoder.decode(m.to_vec(), &mut batch, &Pushdown::default()),
+                Decoded::Append
+            );
+        }
+        let rb = batch.finish().unwrap();
+        let ts = rb
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(ts.value(0), 1_793_363_696_789_012);
+        assert_eq!(ts.value(1), 1_793_318_400_000_000);
+        assert_eq!(ts.value(2), 1_793_363_696, "integer rides through in-unit");
+        assert!(ts.is_null(3));
+        let d = rb
+            .column(1)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Date32Array>()
+            .unwrap();
+        assert_eq!(d.value(0), 20756, "2026-10-30 in days since epoch");
+        assert_eq!(d.value(1), 0);
+        assert_eq!(d.value(2), 20756);
+        assert!(d.is_null(3));
     }
 
     #[test]
