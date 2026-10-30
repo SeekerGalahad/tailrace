@@ -26,7 +26,7 @@
 | 4 | 维表广播 join（`kind=dim` JDBC 表装配期全量装载；50 万行 / 64 MiB 上限；唯一键必检；RIGHT/FULL/CROSS 编译期拒） | 扩展轮 | `tailrace-runtime/src/dim.rs:36` `:39`（上限）；`tailrace-parser/src/lib.rs:351-359`（join 类型门） | `dim_join_flow` e2e（扩展轮评审修复轮） |
 | 5 | 建表闭环（draft→键模型必选 422→execute 全文审计→evolve 仅 ADD COLUMN；纯函数生成器+猜测标注） | R6 | `tailrace-ddl/src/lib.rs:169`（`generate_draft`）、`mysql_exec`（`tailrace-metadata/src/lib.rs:233`）；端点 `api/datasources.rs:1887/:2002/:2162` | `ddl_create.sh` **48/48**（含分区全程、evolve 重启不断、改类型 409） |
 | 6 | 回填与确定性 label（`range_fingerprint`=sha256(from,to)[..8]；`bf-` 台账/消费组隔离；崩溃恢复孤儿 job 标 failed；源门=file only） | R6 | `tailrace-conn-doris/src/lib.rs:153` `:187`（`LabelMode`）；`run_bounded`（`tailrace-runtime/src/lib.rs:773`）；`api/pipelines.rs:2319/:2420/:2277-2289` | `backfill_replay.sh` **31/31**（DUPLICATE KEY 表同区间重放两次行数不变） |
-| 7 | 部分列更新（开关=INSERT 列清单；注册门+活表门+evolve 双向互斥+引擎门四道；`columns` 头必带） | R7 | `tailrace-parser/src/lib.rs:93-98` `:276`；`with_partial_columns`（`tailrace-conn-doris/src/lib.rs:574`）；`api/pipelines.rs:359/:452/:622` | `partial_update.sh` **38/38**（compose）+ **37/37**（外部栈） |
+| 7 | 部分列更新（开关=INSERT 列清单；注册门+活表门+evolve 双向互斥+引擎门四道；`columns` 头必带） | R7 | `tailrace-parser/src/lib.rs:93-98` `:281`；`with_partial_columns`（`tailrace-conn-doris/src/lib.rs:574`）；`api/pipelines.rs:359/:452/:622` | `partial_update.sh` **38/38**（compose）+ **37/37**（外部栈） |
 | 8 | 十六型类型词汇（参数化 parse、规范 Display；未知词迁移窗 warn+折 utf8，下个 minor 翻硬错） | R8 | `tailrace-ir/src/column_type.rs:30` `:84` `:158`（`UNKNOWN_TYPE_UTF8_MIGRATION_WINDOW`） | `type_precision.sh`（decimal(18,2) 精度守恒+sequence_col 定序，compose 40/40+外部 39/39） |
 | 9 | TableObject options 化（5 通用+options；typed accessor；`option_keys` 正典；旧字段 serde 双写双读） | R8 | `tailrace-catalog/src/lib.rs:35` `:80` `:107`；`*TableExt`：conn-kafka:31 / conn-doris:256 / conn-jdbc:80 / conn-file:49 | 交叉窗口契约测试（R8 评审修复轮补） |
 | 10 | Sink 长事务钩子+能力声明（prepare/commit/abort 默认 no-op；`SinkCapabilities` 五旗标真承重） | R7 | `tailrace-connector/src/sink.rs:18` `:107/:113/:119/:126` | 契约 sink_capabilities 5 组 |
@@ -40,7 +40,7 @@
 | 工程纪律与质量门 | 9 | **9**（+治理面） | `forbid(unsafe_code)` 全仓（Cargo.toml:55-56，v1.1.0 时「实践为 0 非编译器保证」的差距闭合）；deny 新 advisory 两轮清偿（R8 `3f4c7d8`）；控制面 e2e 五脚本对真 Doris（2.1.7 compose + 3.1.4 外部栈）；CI 8 job 结构未变 |
 | 技术深度 | 8 | **9** | 十六型 wire 契约（column_type.rs:30）；DDL 生成器以「实测可建形态」为准（R6 评审教训固化）；确定性 label 的区间级幂等（conn-doris:187-213）；partial 四道门含活表实查 fail-closed（pipelines.rs:452）；MCP 描述 OpenAPI 同源防漂移（mcp.rs:739）。扣分项：exactly-once/group commit 仍未交付、回填源=file only、A4/A5 未变现 |
 | 诚实账本 | 8 | **8** | 架构正典 676 行带锚点刷新（docs/design/architecture.zh.md，post-R8 版）；dogfooding 两轮摩擦清单公开（docs/dev/dogfooding-*.md）；「estimatedRows=null 诚实降级」「缺 columns 头=Doris 静默置 NULL」等负面事实全部在档。扣分项：CHANGELOG 尚无 Unreleased 段（本轮 W4 交付） |
-| 公开面一致性 | 5 | **6** | 双 README 本轮对齐（十二项能力矩阵、版本诚实声明、roadmap.md 删档断链修复）；README 基准表补 T32/T33 行。残留：SECURITY.md:5「pre-1.0 (`0.1.x`)」、`config.yml:4` `TODO` URL、mdBook 未部署（book.toml:5）、console-api.md 局部漂移（:216 仍写 10 工具、:28 仍写 4 类词汇） |
+| 公开面一致性 | 5 | **6** | 双 README 本轮对齐（十二项能力矩阵、版本诚实声明、roadmap.md 删档断链修复）；README 基准表补 T32/T33 行。残留：SECURITY.md:5「pre-1.0 (`0.1.x`)」、`config.yml:4` `TODO` URL、mdBook 未部署（book.toml:5）、console-api.md 局部漂移（评估时点 :216 仍写 10 工具、:28 仍写 4 类词汇——前者 W3 `fb52046` 已改十四工具表；后者连同 :4「49 路径」、:84「仅 int64 可分区」两处同类 pre-A3 残留由 R8.5 评审修复轮清偿） |
 | 社区与采用 | 2 | **2** | 本段 `gh api`（2026-10-30）：stars 0 / forks 0 / open_issues 0 / watchers 0——四轮 12 项能力对采用信号零贡献，印证蓝图 §10.1 反向意见⑥ |
 
 ### 0.4 蓝图承诺范围对账（W0-W2）
@@ -68,7 +68,7 @@ v1.1.0 的四竞品对位表（§二）左列仍成立，tailrace 侧右列更�
 ### 0.6 路线展望（post-R8）
 
 - **近期（本文件所在文档轮 W3-W5）**：mdBook 八章刷新与 `mdbook build` 门禁；CHANGELOG 增 Unreleased 段（不预定版本号）；四正典逐条「声明→锚点」核查。**下一发布窗**：G2 迁移窗翻转（column_type.rs:158 常量置 false，未知类型词由 warn+折叠转硬错）排入下个 minor——这是四轮里唯一「随发布必须动行为」的开关。
-- **公开面清偿（v1.1.0 §六②③的存量债，半天量级）**：SECURITY.md:5 改「1.x 默认分支修复」；`config.yml:4` `TODO`→真实仓库；mdBook 上 gh-pages（book.toml:5 的 docs job）；console-api.md 10 工具/4 类词汇两处漂移修正。
+- **公开面清偿（v1.1.0 §六②③的存量债，半天量级）**：SECURITY.md:5 改「1.x 默认分支修复」；`config.yml:4` `TODO`→真实仓库；mdBook 上 gh-pages（book.toml:5 的 docs job）；~~console-api.md 10 工具/4 类词汇两处漂移修正~~（W3 与 R8.5 评审修复轮已清偿）。
 - **中期（下轮候选，蓝图余项）**：A4 VARIANT 直写与 A5 向量列（词汇已落，差 Doris 侧映射+e2e）；E2 告警/SLO（W2 另一半）；回填 kafka 源（分区级种子，pipelines.rs:2277 注释已登记路径）；`tailrace_pipeline_bytes_total` 喂数（metrics.rs:17 声明未喂数，待 sink ack 携带字节）；G3/G6 维持「需要时再做」。
 - **长线不变项**：exactly-once / group commit 触发器制（T36 谱系裁决维持）；MQTT 12 个月计时（2027-10-21 到期）；B 湖仓三触发器；**零用户问题的解法在分发不在功能**——0 star 与 12 项能力的并存是本段最强的实证。
 
@@ -83,7 +83,7 @@ v1.1.0 的四竞品对位表（§二）左列仍成立，tailrace 侧右列更�
 | 500 000 / 64 MiB | 维表行/内存上限 | `dim.rs:36/:39` |
 | 3 天 | Doris label 保留期=回填幂等窗口默认 | `conn-doris/src/lib.rs:183-185` |
 | 48/48、31/31、38/38+37/37、40/40+39/39、24/24 | e2e 各轮登记值 | docs/design/architecture.zh.md §11.1；dogfooding-round2-2026-10-29.md（本段未重跑） |
-| 48 / 24 / 21 / 1.1.0 | 架构正典行数 / SECURITY「pre-1.0」行 / crates.io 包数 / 现行版本 | `wc -l` 本段实测；SECURITY.md:5；CHANGELOG 1.1.0 段；Cargo.toml:39 |
+| 676 / 5 / 21 / 1.1.0 | 架构正典行数 / SECURITY「pre-1.0」所在行 / crates.io 包数 / 现行版本 | `wc -l docs/design/architecture.zh.md` = 676（评审轮更正——原记「48 / 24」为笔误，与 §0.3 自写的 676 矛盾）；SECURITY.md:5（全文 27 行）；CHANGELOG 1.1.0 段；Cargo.toml:39 |
 | 0 / 0 / 0 / 0 | stars / forks / open_issues / watchers（2026-10-30） | 本段 `gh api repos/SeekerGalahad/tailrace` 实查 |
 | aead2b5 / 3690090 / 8ce8a95 | origin/main / R8 HEAD / 本文档轮 HEAD | 本段 `git log` 实查 |
 

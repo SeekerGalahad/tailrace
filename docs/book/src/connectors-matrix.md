@@ -6,8 +6,8 @@
 
 | 类型 | 源 | 汇 | 说明 |
 |---|---|---|---|
-| kafka | ✅ | — | 主力源，分区位点游标，动态分区发现 |
-| file | ✅ | — | 本地/挂载文件；目前管理台回填唯一接受的源（字节位边界） |
+| kafka | ✅ | ✅ | 主力源，分区位点游标，动态分区发现；汇侧按行产出 JSON 对象到 topic——生产者会话内 `enable.idempotence`，broker 侧无去重 label（重放为 at-least-once），不做分区键路由（`engine/crates/tailrace-conn-kafka/src/lib.rs:48` / `:502`） |
+| file | ✅ | ✅ | 本地/挂载文件；目前管理台回填唯一接受的源（字节位边界）；汇侧每次 flush 追加 jsonl 或滚出一个 parquet part 文件（`engine/crates/tailrace-conn-file/src/lib.rs:21` / `:374`）。两汇均不声明 `partial_update` / `transactional`；parser 汇白名单为 kafka / file / doris / starrocks（`engine/crates/tailrace-parser/src/lib.rs:159`） |
 | jdbc | ✅ | — | MySQL / PostgreSQL keyset 批源（[JDBC 批源](connectors-jdbc.md)）；`tailrace-node` feature `connector-jdbc`，**默认不开** |
 | dim | 仅 JOIN | — | JDBC 承载的**广播**维表（`kind = dim`，在 JOIN 中以 `${ds:dim.<别名>}` 引用）：装配期全表装载，50 万行 / 64 MiB 上限，必须有唯一键——不是流式 join。**同样要求 `connector-jdbc` feature**（runtime 把 `dim` 改写为 `jdbc` 后经注册表取源工厂，`engine/crates/tailrace-runtime/src/dim.rs:104-111`） |
 | doris | — | ✅ | Stream Load；label 幂等（进程作用域 + 确定性）、部分列更新、sequence column |

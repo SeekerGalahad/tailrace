@@ -107,7 +107,7 @@ SQL 编译诊断（编辑器内联报错数据源）。
 - **`partial_columns`（R7 T-A7，部分列更新）**：汇表项可带 `partial_columns:[…]`（声明顺序
   的列名子集）——引擎据此让 `DorisSink` 以 `partial_columns=true` **且** `columns:<子集>`
   双头装载（`tailrace-conn-doris/src/lib.rs:574` `with_partial_columns`，**仅 Doris flavor**——
-  starrocks + `partial_columns` 在 doris 工厂层即拒绝装配，`lib.rs:571`）。装配期通用能力门：任何
+  starrocks + `partial_columns` 在 doris 工厂层即拒绝装配，`lib.rs:339-346` 的 `ensure!(flavor != StarRocks)`）。装配期通用能力门：任何
   声明了 `partial_columns` 的汇若 `capabilities().partial_update == false`（file / kafka 及未来
   任何未实现部分更新的汇）即拒绝装配并点名能力缺失（`tailrace-runtime/src/lib.rs:541-545`），
   不会把投影收窄后无声写出缺列的行。未声明的表项不带该键，与 A7 前形态逐字节一致。

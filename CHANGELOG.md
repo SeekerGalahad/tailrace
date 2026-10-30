@@ -105,7 +105,7 @@ this tree._
   otherwise a `backfill_job` row (new console migration) is created and the
   console runs `PipelineRunner::run_bounded(from, to)` in-process
   (`engine/crates/tailrace-runtime/src/lib.rs:773`) against a `bf-<job>`
-  ledger namespace (`:1560` `backfill_state_dir`) and `bf-` consumer
+  ledger namespace (`:1566` `backfill_state_dir`) and `bf-` consumer
   groups — a backfill never reads or advances the resident pipeline's
   cursor. The Doris sink gains `LabelMode::Deterministic`
   (`engine/crates/tailrace-conn-doris/src/lib.rs:187`): labels are
@@ -116,7 +116,12 @@ this tree._
   table's key model. Jobs left `pending` / `running` by a dead console are
   marked `failed` at the next start. Source gate today: `file` only, with
   byte-offset bounds (Kafka per-partition seeding is a follow-up); sinks:
-  doris / starrocks; statements with a dim join are refused. e2e
+  doris / starrocks; statements with a dim join are refused. A web panel on
+  the pipeline monitor page
+  (`web/src/pages/pipelines/parts/BackfillPanel.vue`, 523 lines, mounted at
+  `web/src/pages/pipelines/monitor.vue:548`; landed in the same R6 web commit
+  `ad0ed3d` as the DDL wizard) fronts the flow — range → dry-run preview →
+  confirm — and lists the jobs. e2e
   `backfill_replay.sh` 31/31 — the core assertion is "same range replayed
   twice on a DUPLICATE KEY table, row count unchanged".
 - Partial-column update (T-A7, R7): the switch is the SQL itself — `INSERT
@@ -139,6 +144,23 @@ this tree._
   mode. e2e `partial_update.sh` 38/38 (compose) + 37/37 (external 3.1.4):
   two columns written, the other three keep their old values row by row,
   row count unchanged.
+- Table-object registration API (T-D1 extension round + T-A7 R7): `POST
+  /api/datasources/{id}/tables` takes two new body fields — `sequenceColumn`
+  (dim pagination key / jdbc keyset cursor / Doris UNIQUE KEY dedup column;
+  required for `kind = dim`) and `keyModel` (`unique` / `duplicate`, doris
+  and starrocks datasources only) — and `GET /api/datasources/tables` returns
+  both per row (`console/crates/tailrace-console/src/api/datasources.rs:300`
+  / `:307`, row DTO `:350` / `:353`). A new `PUT
+  /api/datasources/tables/{id}` records the key model of a table created
+  outside the console (`:319` `TableKeyModelBody`, audited as
+  `TABLE_KEY_MODEL` `:1536`; route
+  `console/crates/tailrace-console/src/lib.rs:57-60` — in v1.1.0 that path
+  was DELETE-only), while the DDL `execute` step records it automatically.
+  The plan push now fills `sequence_column` from the registration (extension
+  review `c8defa5`; v1.1.0 hard-coded `"sequence_column": null` into every
+  plan table), which is what made the Doris `sequence_column` Stream Load
+  header, the jdbc cursor column and the dim pagination key reachable from
+  the console at all.
 - 16-word column type vocabulary (T-G2, R8): the type strings in
   `TableObject.columns` are now a parsed wire contract
   (`engine/crates/tailrace-ir/src/column_type.rs:30` `ColumnType`,
@@ -193,7 +215,9 @@ this tree._
   (422 `PARTIAL_DECLARATION_INVALID`) — a DUPLICATE / merge-on-read sink
   with a stale column list fails loudly instead of slipping into partial
   mode (`console/crates/tailrace-console/src/api/pipelines.rs:359`
-  `partial_declarations_gate`, shared by the three paths). A repository
+  `partial_declarations_gate` for publish and plan push — call sites `:1086`
+  / `:1291`; the backfill accept path calls the same diagnostics generator
+  `partial_declaration_diags` (`:289`) directly at `:2265`). A repository
   grep found no in-tree usage of the old form; the impact is user-side
   only.
 - `TableObject` is now five generic fields plus an options map (T-G1, R8):
@@ -205,7 +229,7 @@ this tree._
   `partial_columns`) and typed accessors per connector (`KafkaTableExt` /
   `DorisTableExt` / `JdbcTableExt` / `FileTableExt`). Wire compatibility:
   the six legacy flat keys are **double-written** on serialise and folded
-  into `options` on read for one minor-version window (`:52-57` `LEGACY`,
+  into `options` on read for one minor-version window (`:54-61` `LEGACY`,
   `:257-262` `fold_legacy`; explicit `options` keys win), so stored
   `table_object` rows and plan bodies keep working; a cross-window test
   (legacy field names + new vocabulary words in one object) pins the two

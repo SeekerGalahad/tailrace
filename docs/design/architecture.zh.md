@@ -44,7 +44,7 @@
 
 ```mermaid
 flowchart TB
-  subgraph WEB["web/ — Vue 3 控制台 SPA（构建产物 rust-embed 内嵌，pages+components 共 11254 行）"]
+  subgraph WEB["web/ — Vue 3 控制台 SPA（构建产物 rust-embed 内嵌，web/src 全部 .vue/.ts 共 11254 行：pages 含 parts 8140 + 其余 3114）"]
     PAGES["9 条路由页面 + parts/ 子组件<br/>（TableDdlWizard 建表向导 763 行 / BackfillPanel 回填面板 523 行）"]
     APIW["api 层 7 模块：auth/http/sse/pipelines/nodes/datasources/artifacts"]
   end
@@ -82,7 +82,7 @@ flowchart TB
   ROUTER --- STOREC
   MCPCL -->|"POST /mcp（免会话，限流 100 rps）"| MCP
   PROM -->|"GET /metrics（开放）"| METR
-  ROUTER -->|"register / heartbeat（m2m token）"| APIE
+  APIE -->|"register / heartbeat（m2m token；node 经 --control-plane 主动 POST，heartbeat.rs:719/:740）"| ROUTER
   PROXY -->|"/v1（Bearer/X-Node-Token 五级链）"| APIE
   DEPLOY -.->|"SSH 22（TAILRACE_SSH_KEY 公钥）"| SSHD
   DDLCP -->|"mysql_exec DDL/DESC/SHOW ALTER（FE 9030）"| DORIS
@@ -177,7 +177,7 @@ sequenceDiagram
 | 组装 | `engine/crates/tailrace-runtime/src/lib.rs:508`（`PipelineRunner::assemble`） | `:537-547` **partial 能力门**：声明了 partial_columns 的 sink 若 `capabilities().partial_update=false` 装配即拒（A7×G4，§7.3）；`:559-585` **维表装载**（dim::load_dim 全量拉取+上限检查）；`:516` 调 build_exec_plan 存 `exec_plan: Arc<LogicalPlan>` |
 | 执行 | `engine/crates/tailrace-transform/src/lib.rs:226`（`transform_plan`） | 每微批仅 `inject_src()`（:132）换 source Arc + collect；thread_local SESSION（:88）+ GreedyMemoryPool 默认 256MiB（:53 域） |
 | 解码派发 | `engine/crates/tailrace-runtime/src/lib.rs:1526`（`build_decoder`） | format→Decoder 五臂：ogg/None、json/jsonl、csv、parquet、**debezium-json（:1532）**；未知 format 显式报错不折叠 |
-| 列类型映射 | 同文件 `:1515-1520`（`arrow_type`） | 委托 `tailrace_catalog::arrow_type_or_utf8`（G2 词汇入口，§3.3） |
+| 列类型映射 | 同文件 `:1522`（`arrow_type`，文档注释 :1515-1521） | 委托 `tailrace_catalog::arrow_type_or_utf8`（G2 词汇入口，§3.3） |
 | Sink 契约 | `engine/crates/tailrace-connector/src/sink.rs:83`（`Sink` trait） | write/flush 两点 + G4 长事务钩子（:107-121）+ 能力声明（:126，§5.4）；flush=真正提交点，SinkAck 携 idempotency_key（:6-10） |
 | 主循环 | `engine/crates/tailrace-runtime/src/lib.rs:819`（`run_statement_serve`） | standalone `run_statement()`（:1088）、有界回填 `run_statement_bounded()`（:1335）三态同构（§4.2） |
 
@@ -301,7 +301,7 @@ metadata 侧同步：engine 元数据客户端的 format 白名单接受 `debezi
 - **键名正典 `option_keys`**（:35-57）：`bootstrap`（kafka broker/file 目录/jdbc URL）/ `stream_load_url` / `auth_env` / `label_prefix` / `sequence_column`（一键三义：dim=全量装载分页键、jdbc=增量游标列、doris=UNIQUE KEY 乱序去重基）/ `partial_columns`——**拼写单点**，三处消费方不会漂移。
 - **typed accessor**：语义归各连接器的 `*TableExt`——`KafkaTableExt`（conn-kafka :31）、`DorisTableExt`（conn-doris :256，含 `sequence_column()` :292 / `partial_columns()` :295）、`JdbcTableExt`（conn-jdbc :80）、`FileTableExt`（conn-file :49）。
 - **单一构造点**：`TableObject::new`（catalog :115）+ `with_*` builders——原 17+ 处 struct literal 收敛为一（grep "TableObject {" 只剩工厂体与定义）。
-- **serde 迁移窗**：序列化对 6 个 legacy 键**双写**（options + 旧顶层拼写，`option_keys::LEGACY` :52-57），读取时 legacy 拼写折叠进 options（`fold_legacy` :257-262，显式 options 键优先）——一个 minor 版本窗口后收窄为 options 单轨；跨窗口行为由「旧字段名+新词汇」交叉测试钉住（commit 3690090）。
+- **serde 迁移窗**：序列化对 6 个 legacy 键**双写**（options + 旧顶层拼写，`option_keys::LEGACY` :54-61），读取时 legacy 拼写折叠进 options（`fold_legacy` :257-262，显式 options 键优先）——一个 minor 版本窗口后收窄为 options 单轨；跨窗口行为由「旧字段名+新词汇」交叉测试钉住（commit 3690090）。
 
 ### 5.4 Sink 长事务钩子与能力声明（G4/R7）
 
@@ -317,7 +317,7 @@ metadata 侧同步：engine 元数据客户端的 format 白名单接受 `debezi
 | 域 | 路由数 | 内容 |
 |---|---|---|
 | 开放 | 5 | `/healthz`、**`GET /metrics`**（metrics.rs:40，Prometheus 惯例无会话，§9）、`POST /api/auth/login`(:190)、swagger-ui + openapi.json(:199)、SPA fallback(:201) |
-| 会话域（require_session；上传限 512MB） | **45** 路径模式 / **54** 方法处理器 | auth 2；datasources **13 路径 / 17 处理器**（含 datasource-types 1；CRUD/test/discover/infer-schema/登记 + `{id}/tables/{db}/{table}/ddl/{draft,execute,evolve}` 三端点 :86-95 + `PUT {id}/tables/{tid}` 键模型登记（T-A7 门禁基）;`GET /api/datasources/tables` 行携 `columnsJson`（datasources.rs:338-347，§6.6））；nodes admin **12 路径 / 13 处理器**（deploy/action/deploy-log 真实现，§6.5）；artifacts **2 路径 / 3 处理器**；pipelines **16 路径 / 19 处理器**（CRUD/compile/templates/publish/deploy/pause/resume/stop/recover/stats/offsets/logs(SSE)/metrics-trend + **`POST {id}/backfill` / `GET {id}/backfill/jobs`** :151-158，§7.2）——两口径均为 2026-10-30 实测（路径=`.route(` 调用数，处理器=`get/post/put/delete(api::…)` 数） |
+| 会话域（require_session；上传限 512MB） | **45** 路径模式 / **54** 方法处理器 | auth 2；datasources **13 路径 / 17 处理器**（含 datasource-types 1；CRUD/test/discover/infer-schema/登记 + `{id}/tables/{db}/{table}/ddl/{draft,execute,evolve}` 三端点 :86-95 + `PUT /api/datasources/tables/{id}` 键模型登记（T-A7 门禁基，lib.rs:57-60——与 DELETE 同路径、不在 `{id}/tables` 嵌套下）;`GET /api/datasources/tables` 行携 `columnsJson`（datasources.rs:338-347，§6.6））；nodes admin **12 路径 / 13 处理器**（deploy/action/deploy-log 真实现，§6.5）；artifacts **2 路径 / 3 处理器**；pipelines **16 路径 / 19 处理器**（CRUD/compile/templates/publish/deploy/pause/resume/stop/recover/stats/offsets/logs(SSE)/metrics-trend + **`POST {id}/backfill` / `GET {id}/backfill/jobs`** :151-158，§7.2）——两口径均为 2026-10-30 实测（路径=`.route(` 调用数，处理器=`get/post/put/delete(api::…)` 数） |
 | m2m 免会话 | 2 | `POST /api/nodes/register`、`POST /api/nodes/heartbeat` |
 | MCP 免会话 | 1 | `POST /mcp`（mcp::router :175-180，§6.7） |
 
@@ -423,7 +423,7 @@ flowchart TB
 
 - **`LabelMode::Deterministic`**（conn-doris/src/lib.rs:187-213）：label = `{prefix}-{statement_index}-{fingerprint}_{seq}`，fingerprint = `range_fingerprint(from,to)` = **sha256(from,to) 前 8 hex**；`_` 批序号是 label 公式的必要扩展（一区间一 label 会让区间第二次 flush Dedup 静默丢数据；重放的第 k 批仍得序号 k——此模式豁免序号地板）。幂等窗口 = Doris label 保留期（默认 3 天），更旧重放回落表键模型（随回填 API 文档化）。
 - **`ProcessScoped` 的地板修复**（同进程 stop→deploy 重建场景，R6 计划外真 bug）：`LABEL_SEQ_FLOORS`（:219-243）进程级记录每前缀已成功 flush 的最高序号，新实例从地板续起——否则新实例 `_0` 复用旧 label → Dedup 静默丢批而台账推进。
-- **执行面**：console 进程内 `PipelineRunner::run_bounded(from,to)`（runtime/lib.rs:773）——控制面自持已发布 spec/plan 表解析/密封凭据，是对「console 经 /v1 驱动 node」的一次性例外（常驻管道路径不动，backfill.rs:1-16 架构注记）。游标落 `bf-{jobId}` 命名空间（`backfill_state_dir` :1560）、消费组 `bf-{job}.s{n}`（backfill.rs:58）——**回填永不触碰常驻消费组与主管道台账**；Deterministic 前缀**不含 jobId**（`tr-p{id}-s{n}-bf`，:50）——同区间新 job 复现同 label 才收敛。
+- **执行面**：console 进程内 `PipelineRunner::run_bounded(from,to)`（runtime/lib.rs:773）——控制面自持已发布 spec/plan 表解析/密封凭据，是对「console 经 /v1 驱动 node」的一次性例外（常驻管道路径不动，backfill.rs:1-16 架构注记）。游标落 `bf-{jobId}` 命名空间（`backfill_state_dir` :1566）、消费组 `bf-{job}.s{n}`（backfill.rs:58）——**回填永不触碰常驻消费组与主管道台账**；Deterministic 前缀**不含 jobId**（`tr-p{id}-s{n}-bf`，:50）——同区间新 job 复现同 label 才收敛。
 
 **job 面与崩溃恢复**：`POST /api/pipelines/{id}/backfill`（pipelines.rs:2331）——`dryRun:true` 零副作用预览（jobId/estimatedRows=null 诚实降级/labelPrefix）；`false` 建 pending job 行（02_backfill_job.sql：date-slug 主键命名台账目录/审计/label）。语句约束：doris/starrocks 汇（BACKFILL_SINK_UNSUPPORTED :2255）、**不支持带 dim 的语句**（:2196——广播快照对有界重放的语义未定义，先拒）、partial 声明重过门（:2260 域）。状态机 pending→running→done|failed 为**比较交换更新**（终态不可变，console-store/src/backfill.rs:1-5）；**崩溃恢复**：console 启动期把上一进程遗留的 pending/running 孤儿 job 标 failed（main.rs:115-127 `fail_orphaned_backfill_jobs`）——jobs 列表永不显示幻影 running。验收：DUPLICATE KEY 表同区间重放两次行数不变（e2e 31/31，§11）。
 
@@ -457,7 +457,7 @@ flowchart TB
   FLUSH --> SEND["send_once（:648）PUT Stream Load"]
   SEND --> H1["label 头：当前模式 label"]
   SEND --> H2["format=json + read_json_by_line（Doris 分味）"]
-  SEND --> H3["sequence_column 头（Doris 分味，声明才有）<br/>↔ 表级 function_column.sequence_col 属性（§7.1）"]
+  SEND --> H3["sequence_column 头（Doris 分味恒发：未声明时值为空串，:678-681）<br/>↔ 表级 function_column.sequence_col 属性（§7.1）"]
   SEND --> H4{"partial_update?"}
   H4 -->|"是"| H4A["partial_columns:true + columns:子集<br/>（双头，缺 columns=Doris 静默置 NULL）"]
   H4 -->|"否"| H4B["整行写（载体=全列）"]
@@ -466,7 +466,7 @@ flowchart TB
 
 ## 八、Web 控制台
 
-### 8.1 页面矩阵（路由 9 条未变，web/src/router/index.ts:12-30；pages+parts 2026-10-30 实测 8140+3114 行）
+### 8.1 页面矩阵（路由 9 条未变，web/src/router/index.ts:12-30；2026-10-30 实测 pages 含 parts 8140 行（页面 5936 + parts 2204）+ pages 之外（api/components/layouts/router/stores/theme 等）3114 行，合计 11254）
 
 | 路由 | 行数 | 职责 |
 |---|---|---|
@@ -578,16 +578,16 @@ gantt
   section R5 1.1 发布
   v1.1.0 发布（21×1.1.0 + 9 资产）         :milestone, 2026-10-25, 0d
   section 扩展轮
-  metrics ‖ MCP ‖ 维表 join ‖ Debezium     :2026-10-26, 1d
-  merge a558231（评审修复 c8defa5）         :milestone, 2026-10-26, 0d
+  metrics ‖ MCP ‖ 维表 join ‖ Debezium     :2026-10-27, 1d
+  merge a558231（评审修复 c8defa5）         :milestone, 2026-10-28, 0d
   section R6 建表闭环与回填
-  T-A1 DDL 闭环 + T-A2 回填（e2e 48/48+31/31）:2026-10-27, 1d
+  T-A1 DDL 闭环 + T-A2 回填（e2e 48/48+31/31）:2026-10-28, 1d
   merge a364b8e（评审修复 68f262c）         :milestone, 2026-10-28, 0d
   section R7 Sink 长事务与部分列更新
-  T-G4 + T-A7 + T-A8（e2e 38/38+37/37）     :2026-10-28, 1d
+  T-G4 + T-A7 + T-A8（e2e 38/38+37/37）     :2026-10-28, 2d
   merge aead2b5（评审修复 252b0ec）         :milestone, 2026-10-29, 0d
   section R8 类型地基轮
-  T-G2 词汇 + T-G1 options + T-A3 + 顺带三项 :2026-10-29, 1d
+  T-G2 词汇 + T-G1 options + T-A3 + 顺带三项 :2026-10-29, 2d
   HEAD 3690090（评审修复轮）                :milestone, 2026-10-30, 0d
 ```
 
@@ -603,7 +603,7 @@ gantt
 1. **T33 L3 `smoke.sh --full` 未跑**（DF55 树 Doris 全链；磁盘红线拦截，随 1.1.0 显式裁决延后）：引擎覆盖以 L1 契约+宏基准行数守恒为限；R6-R8 各轮的 Doris 全链验收由控制面 e2e（§11.1 L3.5）在真 2.1.7/3.1.4 栈承担。
 2. **分区发现单向**：死分区项永不清理——v1.x。
 3. **T21/T37 fuzz**：挂起（选做不占关键路径）。
-4. **jdbc 管道 console 端到端**：`build_plan_table` 的 mysql/pg 源 connJson 键位问题（docs/connectors/jdbc.md §七）——注意 G1 options 化后此面已重构（bootstrap 键折叠），该已知边界的表述以 connectors 文档为准。
+4. **jdbc 流式批源动线缺 console 侧 e2e**：原「`build_plan_table` 的 mysql/pg 源 connJson 键位问题」已由扩展轮 T-D1 清偿（pipelines.rs:1497-1498 对 dim/jdbc kind 由 connJson `jdbcUrl` 去 `jdbc:` 前缀填 plan `bootstrap`、`sequence_column` 由登记键列下发；维表动线有 console e2e 钉住）——剩余缺口仅 jdbc 流式批源无 console 侧 e2e 覆盖（docs/connectors/jdbc.md §七）。
 5. **SSH 部署 e2e 未入 CI**：host.docker.internal 回连 + 制品版本 fixture 两处适配未在 Linux docker 主机验证。
 6. **`tailrace_pipeline_bytes_total` 未喂数**（§9）：待 sink ack 携带字节计数。
 7. **G2 迁移窗**：未知类型词 warn+折叠 Utf8 的窗口在下个 minor 版本翻硬错（column_type.rs:158 常量翻转即全链生效）。
