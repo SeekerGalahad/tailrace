@@ -63,9 +63,14 @@ pub enum ColumnType {
     ListFloat32 {
         dim: Option<u32>,
     },
-    /// `variant` (new) — Arrow `Utf8`: the raw JSON bytes pass through
-    /// unfolded and Doris VARIANT infers the sub-columns (A4 groundwork,
-    /// blueprint §7.1 note 4)
+    /// `variant` (new) — Arrow `Utf8`: the raw JSON text passes through
+    /// unfolded and Doris VARIANT infers the sub-columns (blueprint §7.1
+    /// note 4). A4: the decoder writes a nested JSON value back as its
+    /// serialized text (not NULL) when the field carries
+    /// [`VARIANT_FIELD_METADATA`] — see [`arrow_field_or_utf8`]; the sink's
+    /// ordinary string escaping is the right wire shape, because Doris
+    /// parses a JSON string literal into the variant structure (probed on
+    /// 2.1.7 and 3.1.4, scripts/e2e/evidence/variant-probe-2026-10-30/).
     Variant,
     /// `null` (new) — Arrow `Null`: an all-null column typed explicitly
     /// instead of silently falling to Utf8
@@ -183,6 +188,48 @@ pub fn arrow_type_or_utf8(column: &str, vocab: &str) -> anyhow::Result<DataType>
 /// The 16-word list embedded in every unknown-type diagnostic.
 pub const KNOWN_VOCABULARY: &str = "utf8, string, int8, int16, int32, int64, float32, float64, \
      decimal(p,s), timestamp(s|ms|us|ns), date, bool, binary, list<float32[,dim]>, variant, null";
+
+/// Arrow `Field` metadata key marking a `variant` column (A4). `variant`
+/// and `utf8` share the arrow type (`Utf8` — the raw JSON text rides as a
+/// string, see [`ColumnType::to_arrow`]), so the arrow `DataType` alone
+/// cannot tell the decoder which Utf8 columns must take a nested JSON
+/// value as its serialized text instead of NULL. The field metadata is
+/// the arrow-native per-column annotation for exactly that; value is the
+/// literal `"true"`. Every schema the engine builds from the vocabulary
+/// goes through [`arrow_field_or_utf8`] so the plan's anchored `src` schema
+/// and the decode `ColBatch` schema carry identical metadata (the
+/// micro-batch injection refuses a schema that differs from the anchor,
+/// metadata included).
+pub const VARIANT_FIELD_METADATA: &str = "tailrace.variant";
+
+/// The schema-construction entry for one declared column: [`arrow_type_or_utf8`]
+/// for the data type (same migration-window fold for unknown words),
+/// nullable, plus the [`VARIANT_FIELD_METADATA`] marker when the word is
+/// `variant`. The two legacy `Field::new(name, arrow_type(..), true)`
+/// sites (tailrace-ir plan building, tailrace-runtime assembly) migrated
+/// here so the marker cannot be present on one side and absent on the
+/// other.
+pub fn arrow_field_or_utf8(column: &str, vocab: &str) -> anyhow::Result<Field> {
+    let field = Field::new(column, arrow_type_or_utf8(column, vocab)?, true);
+    Ok(
+        if matches!(ColumnType::parse(vocab), Ok(ColumnType::Variant)) {
+            field.with_metadata(std::collections::HashMap::from([(
+                VARIANT_FIELD_METADATA.to_string(),
+                "true".to_string(),
+            )]))
+        } else {
+            field
+        },
+    )
+}
+
+/// Whether a field carries the `variant` marker (decoder-side read of
+/// [`VARIANT_FIELD_METADATA`]). Cheap on the hot path: a non-variant field
+/// has an empty metadata map and short-circuits on `is_empty`.
+pub fn is_variant_field(field: &Field) -> bool {
+    let md = field.metadata();
+    !md.is_empty() && md.get(VARIANT_FIELD_METADATA).map(String::as_str) == Some("true")
+}
 
 // ==================== recursive-descent parser (zero dependencies) ====================
 //
@@ -515,6 +562,34 @@ mod tests {
             DataType::Float64
         );
         assert_eq!(arrow_type_or_utf8("c", "bool").unwrap(), DataType::Boolean);
+    }
+
+    /// A4: the field-construction entry marks exactly the `variant` word.
+    /// utf8 — the same arrow type — carries no metadata (byte-identical to
+    /// the pre-A4 `Field::new(name, type, true)`), so schemas without a
+    /// variant column are unchanged; the unknown-word fold lands a plain
+    /// Utf8 field too (the marker is for the declared word, never a guess).
+    #[test]
+    fn variant_field_marker() {
+        let v = arrow_field_or_utf8("attrs", "variant").unwrap();
+        assert_eq!(v.name(), "attrs");
+        assert_eq!(v.data_type(), &DataType::Utf8);
+        assert!(v.is_nullable());
+        assert!(is_variant_field(&v));
+        assert_eq!(
+            v.metadata().get(VARIANT_FIELD_METADATA).map(String::as_str),
+            Some("true")
+        );
+        for word in ["utf8", "string", "int64", "varchar(64)"] {
+            let f = arrow_field_or_utf8("c", word).unwrap();
+            assert!(!is_variant_field(&f), "{word} must not carry the marker");
+            assert!(f.metadata().is_empty(), "{word} field keeps empty metadata");
+        }
+        assert_eq!(
+            arrow_field_or_utf8("c", "utf8").unwrap(),
+            Field::new("c", DataType::Utf8, true),
+            "non-variant fields are byte-identical to the legacy construction"
+        );
     }
 
     /// Blueprint §7.1 arrow mapping column, all 16 words.

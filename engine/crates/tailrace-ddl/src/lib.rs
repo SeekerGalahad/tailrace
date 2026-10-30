@@ -8,14 +8,19 @@
 //! Purity is what makes the snapshot tests (given schema → fixed DDL text)
 //! meaningful — the whole §7.2 rule table lives here and nowhere else.
 //!
-//! Vocabulary surface (G2 words landed, A3 widened the mapping): columns
-//! carry the 16-word vocabulary; the generator maps the 13 scalar words —
-//! the four legacy ones (`utf8` / `int64` / `float64` / `bool`) plus
-//! `string` / `int8` / `int16` / `int32` / `float32` / `decimal(p,s)` /
-//! `timestamp(unit)` / `date` / `binary` — per blueprint §7.1's mapping
-//! column. `list<float32>` / `variant` / `null` stay outside this round
-//! (ARRAY/VARIANT/NULL_TYPE column shapes want their own live probe, the
-//! W5 e2e pass — writing assertions before that probe is the R7 lesson).
+//! Vocabulary surface (G2 words landed, A3 widened the mapping, A4 opened
+//! `variant`): columns carry the 16-word vocabulary; the generator maps the
+//! 13 scalar words — the four legacy ones (`utf8` / `int64` / `float64` /
+//! `bool`) plus `string` / `int8` / `int16` / `int32` / `float32` /
+//! `decimal(p,s)` / `timestamp(unit)` / `date` / `binary` — per blueprint
+//! §7.1's mapping column, and `variant` → `VARIANT` (probed on 2.1.7 and
+//! 3.1.4 alike, scripts/e2e/evidence/variant-probe-2026-10-30/: a VARIANT
+//! value column creates under DUPLICATE and UNIQUE MoW, the FE refuses it as
+//! a key column, and the engine's string-shaped emission is parsed into the
+//! variant structure server-side). `list<float32>` is the A5 wave (ARRAY
+//! shape wants its own probe); `null` stays unmapped — Doris has no
+//! all-null column type and inventing one (NULL_TYPE is internal) would make
+//! the draft lie, so it keeps erroring until a use case names the target.
 //! Anything unmapped is an explicit error, not a silent fold: a draft built
 //! on a folded type would lie about the table. For the same reason the
 //! partition heuristic is **type**-based since A3 — timestamp/date columns
@@ -185,8 +190,8 @@ pub fn generate_draft(schema: &Schema, hints: &KeyHints) -> anyhow::Result<Draft
             bail!(
                 "列 {name:?} 的类型 {ty:?} 不在 DDL 生成器支持面内\
                  （utf8/string/int8/int16/int32/int64/float32/float64/decimal(p,s)/\
-                 timestamp(s|ms|us|ns)/date/bool/binary；list<float32>/variant/null 待 W5 探针后开放）\
-                 ——不静默折叠未知类型"
+                 timestamp(s|ms|us|ns)/date/bool/binary/variant；list<float32> 待 A5 探针后开放，\
+                 null 无 Doris 对应列类型）——不静默折叠未知类型"
             );
         }
     }
@@ -223,6 +228,22 @@ pub fn generate_draft(schema: &Schema, hints: &KeyHints) -> anyhow::Result<Draft
         }
         None => (guess_key_column(&schema.columns).to_string(), true),
     };
+    // A4: a VARIANT column cannot carry the key (FE: "Variant type should
+    // not be used in key column" on 3.1.4, "JSONB or VARIANT type …" on
+    // 2.1.7 — probe A3). The heuristic already steps over variant columns;
+    // this catches an explicit pick and the all-variant schema, where the
+    // heuristic has nothing else to fall back on — a draft the FE refuses
+    // is a lie, same rule as the partition executability checks.
+    if schema
+        .columns
+        .iter()
+        .any(|(n, t)| n == &key_column && t == "variant")
+    {
+        bail!(
+            "键列 {key_column:?} 的类型为 variant：Doris 不接受 VARIANT 作键列\
+             （FE 拒绝 \"Variant type should not be used in key column\"）——请改选标量列为键"
+        );
+    }
 
     let mut notes = Vec::new();
     if key_model == KeyModel::Duplicate {
@@ -375,8 +396,12 @@ pub fn generate_draft(schema: &Schema, hints: &KeyHints) -> anyhow::Result<Draft
 /// the unit is a decode-side concern only). `binary` lands STRING with the
 /// base64 convention as a column COMMENT — Doris has no native binary, and
 /// a comment rides the table (SHOW CREATE TABLE keeps it visible) where a
-/// generator note would only ride the wizard. `list<float32>` / `variant`
-/// / `null` return `None` this round (see the crate doc).
+/// generator note would only ride the wizard. `variant` lands `VARIANT`
+/// (A4 — DESC prints it back as `variant`, probed on 2.1.7 and 3.1.4; the
+/// column takes any JSON value and the engine's string-shaped emission is
+/// parsed into the variant structure server-side, so no carrier convention
+/// is needed on the DDL). `list<float32>` (A5) / `null` return `None` (see
+/// the crate doc).
 ///
 /// Public since A3: the console's evolve side (ALTER TABLE … ADD/MODIFY
 /// COLUMN texts) reuses this one mapping instead of keeping a second
@@ -395,6 +420,7 @@ pub fn doris_type(vocab: &str) -> Option<String> {
         "date" => Some("DATE".to_string()),
         "bool" => Some("BOOLEAN".to_string()),
         "binary" => Some("STRING COMMENT 'base64-encoded binary'".to_string()),
+        "variant" => Some("VARIANT".to_string()),
         _ => {
             if let Some(rest) = vocab.strip_prefix("decimal(") {
                 let params = rest.strip_suffix(')')?;
@@ -427,16 +453,24 @@ fn has_op_type(columns: &[Column]) -> bool {
 }
 
 /// Key-column heuristic (§7.2 ②): first column named `id` / `*_id` in
-/// declaration order, else the first column. A guess by definition — the
-/// caller flags it.
+/// declaration order, else the first column — skipping `variant` columns at
+/// both steps (A4: the FE refuses VARIANT as a key column, probe A3). A guess
+/// by definition — the caller flags it. When every column is variant the
+/// first one comes back anyway and [`generate_draft`]'s key-type check turns
+/// that into the explicit error.
 fn guess_key_column(columns: &[Column]) -> &str {
-    for (name, _) in columns {
+    let scalar = |(_, ty): &&Column| ty != "variant";
+    for (name, _) in columns.iter().filter(scalar) {
         let n = name.to_ascii_lowercase();
         if n == "id" || n.ends_with("_id") {
             return name.as_str();
         }
     }
-    &columns[0].0
+    columns
+        .iter()
+        .find(scalar)
+        .map(|(n, _)| n.as_str())
+        .unwrap_or(&columns[0].0)
 }
 
 /// Whether a vocabulary word can carry a RANGE partition key (executability
@@ -520,7 +554,8 @@ mod tests {
     //! generator's vocabulary × UNIQUE/DUPLICATE × partitioned/plain, and every
     //! partitioned shape asserted here was created successfully on a live
     //! Doris 2.1.7 (R6 review round; the A3 shapes — new column types,
-    //! DATETIME/DATE RANGE keys, the binary COMMENT — re-probed 2026-10-30)
+    //! DATETIME/DATE RANGE keys, the binary COMMENT — re-probed 2026-10-30;
+    //! the A4 variant shapes probed on 2.1.7 AND 3.1.4 the same day)
     //! — the skipped shapes are the ones the FE refused.
 
     use super::*;
@@ -1180,6 +1215,145 @@ PROPERTIES (
         assert!(d.notes.is_empty(), "{:?}", d.notes);
     }
 
+    // ⑫ A4 — variant value column on a DUPLICATE table (probe A1 shape,
+    // scripts/e2e/evidence/variant-probe-2026-10-30/, created on 2.1.7 and
+    // 3.1.4 alike): `variant` lands VARIANT, no COMMENT convention (the
+    // server parses the engine's string-shaped emission into the variant
+    // structure, probe B2). The key heuristic rides `id` as before.
+    #[test]
+    fn snapshot_variant_value_column_duplicate() {
+        let s = schema(
+            "shop",
+            "events",
+            &[("id", "int64"), ("payload", "variant"), ("memo", "utf8")],
+        );
+        let d = generate_draft(&s, &KeyHints::default()).unwrap();
+        assert_eq!(
+            d.ddl,
+            r#"CREATE TABLE IF NOT EXISTS `shop`.`events` (
+    `id` BIGINT,
+    `payload` VARIANT,
+    `memo` VARCHAR(65533)
+)
+DUPLICATE KEY(`id`)
+DISTRIBUTED BY HASH(`id`) BUCKETS AUTO;"#
+        );
+        assert_eq!(d.key_model, KeyModel::Duplicate);
+        assert_eq!(d.key_column, "id");
+        assert!(d.partition.is_none());
+        assert!(d.notes.is_empty(), "{:?}", d.notes);
+    }
+
+    // ⑬ A4 — variant value column under UNIQUE KEY merge-on-write (probe A2
+    // shape; probe C: partial_columns updates of OTHER columns preserve the
+    // variant value, updates of the variant column replace it whole). The
+    // CDC op_type evidence picks UNIQUE, the variant column is a plain value
+    // column next to a decimal.
+    #[test]
+    fn snapshot_variant_unique_mow_cdc() {
+        let s = schema(
+            "shop",
+            "cdc_orders",
+            &[
+                ("op_type", "utf8"),
+                ("order_id", "utf8"),
+                ("attrs", "variant"),
+                ("amount", "decimal(18,2)"),
+            ],
+        );
+        let hints = KeyHints {
+            replication_num: Some(1),
+            ..KeyHints::default()
+        };
+        let d = generate_draft(&s, &hints).unwrap();
+        assert_eq!(
+            d.ddl,
+            r#"CREATE TABLE IF NOT EXISTS `shop`.`cdc_orders` (
+    `order_id` VARCHAR(65533),
+    `op_type` VARCHAR(65533),
+    `attrs` VARIANT,
+    `amount` DECIMAL(18,2)
+)
+UNIQUE KEY(`order_id`)
+DISTRIBUTED BY HASH(`order_id`) BUCKETS AUTO
+PROPERTIES (
+    "enable_unique_key_merge_on_write" = "true",
+    "replication_num" = "1"
+);"#
+        );
+        assert_eq!(d.key_model, KeyModel::Unique);
+        assert_eq!(d.key_column, "order_id");
+        assert!(d.notes.is_empty(), "{:?}", d.notes);
+    }
+
+    // ⑬b A4 — a variant column never carries the key (FE refuses it, probe
+    // A3): the heuristic steps over variant columns at both the `*_id` step
+    // and the first-column fallback; an explicit variant pick and an
+    // all-variant schema are explicit errors, not FE-refused drafts.
+    #[test]
+    fn variant_never_takes_the_key() {
+        // heuristic: the leading variant column is skipped for the *_id one
+        let d = generate_draft(
+            &schema(
+                "m",
+                "t",
+                &[("meta", "variant"), ("user_id", "int64"), ("v", "float64")],
+            ),
+            &KeyHints::default(),
+        )
+        .unwrap();
+        assert_eq!(d.key_column, "user_id");
+        assert!(d.key_column_guessed);
+        assert!(d.ddl.starts_with(
+            "CREATE TABLE IF NOT EXISTS `m`.`t` (\n    `user_id` BIGINT,\n    `meta` VARIANT,"
+        ));
+        // heuristic: no id-shaped column → first NON-variant column
+        let d = generate_draft(
+            &schema("m", "t", &[("meta", "variant"), ("region", "utf8")]),
+            &KeyHints::default(),
+        )
+        .unwrap();
+        assert_eq!(d.key_column, "region");
+        // explicit variant key → error naming the type
+        let e = generate_draft(
+            &schema("m", "t", &[("id", "int64"), ("meta", "variant")]),
+            &KeyHints {
+                key_column: Some("meta".into()),
+                ..KeyHints::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("meta") && e.contains("variant") && e.contains("键列"),
+            "{e}"
+        );
+        // all-variant schema: nothing can carry the key
+        let e = generate_draft(&schema("m", "t", &[("v", "variant")]), &KeyHints::default())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("variant") && e.contains("键列"), "{e}");
+    }
+
+    // ⑬c A4 — a time-shaped NAME typed variant is text-about-time at best:
+    // not a RANGE key (same path as the utf8 case ④), skip reason spells
+    // the Doris type.
+    #[test]
+    fn variant_time_shaped_name_is_not_a_partition_key() {
+        let d = generate_draft(
+            &schema("m", "t", &[("id", "int64"), ("event_ts", "variant")]),
+            &KeyHints::default(),
+        )
+        .unwrap();
+        assert!(d.partition.is_none());
+        assert_eq!(d.notes.len(), 1, "{:?}", d.notes);
+        assert!(
+            d.notes[0].contains("`event_ts`") && d.notes[0].contains("variant（VARIANT）"),
+            "{}",
+            d.notes[0]
+        );
+    }
+
     #[test]
     fn rejects_bad_inputs() {
         // empty db (dot-less Kafka topic) / empty table / no columns
@@ -1204,7 +1378,8 @@ PROPERTIES (
         // outside the generator's vocabulary — explicit, no silent fold.
         // Two distinct refusals: a word the 16-vocabulary itself rejects
         // (external spelling), and a legal word whose Doris mapping is not
-        // open this round (list/variant/null — the W5 probe pass).
+        // open yet (list<float32> is the A5 wave; null has no Doris column
+        // type — variant opened in A4).
         let e = generate_draft(
             &schema("db", "t", &[("id", "int64"), ("name", "varchar(64)")]),
             &KeyHints::default(),
@@ -1222,7 +1397,17 @@ PROPERTIES (
         .unwrap_err()
         .to_string();
         assert!(
-            e.contains("list<float32>") && e.contains("待 W5 探针后开放"),
+            e.contains("list<float32>") && e.contains("待 A5 探针后开放"),
+            "{e}"
+        );
+        let e = generate_draft(
+            &schema("db", "t", &[("id", "int64"), ("nothing", "null")]),
+            &KeyHints::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("\"null\"") && e.contains("无 Doris 对应列类型"),
             "{e}"
         );
         // parametric bounds mirror the vocabulary contract (p ≤ 38, s ≤ p)

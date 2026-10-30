@@ -5853,6 +5853,7 @@ dependencies = [
  "datafusion",
  "serde_json",
  "simd-json",
+ "tailrace-ir",
 ]
 
 [[package]]

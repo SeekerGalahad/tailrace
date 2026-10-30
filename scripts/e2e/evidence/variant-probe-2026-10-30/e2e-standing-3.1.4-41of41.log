@@ -1,0 +1,44 @@
+== variant e2e: work=/tmp/tailrace-va-e2e fe=127.0.0.1:9030 be=127.0.0.1:8040 db=tailrace_va_e2e console=127.0.0.1:18086 ==
+  ok    S0.1 console binary /Users/wagic/GLMProjects/tailrace/target/debug/tailrace-console
+  ok    S0.2 engine node binary /Users/wagic/GLMProjects/tailrace/target/debug/tailrace-node
+  ok    S0.4 compose override generated: BE swap check neutralized for the e2e stack only (/tmp/tailrace-va-e2e/compose-be-swap-override.yml)
+  ok    S1.1 external standing doris via TAILRACE_E2E_DORIS_MYSQL (compose skipped; fe=127.0.0.1:9030 be=127.0.0.1:8040)
+  ok    S2.0 backend Alive=true (heartbeat-driven availability)
+  ok    S2.1 database tailrace_va_e2e empty (DROP FORCE + CREATE)
+  ok    P0.1 probe_var created (VARIANT, hand-DDLed on purpose — this tier pins Doris, not the engine)
+  ok    P1.1 json STRING shape (the engine's sink emission) parses into the variant structure — v['a']['b']=42 on BOTH shapes, identical to the bare object (probe B2 re-pinned; the contract decoder+sink ride without any sink change)
+  ok    P1.2 deeper leaves ride too: v['a']['c']='x', v['arr']=[7,8,9] (sub-column, not raw-text, assertion)
+  ok    P2.1 UNIQUE MoW partial_columns: other-column update preserves the variant value (keep=orig); variant update replaces it WHOLE (keep gone, new=replaced) — no deep merge (probe C re-pinned)
+  ok    S3.1 console booted (fresh data-dir)
+  ok    S3.2 login → 200 + token
+  ok    S3.3 doris+file datasources (d=1 f=2)
+  ok    S3.4 engine node up (serve)
+  ok    S3.5 node ONLINE
+  ok    T1.1 sink table object variant_events registered (payload variant — the A4 word through the console)
+  ok    T1.2 draft maps variant→VARIANT (A4 mapping in the draft text)
+  ok    T1.3 execute → live SHOW CREATE TABLE carries 'payload variant' (real Doris type, zero hand DDL)
+  ok    T1.4 evolve reports changed=false — DESC folds the live variant column back to the 'variant' word (round-trip stable, no false retyped diff)
+  ok    T1.5 keyColumn=payload → 400 naming variant (the generator refuses a draft the FE would refuse; probe A3)
+  ok    T2.1 file table local.var_in (jsonl, payload variant)
+  ok    T2.2 seeds: 8 rows (nested all-leaf-kinds / array root / string / 4-level deep / null / absent / conflicting k types)
+  ok    T2.3 pipeline full-column file→variant_events deployed → RUNNING
+  ok    T2.4 COUNT=8/8 through the engine chain
+  ok    T2.5 CORE E-1: every leaf of the nested doc answers from the variant — a.b=1, a.c='x', arr=[7,8,9], s='hello', f=1.5, t→1 (n:null dropped server-side, probe B1); the JSON null leaf does NOT fail the row
+  ok    T2.6 E-4 four-level path payload['l1']['l2']['l3']['l4']='deep'
+  ok    T2.7 E-5/E-6 payload NULL (json null and absent alike), E-3 string payload stored as a string scalar
+  ok    T2.8 conflicting sub-column types both answer (k=100 on E-7, k='one hundred' on E-8 — the widened sub-column; CAST spelling onehundred, probe D)
+  ok    T3.1 table object variant_mow registered (UNIQUE, payload variant — probe A2 shape)
+  ok    T3.2 variant_mow created (draft → execute)
+  ok    T3.3 full-column pipeline → variant_mow RUNNING (K1 with the nested payload)
+  ok    T3.4 first round in place (K1 payload.keep=orig via sub-column)
+  ok    T3.5 partial pipeline (k, note) deployed → RUNNING (variant column NOT in the write set)
+  ok    T3.6 CORE other-column partial update PRESERVES the variant value (keep=orig survived note=renamed)
+  ok    T3.7 partial pipeline (k, payload) deployed → RUNNING (variant column IS the write set)
+  ok    T3.8 CORE variant-column partial update replaces the value WHOLE (new=replaced, keep gone — no deep merge) and preserves note (probe C through the engine)
+  ok    T4.1 sink variant_dbz created (draft → execute)
+  ok    T4.2 seeds: debezium c/u events with nested after.payload + one delete (skipped)
+  ok    T4.3 pipeline file(debezium-json)→variant_dbz deployed → RUNNING
+  ok    T4.4 CORE debezium after.payload nested → VARIANT: D-1 a.b=1/src=create, D-2 a.b=2; the delete event skipped (COUNT=2) — the second decoder's passthrough
+scripts/e2e/variant.sh: line 136: 61672 Terminated: 15          TAILRACE_BOOTSTRAP_TOKEN="tr_b_va_e2e_00112233445566778899aabbccddeeff" "$CONSOLE_BIN" --addr "$CONSOLE_ADDR" --data-dir "$WORK/run" > "$WORK/console.log" 2>&1
+  ok    S4.1 external doris cleanup: DROP DATABASE tailrace_va_e2e FORCE (standing stack untouched)
+== variant e2e summary: 41/41 steps passed ==

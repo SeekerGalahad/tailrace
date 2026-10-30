@@ -17,7 +17,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::datatypes::{Field, Schema};
 use datafusion::logical_expr::LogicalPlan;
 
 use dlq::{BadRowPolicy, BadRowRecord};
@@ -553,7 +553,7 @@ impl PipelineRunner {
                 src_obj
                     .columns
                     .iter()
-                    .map(|(n, t)| Ok(Field::new(n.clone(), arrow_type(n, t)?, true)))
+                    .map(|(n, t)| arrow_field(n, t))
                     .collect::<anyhow::Result<Vec<_>>>()?,
             ));
             // T-D1 broadcast join (blueprint D narrow path): dim tables load
@@ -1512,15 +1512,19 @@ fn run_statement_bounded(
     Ok(stats)
 }
 
-/// G2 (R8, blueprint §7.1): column vocabulary → arrow DataType through
+/// G2 (R8, blueprint §7.1): declared column → arrow Field through
 /// `tailrace_catalog::ColumnType::parse` (16 words: 4 legacy kept
 /// byte-compatible + 12 new). Unknown words warn (column name + known
 /// vocabulary) and fold to Utf8 for one minor version (migration window,
 /// blueprint §7.6) — behavior-identical to the pre-G2 `_ => Utf8` fallback
 /// arm, only the warn is new. When the window const in tailrace-ir flips,
-/// this returns the hard error callers already propagate via `?`.
-fn arrow_type(column: &str, t: &str) -> anyhow::Result<DataType> {
-    tailrace_catalog::arrow_type_or_utf8(column, t)
+/// this returns the hard error callers already propagate via `?`. A4: the
+/// field carries the `variant` marker metadata (tailrace-ir
+/// `VARIANT_FIELD_METADATA`) — the same entry tailrace-ir's plan builder
+/// uses, so the ColBatch schema built here and the plan's anchored `src`
+/// schema compare equal at injection.
+fn arrow_field(column: &str, t: &str) -> anyhow::Result<Field> {
+    tailrace_catalog::arrow_field_or_utf8(column, t)
 }
 
 fn build_decoder(obj: &TableObject) -> anyhow::Result<Box<dyn Decoder>> {
@@ -1622,7 +1626,7 @@ mod tests {
         ];
         let schema = Arc::new(Schema::new(
             cols.iter()
-                .map(|(n, t)| Ok(Field::new(n.clone(), arrow_type(n, t)?, true)))
+                .map(|(n, t)| arrow_field(n, t))
                 .collect::<anyhow::Result<Vec<_>>>()?,
         ));
         let n = 4096; // → decode_workers ≥ 2 (floor is 512×2)
@@ -1776,7 +1780,7 @@ mod tests {
             let schema = Arc::new(Schema::new(
                 cols_for_batches
                     .iter()
-                    .map(|(n, t)| Ok(Field::new(n.clone(), arrow_type(n, t)?, true)))
+                    .map(|(n, t)| arrow_field(n, t))
                     .collect::<anyhow::Result<Vec<_>>>()?,
             ));
             let ops: Vec<String> = (0..rows)
@@ -1828,6 +1832,76 @@ mod tests {
         })
         .join()
         .expect("wiring test thread")?;
+        Ok(())
+    }
+
+    /// A4 wiring acceptance: a `variant` column's field marker rides BOTH the
+    /// plan's anchored `src` schema (tailrace-ir `build_exec_plan`) and the
+    /// ColBatch schema assembled here — the micro-batch injection compares
+    /// the two with metadata included and refuses a mismatch, so the two
+    /// construction sites must agree byte-for-byte. End to end: a nested
+    /// JSON row decodes through the real JsonDecoder into a ColBatch, the
+    /// batch injects into the plan, and the variant cell comes out as the
+    /// original sub-document's JSON text.
+    #[test]
+    fn a4_variant_schema_survives_plan_injection() -> anyhow::Result<()> {
+        use datafusion::arrow::array::{Array, StringArray};
+        let cols = vec![
+            ("id".to_string(), "int64".to_string()),
+            ("attrs".to_string(), "variant".to_string()),
+            ("note".to_string(), "utf8".to_string()),
+        ];
+        let plan = std::sync::Arc::new(tailrace_ir::build_exec_plan(
+            "SELECT id, attrs, note FROM src",
+            &cols,
+        )?);
+        let schema = Arc::new(Schema::new(
+            cols.iter()
+                .map(|(n, t)| arrow_field(n, t))
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        ));
+        assert!(
+            tailrace_ir::is_variant_field(schema.field(1)),
+            "runtime schema stamps the marker"
+        );
+        let mut cb = ColBatch::new(schema, 4);
+        let raw = br#"{"id":7,"attrs":{"a":{"b":1,"c":"x"},"arr":[1,2,3]},"note":{"nested":"stays-null"}}"#;
+        assert_eq!(
+            JsonDecoder.decode(raw.to_vec(), &mut cb, &Pushdown::default()),
+            Decoded::Append
+        );
+        let batch = cb.finish()?;
+        let opts = tailrace_transform::TransformOptions::default();
+        std::thread::spawn(move || -> anyhow::Result<()> {
+            // the injection's schema equality is the assertion: a marker on
+            // one side only would surface as "micro-batch schema differs"
+            let out = tailrace_transform::transform_plan(&plan, batch, &opts)?;
+            let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(rows, 1);
+            let attrs = out[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("attrs utf8");
+            let got: serde_json::Value = serde_json::from_str(attrs.value(0))?;
+            assert_eq!(
+                got,
+                serde_json::json!({"a":{"b":1,"c":"x"},"arr":[1,2,3]}),
+                "variant cell is the original sub-document, leaves unparsed"
+            );
+            let note = out[0]
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("note utf8");
+            assert!(
+                note.is_null(0),
+                "the unmarked utf8 sibling keeps NULLing nested values"
+            );
+            Ok(())
+        })
+        .join()
+        .expect("a4 wiring test thread")?;
         Ok(())
     }
 

@@ -23,8 +23,9 @@ pub use plan_options::{PlanOptions, RecoveryOptions, ReliabilityOptions, TuningO
 /// `arrow_type` sites (runtime + ir) map through
 /// [`arrow_type_or_utf8`], which folds unknown words to Utf8 behind a
 /// one-minor-version warn window (const in tailrace-ir) instead of erroring
-/// on the spot.
-pub use tailrace_ir::column_type::{arrow_type_or_utf8, ColumnType};
+/// on the spot. A4: schema construction goes through [`arrow_field_or_utf8`]
+/// (same fold, plus the `variant` field marker the decoder reads).
+pub use tailrace_ir::column_type::{arrow_field_or_utf8, arrow_type_or_utf8, ColumnType};
 
 /// Option key canon (R8 G1): the names of the legacy top-level fields that
 /// moved into `TableObject::options`. The catalog owns the SPELLING only

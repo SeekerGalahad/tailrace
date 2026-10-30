@@ -4,7 +4,10 @@
 //! anchors only); `debug_sql_echo` is diagnostic echo and never executed.
 
 pub mod column_type;
-pub use column_type::{arrow_type_or_utf8, ColumnType, UNKNOWN_TYPE_UTF8_MIGRATION_WINDOW};
+pub use column_type::{
+    arrow_field_or_utf8, arrow_type_or_utf8, is_variant_field, ColumnType,
+    UNKNOWN_TYPE_UTF8_MIGRATION_WINDOW, VARIANT_FIELD_METADATA,
+};
 pub mod placeholder;
 pub use placeholder::{IrCodec, SrcPlaceholderTable};
 
@@ -64,12 +67,11 @@ pub fn build_exec_plan(
                             .map(|(n, t)| {
                                 // G2: vocabulary goes through ColumnType::parse
                                 // (16 words, blueprint §7.1) — unknown words
-                                // warn + fold to Utf8 for one minor version
-                                Ok(datafusion::arrow::datatypes::Field::new(
-                                    n.clone(),
-                                    arrow_type_or_utf8(n, t)?,
-                                    true,
-                                ))
+                                // warn + fold to Utf8 for one minor version.
+                                // A4: the field entry also stamps the variant
+                                // marker, identically to the runtime's ColBatch
+                                // schema (the injection compares them)
+                                arrow_field_or_utf8(n, t)
                             })
                             .collect::<anyhow::Result<Vec<_>>>()?,
                     );

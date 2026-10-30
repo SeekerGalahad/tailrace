@@ -11,6 +11,15 @@
 //! declared schema columns; inference belongs to the console discover step).
 //! parquet brings its own schema: the whole file is one batch, column-cast
 //! into the target via `ColBatch::append_batch`.
+//!
+//! Nested JSON values (objects / arrays) in a field: a scalar column cannot
+//! hold them and the typed chain NULLs them — except a `variant` column (A4,
+//! marked on its arrow Field by tailrace-ir's `VARIANT_FIELD_METADATA`),
+//! which takes the value's serialized JSON text verbatim, leaves unparsed:
+//! the sink escapes it as an ordinary string and Doris parses the string
+//! literal into the VARIANT structure server-side (probed on 2.1.7 and
+//! 3.1.4, scripts/e2e/evidence/variant-probe-2026-10-30/ B2). See
+//! [`append_variant_json`].
 
 use datafusion::arrow::array::{
     ArrayBuilder, BooleanBuilder, Date32Builder, Date64Builder, Decimal128Builder, Float64Builder,
@@ -706,6 +715,43 @@ fn append_g2_json(
     }
 }
 
+// ==================== variant columns (A4) ====================
+//
+// A `variant` column is arrow Utf8 like `utf8`; what sets it apart is the
+// `VARIANT_FIELD_METADATA` marker tailrace-ir stamps on its Field (the same
+// construction on the plan side and the ColBatch side — the micro-batch
+// injection compares the two schemas, metadata included). The decoder's
+// contract for such a column is "do not parse the leaves": a nested object
+// or array is written back as its serialized JSON text, so the whole
+// sub-document reaches Doris and the server-side VARIANT does the
+// sub-column inference. Every other cell shape is unchanged — strings ride
+// as-is, numbers/bools as their JSON text, null/absent as NULL.
+//
+// Wire shape, probed (scripts/e2e/evidence/variant-probe-2026-10-30/ B2 /
+// C1 / C3, 2.1.7 and 3.1.4 alike): the sink escapes the text like any Utf8
+// cell (`"{\"a\":{\"b\":1}}"`), and Doris parses that JSON *string literal*
+// into the variant structure — `v['a']['b']` answers 1 exactly as for a
+// bare object. So no variant-aware raw-emission arm is needed downstream.
+//
+// Key order inside the serialized object is simd-json's (halfbrown keeps
+// insertion order for small objects, not guaranteed beyond): consumers must
+// compare structurally, never byte-for-byte against the input.
+
+/// One JSON cell into a variant column: nested shapes serialize to JSON
+/// text, strings pass through, scalars stringify, null/absent → NULL.
+fn append_variant_json(b: &mut dyn ArrayBuilder, v: Option<&simd_json::BorrowedValue<'_>>) {
+    match v {
+        None => append_str(b, None),
+        Some(v) if v.is_null() => append_str(b, None),
+        Some(v) => match v.as_str() {
+            Some(s) => append_str(b, Some(s)),
+            // object / array / number / bool — `encode` is simd-json's
+            // compact serializer (Writable), no pretty-printing
+            None => append_str(b, Some(&v.encode())),
+        },
+    }
+}
+
 /// Decode outcome: Append=column-filled / Skip=not-a-row, dropped silently /
 /// Bad=parse-or-shape failure (carrying the raw bytes back).
 ///
@@ -795,6 +841,11 @@ impl JsonDecoder {
             if append_g2_json(builders[i].as_mut(), f.data_type(), dom.get(name.as_str())) {
                 continue;
             }
+            // A4 variant columns: nested values ride as JSON text, not NULL
+            if tailrace_ir::is_variant_field(f) {
+                append_variant_json(builders[i].as_mut(), dom.get(name.as_str()));
+                continue;
+            }
             match dom.get(name.as_str()).and_then(|v| v.as_str()) {
                 Some(s) => append_str(builders[i].as_mut(), Some(s)),
                 None => {
@@ -878,6 +929,10 @@ impl OggDecoder {
                     builders[i].as_mut(),
                     dom.get("ts").and_then(|v| v.as_i64()).unwrap_or(0),
                 ),
+                // A4 variant columns: nested after.* values ride as JSON text
+                name if tailrace_ir::is_variant_field(f) => {
+                    append_variant_json(builders[i].as_mut(), after.get(name))
+                }
                 name => match after.get(name).and_then(|v| v.as_str()) {
                     Some(s) => append_str(builders[i].as_mut(), Some(s)),
                     None => {
@@ -926,7 +981,9 @@ impl Decoder for OggDecoder {
 /// v1 row semantics:
 /// - `after.*` keys write into same-named schema columns (typed chain
 ///   identical to JsonDecoder/OggDecoder; nested objects/arrays in a field
-///   value decode as null, matching that family). `before`/`op`/`ts_ms`/
+///   value decode as null, matching that family — unless the column is a
+///   `variant` column, which takes the nested value as JSON text, A4).
+///   `before`/`op`/`ts_ms`/
 ///   `source` are envelope metadata and are NOT decoded into columns (an
 ///   OGG-style op/ts envelope-column pair is a v1.x follow-up, as is console
 ///   discover inference for this format).
@@ -1007,6 +1064,11 @@ impl DebeziumJsonDecoder {
                 f.data_type(),
                 after.get(name.as_str()),
             ) {
+                continue;
+            }
+            // A4 variant columns: nested after.* values ride as JSON text
+            if tailrace_ir::is_variant_field(f) {
+                append_variant_json(builders[i].as_mut(), after.get(name.as_str()));
                 continue;
             }
             match after.get(name.as_str()).and_then(|v| v.as_str()) {
@@ -1698,6 +1760,176 @@ mod tests {
         assert!(tags.is_null(0), "array field → null");
         let name = rb.column(3).as_any().downcast_ref::<StringArray>().unwrap();
         assert!(name.is_null(0), "JSON null field value → null");
+    }
+
+    // ==================== variant passthrough (A4) ====================
+
+    /// The declared-schema construction the runtime uses (tailrace-ir
+    /// `arrow_field_or_utf8`): `attrs` is a marked variant column, `plain`
+    /// an unmarked utf8 column of the same arrow type — the control that
+    /// pins "only the marker changes behaviour".
+    fn variant_schema(extra_front: Vec<Field>) -> SchemaRef {
+        let mut fields = extra_front;
+        fields.push(tailrace_ir::arrow_field_or_utf8("id", "int64").unwrap());
+        fields.push(tailrace_ir::arrow_field_or_utf8("attrs", "variant").unwrap());
+        fields.push(tailrace_ir::arrow_field_or_utf8("plain", "utf8").unwrap());
+        Arc::new(Schema::new(fields))
+    }
+
+    /// The canonical nested row every variant test feeds, and its `attrs`
+    /// sub-document as the structural expectation.
+    const NESTED_ATTRS: &str =
+        r#"{"a":{"b":1,"c":"x"},"arr":[1,2,3],"s":"hello","f":1.5,"t":true,"n":null}"#;
+
+    /// Carrier assertion shared by the three decoders: the cell text parses
+    /// back to the ORIGINAL nested document (structural equality — simd-json
+    /// may reorder keys), the leaves are all still inside it (nothing was
+    /// flattened out or dropped), and the sink's escaping round-trips it:
+    /// `serde_json::to_string(text)` is exactly what tailrace-conn-doris
+    /// emits for a Utf8 cell, and unescaping that string literal yields the
+    /// same document — the two-step unwrap Doris performs on a VARIANT
+    /// column (probe B2).
+    fn assert_variant_carrier(cell: &str, original: &str) {
+        let got: serde_json::Value = serde_json::from_str(cell).expect("cell is JSON text");
+        let want: serde_json::Value = serde_json::from_str(original).unwrap();
+        assert_eq!(got, want, "variant cell must be the original sub-document");
+        for leaf in [
+            "\"a\"", "\"b\"", "\"c\"", "\"arr\"", "\"s\"", "\"f\"", "\"t\"",
+        ] {
+            assert!(
+                cell.contains(leaf),
+                "leaf {leaf} must stay inside the cell: {cell}"
+            );
+        }
+        // sink wire shape → Doris unwrap
+        let wire = serde_json::to_string(cell).unwrap();
+        assert!(
+            wire.starts_with("\"{") && wire.contains("\\\""),
+            "escaped literal: {wire}"
+        );
+        let unescaped: String = serde_json::from_str(&wire).unwrap();
+        let reparsed: serde_json::Value = serde_json::from_str(&unescaped).unwrap();
+        assert_eq!(reparsed, want, "original JSON survives the sink's escaping");
+    }
+
+    /// JsonDecoder: a marked variant column takes nested objects/arrays as
+    /// JSON text (leaves unparsed), strings as-is, scalars stringified,
+    /// null/absent as NULL; the unmarked utf8 sibling keeps NULLing nested
+    /// values (pre-A4 behaviour, byte-identical).
+    #[test]
+    fn variant_passthrough_json_decoder() {
+        use datafusion::arrow::array::StringArray;
+        let mut batch = ColBatch::new(variant_schema(vec![]), 8);
+        let rows: Vec<String> = vec![
+            format!(r#"{{"id":1,"attrs":{NESTED_ATTRS},"plain":{{"nested":true}}}}"#),
+            r#"{"id":2,"attrs":[10,20,30],"plain":[1]}"#.to_string(),
+            r#"{"id":3,"attrs":"plain string","plain":"p"}"#.to_string(),
+            r#"{"id":4,"attrs":42}"#.to_string(),
+            r#"{"id":5,"attrs":true}"#.to_string(),
+            r#"{"id":6,"attrs":null}"#.to_string(),
+            r#"{"id":7}"#.to_string(),
+        ];
+        for r in &rows {
+            assert_eq!(
+                JsonDecoder.decode(r.as_bytes().to_vec(), &mut batch, &Pushdown::default()),
+                Decoded::Append,
+                "{r}"
+            );
+        }
+        let rb = batch.finish().unwrap();
+        assert_eq!(rb.num_rows(), 7);
+        let attrs = rb.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let plain = rb.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_variant_carrier(attrs.value(0), NESTED_ATTRS);
+        assert!(
+            plain.is_null(0),
+            "unmarked utf8 sibling still NULLs a nested object"
+        );
+        assert_eq!(
+            attrs.value(1),
+            "[10,20,30]",
+            "array root serializes compact"
+        );
+        assert!(
+            plain.is_null(1),
+            "unmarked utf8 sibling still NULLs an array"
+        );
+        assert_eq!(
+            attrs.value(2),
+            "plain string",
+            "string cells pass through unquoted"
+        );
+        assert_eq!(plain.value(2), "p");
+        assert_eq!(attrs.value(3), "42", "integer stringifies");
+        assert_eq!(attrs.value(4), "true", "bool stringifies");
+        assert!(attrs.is_null(5), "JSON null → NULL");
+        assert!(attrs.is_null(6), "absent key → NULL");
+        for i in 3..7 {
+            assert!(plain.is_null(i), "absent plain stays NULL");
+        }
+    }
+
+    /// DebeziumJsonDecoder: the same contract on `after.*` — a nested
+    /// after-field in a variant column rides as JSON text; the unmarked
+    /// sibling keeps the family rule (`debezium_nested_objects_and_null_fields`).
+    #[test]
+    fn variant_passthrough_debezium_decoder() {
+        use datafusion::arrow::array::{Int64Array, StringArray};
+        let mut batch = ColBatch::new(variant_schema(vec![]), 4);
+        let event = format!(
+            r#"{{"before":null,"after":{{"id":9,"attrs":{NESTED_ATTRS},"plain":{{"k":"v"}}}},"op":"c","ts_ms":1}}"#
+        );
+        assert_eq!(
+            DebeziumJsonDecoder.decode(event.into_bytes(), &mut batch, &Pushdown::default()),
+            Decoded::Append
+        );
+        // schemas.enable=true wrapper takes the same path
+        let wrapped = format!(
+            r#"{{"schema":{{"type":"struct"}},"payload":{{"after":{{"id":10,"attrs":{NESTED_ATTRS}}},"op":"r","ts_ms":2}}}}"#
+        );
+        assert_eq!(
+            DebeziumJsonDecoder.decode(wrapped.into_bytes(), &mut batch, &Pushdown::default()),
+            Decoded::Append
+        );
+        let rb = batch.finish().unwrap();
+        assert_eq!(rb.num_rows(), 2);
+        let id = rb.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!((id.value(0), id.value(1)), (9, 10));
+        let attrs = rb.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_variant_carrier(attrs.value(0), NESTED_ATTRS);
+        assert_variant_carrier(attrs.value(1), NESTED_ATTRS);
+        let plain = rb.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(
+            plain.is_null(0),
+            "unmarked after.* nested object still NULLs"
+        );
+    }
+
+    /// OggDecoder: `after.*` variant columns ride as JSON text next to the
+    /// envelope columns (the decoder family is one contract).
+    #[test]
+    fn variant_passthrough_ogg_decoder() {
+        use datafusion::arrow::array::StringArray;
+        let schema = variant_schema(vec![
+            Field::new("op_type", DataType::Utf8, false),
+            Field::new("ogg_table", DataType::Utf8, true),
+            Field::new("ogg_ts", DataType::Int64, true),
+        ]);
+        let mut batch = ColBatch::new(schema, 4);
+        let msg = format!(
+            r#"{{"table":"SHOP.EVENTS","op_type":"I","ts":1726000000001,"after":{{"id":1,"attrs":{NESTED_ATTRS},"plain":{{"k":1}}}}}}"#
+        );
+        assert_eq!(
+            OggDecoder.decode(msg.into_bytes(), &mut batch, &Pushdown::default()),
+            Decoded::Append
+        );
+        let rb = batch.finish().unwrap();
+        let op = rb.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(op.value(0), "I");
+        let attrs = rb.column(4).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_variant_carrier(attrs.value(0), NESTED_ATTRS);
+        let plain = rb.column(5).as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(plain.is_null(0));
     }
 
     /// Mixed batch — the pipeline shape: c/u append, d and a real tombstone
