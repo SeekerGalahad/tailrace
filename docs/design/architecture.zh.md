@@ -122,7 +122,7 @@ flowchart TB
 | tailrace-conn-mqtt | **1 行占位**（T18⑥ 裁决：v1.x + 12 个月触发器） | 1 |
 | tailrace-conn-s3 | **1 行占位**（T18⑦a 裁决：v1.x；CDC 走 debezium-json 已落地） | 1 |
 
-DataFusion 依赖面：根 Cargo.toml `datafusion = "55.2.0"` / `datafusion-proto = "55.2.0"`（Cargo.toml:100-102，T33 七版本直跳），随动 arrow/parquet 59.3.1、sqlparser 0.62.0；MSRV 不变（55.2.0 声明 rust-version 1.94 ≤ 工作区 1.95）。
+DataFusion 依赖面：根 Cargo.toml `datafusion = "55.2.0"` / `datafusion-proto = "55.2.0"`（Cargo.toml:99-100，T33 七版本直跳），随动 arrow/parquet 59.3.1、sqlparser 0.62.0；MSRV 不变（55.2.0 声明 rust-version 1.94 ≤ 工作区 1.95）。
 
 ### 2.2 管理面 crate（console/crates/，4 个；行数为 2026-10-30 实测）
 
@@ -238,7 +238,7 @@ metadata 侧同步：engine 元数据客户端的 format 白名单接受 `debezi
 | `JdbcKey` | key + value | jdbc keyset 批源（游标列须 PK/单列 UNIQUE，fail-fast 探针把关） |
 | `None` | — | 无位点语义的源 |
 
-`SourceChunk`（:25）：`raw: Vec<u8>` + `partition: Option<i32>` + `next_offset: Option<i64>`（kafka/plain 两构造）。
+`SourceChunk`（:54）：`raw: Vec<u8>` + `partition: Option<i32>` + `next_offset: Option<i64>`（kafka/plain 两构造）。
 
 ### 4.2 flush 点整图提交（at-least-once 锚）
 
@@ -274,7 +274,7 @@ metadata 侧同步：engine 元数据客户端的 format 白名单接受 `debezi
 
 **注册模型**：显式 `register()` 调用（node `build_registry()`，engine/bin/tailrace-node/src/main.rs:25-51）——≤10 个连接器保持一眼可读，不引入 inventory/linkme 类注册宏。未知 kind 报「源类型未支持：{kind}（本二进制未编译该连接器 feature）」（tailrace-connector/src/registry.rs:122）——裁剪是注册表级语义，不只是字节（负向探针见 BENCHMARKS.md:530）。
 
-**feature 门控**（node Cargo.toml）：default=connector-kafka/file/doris；`connector-jdbc`、`connector-mqtt`、`connector-s3` 为门控 feature（jdbc 已真实现；mqtt/s3 仍占位）；`otel` 与 `jemalloc` 默认关。T16 后 node 的 connector-* 均透传 runtime 同名 feature（两张注册表同源，run/serve 一致）。
+**feature 门控**（node Cargo.toml）：default=connector-kafka/file/doris；`connector-jdbc`、`connector-mqtt`、`connector-s3` 为门控 feature（jdbc 已真实现；mqtt/s3 仍占位）；`otel` 与 `jemalloc` 默认关。T16 后 node 的三个默认 connector-* feature 透传 runtime 同名 feature；`connector-jdbc` 仅在 node 侧（runtime Cargo.toml 无同名 feature），`run`/`serve` 两子命令均经 node `build_registry()` 装配（main.rs:71/:148），故两子命令注册面一致。
 
 ### 5.1 现状矩阵（五个真连接器：kafka/file/doris/starrocks/jdbc；mqtt/s3 占位）
 
@@ -316,8 +316,8 @@ metadata 侧同步：engine 元数据客户端的 format 白名单接受 `debezi
 
 | 域 | 路由数 | 内容 |
 |---|---|---|
-| 开放 | 5 | `/healthz`、**`GET /metrics`**（metrics.rs:40，Prometheus 惯例无会话，§9）、`POST /api/auth/login`(:190)、swagger-ui + openapi.json(:171)、SPA fallback(:173) |
-| 会话域（require_session；上传限 512MB） | **45** 模式 | auth 2；datasources **17**（CRUD/test/discover/infer-schema/登记 + `{id}/tables/{db}/{table}/ddl/{draft,execute,evolve}` 三端点 :86-95 + `PUT {id}/tables/{tid}` 键模型登记（T-A7 门禁基）;`GET /api/datasources/tables` 行携 `columnsJson`（datasources.rs:338-347，§6.6））；nodes admin 12（deploy/action/deploy-log 真实现，§6.5）；artifacts 2；pipelines **19**（CRUD/compile/templates/publish/deploy/pause/resume/stop/recover/stats/offsets/logs(SSE)/metrics-trend + **`POST {id}/backfill` / `GET {id}/backfill/jobs`** :151-158，§7.2） |
+| 开放 | 5 | `/healthz`、**`GET /metrics`**（metrics.rs:40，Prometheus 惯例无会话，§9）、`POST /api/auth/login`(:190)、swagger-ui + openapi.json(:199)、SPA fallback(:201) |
+| 会话域（require_session；上传限 512MB） | **45** 路径模式 / **54** 方法处理器 | auth 2；datasources **13 路径 / 17 处理器**（含 datasource-types 1；CRUD/test/discover/infer-schema/登记 + `{id}/tables/{db}/{table}/ddl/{draft,execute,evolve}` 三端点 :86-95 + `PUT {id}/tables/{tid}` 键模型登记（T-A7 门禁基）;`GET /api/datasources/tables` 行携 `columnsJson`（datasources.rs:338-347，§6.6））；nodes admin **12 路径 / 13 处理器**（deploy/action/deploy-log 真实现，§6.5）；artifacts **2 路径 / 3 处理器**；pipelines **16 路径 / 19 处理器**（CRUD/compile/templates/publish/deploy/pause/resume/stop/recover/stats/offsets/logs(SSE)/metrics-trend + **`POST {id}/backfill` / `GET {id}/backfill/jobs`** :151-158，§7.2）——两口径均为 2026-10-30 实测（路径=`.route(` 调用数，处理器=`get/post/put/delete(api::…)` 数） |
 | m2m 免会话 | 2 | `POST /api/nodes/register`、`POST /api/nodes/heartbeat` |
 | MCP 免会话 | 1 | `POST /mcp`（mcp::router :175-180，§6.7） |
 
@@ -355,7 +355,7 @@ openapi（utoipa 6）：**58 path 条目 + 86 DTO** 全登记（openapi.rs:43-15
 
 ### 6.7 MCP Server（T-E4/扩展轮，R8 扩至 14 工具）
 
-`POST /mcp`（console/src/mcp.rs:175-180 挂载）：JSON-RPC 2.0、Streamable HTTP 请求/响应形态（无服务端→客户端 SSE 流；单消息单 POST，batch 拒收——MCP 2025-06-18 移除）；`initialize` 发 `Mcp-Session-Id`，后续调用归因到 `clientInfo.name`（回退 `X-MCP-Client`/`User-Agent`）。协议版本 2025-06-18（旧版 2025-03-26/2024-11-05 回显，mcp.rs:47-48）。
+`POST /mcp`（console/src/mcp.rs:175-180 挂载）：JSON-RPC 2.0、Streamable HTTP 请求/响应形态（无服务端→客户端 SSE 流；单消息单 POST，batch 拒收——MCP 2025-06-18 移除）；`initialize` 发 `Mcp-Session-Id`，后续调用归因到 `clientInfo.name`（回退 `X-MCP-Client`/`User-Agent`）。协议版本 2025-06-18（旧版 2025-03-26/2024-11-05 回显，mcp.rs:59-60 `PROTOCOL_VERSION`/`SUPPORTED_PROTOCOL_VERSIONS`）。
 
 **十四工具表**（`TOOLS` :90-105，§7.5 十 + R8 四；≤16 预算内）：
 
@@ -364,7 +364,7 @@ openapi（utoipa 6）：**58 path 条目 + 86 DTO** 全登记（openapi.rs:43-15
 | list_datasources / list_pipelines / get_pipeline / get_pipeline_stats / get_pipeline_logs | 读 | 对应 GET 端点 |
 | compile_sql | 读 | POST /api/pipelines/compile |
 | create_pipeline / deploy_pipeline / pause_resume_pipeline（action 选择） | **写** | 对应写端点 |
-| trigger_backfill | **写** | POST /api/pipelines/{id}/backfill，**dryRun 默认 TRUE**（MCP 调用者零副作用预览，mcp.rs:45-47） |
+| trigger_backfill | **写** | POST /api/pipelines/{id}/backfill，**dryRun 默认 TRUE**（MCP 调用者零副作用预览，mcp.rs:36 模块文档 / :865 入参 schema `"default": true` / :575-590 handler 取参） |
 | ddl_draft | 读 | POST …/ddl/draft（纯文本组合，无副作用） |
 | ddl_execute / ddl_evolve | **写** | POST …/ddl/execute、/ddl/evolve（真跑 DDL） |
 | backfill_status | 读 | GET /api/pipelines/{id}/backfill/jobs |
@@ -410,7 +410,7 @@ flowchart TB
 
 1. **draft**（①+②）：`generate_draft`（ddl/src/lib.rs:169）产 `DraftDdl`（:143——完整 DDL 文本、键模型+推荐理由、键列+猜测徽标、分区候选+跳过原因 notes）。规则面：CDC 证据（声明 sequence_column 或含 op_type 列）推荐 UNIQUE KEY（:199-212）；键列 id/`*_id` 启发式猜测（未确认即标注）；分区候选**只给实测可建形态**（R6 评审教训：VARCHAR 分区列/UNIQUE 非键列在真 Doris 必败——int64 候选带 yyyyMMdd 整数区间 caveat，时间类型 A3 起直取 RANGE 键，:231-266）；`doris_type`（:385）映射 13 标量词、未映射显式报错不折叠（:184-192）；属性序固定保快照稳定：MoW → sequence_col → 动态分区 → replication（:311 域）。
 2. **人工确认**（web 向导，§8）：键模型三选一必选、分区可确认可关（`KeyHints.partition=Some(false)` 即无子句无属性）、猜测徽标全显。
-3. **execute**（③）：**422 三门先于任何连接**——keyModel 缺失/未知（KEY_MODEL_REQUIRED）、ddl 缺失（DDL_REQUIRED）、回显文本的键子句与确认模型不符（KEY_MODEL_MISMATCH——过期草稿/错配客户端不许审计谎言，datasources.rs:2040-2085）；过门后 `mysql_exec` 逐字执行（不改写、无 allowlist——确认的文本即门），成败均审计 `TABLE_DDL_EXECUTE`（:2096/:2120：全文+耗时 / Doris 原文），成功后台账补写 key_model。
+3. **execute**（③）：**422 三门先于任何连接**——keyModel 缺失/未知（KEY_MODEL_REQUIRED）、ddl 缺失（DDL_REQUIRED）、回显文本的键子句与确认模型不符（KEY_MODEL_MISMATCH——过期草稿/错配客户端不许审计谎言，datasources.rs:2038-2085）；过门后 `mysql_exec` 逐字执行（不改写、无 allowlist——确认的文本即门），成败均审计 `TABLE_DDL_EXECUTE`（:2096/:2120：全文+耗时 / Doris 原文），成功后台账补写 key_model。
 4. **evolve**（④）：DESC 差集**仅执行 ADD COLUMN**（Light Schema Change；改类型/删列只报告不执行）；与 partial 双向互斥（:1559-1566 PARTIAL_UPDATE_NOTICE：该表有已部署 partial 管道 → 409 PARTIAL_UPDATE_ACTIVE；反之 partial 部署查 SHOW ALTER TABLE COLUMN 未完结 → 409 SCHEMA_CHANGE_IN_PROGRESS）；审计 `TABLE_DDL_EVOLVE`（:2286/:2312）。
 
 **sequence_col 属性（R8 顺带，dogfooding #3 清偿）**：UNIQUE KEY + 声明 sequence_column 时，生成器附表级属性 `"function_column.sequence_col" = "<列>"`（ddl/src/lib.rs:316-331）——没有它 Doris 静默忽略引擎的 `sequence_column` stream load 头（Status Success 但低序写覆盖高序行，2.1.7/3.1.4 双栈 live 探针实证）；列本身保持普通声明列，DUPLICATE KEY 下只留 notes 提示无去重语义（:227-232）。
@@ -608,7 +608,7 @@ gantt
 6. **`tailrace_pipeline_bytes_total` 未喂数**（§9）：待 sink ack 携带字节计数。
 7. **G2 迁移窗**：未知类型词 warn+折叠 Utf8 的窗口在下个 minor 版本翻硬错（column_type.rs:158 常量翻转即全链生效）。
 8. **variant 与 `list<float32>` 的 DDL 与直写**：词汇已落（§3.3），Doris 侧映射与 e2e 留待后续轮（A4/A5 方向）；`estimatedRows` 诚实降级为 null（回填 dryRun）。
-9. 开放问题沿旧：OTLP 默认开未决；proto plan 解码 gated 维持（CustomScan qualifier 边界）；`migrate`/`ticket` 留 501。
+9. 开放问题沿旧：OTLP 默认开未决；proto plan 解码 gated 维持（CustomScan qualifier 边界）；`migrate` 留 501（nodes_admin.rs:1193）；`ticket` 端点尚未开路由（凭据加密静态半边已落地，票据链为 v1.x 结构性修复，console-api.md「已知差异」）。
 
 ## 十三、附录
 

@@ -9,6 +9,7 @@ understanding the codebase evolution.
 - Golden attribution tables (e.g., dependency upgrade byte-diff analysis)
 - Architecture Decision Records (ADRs)
 - Migration guides with before/after evidence
+- Documentation consistency audits (claim → code-anchor reconciliation)
 
 ## What does NOT belong here
 
