@@ -1,3 +1,94 @@
+# tailrace 现状评估与未来展望
+
+> 本文按日期分两段、自上而下以新覆旧。**§〇 post-R8 基线（2026-10-30）**描述 v1.1.0 之后四轮开发（扩展轮 / R6 / R7 / R8）落地后的实况，是当前有效结论。其后的 **v1.1.0 基线（2026-10-26）**为时点评估原文，逐字保留不改——其中引用的 `roadmap.md`、`R3-升格评审`、`R5-lineage-judge` 等过程档已于 2026-10-26（提交 `1bed48d`，公私仓文档分离）移入私有工作流，作为当时的证据链原样保留、公开仓内不再可点开。两段结论不一致处，以 §〇 为准。
+
+## 〇、post-R8 基线（2026-10-30）
+
+> **基线**：工作树分支 `feature/docs-v1.2`（HEAD `8ce8a95`，正典文档对齐轮），上承 `feature/type-foundation@3690090`（R8 收口）；`origin/main` 现值 `aead2b5`（R7 合并），R8 七提交待随文档轮合入。
+> **版本诚实声明**：git tag 与 GitHub Release 止于 **v1.1.0**（本段 `gh release list` 实查：v1.1.0 = Latest，2026-10-25T12:30:30Z）；`Cargo.toml:39` `version = "1.1.0"`——四轮能力**均未发包**，开发线超前于已发布版；下一个版本号在发布时定，本文不预定。
+> **引用纪律**：代码锚点 `路径:行号` 均为 2026-10-30 本段落稿会话在上述工作树实读；性能数字只引 `docs/BENCHMARKS.md`（本段未新测）；e2e 通过数为各轮落地时登记值（本段未重跑）；GitHub 数字为本段 `gh api` 实查。
+
+### 0.1 一页纸结论（post-R8）
+
+- v1.1.0 之后**四轮开发、十二项能力面**落地（§0.2 表，逐条带代码锚点与 e2e），**crates.io / Release 现值仍 1.1.0**——「能力超前于已发布版」是本段最重要的版本事实。
+- 对照演化蓝图（2026-10-26；公开代码注释中以 blueprint §x.y 引用）的承诺范围：W0 地基 **4/6**（G1 TableObject options、G2 十六型词汇、G4 Sink 钩子、G5 多源注册 ✅；G3 Cursor 开放化、G6 管道即代码未做）；W1 Doris 原生写入 **6/8**（A1 建表闭环、A2 回填、A3 类型面、A6 metrics、A7 部分列更新、A8 dogfooding ✅；A4 VARIANT 直写、A5 向量列——词汇已落，Doris 侧映射与 e2e 未做）；W2 控制面核心 **1/2**（E4 MCP ✅ 14 工具；E2 告警/SLO 未做）；W3 期权两项提前兑现（C 窄口 debezium-json、D1 维表广播 join），其余期权未动。
+- 健康分 **7 → 7.5 / 10**（§0.3）：技术深度 8→9、工程纪律 9 持平（`forbid(unsafe_code)` 全仓落地把「实践为 0」变成「编译器保证为 0」）；公开面一致性 5→6（双 README 与架构正典本轮对齐、修复 roadmap.md 删档断链，但 SECURITY.md「pre-1.0」与 issue 模板 `TODO` URL 仍在）；社区 2 持平（本段 `gh api` 实查：stars 0 / forks 0 / open_issues 0 / watchers 0，2026-10-30）。
+- 三条差异化从「有数据」升级为「有闭环」：①SQL-first 的 SQL 面扩为「INSERT 列清单 = 部分列更新开关」（tailrace-parser/src/lib.rs:93-98）+「`${ds:dim.…}` 维表引用」（:322），仍无私有 DSL；②Doris 深度工程化新增建表闭环、确定性回填 label、UNIQUE 部分列更新、`sequence_col` 表级属性；③控制面新增 `/metrics`、MCP 14 工具、DDL/回填端点与 web 向导（§0.5）。
+- 第一性问题未变：**0 用户**。四轮拆掉的是「用户第一次试用就会撞到的墙」（建表、补数、指标、类型面——蓝图 §2.3 前 6 行缺口中的 4 行），不是用户数本身。下一步仍是被看见（§0.6），不是再加功能。
+
+### 0.2 十二项能力面（v1.1.0 后四轮，逐条锚点）
+
+| # | 能力 | 轮次 | 代码锚点（2026-10-30 实读） | e2e（落地时登记） |
+|---|---|---|---|---|
+| 1 | Prometheus `/metrics`（9 指标手写 text format，node+console） | 扩展轮 | `tailrace-api/src/metrics.rs:9`（指标面）`:235`（`node_metrics_text`）；`tailrace-console/src/metrics.rs:40`（`scrape`）、路由 `tailrace-console/src/lib.rs:189` | 蓝图 §7.4 面审计（单测 `text_format_validity` 等 5 组） |
+| 2 | `debezium-json` 解码（C 窄口：消费事件不抓 binlog；`c/r/u` 转行、`d`+墓碑跳过、schemas 外壳解包、畸形进 DLQ） | 扩展轮 | `tailrace-decode/src/lib.rs:950`（`DebeziumJsonDecoder`）；派发 `tailrace-runtime/src/lib.rs:1532` | 单测 5 组（`debezium_decode_c_r_u_events` 等） |
+| 3 | MCP Server（JSON-RPC 2.0 over `POST /mcp`；14 工具=8 读+6 写；写需进程开关+`confirm:true` 双门禁；全调用审计 `actor=mcp:<client>`；工具描述 OpenAPI 同源生成） | 扩展轮+R8 | `tailrace-console/src/mcp.rs:90`（`TOOLS` 表）、路由 `:177`；开关 `main.rs:26` | dogfooding round2（24/24：initialize 握手 + tools/list=14 + 缺 confirm 拒绝） |
+| 4 | 维表广播 join（`kind=dim` JDBC 表装配期全量装载；50 万行 / 64 MiB 上限；唯一键必检；RIGHT/FULL/CROSS 编译期拒） | 扩展轮 | `tailrace-runtime/src/dim.rs:36` `:39`（上限）；`tailrace-parser/src/lib.rs:351-359`（join 类型门） | `dim_join_flow` e2e（扩展轮评审修复轮） |
+| 5 | 建表闭环（draft→键模型必选 422→execute 全文审计→evolve 仅 ADD COLUMN；纯函数生成器+猜测标注） | R6 | `tailrace-ddl/src/lib.rs:169`（`generate_draft`）、`mysql_exec`（`tailrace-metadata/src/lib.rs:233`）；端点 `api/datasources.rs:1887/:2002/:2162` | `ddl_create.sh` **48/48**（含分区全程、evolve 重启不断、改类型 409） |
+| 6 | 回填与确定性 label（`range_fingerprint`=sha256(from,to)[..8]；`bf-` 台账/消费组隔离；崩溃恢复孤儿 job 标 failed；源门=file only） | R6 | `tailrace-conn-doris/src/lib.rs:153` `:187`（`LabelMode`）；`run_bounded`（`tailrace-runtime/src/lib.rs:773`）；`api/pipelines.rs:2319/:2420/:2277-2289` | `backfill_replay.sh` **31/31**（DUPLICATE KEY 表同区间重放两次行数不变） |
+| 7 | 部分列更新（开关=INSERT 列清单；注册门+活表门+evolve 双向互斥+引擎门四道；`columns` 头必带） | R7 | `tailrace-parser/src/lib.rs:93-98` `:276`；`with_partial_columns`（`tailrace-conn-doris/src/lib.rs:574`）；`api/pipelines.rs:359/:452/:622` | `partial_update.sh` **38/38**（compose）+ **37/37**（外部栈） |
+| 8 | 十六型类型词汇（参数化 parse、规范 Display；未知词迁移窗 warn+折 utf8，下个 minor 翻硬错） | R8 | `tailrace-ir/src/column_type.rs:30` `:84` `:158`（`UNKNOWN_TYPE_UTF8_MIGRATION_WINDOW`） | `type_precision.sh`（decimal(18,2) 精度守恒+sequence_col 定序，compose 40/40+外部 39/39） |
+| 9 | TableObject options 化（5 通用+options；typed accessor；`option_keys` 正典；旧字段 serde 双写双读） | R8 | `tailrace-catalog/src/lib.rs:35` `:80` `:107`；`*TableExt`：conn-kafka:31 / conn-doris:256 / conn-jdbc:80 / conn-file:49 | 交叉窗口契约测试（R8 评审修复轮补） |
+| 10 | Sink 长事务钩子+能力声明（prepare/commit/abort 默认 no-op；`SinkCapabilities` 五旗标真承重） | R7 | `tailrace-connector/src/sink.rs:18` `:107/:113/:119/:126` | 契约 sink_capabilities 5 组 |
+| 11 | `sequence_col` 表级属性（UNIQUE+sequenceColumn 时生成器附 `"function_column.sequence_col"`） | R8 | `tailrace-ddl/src/lib.rs:327-329` | `type_precision.sh` 对照失效形态（2.1.7/3.1.4 双栈探针） |
+| 12 | 工程治理（`forbid(unsafe_code)` 全 workspace；debug=line-tables-only；deny 随到随清） | R6-R8 | `Cargo.toml:55-56`（lints）`:71-72/:84-85`（profile）；`deny.toml` | R8 收口 RUSTSEC 清偿（`3f4c7d8`，libz-sys 等） |
+
+### 0.3 现状评估（post-R8，分项）
+
+| 维度 | v1.1.0 | post-R8 | 依据（锚点） |
+|---|---|---|---|
+| 工程纪律与质量门 | 9 | **9**（+治理面） | `forbid(unsafe_code)` 全仓（Cargo.toml:55-56，v1.1.0 时「实践为 0 非编译器保证」的差距闭合）；deny 新 advisory 两轮清偿（R8 `3f4c7d8`）；控制面 e2e 五脚本对真 Doris（2.1.7 compose + 3.1.4 外部栈）；CI 8 job 结构未变 |
+| 技术深度 | 8 | **9** | 十六型 wire 契约（column_type.rs:30）；DDL 生成器以「实测可建形态」为准（R6 评审教训固化）；确定性 label 的区间级幂等（conn-doris:187-213）；partial 四道门含活表实查 fail-closed（pipelines.rs:452）；MCP 描述 OpenAPI 同源防漂移（mcp.rs:739）。扣分项：exactly-once/group commit 仍未交付、回填源=file only、A4/A5 未变现 |
+| 诚实账本 | 8 | **8** | 架构正典 676 行带锚点刷新（docs/design/architecture.zh.md，post-R8 版）；dogfooding 两轮摩擦清单公开（docs/dev/dogfooding-*.md）；「estimatedRows=null 诚实降级」「缺 columns 头=Doris 静默置 NULL」等负面事实全部在档。扣分项：CHANGELOG 尚无 Unreleased 段（本轮 W4 交付） |
+| 公开面一致性 | 5 | **6** | 双 README 本轮对齐（十二项能力矩阵、版本诚实声明、roadmap.md 删档断链修复）；README 基准表补 T32/T33 行。残留：SECURITY.md:5「pre-1.0 (`0.1.x`)」、`config.yml:4` `TODO` URL、mdBook 未部署（book.toml:5）、console-api.md 局部漂移（:216 仍写 10 工具、:28 仍写 4 类词汇） |
+| 社区与采用 | 2 | **2** | 本段 `gh api`（2026-10-30）：stars 0 / forks 0 / open_issues 0 / watchers 0——四轮 12 项能力对采用信号零贡献，印证蓝图 §10.1 反向意见⑥ |
+
+### 0.4 蓝图承诺范围对账（W0-W2）
+
+| 阶段 | 蓝图承诺 | post-R8 实况 | 未清项 |
+|---|---|---|---|
+| W0 地基 | G1-G6 + 公开面清偿 | **4/6 落地**（G1/G2/G4/G5）；公开面清偿部分完成（README ✅ 本轮；SECURITY/模板 TODO 未清） | G3 Cursor 开放化、G6 管道即代码 |
+| W1 Doris 原生写入 | A1/A2/A6/A7/A8 + A4/A5 | **6/8 落地**；出口标准「新用户零 DDL 建表」「Grafana 抓 lag」「重放行数不变」均达成 | A4 VARIANT 直写、A5 向量列（词汇已落，R9 候选） |
+| W2 控制面核心 | E2 告警/SLO + E4 MCP | **1/2 落地**（E4 超 blueprint §7.5 的 10 工具预算至 14，双门禁+审计） | E2 告警/SLO（lag/freshness/DLQ 率→Webhook） |
+| W3 期权 | C 窄口 / D1 / E3 / E5 / B 按需 | **C 窄口+D1 提前兑现**（成本判断正确：C 实际 ~1.5 人日量级）；其余未动且触发器未响 | E3 GitOps、E5 RBAC、B Iceberg（三触发器制）、D3/D4（不做/永不做的红线不变） |
+
+### 0.5 竞争位置（post-R8）
+
+v1.1.0 的四竞品对位表（§二）左列仍成立，tailrace 侧右列更新：
+
+| 竞品 | post-R8 对位（增量） |
+|---|---|
+| Vector | 仍是「可观测管道 + VRL」；tailrace 的差距面不变，新增领先面：`/metrics` 原生、DDL 闭环、回填、MCP——单二进制竞品的 Day-2 闭环仍是空白 |
+| Airbyte | 仍是多容器 ELT；tailrace「两个二进制 + 2-4GB」定位面新增「建表→写入→补数→部分列更新」全链不经 K8s |
+| SeaTunnel | 连接器矩阵的差距**有意保留**（红线），但 CDC 一项经 `debezium-json` 解码覆盖了「已上 Debezium 的库」（消费位）；写入语义（label 幂等/部分列/sequence_col）继续做深 |
+| Redpanda Connect | Bloblang vs SQL 不变；控制面（内置 UI+MCP+SSH 部署链）仍是结构性差异 |
+
+三大差距（v1.1.0 §2.2）post-R8 状态：①连接器面窄——不变（5 真+1 dim，mqtt/s3 占位）；②交付语义——仍止于 at-least-once + label 幂等，但 label 分双模式（进程作用域/确定性）且 `SinkCapabilities.transactional` 扩展点已立，无 sink 声明事务；③社区与国际化——不变（0 信号、中文单轨）。**谁会切换**：候选画像从「要写 Doris 的小团队」收窄为「要在 2-4GB 边缘盒子上完成建表→写入→补数全闭环、且能被 AI/脚本经 MCP 操作的 Doris/StarRocks 用户」。
+
+### 0.6 路线展望（post-R8）
+
+- **近期（本文件所在文档轮 W3-W5）**：mdBook 八章刷新与 `mdbook build` 门禁；CHANGELOG 增 Unreleased 段（不预定版本号）；四正典逐条「声明→锚点」核查。**下一发布窗**：G2 迁移窗翻转（column_type.rs:158 常量置 false，未知类型词由 warn+折叠转硬错）排入下个 minor——这是四轮里唯一「随发布必须动行为」的开关。
+- **公开面清偿（v1.1.0 §六②③的存量债，半天量级）**：SECURITY.md:5 改「1.x 默认分支修复」；`config.yml:4` `TODO`→真实仓库；mdBook 上 gh-pages（book.toml:5 的 docs job）；console-api.md 10 工具/4 类词汇两处漂移修正。
+- **中期（下轮候选，蓝图余项）**：A4 VARIANT 直写与 A5 向量列（词汇已落，差 Doris 侧映射+e2e）；E2 告警/SLO（W2 另一半）；回填 kafka 源（分区级种子，pipelines.rs:2277 注释已登记路径）；`tailrace_pipeline_bytes_total` 喂数（metrics.rs:17 声明未喂数，待 sink ack 携带字节）；G3/G6 维持「需要时再做」。
+- **长线不变项**：exactly-once / group commit 触发器制（T36 谱系裁决维持）；MQTT 12 个月计时（2027-10-21 到期）；B 湖仓三触发器；**零用户问题的解法在分发不在功能**——0 star 与 12 项能力的并存是本段最强的实证。
+
+### 0.7 本段数字对账表
+
+| 数字 | 含义 | 来源 |
+|---|---|---|
+| 4 轮 / 12 项 | v1.1.0 后开发轮数与能力面数 | §0.2 表（逐条锚点） |
+| 14（8R+6W） | MCP 工具数 | `mcp.rs:90` TOOLS 表（本段实数） |
+| 16 | 列类型词汇词数 | `column_type.rs:30-72`（枚举 16 变体，本段点数） |
+| 13 | DDL 生成器映射的标量词数 | `tailrace-ddl/src/lib.rs:385` `doris_type`（ddl/src/lib.rs:9-13 模块文档） |
+| 500 000 / 64 MiB | 维表行/内存上限 | `dim.rs:36/:39` |
+| 3 天 | Doris label 保留期=回填幂等窗口默认 | `conn-doris/src/lib.rs:183-185` |
+| 48/48、31/31、38/38+37/37、40/40+39/39、24/24 | e2e 各轮登记值 | docs/design/architecture.zh.md §11.1；dogfooding-round2-2026-10-29.md（本段未重跑） |
+| 48 / 24 / 21 / 1.1.0 | 架构正典行数 / SECURITY「pre-1.0」行 / crates.io 包数 / 现行版本 | `wc -l` 本段实测；SECURITY.md:5；CHANGELOG 1.1.0 段；Cargo.toml:39 |
+| 0 / 0 / 0 / 0 | stars / forks / open_issues / watchers（2026-10-30） | 本段 `gh api repos/SeekerGalahad/tailrace` 实查 |
+| aead2b5 / 3690090 / 8ce8a95 | origin/main / R8 HEAD / 本文档轮 HEAD | 本段 `git log` 实查 |
+
+---
+
 # tailrace 现状评估与未来展望（v1.1.0 基线）
 
 > **基线**：tag `v1.1.0`（指向 `6cedcf7`，2026-10-25）；工作树 HEAD `b19661b`；评估日 2026-10-26。
