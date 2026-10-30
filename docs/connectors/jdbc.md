@@ -23,6 +23,11 @@ kafka/file/jdbc；汇白名单 kafka/file/doris/starrocks）。注意 `jdbc_tabl
 
 ## 二、连接参数（TableObject 映射）
 
+> R8 G1 起 `bootstrap` / `sequence_column` 归入 `TableObject.options` 映射（键名正典
+> `tailrace-catalog` `option_keys`），连接器经 `JdbcTableExt` typed accessor 读取
+> （`tailrace-conn-jdbc/src/lib.rs:80`）；旧顶层扁平写法在一个 minor 版本的兼容窗内
+> 双写双读、仍可用。下表字段名即 options 键名。
+
 | 字段 | 含义 | 约束 |
 |---|---|---|
 | `kind` | `jdbc` | 源专属；`jdbc_table` 是 Doris 汇别名 |
@@ -69,6 +74,31 @@ UNIQUE 索引），不唯一即拒启：
 
 探针通过后每轮 poll 若游标列出现 NULL → 整轮失败并提示「声明 NOT NULL 游标列」。
 
+## 四·五、维表装载（`kind = dim`，T-D1 广播 join）
+
+JDBC 连接器的第二个用途：**广播维表**。目录对象登记为 `kind = dim`（mysql/postgresql
+数据源下），SQL 里以 `… JOIN ${ds:dim.<datasourceId>.<table>} d ON …` 引用——这是
+**广播 join，不是流式 join**（项目红线）：管道**装配期**经本连接器**全表**翻页装载为
+静态 `dim_<alias>` MemTable 嵌入执行计划，无水位线、无状态后端、运行期不刷新，重启才
+重载快照（`tailrace-runtime/src/dim.rs:1-22` 模块文档）。
+
+- **就是这个连接器在干活**：runtime 把 `kind=dim` 改写为 `jdbc` 后经注册表取源工厂
+  （`dim.rs:104-111`，失败消息明示「dim table needs the JDBC connector」）——因此维表 join
+  **同样要求 `tailrace-node` 开 `connector-jdbc` feature**（默认不开，见 §二）。
+- **翻页 = §一的 keyset 窗口**：`sequence_column` 即分页键，`SELECT * … ORDER BY key
+  LIMIT page` 逐页排干；**唯一键必检**复用 §四的连接探针（无 PRIMARY KEY / 单列 UNIQUE
+  即拒绝编译——防笛卡尔放大）。
+- **fail-fast 上限**（装配期拒绝而非 OOM）：行数默认 500 000（`dim.rs:36`
+  `DEFAULT_DIM_MAX_ROWS`，plan tuning `dimMaxRows`）、内存默认 64 MiB 按解码后 Arrow
+  计（`dim.rs:39` `DEFAULT_DIM_MAX_BYTES`，`dimMaxBytes`），逐页累计越界即中止。
+- **连接词仅 `INNER JOIN` / `JOIN` / `LEFT [OUTER] JOIN`**：RIGHT/FULL 会对每个微批重发
+  全部未匹配维表行、CROSS 按 |src|×|dim| 逐批放大——parser 编译期拒绝
+  （`tailrace-parser/src/lib.rs:351-359`）；JOIN 目标只能是 `${ds:dim.*}`，第二个流式源
+  不支持。
+- 含维表 JOIN 的语句**暂不能回填**（console 422 `BACKFILL_DIM_UNSUPPORTED`）。
+- console 侧登记与 plan 下推见 `docs/protocol/console-api.md` §三.7；引擎侧契约见
+  `docs/protocol/engine-v1.md` §二「维表打宽」。
+
 ## 五、类型面（首版刻意裁剪）
 
 **游标列可用类型**（`mysql_cursor_kind` / `pg_cursor_kind`）：
@@ -112,13 +142,17 @@ numeric/数组/扩展类型。类型图收窄是首版有意为之（sqlx 需要
   console-store `cursor_semantics` 派生 `jdbc → JDBC_KEY`（对齐 IR
   `Cursor::JdbcKey`，单测+集成双断言）；**discover / infer-schema 通道可用**
   （`POST /api/datasources/{id}/discover` 列库表、`/infer-schema` 读 DDL 列型
-  推断 arrow 列，PG 走 `information_schema`——`engine/crates/tailrace-metadata`）。
-- **剩余缺口（T14 结果行登记遗留）**：① jdbc 管道 console 端到端未通——
-  `build_plan_table`（`api/pipelines.rs`）的 `bootstrap` 取 connJson `bootstrap`
-  键而 mysql/postgresql 数据源只有 `jdbcUrl`，且 `sequence_column` 恒 null，两
-  者恰为 jdbc 源工厂必填（`tailrace-conn-jdbc/src/lib.rs:82/89`）——部署期才
-  会炸，jdbc 管道动线留后续；② discover/infer-schema 对 **doris 型数据源**的
-  9030 文本协议未在真 Doris FE 上实测（测试覆盖为 testcontainers mysql/pg）；
+  推断列词汇，PG 走 `information_schema`——`engine/crates/tailrace-metadata`；
+  **R8 A3 起按十六词词汇收窄**：tinyint/smallint/int→int8/int16/int32、decimal(p,s) 保参、
+  datetime/timestamp→timestamp(us)、date→date、text 族→string，未识别型折 utf8，
+  `tailrace-metadata/src/infer.rs:257` `ddl_arrow_type` / `:296` `pg_arrow_type`）。
+- **剩余缺口（T14 结果行登记遗留）**：① ~~jdbc 管道 console 端到端未通~~——
+  **T-D1（2026-10-27）清偿大半**：`build_plan_table`（`api/pipelines.rs:1498-1500`）对
+  `dim` / `jdbc` 两种 kind 由数据源 connJson `jdbcUrl` 去 `jdbc:` 前缀填 plan `bootstrap`
+  （引擎方言选 `mysql://` / `postgres://`），`sequence_column` 由表对象登记键列下发
+  （`:1515-1536`）——正是本源工厂必填的两键；维表动线有 console e2e 钉住，**jdbc 流式
+  批源动线仍未有 console 侧 e2e 覆盖**（留后续补）；② discover/infer-schema 对 **doris
+  型数据源**的 9030 文本协议未在真 Doris FE 上实测（测试覆盖为 testcontainers mysql/pg）；
   ③ openapi components 缺新 DTO 与 protocol 文档 501 残留——**T24③④ 已清偿**
   （openapi.rs 补 `DiscoverResponse`/`DiscoveredAssetDto`/`InferSchemaBody`/
   `InferSchemaResponse`；console-api.md 改真实现契约）。

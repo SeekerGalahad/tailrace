@@ -89,6 +89,28 @@ SQL 编译诊断（编辑器内联报错数据源）。
 ```
 
 - `tables` 随 plan 携带表对象元数据（缺引用表整体拒绝，不启动半装配管道）；`kind` 规范化为注册表键：`topic→kafka`、`doris_table`/`JDBC_TABLE→doris`（旧值作别名兼容）。
+- **表项形态（R8 G1 options 化）**：每个表项 = 5 个通用字段 `reference` / `kind` / `format` /
+  `columns` / `options`，连接器专属键全部收进 `options` 映射（键名正典
+  `tailrace-catalog/src/lib.rs:35` `option_keys`：`bootstrap` / `stream_load_url` /
+  `auth_env` / `label_prefix` / `sequence_column` / `partial_columns`；额外键原样透传，
+  连接器经 typed accessor 读取）。上例的**顶层扁平写法在一个 minor 版本的兼容窗内仍有效**：
+  这六键**双写双读**——写侧 options 与顶层同时输出，读侧顶层键折进 options（显式
+  `options` 键优先、顶层 `null` 视为未设；`lib.rs:54` `LEGACY` 六键表、`:715`
+  `PlanTableObject`、`:745` Raw 折叠镜像）。窗口关闭后只认 `options`。
+- **`columns` 的类型词汇（R8 G2）**：`[列名, 类型串]` 的类型串按**十六词词汇**解析
+  （`tailrace-ir/src/column_type.rs:30` `ColumnType`，经 `tailrace_catalog::ColumnType`
+  re-export）：4 个旧词 `utf8` / `int64` / `float64` / `bool` 字节级兼容 + 12 个新词
+  `string` / `int8` / `int16` / `int32` / `float32` / `decimal(p,s)` / `timestamp(unit)` /
+  `date` / `binary` / `list<float32[,dim]>` / `variant` / `null`；小写精确拼写。未知词在
+  迁移窗内 warn（列名 + 已知词表）并折为 `utf8`（与 G2 前 `_ => Utf8` 臂行为一致），
+  窗口常量翻转后转硬错误、装配期拒绝（`column_type.rs:14-20`）。
+- **`partial_columns`（R7 T-A7，部分列更新）**：汇表项可带 `partial_columns:[…]`（声明顺序
+  的列名子集）——引擎据此让 `DorisSink` 以 `partial_columns=true` **且** `columns:<子集>`
+  双头装载（`tailrace-conn-doris/src/lib.rs:574` `with_partial_columns`，**仅 Doris flavor**——
+  starrocks + `partial_columns` 在 doris 工厂层即拒绝装配，`lib.rs:571`）。装配期通用能力门：任何
+  声明了 `partial_columns` 的汇若 `capabilities().partial_update == false`（file / kafka 及未来
+  任何未实现部分更新的汇）即拒绝装配并点名能力缺失（`tailrace-runtime/src/lib.rs:541-545`），
+  不会把投影收窄后无声写出缺列的行。未声明的表项不带该键，与 A7 前形态逐字节一致。
 - **file 表的 `bootstrap` = 登记目录**（R6 评审修复轮）：file 表对象在 `tables[]` 里
   携带 `bootstrap`（console 由 file 数据源 connJson 的 `path` 填充）时，file 源/汇以
   `bootstrap/表名` 解析文件路径——与进程 cwd 无关，常驻 node 与 console 内回填执行器
@@ -244,5 +266,5 @@ bootstrap token 自愈。
 ## 四、凭据与连接器语义（与 /v1 交互面相关）
 
 - **凭据永不入 plan body**：plan 携带 `auth_env` 环境变量名（仅允许 `TAILRACE_` 前缀，防指向任意环境变量外泄）；节点侧现取现焚。
-- 连接器按 Cargo feature 编译注册（`tailrace-node` default = kafka,file,doris；starrocks 随 doris crate feature；mqtt/jdbc/s3 占位不注册）——未编译的 kind 在 plan 装配时报「源/sink 类型未支持（本二进制未编译该连接器 feature）」。
+- 连接器按 Cargo feature 编译注册（`tailrace-node` default = kafka,file,doris；starrocks 随 doris crate feature；**jdbc 为真实连接器但默认不开**——`--features connector-jdbc` 注册 MySQL/PostgreSQL keyset 批源（`engine/bin/tailrace-node/src/main.rs:36-38`），**维表 `kind=dim` 的全表装载也经注册表的 `jdbc` 源工厂**（`tailrace-runtime/src/dim.rs:104-111`），故维表 join 同样要求该 feature；mqtt/s3 仍为占位 crate 不注册）——未编译的 kind 在 plan 装配时报「源/sink 类型未支持（本二进制未编译该连接器 feature）」。
 - at-least-once 锚：sink flush 成功才提交游标账本；暂停=挂分区（Kafka 防组逐出）。
