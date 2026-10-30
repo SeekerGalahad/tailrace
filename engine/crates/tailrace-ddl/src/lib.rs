@@ -9,16 +9,22 @@
 //! meaningful — the whole §7.2 rule table lives here and nowhere else.
 //!
 //! Vocabulary surface (G2 words landed, A3 widened the mapping, A4 opened
-//! `variant`): columns carry the 16-word vocabulary; the generator maps the
-//! 13 scalar words — the four legacy ones (`utf8` / `int64` / `float64` /
-//! `bool`) plus `string` / `int8` / `int16` / `int32` / `float32` /
-//! `decimal(p,s)` / `timestamp(unit)` / `date` / `binary` — per blueprint
-//! §7.1's mapping column, and `variant` → `VARIANT` (probed on 2.1.7 and
-//! 3.1.4 alike, scripts/e2e/evidence/variant-probe-2026-10-30/: a VARIANT
-//! value column creates under DUPLICATE and UNIQUE MoW, the FE refuses it as
-//! a key column, and the engine's string-shaped emission is parsed into the
-//! variant structure server-side). `list<float32>` is the A5 wave (ARRAY
-//! shape wants its own probe); `null` stays unmapped — Doris has no
+//! `variant`, A5 opened `list<float32>`): columns carry the 16-word
+//! vocabulary; the generator maps the 13 scalar words — the four legacy ones
+//! (`utf8` / `int64` / `float64` / `bool`) plus `string` / `int8` / `int16`
+//! / `int32` / `float32` / `decimal(p,s)` / `timestamp(unit)` / `date` /
+//! `binary` — per blueprint §7.1's mapping column, `variant` → `VARIANT`
+//! (probed on 2.1.7 and 3.1.4 alike,
+//! scripts/e2e/evidence/variant-probe-2026-10-30/: a VARIANT value column
+//! creates under DUPLICATE and UNIQUE MoW, the FE refuses it as a key column,
+//! and the engine's string-shaped emission is parsed into the variant
+//! structure server-side), and `list<float32[,dim]>` → `ARRAY<FLOAT>` with
+//! the declared dimension as a column COMMENT (probed on 3.1.4,
+//! scripts/e2e/evidence/vector-probe-2026-10-30/: the value column creates
+//! under DUPLICATE and UNIQUE MoW with the COMMENT kept verbatim, the FE
+//! refuses ARRAY as a key column and as a partition column — Doris itself
+//! has no array dimension, so the COMMENT is documentation and the decoder's
+//! dim guard is the enforcement). `null` stays unmapped — Doris has no
 //! all-null column type and inventing one (NULL_TYPE is internal) would make
 //! the draft lie, so it keeps erroring until a use case names the target.
 //! Anything unmapped is an explicit error, not a silent fold: a draft built
@@ -190,7 +196,7 @@ pub fn generate_draft(schema: &Schema, hints: &KeyHints) -> anyhow::Result<Draft
             bail!(
                 "列 {name:?} 的类型 {ty:?} 不在 DDL 生成器支持面内\
                  （utf8/string/int8/int16/int32/int64/float32/float64/decimal(p,s)/\
-                 timestamp(s|ms|us|ns)/date/bool/binary/variant；list<float32> 待 A5 探针后开放，\
+                 timestamp(s|ms|us|ns)/date/bool/binary/variant/list<float32[,dim]>；\
                  null 无 Doris 对应列类型）——不静默折叠未知类型"
             );
         }
@@ -242,6 +248,20 @@ pub fn generate_draft(schema: &Schema, hints: &KeyHints) -> anyhow::Result<Draft
         bail!(
             "键列 {key_column:?} 的类型为 variant：Doris 不接受 VARIANT 作键列\
              （FE 拒绝 \"Variant type should not be used in key column\"）——请改选标量列为键"
+        );
+    }
+    // A5: same rule for the vector column (FE: "Array can only be used in
+    // the non-key column of the duplicate table at present." — probe A3,
+    // 3.1.4; the wording is legacy, the value-column case works under
+    // UNIQUE too, probe A2).
+    if let Some((_, ty)) = schema
+        .columns
+        .iter()
+        .find(|(n, t)| n == &key_column && is_list_type(t))
+    {
+        bail!(
+            "键列 {key_column:?} 的类型为 {ty}：Doris 不接受 ARRAY 作键列\
+             （FE 拒绝 \"Array can only be used in the non-key column\"）——请改选标量列为键"
         );
     }
 
@@ -400,8 +420,16 @@ pub fn generate_draft(schema: &Schema, hints: &KeyHints) -> anyhow::Result<Draft
 /// (A4 — DESC prints it back as `variant`, probed on 2.1.7 and 3.1.4; the
 /// column takes any JSON value and the engine's string-shaped emission is
 /// parsed into the variant structure server-side, so no carrier convention
-/// is needed on the DDL). `list<float32>` (A5) / `null` return `None` (see
-/// the crate doc).
+/// is needed on the DDL). `list<float32[,dim]>` lands `ARRAY<FLOAT>` (A5 —
+/// DESC prints it back as `array<float>`, probed on 3.1.4), the declared
+/// dimension riding as a column COMMENT in the binary style: Doris has no
+/// array dimension (a 5-element array loads into a dim=3 column, probe B9),
+/// so the comment documents the contract for whoever reads SHOW CREATE
+/// TABLE while the decoder's dim guard enforces it on the way in. The
+/// `list<…>` form is parsed locally like `decimal(…)` (same datafusion-free
+/// rationale): element must be `float32`, dim — when present — a decimal
+/// integer ≥ 1, the same contract `ColumnType::parse` checks. `null`
+/// returns `None` (see the crate doc).
 ///
 /// Public since A3: the console's evolve side (ALTER TABLE … ADD/MODIFY
 /// COLUMN texts) reuses this one mapping instead of keeping a second
@@ -438,11 +466,37 @@ pub fn doris_type(vocab: &str) -> Option<String> {
                     "s" | "ms" | "us" | "ns" => Some("DATETIME(6)".to_string()),
                     _ => None,
                 }
+            } else if let Some(inner) = vocab
+                .strip_prefix("list<")
+                .and_then(|rest| rest.strip_suffix('>'))
+            {
+                // `float32` alone, or `float32,dim` with dim ≥ 1
+                let (elem, dim) = match inner.split_once(',') {
+                    Some((e, d)) => (e.trim(), Some(d.trim())),
+                    None => (inner.trim(), None),
+                };
+                if elem != "float32" {
+                    return None;
+                }
+                match dim {
+                    None => Some("ARRAY<FLOAT>".to_string()),
+                    Some(d) => {
+                        let d: u32 = d.parse().ok().filter(|d| *d >= 1)?;
+                        Some(format!("ARRAY<FLOAT> COMMENT 'vector dim={d}'"))
+                    }
+                }
             } else {
                 None
             }
         }
     }
+}
+
+/// Whether a vocabulary word is the vector column (`list<…>`). Only called
+/// on words [`doris_type`] already accepted, so the prefix is enough — the
+/// generator never sees an unparsed `list<…>` past the validation pass.
+fn is_list_type(vocab: &str) -> bool {
+    vocab.starts_with("list<")
 }
 
 /// The OGG envelope's CDC marker column (exact name, case-insensitive).
@@ -453,13 +507,14 @@ fn has_op_type(columns: &[Column]) -> bool {
 }
 
 /// Key-column heuristic (§7.2 ②): first column named `id` / `*_id` in
-/// declaration order, else the first column — skipping `variant` columns at
-/// both steps (A4: the FE refuses VARIANT as a key column, probe A3). A guess
-/// by definition — the caller flags it. When every column is variant the
-/// first one comes back anyway and [`generate_draft`]'s key-type check turns
-/// that into the explicit error.
+/// declaration order, else the first column — skipping `variant` columns
+/// (A4: the FE refuses VARIANT as a key column, probe A3) and `list<…>`
+/// columns (A5: the FE refuses ARRAY as a key column, vector probe A3) at
+/// both steps. A guess by definition — the caller flags it. When every
+/// column is variant/list the first one comes back anyway and
+/// [`generate_draft`]'s key-type checks turn that into the explicit error.
 fn guess_key_column(columns: &[Column]) -> &str {
-    let scalar = |(_, ty): &&Column| ty != "variant";
+    let scalar = |(_, ty): &&Column| ty != "variant" && !is_list_type(ty);
     for (name, _) in columns.iter().filter(scalar) {
         let n = name.to_ascii_lowercase();
         if n == "id" || n.ends_with("_id") {
@@ -555,8 +610,10 @@ mod tests {
     //! partitioned shape asserted here was created successfully on a live
     //! Doris 2.1.7 (R6 review round; the A3 shapes — new column types,
     //! DATETIME/DATE RANGE keys, the binary COMMENT — re-probed 2026-10-30;
-    //! the A4 variant shapes probed on 2.1.7 AND 3.1.4 the same day)
-    //! — the skipped shapes are the ones the FE refused.
+    //! the A4 variant shapes probed on 2.1.7 AND 3.1.4 the same day; the A5
+    //! vector shapes probed on 3.1.4,
+    //! scripts/e2e/evidence/vector-probe-2026-10-30/) — the skipped shapes
+    //! are the ones the FE refused.
 
     use super::*;
 
@@ -1354,6 +1411,171 @@ PROPERTIES (
         );
     }
 
+    // ⑭ A5 — vector columns on a DUPLICATE table (vector probe A1 shape,
+    // scripts/e2e/evidence/vector-probe-2026-10-30/, created on 3.1.4 with
+    // the COMMENT kept verbatim by SHOW CREATE TABLE): the dimensioned word
+    // lands ARRAY<FLOAT> with the dim as a column COMMENT (binary's
+    // convention — Doris has no array dimension, probe B9: a 5-element array
+    // loads into a dim=3 column, so the comment documents the contract and
+    // the decoder's dim guard enforces it); the bare word lands a plain
+    // ARRAY<FLOAT> (any length legal). The key heuristic rides `doc_id`.
+    #[test]
+    fn snapshot_vector_columns_duplicate() {
+        let s = schema(
+            "kb",
+            "chunks",
+            &[
+                ("doc_id", "int64"),
+                ("emb", "list<float32,768>"),
+                ("scores", "list<float32>"),
+            ],
+        );
+        let d = generate_draft(&s, &KeyHints::default()).unwrap();
+        assert_eq!(
+            d.ddl,
+            r#"CREATE TABLE IF NOT EXISTS `kb`.`chunks` (
+    `doc_id` BIGINT,
+    `emb` ARRAY<FLOAT> COMMENT 'vector dim=768',
+    `scores` ARRAY<FLOAT>
+)
+DUPLICATE KEY(`doc_id`)
+DISTRIBUTED BY HASH(`doc_id`) BUCKETS AUTO;"#
+        );
+        assert_eq!(d.key_model, KeyModel::Duplicate);
+        assert_eq!(d.key_column, "doc_id");
+        assert!(d.partition.is_none());
+        assert!(d.notes.is_empty(), "{:?}", d.notes);
+    }
+
+    // ⑮ A5 — a vector value column under UNIQUE KEY merge-on-write (vector
+    // probe A2 shape, created on 3.1.4): CDC op_type evidence picks UNIQUE,
+    // the vector column is a plain value column next to a scalar, and the
+    // single-node replication downgrade rides along.
+    #[test]
+    fn snapshot_vector_unique_mow_cdc() {
+        let s = schema(
+            "kb",
+            "cdc_chunks",
+            &[
+                ("op_type", "utf8"),
+                ("chunk_id", "utf8"),
+                ("emb", "list<float32,3>"),
+                ("score", "float64"),
+            ],
+        );
+        let hints = KeyHints {
+            replication_num: Some(1),
+            ..KeyHints::default()
+        };
+        let d = generate_draft(&s, &hints).unwrap();
+        assert_eq!(
+            d.ddl,
+            r#"CREATE TABLE IF NOT EXISTS `kb`.`cdc_chunks` (
+    `chunk_id` VARCHAR(65533),
+    `op_type` VARCHAR(65533),
+    `emb` ARRAY<FLOAT> COMMENT 'vector dim=3',
+    `score` DOUBLE
+)
+UNIQUE KEY(`chunk_id`)
+DISTRIBUTED BY HASH(`chunk_id`) BUCKETS AUTO
+PROPERTIES (
+    "enable_unique_key_merge_on_write" = "true",
+    "replication_num" = "1"
+);"#
+        );
+        assert_eq!(d.key_model, KeyModel::Unique);
+        assert_eq!(d.key_column, "chunk_id");
+        assert!(d.notes.is_empty(), "{:?}", d.notes);
+    }
+
+    // ⑮b A5 — a vector column never carries the key (FE refuses ARRAY as a
+    // key column, vector probe A3): the heuristic steps over list columns
+    // at both the `*_id` step and the first-column fallback; an explicit
+    // list pick and an all-list schema are explicit errors, not
+    // FE-refused drafts.
+    #[test]
+    fn vector_column_never_takes_the_key() {
+        // heuristic: the leading list column is skipped for the *_id one
+        let d = generate_draft(
+            &schema(
+                "m",
+                "t",
+                &[
+                    ("emb", "list<float32,3>"),
+                    ("doc_id", "int64"),
+                    ("v", "float64"),
+                ],
+            ),
+            &KeyHints::default(),
+        )
+        .unwrap();
+        assert_eq!(d.key_column, "doc_id");
+        assert!(d.key_column_guessed);
+        assert!(
+            d.ddl
+                .starts_with("CREATE TABLE IF NOT EXISTS `m`.`t` (\n    `doc_id` BIGINT,\n    `emb` ARRAY<FLOAT>"),
+            "{}",
+            d.ddl
+        );
+        // heuristic: no id-shaped column → first NON-list column
+        let d = generate_draft(
+            &schema("m", "t", &[("emb", "list<float32>"), ("region", "utf8")]),
+            &KeyHints::default(),
+        )
+        .unwrap();
+        assert_eq!(d.key_column, "region");
+        // explicit list key → error naming the type
+        let e = generate_draft(
+            &schema("m", "t", &[("id", "int64"), ("emb", "list<float32,3>")]),
+            &KeyHints {
+                key_column: Some("emb".into()),
+                ..KeyHints::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("emb") && e.contains("list<float32,3>") && e.contains("ARRAY 作键列"),
+            "{e}"
+        );
+        // all-list schema: nothing can carry the key
+        let e = generate_draft(
+            &schema("m", "t", &[("v", "list<float32>")]),
+            &KeyHints::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("list<float32>") && e.contains("ARRAY 作键列"),
+            "{e}"
+        );
+    }
+
+    // ⑮c A5 — a time-shaped NAME typed list is not a RANGE key either
+    // (FE: "Complex type column can't be partition column: ARRAY<FLOAT>",
+    // vector probe A4): same skip path as the utf8 case ④, reason spells
+    // the Doris type.
+    #[test]
+    fn vector_time_shaped_name_is_not_a_partition_key() {
+        let d = generate_draft(
+            &schema(
+                "m",
+                "t",
+                &[("id", "int64"), ("event_ts", "list<float32,2>")],
+            ),
+            &KeyHints::default(),
+        )
+        .unwrap();
+        assert!(d.partition.is_none());
+        assert_eq!(d.notes.len(), 1, "{:?}", d.notes);
+        assert!(
+            d.notes[0].contains("`event_ts`")
+                && d.notes[0].contains("list<float32,2>（ARRAY<FLOAT> COMMENT 'vector dim=2'）"),
+            "{}",
+            d.notes[0]
+        );
+    }
+
     #[test]
     fn rejects_bad_inputs() {
         // empty db (dot-less Kafka topic) / empty table / no columns
@@ -1378,8 +1600,8 @@ PROPERTIES (
         // outside the generator's vocabulary — explicit, no silent fold.
         // Two distinct refusals: a word the 16-vocabulary itself rejects
         // (external spelling), and a legal word whose Doris mapping is not
-        // open yet (list<float32> is the A5 wave; null has no Doris column
-        // type — variant opened in A4).
+        // open (null has no Doris column type — variant opened in A4,
+        // list<float32> in A5).
         let e = generate_draft(
             &schema("db", "t", &[("id", "int64"), ("name", "varchar(64)")]),
             &KeyHints::default(),
@@ -1390,16 +1612,32 @@ PROPERTIES (
             e.contains("varchar(64)") && e.contains("不在 DDL 生成器支持面内"),
             "{e}"
         );
-        let e = generate_draft(
-            &schema("db", "t", &[("id", "int64"), ("tags", "list<float32>")]),
-            &KeyHints::default(),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            e.contains("list<float32>") && e.contains("待 A5 探针后开放"),
-            "{e}"
-        );
+        // A5: malformed list forms are refused like any external spelling —
+        // wrong element, dim 0, missing dim, bare word, unclosed — the same
+        // contract `ColumnType::parse` enforces (the vector probe B9 shows
+        // Doris would not catch a bad dimension for us)
+        for bad in [
+            "list<int64>",
+            "list<float32,0>",
+            "list<float32,>",
+            "list<float32,-1>",
+            "list<float32,1.5>",
+            "list<float32,3,4>",
+            "list",
+            "list<float32",
+            "list<>",
+        ] {
+            let e = generate_draft(
+                &schema("db", "t", &[("id", "int64"), ("emb", bad)]),
+                &KeyHints::default(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                e.contains(bad) && e.contains("不在 DDL 生成器支持面内"),
+                "{bad:?}: {e}"
+            );
+        }
         let e = generate_draft(
             &schema("db", "t", &[("id", "int64"), ("nothing", "null")]),
             &KeyHints::default(),

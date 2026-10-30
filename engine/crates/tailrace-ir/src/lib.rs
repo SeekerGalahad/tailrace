@@ -5,8 +5,9 @@
 
 pub mod column_type;
 pub use column_type::{
-    arrow_field_or_utf8, arrow_type_or_utf8, is_variant_field, ColumnType,
-    UNKNOWN_TYPE_UTF8_MIGRATION_WINDOW, VARIANT_FIELD_METADATA,
+    arrow_field_or_utf8, arrow_type_or_utf8, is_variant_field, is_vector_field, vector_dim,
+    ColumnType, UNKNOWN_TYPE_UTF8_MIGRATION_WINDOW, VARIANT_FIELD_METADATA,
+    VECTOR_DIM_FIELD_METADATA,
 };
 pub mod placeholder;
 pub use placeholder::{IrCodec, SrcPlaceholderTable};

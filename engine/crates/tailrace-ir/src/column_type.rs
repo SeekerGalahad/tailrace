@@ -59,7 +59,12 @@ pub enum ColumnType {
     /// The optional dimension is a declaration-only annotation (vector
     /// columns, Doris ARRAY<FLOAT> on the DDL side): arrow `List` cannot
     /// carry it, so `to_arrow` drops it while Display keeps it round-trip
-    /// stable.
+    /// stable. A5: the decoder needs the dimension to guard every cell
+    /// (Doris itself has none — a 5-element array loads into a dim=3 column,
+    /// probed on 3.1.4, scripts/e2e/evidence/vector-probe-2026-10-30/ B9),
+    /// so [`arrow_field_or_utf8`] rides it on the Field as
+    /// [`VECTOR_DIM_FIELD_METADATA`] — the same per-column annotation
+    /// channel the `variant` marker uses.
     ListFloat32 {
         dim: Option<u32>,
     },
@@ -204,23 +209,28 @@ pub const VARIANT_FIELD_METADATA: &str = "tailrace.variant";
 
 /// The schema-construction entry for one declared column: [`arrow_type_or_utf8`]
 /// for the data type (same migration-window fold for unknown words),
-/// nullable, plus the [`VARIANT_FIELD_METADATA`] marker when the word is
-/// `variant`. The two legacy `Field::new(name, arrow_type(..), true)`
-/// sites (tailrace-ir plan building, tailrace-runtime assembly) migrated
-/// here so the marker cannot be present on one side and absent on the
-/// other.
+/// nullable, plus the per-column annotation the arrow type cannot carry:
+/// the [`VARIANT_FIELD_METADATA`] marker when the word is `variant`, the
+/// declared dimension as [`VECTOR_DIM_FIELD_METADATA`] when the word is
+/// `list<float32,dim>` (A5). The two legacy `Field::new(name,
+/// arrow_type(..), true)` sites (tailrace-ir plan building, tailrace-runtime
+/// assembly) migrated here so an annotation cannot be present on one side
+/// and absent on the other. Every other word — including a bare
+/// `list<float32>` — lands a field with empty metadata, byte-identical to
+/// the legacy construction.
 pub fn arrow_field_or_utf8(column: &str, vocab: &str) -> anyhow::Result<Field> {
     let field = Field::new(column, arrow_type_or_utf8(column, vocab)?, true);
-    Ok(
-        if matches!(ColumnType::parse(vocab), Ok(ColumnType::Variant)) {
-            field.with_metadata(std::collections::HashMap::from([(
-                VARIANT_FIELD_METADATA.to_string(),
-                "true".to_string(),
-            )]))
-        } else {
-            field
-        },
-    )
+    let annotate =
+        |key: &str, value: String| std::collections::HashMap::from([(key.to_string(), value)]);
+    Ok(match ColumnType::parse(vocab) {
+        Ok(ColumnType::Variant) => {
+            field.with_metadata(annotate(VARIANT_FIELD_METADATA, "true".to_string()))
+        }
+        Ok(ColumnType::ListFloat32 { dim: Some(d) }) => {
+            field.with_metadata(annotate(VECTOR_DIM_FIELD_METADATA, d.to_string()))
+        }
+        _ => field,
+    })
 }
 
 /// Whether a field carries the `variant` marker (decoder-side read of
@@ -229,6 +239,34 @@ pub fn arrow_field_or_utf8(column: &str, vocab: &str) -> anyhow::Result<Field> {
 pub fn is_variant_field(field: &Field) -> bool {
     let md = field.metadata();
     !md.is_empty() && md.get(VARIANT_FIELD_METADATA).map(String::as_str) == Some("true")
+}
+
+/// Arrow `Field` metadata key carrying a `list<float32,dim>` column's
+/// declared dimension (A5), value = the dimension in decimal (`"768"`).
+/// Arrow `List` has no fixed length (`FixedSizeList` would have one, but the
+/// vocabulary maps to `List` so that the undimensioned `list<float32>` and
+/// the dimensioned form share one arrow type and one builder); the metadata
+/// is how the declaration reaches the decoder's dim guard. Absent on a bare
+/// `list<float32>` — any length is legal there.
+pub const VECTOR_DIM_FIELD_METADATA: &str = "tailrace.vector_dim";
+
+/// Whether a field is the vector column shape — arrow `List` of `Float32`,
+/// the `to_arrow` image of `list<float32[,dim]>`. Type-based (no marker
+/// needed): nothing else in the vocabulary lands a List.
+pub fn is_vector_field(field: &Field) -> bool {
+    matches!(field.data_type(), DataType::List(item) if item.data_type() == &DataType::Float32)
+}
+
+/// The declared dimension of a vector field (decoder-side read of
+/// [`VECTOR_DIM_FIELD_METADATA`]): `Some(dim)` for `list<float32,dim>`,
+/// `None` for the bare `list<float32>` and for every non-vector field. Same
+/// `is_empty` short-circuit as [`is_variant_field`].
+pub fn vector_dim(field: &Field) -> Option<u32> {
+    let md = field.metadata();
+    if md.is_empty() {
+        return None;
+    }
+    md.get(VECTOR_DIM_FIELD_METADATA)?.parse().ok()
 }
 
 // ==================== recursive-descent parser (zero dependencies) ====================
@@ -590,6 +628,55 @@ mod tests {
             Field::new("c", DataType::Utf8, true),
             "non-variant fields are byte-identical to the legacy construction"
         );
+    }
+
+    /// A5: the field-construction entry rides the declared dimension of
+    /// `list<float32,dim>` as metadata, and ONLY then — the bare
+    /// `list<float32>` is the same arrow List with empty metadata (any
+    /// length legal), and no scalar word is ever a vector field. The dim
+    /// reads back as the number it was declared with (the decoder's guard
+    /// compares against it), never confused with the variant marker.
+    #[test]
+    fn vector_dim_field_marker() {
+        let f32_list = DataType::List(std::sync::Arc::new(Field::new(
+            "item",
+            DataType::Float32,
+            true,
+        )));
+        let dimmed = arrow_field_or_utf8("emb", "list<float32,768>").unwrap();
+        assert_eq!(dimmed.name(), "emb");
+        assert_eq!(dimmed.data_type(), &f32_list);
+        assert!(dimmed.is_nullable());
+        assert!(is_vector_field(&dimmed));
+        assert_eq!(vector_dim(&dimmed), Some(768));
+        assert_eq!(
+            dimmed
+                .metadata()
+                .get(VECTOR_DIM_FIELD_METADATA)
+                .map(String::as_str),
+            Some("768")
+        );
+        assert!(!is_variant_field(&dimmed), "a vector is not a variant");
+        // smallest legal dimension survives the decimal round trip
+        assert_eq!(
+            vector_dim(&arrow_field_or_utf8("e", "list<float32,1>").unwrap()),
+            Some(1)
+        );
+        // bare list: vector shape, no dimension, empty metadata
+        let bare = arrow_field_or_utf8("emb", "list<float32>").unwrap();
+        assert!(is_vector_field(&bare));
+        assert_eq!(vector_dim(&bare), None);
+        assert!(
+            bare.metadata().is_empty(),
+            "undimensioned list keeps empty metadata"
+        );
+        assert_eq!(bare, Field::new("emb", f32_list, true));
+        // nothing else is a vector field, nothing else carries a dimension
+        for word in ["utf8", "float32", "variant", "binary", "varchar(64)"] {
+            let f = arrow_field_or_utf8("c", word).unwrap();
+            assert!(!is_vector_field(&f), "{word} is not a vector field");
+            assert_eq!(vector_dim(&f), None, "{word} carries no dimension");
+        }
     }
 
     /// Blueprint §7.1 arrow mapping column, all 16 words.

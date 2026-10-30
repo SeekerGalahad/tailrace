@@ -20,7 +20,12 @@
 //! 「G2 扩词汇后收窄」). Doris DESC prints a `STRING` column back as `text`
 //! (live-probed 2.1.7, 2026-10-30), so `text` maps to `string` — that keeps
 //! the draft→DESC round trip stable for evolve; likewise a VARIANT column
-//! prints back as `variant` (probed 2.1.7 and 3.1.4) and maps to `variant`.
+//! prints back as `variant` (probed 2.1.7 and 3.1.4) and maps to `variant`,
+//! and an ARRAY<FLOAT> column prints back as `array<float>` (A5, probed
+//! 3.1.4) and maps to the bare `list<float32>`. JSON-sample inference does
+//! NOT pick `list<float32>` on its own — a numeric array in a sample is
+//! `variant` like any array: whether it is a vector (and of what dimension)
+//! is the operator's declaration, not a guess from samples.
 
 use std::collections::HashMap;
 
@@ -267,7 +272,13 @@ fn detect(parsed: &[Value]) -> Fmt {
 /// wider carrier than VARCHAR(65533)). A4: Doris prints a VARIANT column
 /// back as `variant` (probed 2.1.7 and 3.1.4,
 /// scripts/e2e/evidence/variant-probe-2026-10-30/ A4) → `variant`, the
-/// same round-trip reasoning. MySQL `json` / Doris `json`/`jsonb` stay utf8:
+/// same round-trip reasoning. A5: Doris prints an ARRAY<FLOAT> column back
+/// as `array<float>` (probed 3.1.4,
+/// scripts/e2e/evidence/vector-probe-2026-10-30/ A5) → `list<float32>`; the
+/// declared dimension is a column COMMENT, not part of the type, so DESC
+/// cannot give it back — a dimensioned registration reads back as the bare
+/// word. Every other array element type stays utf8 (the engine has no other
+/// list word). MySQL `json` / Doris `json`/`jsonb` stay utf8:
 /// they are not VARIANT and the engine has no JSON-column word.
 pub(crate) fn ddl_arrow_type(ddl: &str) -> String {
     let lower = ddl.trim().to_ascii_lowercase();
@@ -284,6 +295,13 @@ pub(crate) fn ddl_arrow_type(ddl: &str) -> String {
         let (p, s): (u32, u32) = (p.trim().parse().ok()?, s.trim().parse().ok()?);
         ((1..=38).contains(&p) && s <= p).then(|| format!("decimal({p},{s})"))
     };
+    // `array_elem()` = the element type between `array<` and `>`
+    let array_elem = || -> Option<&str> {
+        lower
+            .strip_prefix("array<")
+            .and_then(|rest| rest.strip_suffix('>'))
+            .map(str::trim)
+    };
     match head.as_str() {
         "tinyint" => "int8".to_string(),
         "smallint" => "int16".to_string(),
@@ -297,6 +315,7 @@ pub(crate) fn ddl_arrow_type(ddl: &str) -> String {
         "date" | "datev2" => "date".to_string(),
         "text" | "tinytext" | "mediumtext" | "longtext" | "string" => "string".to_string(),
         "variant" => "variant".to_string(),
+        "array" if array_elem() == Some("float") => "list<float32>".to_string(),
         _ => "utf8".to_string(),
     }
 }
@@ -517,9 +536,18 @@ mod tests {
             ("variant", "variant"), // Doris VARIANT prints back as variant (probed 2.1.7 + 3.1.4)
             ("json", "utf8"),       // MySQL JSON / Doris JSON(B): not VARIANT, no vocabulary word
             ("jsonb", "utf8"),      // Doris
-            ("array<int>", "utf8"), // Doris
-            ("hll", "utf8"),        // Doris
-            ("bitmap", "utf8"),     // Doris
+            // A5: Doris ARRAY<FLOAT> prints back as array<float> (probed
+            // 3.1.4) → the bare vector word (the dim is a COMMENT, not the
+            // type); any other element type has no vocabulary word
+            ("array<float>", "list<float32>"),
+            ("ARRAY<FLOAT>", "list<float32>"), // SHOW CREATE TABLE casing
+            ("array< float >", "list<float32>"),
+            ("array<int>", "utf8"),    // Doris
+            ("array<double>", "utf8"), // no list<float64> word
+            ("array<array<float>>", "utf8"),
+            ("array", "utf8"),  // bare / malformed
+            ("hll", "utf8"),    // Doris
+            ("bitmap", "utf8"), // Doris
         ] {
             assert_eq!(ddl_arrow_type(ddl), want, "ddl {ddl:?}");
         }
