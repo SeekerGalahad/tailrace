@@ -5,6 +5,9 @@ use utoipa::OpenApi;
 use crate::api::alerts::{
     AlertEventItem, AlertRuleBody, AlertRuleCreated, AlertRuleItem, AlertsResponse,
 };
+use crate::api::apply::{
+    ApplyChange, ApplyFile, ApplyItem, ApplyOrphan, ApplyResponse, ApplySummary, ApplyTable,
+};
 use crate::api::artifacts::{ArtifactItem, ArtifactUploaded, ArtifactsResponse};
 use crate::api::auth::{LoginRequest, LoginResponse, MeResponse, UserInfo};
 use crate::api::datasources::{
@@ -116,6 +119,9 @@ use crate::compile::{CompileDiag, DimJoinOut, StatementOut};
         crate::api::alerts::update,
         crate::api::alerts::remove,
         crate::api::alerts::stream,
+        // T-G6 pipeline-as-code: declarative apply + dry-run diff
+        crate::api::apply::apply,
+        crate::api::apply::dry_run,
     ),
     components(schemas(
         // auth
@@ -157,6 +163,8 @@ use crate::compile::{CompileDiag, DimJoinOut, StatementOut};
         BackfillJobsResponse,
         // T-E2 alerting DTOs
         AlertsResponse, AlertRuleItem, AlertEventItem, AlertRuleBody, AlertRuleCreated,
+        // T-G6 pipeline-as-code DTOs (bodies embed the REST CRUD DTOs above)
+        ApplyFile, ApplyTable, ApplyResponse, ApplyItem, ApplyChange, ApplyOrphan, ApplySummary,
         // shared
         ErrorResponse, ErrorBody,
     )))]
@@ -437,6 +445,79 @@ mod tests {
             };
             assert!(desc.contains(expect), "{what} 409 must name {expect}: {desc}");
         }
+    }
+
+    /// T-G6: the pipeline-as-code pair is published — both apply paths, the
+    /// dry-run 400, and the response DTOs carry the fields the CLI renders
+    /// (summary counts, per-item action/id/changes with from/to, orphans).
+    /// The declaration file embeds the REST CRUD DTOs; those $refs must
+    /// resolve (the shared `every_schema_ref_resolves` walk covers that).
+    #[test]
+    fn apply_surface_is_published() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("openapi serializes");
+        for path in [
+            "/paths/~1api~1apply/post",
+            "/paths/~1api~1apply~1dry-run/post",
+        ] {
+            assert!(doc.pointer(path).is_some(), "missing {path}");
+        }
+        assert!(
+            doc.pointer("/paths/~1api~1apply~1dry-run/post/responses/400")
+                .is_some(),
+            "dry-run must declare its 400"
+        );
+        let props = |schema: &str| {
+            doc.pointer(&format!("/components/schemas/{schema}/properties"))
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_else(|| panic!("{schema}.properties"))
+        };
+        for k in [
+            "dryRun",
+            "summary",
+            "datasources",
+            "tables",
+            "pipelines",
+            "orphans",
+        ] {
+            assert!(
+                props("ApplyResponse").contains_key(k),
+                "ApplyResponse missing {k}"
+            );
+        }
+        for k in ["create", "update", "unchanged", "orphan"] {
+            assert!(
+                props("ApplySummary").contains_key(k),
+                "ApplySummary missing {k}"
+            );
+        }
+        for k in ["key", "action", "id", "changes"] {
+            assert!(props("ApplyItem").contains_key(k), "ApplyItem missing {k}");
+        }
+        for k in ["field", "from", "to"] {
+            assert!(
+                props("ApplyChange").contains_key(k),
+                "ApplyChange missing {k}"
+            );
+        }
+        for k in ["kind", "key", "id"] {
+            assert!(
+                props("ApplyOrphan").contains_key(k),
+                "ApplyOrphan missing {k}"
+            );
+        }
+        // the table entry is the REST registration body plus `datasource`
+        // (serde flatten → an allOf composition over the registered
+        // TableRegisterBody schema)
+        let apply_table = doc
+            .pointer("/components/schemas/ApplyTable")
+            .cloned()
+            .expect("ApplyTable schema registered");
+        let raw = apply_table.to_string();
+        assert!(
+            raw.contains("datasource") && raw.contains("TableRegisterBody"),
+            "ApplyTable must compose `datasource` over the REST registration body: {raw}"
+        );
     }
 
     /// T-E2: the alert surface is published end to end — the combined read,

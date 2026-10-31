@@ -6,6 +6,7 @@
 
 pub mod alerting;
 pub mod api;
+pub mod apply_cli;
 pub mod backfill;
 pub mod compile;
 pub mod deploy;
@@ -130,6 +131,10 @@ pub fn build_router_with_mcp(state: AppState, mcp_state: mcp::McpState) -> Route
         )
         .route("/api/pipelines/compile", post(api::pipelines::compile))
         .route("/api/pipelines/templates", get(api::pipelines::templates))
+        // T-G6 pipeline-as-code: declarative file → structured diff /
+        // idempotent upsert (one entry for GitOps, CI and the CLI shell)
+        .route("/api/apply", post(api::apply::apply))
+        .route("/api/apply/dry-run", post(api::apply::dry_run))
         .route(
             "/api/pipelines/{id}",
             get(api::pipelines::detail)

@@ -24,6 +24,7 @@ struct Args {
 fn usage() {
     eprintln!(
         "Usage: tailrace-console [--addr <HOST:PORT>] [--data-dir <DIR>] [--mcp-allow-write] [--version]\n\
+         \x20              tailrace-console apply -f <file.json> [--dry-run] [--server <URL>] …\n\
          \n\
          Options:\n\
          \x20 -a, --addr <HOST:PORT>   listen address (default {DEFAULT_ADDR})\n\
@@ -31,6 +32,10 @@ fn usage() {
          \x20     --mcp-allow-write    enable the four MCP write tools on POST /mcp (default: read-only;\n\
          \x20                             write calls additionally require \"confirm\": true)\n\
          \x20 -V, --version            print version and exit\n\
+         \n\
+         Subcommand (T-G6 pipeline-as-code — `tailrace-console apply --help` for flags):\n\
+         \x20 apply -f <file.json> [--dry-run] [--server <URL>] [--token <T> | --user <U> --password <P>]\n\
+         \x20                             send a declaration file to /api/apply[/dry-run], print the diff\n\
          \n\
          Env:\n\
          \x20 MCP_ALLOW_WRITE           same as --mcp-allow-write (1/true/yes/on)\n\
@@ -46,6 +51,7 @@ fn usage() {
          \x20 TAILRACE_DEPLOY_HEALTH_TIMEOUT_SECS  deploy health/register window (default 90)\n\
          \x20 TAILRACE_ALERT_INTERVAL_SECS  alert evaluator period in seconds (default 15, min 1;\n\
          \x20                             T-E2 rules engine over the aggregated node /metrics)\n\
+         \x20 TAILRACE_CONSOLE_TOKEN / _USER / _PASSWORD  the apply subcommand's credentials\n\
          \x20 RUST_LOG                   tracing filter (default info)"
     );
 }
@@ -100,7 +106,14 @@ fn parse_args(argv: &[String]) -> Result<Args> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = parse_args(std::env::args().skip(1).collect::<Vec<_>>().as_slice())?;
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // T-G6: `apply` is a client subcommand — it talks to a console over
+    // HTTP and never opens the local store, so it short-circuits before
+    // any server-side startup side effect (data dir, migrations, seeds).
+    if argv.first().map(String::as_str) == Some("apply") {
+        std::process::exit(tailrace_console::apply_cli::run(&argv[1..]).await);
+    }
+    let args = parse_args(&argv)?;
 
     tracing_subscriber::fmt()
         .with_env_filter(

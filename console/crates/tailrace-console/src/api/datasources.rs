@@ -168,7 +168,7 @@ fn registry() -> Vec<DatasourceType> {
 }
 
 /// Registry order gate for write paths (§4.2: 400 when the type is unknown).
-fn registry_type(ty: &str) -> Option<&'static str> {
+pub(crate) fn registry_type(ty: &str) -> Option<&'static str> {
     match ty {
         "kafka" => Some("kafka"),
         "doris" => Some("doris"),
@@ -181,7 +181,7 @@ fn registry_type(ty: &str) -> Option<&'static str> {
 }
 
 /// Required connJson keys per type (form-completeness precheck).
-fn required_conn_keys(ty: &str) -> &'static [&'static str] {
+pub(crate) fn required_conn_keys(ty: &str) -> &'static [&'static str] {
     match ty {
         "kafka" => &["bootstrap"],
         "doris" | "starrocks" => &["jdbcUrl", "streamLoadUrl"],
@@ -201,7 +201,7 @@ fn required_conn_keys(ty: &str) -> &'static [&'static str] {
 /// `kind == "starrocks"`, so folding starrocks into "doris" here would make
 /// the engine send Doris-only headers to a StarRocks FE. Both kinds derive
 /// cursor NONE (sink-side).
-fn table_kind_for(ds_type: &str) -> &str {
+pub(crate) fn table_kind_for(ds_type: &str) -> &str {
     match ds_type {
         "mysql" | "postgresql" => "jdbc",
         other => other,
@@ -525,14 +525,12 @@ fn validate_upsert(body: &DatasourceUpsertBody) -> Result<String, Response> {
     serde_json::to_string(&conn).map_err(|e| ApiError::internal(&e.into()).into_response())
 }
 
-/// Credential halves (§5.3): JSON {"username","password"} sealed with
-/// AES-256-GCM → (nonce_b64, ciphertext_b64) for the two
-/// `datasource_credential` columns. Plaintext never reaches storage or any
-/// response, and credentials are never returned by any endpoint.
-fn credential_halves(
-    body: &DatasourceUpsertBody,
-    cipher: &console_store::CredentialCipher,
-) -> Option<anyhow::Result<(String, String)>> {
+/// The credential plaintext a body declares — JSON `{"username","password"}`
+/// — or None when the body carries neither (blank password keeps the stored
+/// credential, §4.2 A.1 #7). Shared by [`credential_halves`] and the T-G6
+/// apply diff, which opens the stored halves and compares against exactly
+/// this text so a re-declared identical credential is "unchanged".
+pub(crate) fn credential_payload(body: &DatasourceUpsertBody) -> Option<String> {
     let has_user = body
         .username
         .as_deref()
@@ -546,11 +544,24 @@ fn credential_halves(
     if !has_user && !has_pass {
         return None;
     }
-    let payload = json!({
-        "username": body.username.as_deref().unwrap_or(""),
-        "password": body.password.as_deref().unwrap_or(""),
-    });
-    Some(cipher.seal(&payload.to_string()))
+    Some(
+        json!({
+            "username": body.username.as_deref().unwrap_or(""),
+            "password": body.password.as_deref().unwrap_or(""),
+        })
+        .to_string(),
+    )
+}
+
+/// Credential halves (§5.3): JSON {"username","password"} sealed with
+/// AES-256-GCM → (nonce_b64, ciphertext_b64) for the two
+/// `datasource_credential` columns. Plaintext never reaches storage or any
+/// response, and credentials are never returned by any endpoint.
+fn credential_halves(
+    body: &DatasourceUpsertBody,
+    cipher: &console_store::CredentialCipher,
+) -> Option<anyhow::Result<(String, String)>> {
+    credential_payload(body).map(|payload| cipher.seal(&payload))
 }
 
 /// `GET /api/datasources?type=&layer=` (§4.2; `layer` accepted for form
@@ -1679,7 +1690,7 @@ fn ddl_ident(name: &str) -> anyhow::Result<String> {
 }
 
 /// `unique` / `duplicate` (case-insensitive) → key model.
-fn parse_key_model(s: &str) -> Option<tailrace_ddl::KeyModel> {
+pub(crate) fn parse_key_model(s: &str) -> Option<tailrace_ddl::KeyModel> {
     match s.trim().to_ascii_lowercase().as_str() {
         "unique" => Some(tailrace_ddl::KeyModel::Unique),
         "duplicate" => Some(tailrace_ddl::KeyModel::Duplicate),
