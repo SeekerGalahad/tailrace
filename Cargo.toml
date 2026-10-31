@@ -36,7 +36,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.95"
@@ -179,19 +179,19 @@ testcontainers = { version = "0.27.3", default-features = false, features = ["bl
 # tags are pinned to the preheated local images (mysql:8.0, postgres:15).
 testcontainers-modules = { version = "0.15", default-features = false, features = ["kafka", "mysql", "postgres", "blocking"] }
 # internal crates (path + version, mirrors original engine practice)
-tailrace-connector = { path = "engine/crates/tailrace-connector", version = "1.1.0" }
-tailrace-conn-kafka = { path = "engine/crates/tailrace-conn-kafka", version = "1.1.0" }
-tailrace-conn-file = { path = "engine/crates/tailrace-conn-file", version = "1.1.0" }
-tailrace-conn-doris = { path = "engine/crates/tailrace-conn-doris", version = "1.1.0" }
-tailrace-conn-mqtt = { path = "engine/crates/tailrace-conn-mqtt", version = "1.1.0" }
-tailrace-conn-jdbc = { path = "engine/crates/tailrace-conn-jdbc", version = "1.1.0" }
-tailrace-conn-s3 = { path = "engine/crates/tailrace-conn-s3", version = "1.1.0" }
-tailrace-ir = { path = "engine/crates/tailrace-ir", version = "1.1.0" }
-tailrace-decode = { path = "engine/crates/tailrace-decode", version = "1.1.0" }
-tailrace-transform = { path = "engine/crates/tailrace-transform", version = "1.1.0" }
-tailrace-parser = { path = "engine/crates/tailrace-parser", version = "1.1.0" }
-tailrace-state = { path = "engine/crates/tailrace-state", version = "1.1.0" }
-tailrace-catalog = { path = "engine/crates/tailrace-catalog", version = "1.1.0" }
+tailrace-connector = { path = "engine/crates/tailrace-connector", version = "1.2.0" }
+tailrace-conn-kafka = { path = "engine/crates/tailrace-conn-kafka", version = "1.2.0" }
+tailrace-conn-file = { path = "engine/crates/tailrace-conn-file", version = "1.2.0" }
+tailrace-conn-doris = { path = "engine/crates/tailrace-conn-doris", version = "1.2.0" }
+tailrace-conn-mqtt = { path = "engine/crates/tailrace-conn-mqtt", version = "1.2.0" }
+tailrace-conn-jdbc = { path = "engine/crates/tailrace-conn-jdbc", version = "1.2.0" }
+tailrace-conn-s3 = { path = "engine/crates/tailrace-conn-s3", version = "1.2.0" }
+tailrace-ir = { path = "engine/crates/tailrace-ir", version = "1.2.0" }
+tailrace-decode = { path = "engine/crates/tailrace-decode", version = "1.2.0" }
+tailrace-transform = { path = "engine/crates/tailrace-transform", version = "1.2.0" }
+tailrace-parser = { path = "engine/crates/tailrace-parser", version = "1.2.0" }
+tailrace-state = { path = "engine/crates/tailrace-state", version = "1.2.0" }
+tailrace-catalog = { path = "engine/crates/tailrace-catalog", version = "1.2.0" }
 # T16 (roadmap §九): default-features = false so a connector-trimmed
 # tailrace-node actually drops the connector crates from its link graph.
 # Without it every runtime edge (node AND tailrace-api, which sits in the
@@ -204,12 +204,12 @@ tailrace-catalog = { path = "engine/crates/tailrace-catalog", version = "1.1.0" 
 # unchanged; tailrace-api never instantiates connectors, while tests/contract
 # does exercise default_registry() and therefore re-enables connector-file
 # explicitly in its own manifest.
-tailrace-runtime = { path = "engine/crates/tailrace-runtime", version = "1.1.0", default-features = false }
-tailrace-metadata = { path = "engine/crates/tailrace-metadata", version = "1.1.0" }
+tailrace-runtime = { path = "engine/crates/tailrace-runtime", version = "1.2.0", default-features = false }
+tailrace-metadata = { path = "engine/crates/tailrace-metadata", version = "1.2.0" }
 # T-A1 (R6): pure draft-DDL generator — no IO, no tokio; console pairs it
 # with tailrace-metadata's mysql_exec for the create-table closed loop.
-tailrace-ddl = { path = "engine/crates/tailrace-ddl", version = "1.1.0" }
-tailrace-api = { path = "engine/crates/tailrace-api", version = "1.1.0" }
-console-store = { path = "console/crates/console-store", version = "1.1.0" }
-console-auth = { path = "console/crates/console-auth", version = "1.1.0" }
-console-proxy = { path = "console/crates/console-proxy", version = "1.1.0" }
+tailrace-ddl = { path = "engine/crates/tailrace-ddl", version = "1.2.0" }
+tailrace-api = { path = "engine/crates/tailrace-api", version = "1.2.0" }
+console-store = { path = "console/crates/console-store", version = "1.2.0" }
+console-auth = { path = "console/crates/console-auth", version = "1.2.0" }
+console-proxy = { path = "console/crates/console-proxy", version = "1.2.0" }

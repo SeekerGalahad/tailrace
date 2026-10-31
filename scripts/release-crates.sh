@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ============================================================================
-# scripts/release-crates.sh — T27 crates.io full-tree release driver (21 pkgs)
+# scripts/release-crates.sh — T27 crates.io full-tree release driver (22 pkgs)
 # ============================================================================
 # Publish topology (roadmap §九 T27; verified against this tree with
 # `cargo metadata --no-deps` — every L(n) package depends only on L(<n)):
-#   L0 ir / decode / transform / conn-mqtt / conn-s3 / metadata /
+#   L0 ir / decode / transform / conn-mqtt / conn-s3 / metadata / ddl /
 #      console-store / console-proxy          (zero internal deps)
 #   L1 state / catalog / parser / auth
 #   L2 connector
@@ -15,7 +15,7 @@
 # tests-contract is excluded (publish = false).
 #
 # Modes:
-#   --list                print the 21 package names in publish order
+#   --list                print the 22 package names in publish order
 #   --dry-run             per package `cargo publish --dry-run`. A failure
 #                         whose ONLY cause is unpublished internal deps
 #                         ("no matching package named ..." — the expected
@@ -55,14 +55,21 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 export CARGO_PROFILE_DEV_DEBUG=0
-VERSION="1.1.0"
+# Single source of truth is [workspace.package] version in the root
+# Cargo.toml (the only `version = "…"` at column 0 there; the internal-dep
+# table pins live inside braces). b19661b's message promised this read but
+# its diff only re-pinned the literal, so the 1.1.0 wave would have SKIPped
+# every package at the next release the same way 1.0.0 did — v1.2.0 prep
+# makes the promise true.
+VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+[ -n "$VERSION" ] || { echo "error: could not read workspace version from Cargo.toml" >&2; exit 1; }
 REGISTRY="crates-io"
 MAX_TRIES=10
 RETRY_SLEEP=15
 LOGFILE="scripts/release-log-$(date +%Y%m%d).txt"
 
 LEVELS=(
-  "tailrace-ir tailrace-decode tailrace-transform tailrace-conn-mqtt tailrace-conn-s3 tailrace-metadata console-store console-proxy"
+  "tailrace-ir tailrace-decode tailrace-transform tailrace-conn-mqtt tailrace-conn-s3 tailrace-metadata tailrace-ddl console-store console-proxy"
   "tailrace-state tailrace-catalog tailrace-parser console-auth"
   "tailrace-connector"
   "tailrace-conn-kafka tailrace-conn-file tailrace-conn-doris tailrace-conn-jdbc"
@@ -80,10 +87,11 @@ all_packages() {
   done
 }
 
-# Integrity: the wave acceptance counts 21 packages; refuse to run on a
+# Integrity: the wave acceptance counts 22 packages (21 at T27 + tailrace-ddl
+# from R6 T-A1, which tailrace-console depends on); refuse to run on a
 # silently mutated topology.
-[ "$(all_packages | wc -l | tr -d ' ')" -eq 21 ] || {
-  echo "error: topology integrity check failed (expected 21 packages)" >&2
+[ "$(all_packages | wc -l | tr -d ' ')" -eq 22 ] || {
+  echo "error: topology integrity check failed (expected 22 packages)" >&2
   exit 1
 }
 
@@ -231,4 +239,4 @@ for level in "${LEVELS[@]}"; do
     fi
   done
 done
-log "publish wave complete: 21 packages at $VERSION"
+log "publish wave complete: 22 packages at $VERSION"
