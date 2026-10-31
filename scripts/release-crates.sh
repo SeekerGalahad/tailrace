@@ -2,11 +2,14 @@
 # ============================================================================
 # scripts/release-crates.sh — T27 crates.io full-tree release driver (22 pkgs)
 # ============================================================================
-# Publish topology (roadmap §九 T27; verified against this tree with
-# `cargo metadata --no-deps` — every L(n) package depends only on L(<n)):
-#   L0 ir / decode / transform / conn-mqtt / conn-s3 / metadata / ddl /
+# Publish topology (roadmap §九 T27; re-verified against this tree with
+# `cargo metadata --no-deps` on 2026-10-31 — every L(n) package depends
+# only on L(<n); in-level order below also respects in-level edges):
+#   L0 ir / transform / conn-mqtt / conn-s3 / metadata / ddl /
 #      console-store / console-proxy          (zero internal deps)
-#   L1 state / catalog / parser / auth
+#   L1 decode / state / catalog / parser / auth
+#      (decode->ir since R9 A4, state->ir, catalog->ir,
+#       parser->catalog — hence catalog before parser in-level)
 #   L2 connector
 #   L3 conn-kafka / conn-file / conn-doris / conn-jdbc
 #   L4 runtime
@@ -18,22 +21,25 @@
 #   --list                print the 22 package names in publish order
 #   --dry-run             per package `cargo publish --dry-run`. A failure
 #                         whose ONLY cause is unpublished internal deps
-#                         ("no matching package named ..." — the expected
-#                         state before the first real publish) falls back to
-#                         `cargo package --list` (validates manifest,
-#                         metadata and the packaged file set WITHOUT the
-#                         registry resolve; note `--no-verify` still
-#                         resolves and is NOT usable pre-publication) and is
-#                         labeled "package" (full verify deferred to the
-#                         publish wave, where deps resolve from the
-#                         registry). Any other failure is a hard stop.
-#                         No retries here: nothing is propagating yet.
+#                         falls back to `cargo package --list` (validates
+#                         manifest, metadata and the packaged file set
+#                         WITHOUT the registry resolve; note `--no-verify`
+#                         still resolves and is NOT usable pre-publication)
+#                         and is labeled "package" (full verify deferred to
+#                         the publish wave, where deps resolve from the
+#                         registry). Cargo words that state two ways — see
+#                         unpublished_dep_names below. Any other failure is
+#                         a hard stop. No retries here: nothing is
+#                         propagating yet.
 #   --publish [--resume]  IRREVERSIBLE. Per package: dry-run gate with
 #                         registry-propagation retry (<=10 tries x 15s,
-#                         retrying only "no matching package named"), then
-#                         the real publish. --resume queries the crates.io
-#                         API per package and skips any whose max_version is
-#                         already $VERSION (restart after a partial wave).
+#                         retrying only unresolved-internal-dep errors,
+#                         both cargo wordings — mirror lag shows up as
+#                         "candidate versions ... didn't match" once older
+#                         versions are live), then the real publish.
+#                         --resume queries the crates.io API per package
+#                         and skips any whose max_version is already
+#                         $VERSION (restart after a partial wave).
 #
 # Registry: every cargo call passes --registry crates-io — this machine
 # replaces crates.io with the rsproxy-sparse mirror (~/.cargo/config.toml),
@@ -69,8 +75,8 @@ RETRY_SLEEP=15
 LOGFILE="scripts/release-log-$(date +%Y%m%d).txt"
 
 LEVELS=(
-  "tailrace-ir tailrace-decode tailrace-transform tailrace-conn-mqtt tailrace-conn-s3 tailrace-metadata tailrace-ddl console-store console-proxy"
-  "tailrace-state tailrace-catalog tailrace-parser console-auth"
+  "tailrace-ir tailrace-transform tailrace-conn-mqtt tailrace-conn-s3 tailrace-metadata tailrace-ddl console-store console-proxy"
+  "tailrace-decode tailrace-state tailrace-catalog tailrace-parser console-auth"
   "tailrace-connector"
   "tailrace-conn-kafka tailrace-conn-file tailrace-conn-doris tailrace-conn-jdbc"
   "tailrace-runtime"
@@ -85,6 +91,41 @@ all_packages() {
   for level in "${LEVELS[@]}"; do
     for pkg in $level; do printf '%s\n' "$pkg"; done
   done
+}
+
+# Cargo reports "internal dep not on the registry at $VERSION" under two
+# wordings, depending on whether the crate has any PRIOR publish:
+#   never published      -> "no matching package named `tailrace-x` found"
+#   older live versions  -> "failed to select a version for the requirement
+#                            `tailrace-x = "^1.2.0`" + "candidate versions
+#                            found which didn't match: 1.1.0, 1.0.0"
+# Both are the same expected pre-publish / mirror-lag state (the v1.2.0
+# preflight only met the second one — ir 1.0.0/1.1.0 were already live —
+# and the old single-pattern match hard-stopped on it). Extract every crate
+# name cited by either wording.
+unpublished_dep_names() {
+  local out="$1"
+  {
+    # `|| true`: a wording that is absent is not an error — under
+    # `set -euo pipefail` a bare unmatched grep would abort this
+    # process-substitution shell before the second pattern ever runs.
+    grep -oE 'no matching package named `[^` ]+' <<<"$out" | sed 's/.*`//' || true
+    grep -oE 'failed to select a version for the requirement `[^ ]+' <<<"$out" | sed 's/.*`//' || true
+  } | sort -u
+}
+
+# True when $1's failed resolve cites ONLY packages from this wave: the
+# expected state before (dry-run) or mid-propagation (publish retry) a
+# wave. An EXTERNAL requirement that cannot resolve is a manifest bug and
+# must stay a hard stop, so every cited name is checked against the wave.
+registry_lag_only() {
+  local out="$1" name seen=0
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    seen=1
+    all_packages | grep -qx "$name" || return 1
+  done < <(unpublished_dep_names "$out")
+  [ "$seen" -eq 1 ]
 }
 
 # Integrity: the wave acceptance counts 22 packages (21 at T27 + tailrace-ddl
@@ -154,8 +195,9 @@ if [ "$mode" = "--dry-run" ]; then
         pass=$((pass + 1))
         continue
       fi
-      if grep -q "no matching package named" <<<"$out"; then
-        # Expected pre-publish state: internal deps not on the registry yet.
+      if registry_lag_only "$out"; then
+        # Expected pre-publish state: internal deps not on the registry yet
+        # at $VERSION (either cargo wording — see unpublished_dep_names).
         # Fall back to package-list validation (manifest/metadata/files,
         # no registry resolve).
         if cargo package --registry "$REGISTRY" --list --allow-dirty -p "$pkg" >/dev/null 2>&1; then
@@ -216,7 +258,7 @@ for level in "${LEVELS[@]}"; do
         ok=1
         break
       fi
-      if ! grep -q "no matching package named" <<<"$out"; then
+      if ! registry_lag_only "$out"; then
         log "DRY $pkg FAIL (attempt $try — non-propagation error, not retried)"
         printf '%s\n' "$out" >&2
         exit 1
