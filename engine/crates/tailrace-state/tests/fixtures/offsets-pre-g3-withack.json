@@ -1,0 +1,48 @@
+{
+  "0": {
+    "cursor": {
+      "Kafka": {
+        "topic": "orders_ogg",
+        "group": "tr.p12.s0",
+        "offsets": {
+          "0": 42,
+          "1": 7
+        }
+      }
+    },
+    "lastAck": "p12-flush-3",
+    "totals": {
+      "consumed": 300,
+      "flushed": 300,
+      "flushes": 3
+    }
+  },
+  "1": {
+    "cursor": {
+      "File": {
+        "path": "/var/log/app/orders.log",
+        "byte_pos": 65536
+      }
+    },
+    "lastAck": "p12-flush-1"
+  },
+  "2": {
+    "cursor": {
+      "JdbcKey": {
+        "key": "id",
+        "value": "100"
+      }
+    },
+    "lastAck": null,
+    "totals": {
+      "consumed": 10,
+      "flushed": 10,
+      "flushes": 1
+    }
+  },
+  "3": {
+    "cursor": "None",
+    "lastAck": null,
+    "totals": null
+  }
+}

@@ -36,6 +36,10 @@ pub struct StatementTotals {
 /// through Content, and BTreeMap<i32,i64> integer keys cannot convert from
 /// string keys (observed as "data did not match any variant"), so any Cursor
 /// holding an i32-keyed partition map must bypass that path.
+/// G3 (Cursor::Custom) rides the same entry unchanged: the enum stays
+/// externally tagged, so the four built-in shapes keep their pre-G3 wire and
+/// old ledgers load without migration (read old, write new — the committed
+/// fixtures under `tests/fixtures/offsets-pre-g3-*.json` pin that wire).
 #[derive(Debug, Clone)]
 pub enum LedgerEntry {
     WithAck {
@@ -433,6 +437,223 @@ mod tests {
         assert_eq!(
             totals, None,
             "no totals key = seed falls back to zero (old behavior)"
+        );
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// The four built-in shapes exactly as the committed pre-G3 fixtures
+    /// encode them (`tests/fixtures/offsets-pre-g3-*.json`; statement index
+    /// = array index).
+    fn pre_g3_shapes(group: &str) -> [Cursor; 4] {
+        [
+            Cursor::Kafka {
+                topic: "orders_ogg".into(),
+                group: group.into(),
+                offsets: BTreeMap::from([(0, 42), (1, 7)]),
+            },
+            Cursor::File {
+                path: "/var/log/app/orders.log".into(),
+                byte_pos: 65536,
+            },
+            Cursor::JdbcKey {
+                key: "id".into(),
+                value: "100".into(),
+            },
+            Cursor::None,
+        ]
+    }
+
+    const PRE_G3_BARE: &[u8] = include_bytes!("../tests/fixtures/offsets-pre-g3-bare.json");
+    const PRE_G3_WITHACK: &[u8] = include_bytes!("../tests/fixtures/offsets-pre-g3-withack.json");
+
+    /// G3 read-old (blueprint §7.7 "旧台账读取"), oldest wire: a bare
+    /// statement→Cursor map written before lastAck/totals existed still
+    /// loads every one of the four built-in shapes typed and intact. The
+    /// fixture is a committed pre-G3 file rather than a literal produced by
+    /// the current code, so a serde drift on any legacy tag fails here.
+    #[test]
+    fn pre_g3_bare_ledger_loads_four_shapes_unchanged() -> anyhow::Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("tailrace-state-g3-bare-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("offsets-11.json"), PRE_G3_BARE)?;
+        let store = FileOffsetStore::new(&dir)?;
+        for (i, expected) in pre_g3_shapes("tr.p11.s0").into_iter().enumerate() {
+            assert_eq!(
+                store.load(11, i as u32)?,
+                Some((expected, None, None)),
+                "statement {i}"
+            );
+        }
+        let all = store.load_all(11)?;
+        assert_eq!(all.len(), 4);
+        assert!(
+            all.values().all(|e| matches!(e, LedgerEntry::Bare(_))),
+            "the bare wire loads as Bare entries"
+        );
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// G3 read-old, current pre-G3 wire (cursor + lastAck + totals, with one
+    /// entry from the pre-totals era and one carrying explicit nulls): all
+    /// four shapes load typed, and ack/totals come back per statement.
+    #[test]
+    fn pre_g3_withack_ledger_loads_four_shapes_unchanged() -> anyhow::Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("tailrace-state-g3-withack-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("offsets-12.json"), PRE_G3_WITHACK)?;
+        let store = FileOffsetStore::new(&dir)?;
+        let sidecars: [(Option<&str>, Option<StatementTotals>); 4] = [
+            (
+                Some("p12-flush-3"),
+                Some(StatementTotals {
+                    consumed: 300,
+                    flushed: 300,
+                    flushes: 3,
+                }),
+            ),
+            (Some("p12-flush-1"), None), // no totals key (pre-totals entry)
+            (
+                None,
+                Some(StatementTotals {
+                    consumed: 10,
+                    flushed: 10,
+                    flushes: 1,
+                }),
+            ),
+            (None, None), // explicit nulls
+        ];
+        for (i, (expected, (ack, totals))) in pre_g3_shapes("tr.p12.s0")
+            .into_iter()
+            .zip(sidecars)
+            .enumerate()
+        {
+            assert_eq!(
+                store.load(12, i as u32)?,
+                Some((expected, ack.map(String::from), totals)),
+                "statement {i}"
+            );
+        }
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// G3 write-new + restart recovery (blueprint §7.7 "Custom 变体 serde
+    /// 往返" / "重启后 cursor 恢复"): a Custom cursor commits under its own
+    /// tag together with lastAck + totals, the on-disk file carries the
+    /// `Custom` tag (no fold into a legacy shape), and a fresh store over the
+    /// same directory — the restart path — restores it exactly; a later
+    /// payload advance keeps the account/counters on None like any shape.
+    #[test]
+    fn custom_cursor_round_trips_and_survives_restart() -> anyhow::Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("tailrace-state-g3-custom-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let snapshot = |id: i64, manifests: &[&str]| Cursor::Custom {
+            kind: "iceberg-snapshot".into(),
+            payload: serde_json::json!({
+                "snapshot_id": id,
+                "manifests": manifests,
+                "etag": null,
+            }),
+        };
+        let cur = snapshot(123_456_789_012, &["m-1.avro", "m-2.avro"]);
+        let totals = StatementTotals {
+            consumed: 5,
+            flushed: 5,
+            flushes: 1,
+        };
+        {
+            let mut store = FileOffsetStore::new(&dir)?;
+            store.save(13, 0, &cur, Some("p13-flush-1"), Some(totals))?;
+        } // store dropped = the process is gone
+        let raw = std::fs::read_to_string(dir.join("offsets-13.json"))?;
+        assert!(
+            raw.contains(r#""Custom""#) && raw.contains(r#""kind": "iceberg-snapshot""#),
+            "Custom must land under its own tag:\n{raw}"
+        );
+        // restart: a new store over the same directory
+        let store = FileOffsetStore::new(&dir)?;
+        assert_eq!(
+            store.load(13, 0)?,
+            Some((cur, Some("p13-flush-1".into()), Some(totals)))
+        );
+        // next commit advances the payload; None keeps ack + counters
+        let cur2 = snapshot(123_456_789_013, &["m-3.avro"]);
+        {
+            let mut store = FileOffsetStore::new(&dir)?;
+            store.save(13, 0, &cur2, None, None)?;
+        }
+        assert_eq!(
+            FileOffsetStore::new(&dir)?.load(13, 0)?,
+            Some((cur2, Some("p13-flush-1".into()), Some(totals)))
+        );
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// G3 read-old-write-new on one file: starting from the committed pre-G3
+    /// bare ledger, a Custom commit on a new statement must (a) leave the
+    /// four legacy entries loadable and typed after a restart, (b) keep them
+    /// on their legacy bare wire — the rewrite does not migrate untouched
+    /// entries — (c) land the Custom entry in the current cursor/lastAck/
+    /// totals wire, and (d) keep the pre-G3 bytes verbatim as `.bak` (the
+    /// self-healing fallback source).
+    #[test]
+    fn read_old_write_new_keeps_legacy_entries_beside_custom() -> anyhow::Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("tailrace-state-g3-mixed-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("offsets-11.json"), PRE_G3_BARE)?;
+        let custom = Cursor::Custom {
+            kind: "pg-lsn".into(),
+            payload: serde_json::json!("0/16B3748"),
+        };
+        {
+            let mut store = FileOffsetStore::new(&dir)?;
+            store.save(11, 4, &custom, Some("p11-flush-9"), None)?;
+        }
+        // restart
+        let store = FileOffsetStore::new(&dir)?;
+        for (i, expected) in pre_g3_shapes("tr.p11.s0").into_iter().enumerate() {
+            assert_eq!(
+                store.load(11, i as u32)?,
+                Some((expected, None, None)),
+                "legacy statement {i} after the rewrite"
+            );
+        }
+        assert_eq!(
+            store.load(11, 4)?,
+            Some((custom, Some("p11-flush-9".into()), None))
+        );
+        // on-disk shape: legacy entries untouched (bare), the new one wrapped
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("offsets-11.json"))?)?;
+        assert!(
+            on_disk["0"].get("Kafka").is_some() && on_disk["0"].get("cursor").is_none(),
+            "legacy entry 0 stays bare: {}",
+            on_disk["0"]
+        );
+        assert_eq!(on_disk["3"], serde_json::json!("None"));
+        assert_eq!(
+            on_disk["4"]["cursor"]["Custom"]["kind"],
+            serde_json::json!("pg-lsn")
+        );
+        assert_eq!(
+            on_disk["4"]["cursor"]["Custom"]["payload"],
+            serde_json::json!("0/16B3748")
+        );
+        assert_eq!(on_disk["4"]["lastAck"], serde_json::json!("p11-flush-9"));
+        assert_eq!(
+            std::fs::read(dir.join("offsets-11.json.bak"))?,
+            PRE_G3_BARE,
+            ".bak = the pre-G3 file byte for byte"
         );
         std::fs::remove_dir_all(&dir)?;
         Ok(())

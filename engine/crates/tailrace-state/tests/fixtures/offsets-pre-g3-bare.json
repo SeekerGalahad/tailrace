@@ -1,0 +1,25 @@
+{
+  "0": {
+    "Kafka": {
+      "topic": "orders_ogg",
+      "group": "tr.p11.s0",
+      "offsets": {
+        "0": 42,
+        "1": 7
+      }
+    }
+  },
+  "1": {
+    "File": {
+      "path": "/var/log/app/orders.log",
+      "byte_pos": 65536
+    }
+  },
+  "2": {
+    "JdbcKey": {
+      "key": "id",
+      "value": "100"
+    }
+  },
+  "3": "None"
+}

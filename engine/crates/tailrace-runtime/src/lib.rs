@@ -1282,13 +1282,15 @@ const BOUNDED_IDLE_POLLS: u32 = 60;
 /// value parsed as i64 (a non-numeric keyset never reaches; the idle guard
 /// ends those runs); Kafka: EVERY assigned partition's next offset (a
 /// single-dimensional `to` over a multi-partition topic needs the console
-/// to resolve it per partition first).
+/// to resolve it per partition first); Custom (G3): the payload is opaque
+/// to the engine, so it never reaches either — the idle guard ends those
+/// runs, exactly like a non-numeric keyset.
 fn cursor_reached(c: &Cursor, to: i64) -> bool {
     match c {
         Cursor::File { byte_pos, .. } => *byte_pos as i64 >= to,
         Cursor::JdbcKey { value, .. } => value.parse::<i64>().map(|v| v >= to).unwrap_or(false),
         Cursor::Kafka { offsets, .. } => !offsets.is_empty() && offsets.values().all(|o| *o >= to),
-        Cursor::None => false,
+        Cursor::Custom { .. } | Cursor::None => false,
     }
 }
 
@@ -1299,6 +1301,9 @@ fn cursor_reached(c: &Cursor, to: i64) -> bool {
 /// dimension (the partition map is unknown here) — the empty map is the
 /// no-cursor equivalent, so the statement starts from its declared start
 /// position (timestamp→offset resolution belongs to the console side).
+/// Custom shapes (G3) cannot be seeded either — a scalar `from` has no
+/// meaning against an opaque payload — so the probe cursor is kept as is
+/// (the connector's own start position).
 fn seed_from_cursor(probe: &Cursor, from: i64) -> Cursor {
     match probe {
         Cursor::File { path, .. } => Cursor::File {
@@ -1321,6 +1326,15 @@ fn seed_from_cursor(probe: &Cursor, from: i64) -> Cursor {
                 group: group.clone(),
                 offsets: Default::default(),
             }
+        }
+        Cursor::Custom { kind, .. } => {
+            tracing::warn!(
+                from,
+                kind = %kind,
+                "bounded run over a custom-cursor source: a scalar `from` cannot address an \
+                 opaque payload — starting from the connector's probe position"
+            );
+            probe.clone()
         }
         Cursor::None => Cursor::None,
     }
@@ -1607,6 +1621,30 @@ mod tests {
         assert!(!no_bytes.flush_due(0, u64::MAX, Duration::from_secs(9)));
         // all three far below their boundaries → no flush
         assert!(!opts.flush_due(1, 1, Duration::from_millis(1)));
+    }
+
+    /// G3 (Cursor::Custom) bounded-mode posture: an opaque payload never
+    /// "reaches" a scalar `to` (the idle guard ends such runs, like a
+    /// non-numeric keyset), and a scalar `from` cannot be seeded into it —
+    /// the probe cursor is kept verbatim. The four built-in shapes are
+    /// untouched (File still reaches).
+    #[test]
+    fn custom_cursor_never_reaches_and_seed_keeps_probe() {
+        let probe = Cursor::Custom {
+            kind: "pg-lsn".into(),
+            payload: serde_json::json!({ "lsn": "0/16B3748" }),
+        };
+        assert!(!cursor_reached(&probe, i64::MIN));
+        assert!(!cursor_reached(&probe, 0));
+        assert!(!cursor_reached(&probe, i64::MAX));
+        assert_eq!(seed_from_cursor(&probe, 12_345), probe);
+        assert!(cursor_reached(
+            &Cursor::File {
+                path: "f".into(),
+                byte_pos: 10
+            },
+            10
+        ));
     }
 
     /// T5 equivalence acceptance: the parallel decode path (fan-out above
