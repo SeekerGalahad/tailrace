@@ -245,7 +245,8 @@
      恢复后同一事件续、恢复且清除才 resolved）、DELETE firing 规则投递 resolved(reason=deleted)、窗口类跨重启/缺样保持（不假 resolved、
      跨缺口差值不误报）、逐序列事件与通知、阈值 0 单行即触发、不可能过滤 400、snapshot 以 console 时钟合成心跳年龄并标记不可达节点；
     评估器纯函数单测另钉解析/序列键转义往返/五类三态裁决/窗口对齐与缺口/参数校验。真告警触发 + webhook 收到的 dogfooding 验证属 R9 W4
-    （修复轮改动后的 e2e `alert_flow.sh` 断言已同步，**未在本轮复跑**——需活栈）。
+    （修复轮改动后的 e2e `alert_flow.sh` 断言已同步；R10 复跑门在 `a435afe` 上实跑 **38/38**，证据
+    `scripts/e2e/evidence/alert-flow-e2e-2026-10-31-r10recert/e2e-38of38.log`）。
 
 12. **管道即代码（T-G6）的声明语义、幂等口径与安全边界**（2026-10-31 增补，R10 详案设计裁决照实施）：
    - **服务端单一入口**：diff 只在服务端算一份（`api/apply.rs` 的 `plan()`），dry-run 与 apply 共用同一计划函数，CLI/CI（及后续 MCP 包装）全走这对端点——「人审的 diff」与「机器落的变更」不可能不一致。CLI 薄壳零 diff 逻辑，只渲染。
@@ -261,7 +262,7 @@
 13. **DLQ 是 at-least-once 记账 + badRowPolicy 六段透传**（2026-10-31 增补，R10 尾债包——dogfooding round3 #3/#4 的如实披露，行为零改动）：
    - **同一坏行可能被隔离多次**：坏行进 DLQ 时游标照常越过，但**越过的是已持久化 DLQ 记录对应的游标**——flush 失败重启后的重放窗口从「上一次成功 flush 的游标」起算，窗口内已隔离过的坏行会随重放**再隔离一次**（侧文件追加式，不去重）。实测（dogfooding round3 #3，`run1-dlq-p2-s0.jsonl`）：首批 2 好 3 坏 → flush 撞 BE MEM_LIMIT 窗口 → 重启重放两次 → 侧文件与 `tailrace_dlq_rows_total` 记到 **9**（3 坏行 × 3 次隔离），三组时间戳、游标相同。
    - **消费方须知**：侧文件与指标计的是**隔离次数**，不是坏行数；下游消费/回放 DLQ 必须以记录里的 **`rawB64`（原始字节）为幂等键去重**（同一坏行的重放记录 `cursor` 亦相同，可作辅助校验）。`dlq_window` 告警规则同样按隔离次数计数——重放风暴期其增量按次数放大，属预期。v1.3 若做 DLQ 回放工具将内置去重。
-   - **badRowPolicy 透传补齐**：`PipelineConfig` DTO 增 `badRowPolicy` 键（此前五段 DTO 无该键，请求携带即被 serde 静默丢弃——落库 config_json 与推给引擎的 plan `options` 均不见它，`fail` 策略实际按默认 `dlq` 执行，dogfooding round3 #4）。现 DTO 与引擎 `PlanOptions` 键对键镜像，由契约测试 `pipeline_config_wires_every_plan_options_key` 钉住（引擎侧未来加键、console 未跟即测试失败）；取值校验在引擎 deploy 期（非法值整体拒绝 plan）。
+   - **badRowPolicy 透传补齐**：`PipelineConfig` DTO 增 `badRowPolicy` 键（此前五段 DTO 无该键，请求携带即被 serde 静默丢弃——落库 config_json 与推给引擎的 plan `options` 均不见它，`fail` 策略实际按默认 `dlq` 执行，dogfooding round3 #4）。现 DTO 与引擎 `PlanOptions` 键对键镜像，由契约测试 `pipeline_config_wires_every_plan_options_key` 钉住（引擎侧未来加键、console 未跟即测试失败）；取值校验在引擎 deploy 期（非法值整体拒绝 plan）。**非默认值的引擎行为**由 e2e `alert_flow.sh` B 段端到端钉住（R10 评审修复轮，50/50）：skip → 坏行丢弃只计数、不建 `bad_rows/`、管道保持 RUNNING；fail → `STATEMENT_FAILED` 带引擎原文、同批好行不越过游标；`"drop"` → 502 `ENGINE_REJECTED` 点名 `options.badRowPolicy`——证据 `scripts/e2e/evidence/alert-flow-e2e-2026-10-31-r10review/`。
 
 ## 四、未决 / 后续
 

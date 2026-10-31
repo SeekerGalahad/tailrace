@@ -8,11 +8,17 @@
 #                  wall time); appending a row and resuming drops it back to
 #                  ~0 → firing → resolved, both episodes landing in
 #                  alert_event, both notices POSTed to a mock webhook;
-#   state rule   : a REAL FAILED state is manufactured by poison data — one
-#                  malformed JSON row under badRowPolicy=fail with
-#                  recovery.autoRestart=false (first decode failure is
+#   state rule   : a REAL FAILED state is manufactured by a deterministic
+#                  engine fault — the SELECT projection order disagrees with
+#                  the sink's registered column order — under
+#                  recovery.autoRestart=false (first statement error is
 #                  terminal, engine/registry.rs); the rule fires, stopping
-#                  the pipeline (series gone) resolves it.
+#                  the pipeline (series gone) resolves it;
+#   badRowPolicy : section B (R10 review) runs the NON-default values
+#                  skip / fail and an invalid one end to end — console DTO →
+#                  config_json → plan.options → engine parse_strict — and
+#                  asserts on what the engine did (dropped+counted / halted
+#                  before the cursor / plan rejected), not on the DTO.
 #
 # 用法：
 #   ./scripts/build.sh   # 先构建（release 二进制默认路径 target/release/…）
@@ -42,10 +48,20 @@
 #        column order != sink」→ recovery.autoRestart=false 即终态 FAILED
 #        （node /metrics tailrace_pipeline_state=3）→ 建 state_failed 规则
 #        → firing（webhook 第 3 条）→ stop（series 消失）→ resolved（第 4
-#        条）；DELETE 规则 → 204 → 空集。注：badRowPolicy 在 console 的
-#        PipelineConfig 无字段——带上会被 serde 静默丢弃（dogfooding round3
-#        摩擦）；坏 JSON 行在默认 dlq 策略下只进 DLQ，不是语句错误（run3
-#        实测，造不出 FAILED）。
+#        条）；DELETE 规则 → 204 → 空集。注：F 段刻意不依赖 badRowPolicy
+#        （坏 JSON 行在默认 dlq 策略下只进 DLQ，不是语句错误——run3 实测），
+#        非默认 badRowPolicy 的端到端由 B 段专门覆盖；
+#   B    badRowPolicy 非默认值端到端（R10 评审：a435afe 给 PipelineConfig 补
+#        了 bad_row_policy 字段，契约测试只钉 serde 往返，这里钉引擎行为）：
+#        B1 skip——好/坏/好三行，管道保持 RUNNING，两好行落 sink，**不建**
+#        bad_rows 隔离文件，DECODE_BAD 事件写明 dropped+counted，node.log
+#        启动行 bad_row_policy=skip；B2 fail——好/坏两行同一批，STATEMENT_
+#        FAILED 事件带引擎原文「decode bad row under badRowPolicy=fail」，
+#        state=3，且同批好行**不**落 sink（游标越批前即止）；B3 负例——
+#        badRowPolicy="drop" 过 create/publish（console 只携带不校验），deploy
+#        被引擎 parse_strict 拒绝 → 502 ENGINE_REJECTED 点名 options.
+#        badRowPolicy（严格解析，不静默退回 dlq）。B 段在规则面清空之后
+#        运行，不会给 webhook 计数添任何一条。
 #
 # 覆盖变量：
 #   TAILRACE_E2E_CONSOLE_ADDR   console 监听地址   默认 127.0.0.1:18088
@@ -127,6 +143,10 @@ wait_http() { # wait_http <url> <tries>
 }
 json_sql() { printf '%s' "$1" | jq -Rs .; }
 node_metric() { curl -s "http://$NODE_ADDR/metrics" | grep "^$1" | head -1; }
+# node_log_plain → node.log with the ANSI colour codes stripped (tracing
+# writes them even into a file). The engine's start line then reads
+# "pipeline started (serve) pipeline_id=N statements=1 dispatch_id=… bad_row_policy=<v>"
+node_log_plain() { sed $'s/\x1b\\[[0-9;]*m//g' "$WORK/node.log" 2>/dev/null; }
 # rule_state <name> → the rule's evaluator state via GET /api/alerts
 rule_state() {
   req GET /api/alerts "" "$TOKEN"
@@ -425,11 +445,13 @@ TOTAL_HOOKS="$(wait_hook 2 20)"
 # runtime bails on the first data-carrying batch ("transform output column
 # order != sink", engine/crates/tailrace-runtime/src/lib.rs) and with
 # recovery.autoRestart=false the first statement error is terminal FAILED.
-# (badRowPolicy=fail would also work on the engine side, but the console's
-# PipelineConfig has no field for it — a config carrying "badRowPolicy" is
-# DROPPED by serde, silently; dogfooding round 3 friction, noted above the
-# CFG. The malformed-JSON variant of this section rides only the DLQ, which
-# is NOT a statement error — run-3 finding.)
+# (badRowPolicy=fail would also produce a FAILED here — since a435afe the
+# console's PipelineConfig carries bad_row_policy, the silent serde drop
+# dogfooding round 3 hit is gone — but this section keeps the projection
+# fault on purpose: the alert semantics under test must not depend on the
+# bad-row policy. The non-default policies get their own end-to-end
+# section B below. The malformed-JSON variant under the default dlq policy
+# rides only the DLQ, which is NOT a statement error — run-3 finding.)
 COLS_F='[["id","utf8"],["extra","utf8"]]'
 req POST "/api/datasources/$FDS/tables" "{\"dbName\":\"local\",\"tableName\":\"fail_sink\",\"format\":\"jsonl\",\"columnsJson\":$COLS_F}" "$TOKEN"
 req POST "/api/datasources/$FDS/tables" "{\"dbName\":\"local\",\"tableName\":\"fail_in\",\"format\":\"jsonl\",\"columnsJson\":$COLS_F}" "$TOKEN"
@@ -495,6 +517,104 @@ NH="$(wc -l < "$WORK/hook.jsonl" 2>/dev/null | tr -d ' ')"
 { [ "$D1" = "204" ] && [ "$D2" = "204" ] && [ "$NR" = "0" ] && [ "$NH" = "4" ]; } \
   && step pass "S3.1 rules deleted (204 ×2) → empty rule set; no extra notice (none was firing — a firing rule would have been closed with reason=deleted and its resolved delivered first)" \
   || step fail "S3.1 rule cleanup" "d1=$D1 d2=$D2 rules=$NR hook_notices=$NH"
+
+# ---------- B badRowPolicy: the NON-default values end to end ----------
+# R10 review: a435afe gave PipelineConfig the bad_row_policy field and the
+# contract test pins DTO keys == engine PlanOptions keys — that proves the
+# serde round-trip, not that the ENGINE acts on fail/skip. Dogfooding round 3
+# found the silent drop only by running a non-default value, so this section
+# pushes all three forms through console → config_json → plan.options →
+# engine parse_strict and asserts on what the engine DID. It runs after the
+# rule face is empty: nothing here can add a webhook notice.
+COLS_B='[["id","utf8"]]'
+for t in bp_skip bp_skip_in bp_fail bp_fail_in; do
+  req POST "/api/datasources/$FDS/tables" "{\"dbName\":\"local\",\"tableName\":\"$t\",\"format\":\"jsonl\",\"columnsJson\":$COLS_B}" "$TOKEN"
+done
+# B1 skip: good / MALFORMED / good — the engine drops+counts the middle row,
+# keeps running, writes no quarantine file (that is the dlq policy's job)
+printf '%s\n' '{"id":"S-1"}' 'not json {' '{"id":"S-2"}' > "$WORK/node/bp_skip_in"
+CFG_SKIP='{"reliability":null,"recovery":{"autoRestart":false},"tuning":null,"groupPrefix":null,"startOffset":null,"badRowPolicy":"skip"}'
+if deploy_pipeline af-bp-skip bp_skip bp_skip_in "id" "$CFG_SKIP"; then
+  SKIP_PID="$P_ID"
+  step pass "B1.1 badRowPolicy=skip pipeline deployed → RUNNING (pipeline #$SKIP_PID; seed = good, MALFORMED, good)"
+else
+  SKIP_PID="${P_ID:-0}"
+  step fail "B1.1 skip pipeline deploy" "http=$CODE body=$(head -c 200 <<<"$BODY")"
+fi
+if node_log_plain | grep -q "pipeline started (serve) pipeline_id=$SKIP_PID .*bad_row_policy=skip"; then
+  step pass "B1.2 CORE node.log start line for pipeline #$SKIP_PID says bad_row_policy=skip — the value crossed console → config_json → plan.options → engine parse_strict (the engine's own log, not the DTO)"
+else
+  step fail "B1.2 skip passthrough" "$(node_log_plain | grep "pipeline started (serve) pipeline_id=$SKIP_PID" | tail -1)"
+fi
+SK=0; S1=0; S2=0
+for i in $(seq 1 30); do
+  S1="$(grep -c '"S-1"' "$WORK/node/bp_skip" 2>/dev/null || echo 0)"
+  S2="$(grep -c '"S-2"' "$WORK/node/bp_skip" 2>/dev/null || echo 0)"
+  { [ "$S1" = "1" ] && [ "$S2" = "1" ]; } && { SK=1; break; }
+  sleep 1
+done
+SKST="$(node_metric "tailrace_pipeline_state{.*pipeline=\"$SKIP_PID\".*}" | awk '{print $2}')"
+{ [ "$SK" = "1" ] && [ "${SKST:-x}" != "3" ]; } \
+  && step pass "B1.3 CORE skip semantics: both good rows (S-1, S-2) flushed around the dropped row, tailrace_pipeline_state=$SKST (not FAILED)" \
+  || step fail "B1.3 skip behaviour" "s1=$S1 s2=$S2 state=$SKST node.log=$(node_log_plain | tail -3)"
+SKIP_DLQ="$WORK/node-state/bad_rows/p$SKIP_PID-s0.jsonl"
+if [ ! -e "$SKIP_DLQ" ] && grep -q "DECODE_BAD.*pipeline#$SKIP_PID.*badRowPolicy=skip (rows dropped, counted only)" "$WORK/node-state/events.log" 2>/dev/null; then
+  step pass "B1.4 CORE skip ≠ dlq: no bad_rows/p$SKIP_PID-s0.jsonl was created and the DECODE_BAD event reads 'badRowPolicy=skip (rows dropped, counted only)'"
+else
+  step fail "B1.4 skip vs dlq" "dlq_exists=$([ -e "$SKIP_DLQ" ] && echo yes || echo no) events=$(grep "pipeline#$SKIP_PID" "$WORK/node-state/events.log" 2>/dev/null | tail -2)"
+fi
+req POST "/api/pipelines/$SKIP_PID/stop" '{}' "$TOKEN"
+[ "$CODE" = "200" ] && step pass "B1.5 skip pipeline stopped" || step fail "B1.5 stop" "http=$CODE body=$BODY"
+
+# B2 fail: good / MALFORMED in ONE poll (the file is complete before the
+# deploy; FileSource reads to EOF per poll) — the engine halts the statement
+# before the cursor crosses the batch, so the good row must not land either
+printf '%s\n' '{"id":"X-1"}' 'not json {' > "$WORK/node/bp_fail_in"
+CFG_BPFAIL='{"reliability":null,"recovery":{"autoRestart":false},"tuning":null,"groupPrefix":null,"startOffset":null,"badRowPolicy":"fail"}'
+if deploy_pipeline af-bp-fail bp_fail bp_fail_in "id" "$CFG_BPFAIL"; then
+  BPF_PID="$P_ID"
+  step pass "B2.1 badRowPolicy=fail pipeline deployed → RUNNING (pipeline #$BPF_PID; seed = good, MALFORMED — one poll, one batch)"
+else
+  BPF_PID="${P_ID:-0}"
+  step fail "B2.1 fail pipeline deploy" "http=$CODE body=$(head -c 200 <<<"$BODY")"
+fi
+if node_log_plain | grep -q "pipeline started (serve) pipeline_id=$BPF_PID .*bad_row_policy=fail"; then
+  step pass "B2.2 node.log start line for pipeline #$BPF_PID says bad_row_policy=fail"
+else
+  step fail "B2.2 fail passthrough" "$(node_log_plain | grep "pipeline started (serve) pipeline_id=$BPF_PID" | tail -1)"
+fi
+ST=""
+for i in $(seq 1 45); do
+  ST="$(node_metric "tailrace_pipeline_state{.*pipeline=\"$BPF_PID\".*}" | awk '{print $2}')"
+  [ "$ST" = "3" ] && break
+  sleep 2
+done
+[ "${ST:-x}" = "3" ] \
+  && step pass "B2.3 CORE fail semantics: the malformed row IS a statement error — tailrace_pipeline_state{pipeline=\"$BPF_PID\"}=3 (terminal FAILED under autoRestart=false)" \
+  || step fail "B2.3 fail state" "state=$ST node.log=$(node_log_plain | tail -3)"
+if grep -q "STATEMENT_FAILED.*pipeline#$BPF_PID.*decode bad row under badRowPolicy=fail" "$WORK/node-state/events.log" 2>/dev/null; then
+  step pass "B2.4 CORE STATEMENT_FAILED event carries the engine's own text 'decode bad row under badRowPolicy=fail' — the fail branch ran, not section F's projection fault"
+else
+  step fail "B2.4 fail text" "$(grep "pipeline#$BPF_PID" "$WORK/node-state/events.log" 2>/dev/null | tail -2)"
+fi
+XC="$(grep -c '"X-1"' "$WORK/node/bp_fail" 2>/dev/null || echo 0)"
+[ "${XC:-0}" = "0" ] \
+  && step pass "B2.5 fail halts BEFORE the cursor crosses the batch: the good row that shared the poll with the poison was not written (bp_fail holds 0 × X-1)" \
+  || step fail "B2.5 pre-cursor halt" "x1=$XC"
+req POST "/api/pipelines/$BPF_PID/stop" '{}' "$TOKEN"
+[ "$CODE" = "200" ] && step pass "B2.6 fail pipeline stopped" || step fail "B2.6 stop" "http=$CODE body=$BODY"
+
+# B3 negative: an invalid value. create/publish accept it (the console only
+# carries the field); the engine's strict parse rejects the plan at deploy —
+# strictness is what keeps a typo from silently degrading to dlq.
+CFG_DROP='{"reliability":null,"recovery":null,"tuning":null,"groupPrefix":null,"startOffset":null,"badRowPolicy":"drop"}'
+deploy_pipeline af-bp-drop bp_fail bp_fail_in "id" "$CFG_DROP" >/dev/null 2>&1
+DROP_CODE="$CODE"; DROP_BODY="$BODY"
+if [ "$DROP_CODE" = "502" ] && grep -q 'ENGINE_REJECTED' <<<"$DROP_BODY" && grep -q 'badRowPolicy' <<<"$DROP_BODY"; then
+  step pass "B3.1 negative: badRowPolicy=\"drop\" passes create/publish and the ENGINE rejects the plan at deploy → 502 ENGINE_REJECTED naming options.badRowPolicy (strict parse, no silent fallback to dlq)"
+else
+  step fail "B3.1 invalid policy" "http=$DROP_CODE body=$(head -c 300 <<<"$DROP_BODY")"
+fi
 
 TOTAL=$((PASS+FAIL))
 echo "== alert_flow e2e summary: $PASS/$TOTAL steps passed =="

@@ -1,0 +1,11 @@
+[2m2026-10-31T11:09:35.074688Z[0m [32m INFO[0m [2mrusqlite_migration[0m[2m:[0m Database migrated to version 6
+──────────────────────────────────────────────────────────────
+[Tailrace] 首次启动：初始管理员已创建
+[Tailrace]   用户名：admin
+[Tailrace]   初始密码：<redacted-e2e-bootstrap>
+[Tailrace]   （仅此一次显示，请妥善保存）
+──────────────────────────────────────────────────────────────
+[2m2026-10-31T11:09:35.097644Z[0m [32m INFO[0m [2mtailrace_console::alerting[0m[2m:[0m alert evaluator started [3minterval_secs[0m[2m=[0m2
+[2m2026-10-31T11:09:35.105211Z[0m [32m INFO[0m [2mtailrace_console[0m[2m:[0m tailrace-console 1.1.0 listening on http://127.0.0.1:18088
+[2m2026-10-31T11:09:35.105281Z[0m [32m INFO[0m [2mtailrace_console[0m[2m:[0m data dir: /tmp/tailrace-af-e2e/run | swagger: http://127.0.0.1:18088/swagger-ui | api doc: http://127.0.0.1:18088/api-docs/openapi.json
+[2m2026-10-31T11:09:35.105286Z[0m [32m INFO[0m [2mtailrace_console[0m[2m:[0m mcp: http://127.0.0.1:18088/mcp (write tools disabled)

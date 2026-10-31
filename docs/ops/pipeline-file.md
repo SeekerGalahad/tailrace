@@ -79,7 +79,7 @@ diff 的字段：`kind`、`format`、`columnsJson`、`sequenceColumn`、`keyMode
 | `dsMapping` | `{别名: 数据源名\|id}` | — | **值推荐写数据源名**（可移植）；数字 id 仍接受 |
 | `checkpointMs` | int | — | 缺省 10000 |
 | `preferredNodeId` | int | — | 环境相关，跨环境文件建议留空 |
-| `config` | object | — | 五段 PlanOptions（reliability/recovery/tuning/groupPrefix/startOffset），与 REST 同源 |
+| `config` | object | — | **六段** PlanOptions（reliability/recovery/tuning/groupPrefix/startOffset/**badRowPolicy**），与 REST 同源。`badRowPolicy` 取 `dlq`（缺省）/`fail`/`skip`，console 只携带不校验，引擎在 deploy 时严格解析（非法值整个计划被拒 → 502 ENGINE_REJECTED）。**条目里省略 `config` = 声明该管道「无高级配置」**，不是「不管」：已有 config 的管道会被 apply 更新为 `null`（dry-run 以 `config: {…} -> null` 明示）——从 UI 建的管道导出成文件时务必把 `config` 一并带上 |
 | `generation` | int | — | apply 忽略 |
 
 **apply 不发布不部署**：新建管道落 DRAFT；更新已发布管道与 `PUT /api/pipelines/{id}` 同语义——非 DRAFT 保存后转 `PENDING_CHANGES`，需再走 publish/deploy 才生效。已匹配（unchanged）的管道 apply **不触碰**（不翻状态、不动 updated_at）。
@@ -112,7 +112,8 @@ diff 的字段：`kind`、`format`、`columnsJson`、`sequenceColumn`、`keyMode
      "dsMapping": {"shop": "edge-kafka", "ods": "doris-sink"},
      "checkpointMs": 10000,
      "config": {"reliability": null, "recovery": null, "tuning": null,
-                "groupPrefix": null, "startOffset": "earliest"}}
+                "groupPrefix": null, "startOffset": "earliest",
+                "badRowPolicy": "dlq"}}
   ]
 }
 ```
@@ -156,6 +157,7 @@ summary: create 2, update 1, unchanged 1, orphan 1
 ## 八、语义速查
 
 - **幂等**：同文件连 apply，第二次全 `unchanged`、零写、零审计行；差异只在真有漂移的字段上落地（数据源 CAS 代不无谓 +1，管道状态不翻 PENDING_CHANGES）。
+- **条目内字段省略 = 声明为缺省值**（与顶层三键的「键缺省=不表态」不同）：管道条目省略 `config` 即把该管道的高级配置声明为空——已有 config 的管道在首次 apply 时会被清成 `null`（dry-run 里是一行 `config: {…} -> null` 的 update）；二连 apply 收敛（`null == null`）。同理 `checkpointMs` 省略 = 10000。要「保持线上不变」就把当前值写进文件，apply 没有「不管这个字段」的语义。
 - **永不删除**：从文件删条目 ≠ 删线上对象；orphan 只是提醒。清理仍走各 REST DELETE（带 IN_USE 守卫）。
 - **全文件校验前置**：任何一个未知引用（表指向不存在的数据源、dsMapping 引用不存在的别名）→ 整个文件 400，一个字都不写。
 - **执行顺序**：datasources → tables → pipelines（依赖方向）。跨对象非单事务：中途失败可能留下前半段写入——重跑同一文件即收敛（幂等是恢复路径）。

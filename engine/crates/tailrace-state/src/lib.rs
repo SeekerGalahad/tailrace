@@ -467,11 +467,16 @@ mod tests {
     const PRE_G3_BARE: &[u8] = include_bytes!("../tests/fixtures/offsets-pre-g3-bare.json");
     const PRE_G3_WITHACK: &[u8] = include_bytes!("../tests/fixtures/offsets-pre-g3-withack.json");
 
-    /// G3 read-old (blueprint §7.7 "旧台账读取"), oldest wire: a bare
-    /// statement→Cursor map written before lastAck/totals existed still
-    /// loads every one of the four built-in shapes typed and intact. The
-    /// fixture is a committed pre-G3 file rather than a literal produced by
-    /// the current code, so a serde drift on any legacy tag fails here.
+    /// G3 read-old (blueprint §7.7 "旧台账读取"), oldest ACCEPTED shape: a
+    /// bare statement→Cursor map loads every one of the four built-in shapes
+    /// typed and intact. Provenance, stated plainly: within this repo's git
+    /// history (baseline d547630 onward) `save` has only ever written
+    /// `WithAck` — three keys, `None` as an explicit null — and `Bare` exists
+    /// solely on the read side (the `Deserialize` fallback and the
+    /// `load_all` legacy branch, which the baseline already called "legacy
+    /// format"). So this fixture is a hand-written pin of the ACCEPTANCE
+    /// surface, not a ledger any released version is known to have produced;
+    /// it still fails on a serde drift of any legacy tag, which is its job.
     #[test]
     fn pre_g3_bare_ledger_loads_four_shapes_unchanged() -> anyhow::Result<()> {
         let dir =
@@ -497,9 +502,13 @@ mod tests {
         Ok(())
     }
 
-    /// G3 read-old, current pre-G3 wire (cursor + lastAck + totals, with one
-    /// entry from the pre-totals era and one carrying explicit nulls): all
-    /// four shapes load typed, and ack/totals come back per statement.
+    /// G3 read-old, the pre-G3 `WithAck` wire. Statements 0 and 3 are the
+    /// literal v1.1.0 on-disk form (three keys, `None` written as an explicit
+    /// null — what `save` has produced since the baseline); statement 1
+    /// omits the `totals` key, which is an ACCEPTED shape (the `Deserialize`
+    /// fallback reads a missing key as `None`) rather than one any release
+    /// wrote. All four shapes load typed, and ack/totals come back per
+    /// statement.
     #[test]
     fn pre_g3_withack_ledger_loads_four_shapes_unchanged() -> anyhow::Result<()> {
         let dir =
@@ -517,7 +526,7 @@ mod tests {
                     flushes: 3,
                 }),
             ),
-            (Some("p12-flush-1"), None), // no totals key (pre-totals entry)
+            (Some("p12-flush-1"), None), // totals key omitted: accepted shape, not a written one
             (
                 None,
                 Some(StatementTotals {

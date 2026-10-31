@@ -99,6 +99,13 @@ run5 观测 = {cursor=EOF, flushed=4, 表 4/5 行, 60s 不补}。逐一对照：
 
 ## 二、DorisSink 路径定向复现尝试
 
+> **证据归档状态（R10 评审修复轮如实标注）**：本节三次尝试的运行产物——本地 HTTP 代理脚本、
+> 各次 node.log、`GET offsets` 原始 JSON、代理拒载日志——**均未归档入仓**；§2.2 的数字与时序是
+> 执行者当场观测的记录，第三方**不能据仓内文件复核或重放**这三次尝试。这与 R9/R10 e2e 证据目录
+> （`scripts/e2e/evidence/*`，脚本+日志+台账全落盘）的可审计标准**不对等**。因此本文档的「证据」
+> 分两层读：§一 源码不变量分析（行号可核）+ 已归档的单测/e2e 落盘件 = **可独立复核**；§二 三次
+> 定向复现 = **不可复核的执行叙述**，只作旁证、不作独立结论依据。§三 结论据此措辞。
+
 ### 2.1 设计
 
 目标：在 **BE 拒载窗口**下重放 round3 run5 场景（file→doris，喂行后立即 stop），
@@ -147,31 +154,46 @@ re-deploy」。前段同尝试 1（4 好 flushed、DOC-5 finalization 被拒耗�
 
 - **badRowPolicy 透传**（R10 ①）：尝试 1 的 config 带 `"badRowPolicy":"skip"`，node.log
   启动行打 `bad_row_policy=skip`——console DTO 补齐后端到端生效（dogfooding #4 的
-  「仍是 dlq」不复存在）。
+  「仍是 dlq」不复存在）。**该项已不依赖本节叙述**：R10 评审修复轮把 skip / fail / 非法值
+  三形态写进 `scripts/e2e/alert_flow.sh` B 段（12 步）并实跑 50/50，node.log 启动行、
+  DECODE_BAD/STATEMENT_FAILED 事件原文、sink 内容、502 ENGINE_REJECTED 全部落盘——
+  `scripts/e2e/evidence/alert-flow-e2e-2026-10-31-r10review/`（README 逐步对照）。
 - **MEM_LIMIT retryable**（R10 ②）：三次尝试的拒载全部走
   `BE memory pressure (transient): Status=Fail Reason=[MEM_LIMIT_EXCEEDED]…` 的
   **retryable** 分类（node.log WARN 逐次可见 1s/4s/16s 退避），不再落入 fatal；
-  窗口关闭后同 label 重发即成功（尝试 3）。
-- **DLQ at-least-once**（R10 ③）：尝试 2 的 2 条重复隔离记录是文档披露的又一实证。
+  窗口关闭后同 label 重发即成功（尝试 3）。可复核部分 = `tailrace-conn-doris` 的
+  `is_memory_pressure` 拼写单测 `memory_pressure_classification_pins_doris_spellings`（正例为
+  3.1.4 实录文本）与状态矩阵 ⑧/⑧b 用例；「活 BE 窗口内逐次退避」本身只有本节叙述。
+- **DLQ at-least-once**（R10 ③）：尝试 2 的 2 条重复隔离记录是文档披露的又一实证
+  （已归档的同构落盘件 = `scripts/e2e/evidence/variant-vector-e2e-2026-10-31/run1-dlq-p2-s0.jsonl`
+  的 3 坏行 × 3 次隔离 = 9 条）。
 
-## 三、结论：以证据关闭（无缺陷定位，不复现）
+## 三、结论：以源码证据链关闭（无缺陷定位，不复现；定向复现叙述未归档、仅作旁证）
 
-三次定向复现（run5 精确形态 / run1 重启风暴+毒数据 / armor re-deploy）**均未出现**
-「cursor 到 EOF 但 totals.flushed 少一行」的组合；每次的 cursor/flushed/表行数行为都
-与 §一 的源码不变量精确一致。结合 §1.7 的排除表，判定：
+关闭依据按可复核性分层：**主依据** = §一 源码不变量分析（行号可核）+ 已归档落盘件
+（R10 评审修复轮 `alert_flow.sh` B 段：skip 管道的 ledger 落成 `cursor=EOF / consumed=3 /
+flushed=2`，见 `scripts/e2e/evidence/alert-flow-e2e-2026-10-31-r10review/review-offsets-3-skip-ledger.json`
+——这是 §1.7 推演的「Bad 路径越过游标、flushed 不计、consumed 多出坏行数」形态的第一份
+落盘实证）；**旁证** = §二 三次 DorisSink 定向复现（run5 精确形态 / run1 重启风暴+毒数据 /
+armor re-deploy）据执行叙述**均未出现**「cursor 到 EOF 但 totals.flushed 少一行」的组合，每次
+cursor/flushed/表行数与 §一 不变量一致——但产物未归档，第三方不可复核。结合 §1.7 排除表，判定：
 
-1. **引擎侧未发现「好行被游标越过而不入账/不入表」的窗口**。flush 失败（含 BE 内存
-   拒载）时游标从不越过未确认的行；窗口过后的重放（含 stop→re-deploy armor）把行
-   补写且 flushed/表行数一致；label floor 防撞有效，Dedup 路径不丢行。
+1. **引擎侧未发现「好行被游标越过而不入账/不入表」的窗口**。源码层：flush 失败（含 BE 内存
+   拒载）时游标从不越过未确认的行（S1/S2 save 在 flush 成功之后、S3 flush 失败即 Err 不 save）；
+   窗口过后的重放（含 stop→re-deploy armor）把行补写且 flushed/表行数一致；label floor 防撞有效，
+   Dedup 路径不丢行——后三点在 §二 叙述中得到印证，但该印证不可独立复核。
 2. round3 run5 的观测 {cursor=EOF, flushed=4, 表 4/5} 与引擎行为的**唯一自洽解释**
    仍是 §1.7 路径 (a)：DOC-5 在该次 poll 中被判 Bad 隔离进 DLQ（dlq 策略下的**正确**
-   行为，行可恢复）或被投影过滤——该解释需要 run5 现场的 `consumed`/`bad` 计数、
-   DLQ 文件或 `DECODE_BAD` 事件证实，而现场未留存（evidence 目录只含最终 27/27 轮），
-   **无法回溯证实或证伪**。次要可能：观测为操作者口头记录、原始 offsets JSON 未留
-   存，读数时点与最终 ledger 的一致性无法复核。
-3. **不做强行归因**：本项以证据关闭为「机制未明但引擎不变量在三形态实测下全部
-   成立」；若再次出现同形观测，取证清单（按优先级）：`GET offsets` 原始 JSON 全文
-   （cursor/totals 三项）、`GET stats`（consumed/bad）、`bad_rows/p{P}-s{N}.jsonl`
-   尾部与 mtime、node.log 中该管道的 DECODE_BAD/FLUSH_OK/final flush 行、Doris
-   `SHOW TRANSACTION`/`SHOW PROC '/transactions/…'` 的 label 状态。收齐即可在
-   「DLQ 隔离（正确行为）」与「新机制」之间一锤定音。
+   行为，行可恢复）或被投影过滤。该路径会产生的 ledger 形态**已有落盘件**（上述 r10review
+   `offsets-3`：skip 与 dlq 在游标/计数上同构，仅侧文件有无之别）。但 run5 现场的
+   `consumed`/`bad` 计数、DLQ 文件或 `DECODE_BAD` 事件未留存（evidence 目录只含最终 27/27 轮），
+   **无法回溯证实或证伪**。次要可能：观测为操作者口头记录、原始 offsets JSON 未留存，读数时点
+   与最终 ledger 的一致性无法复核。
+3. **不做强行归因**：本项以证据关闭为「机制未明；引擎不变量在源码层成立、在一组可归档 e2e
+   （skip 路径）下实证、在三次未归档的 DorisSink 定向尝试下据叙述未被推翻」。若再次出现同形
+   观测，取证清单（按优先级）：`GET offsets` 原始 JSON 全文（cursor/totals 三项——`consumed`
+   与 `flushed` 的差即过 Bad/过滤路径的行数）、`GET stats`（consumed/bad）、
+   `bad_rows/p{P}-s{N}.jsonl` 尾部与 mtime、node.log 中该管道的 DECODE_BAD/FLUSH_OK/final flush
+   行、Doris `SHOW TRANSACTION`/`SHOW PROC '/transactions/…'` 的 label 状态。收齐即可在
+   「DLQ 隔离（正确行为）」与「新机制」之间一锤定音；**取证件须随 evidence 目录入仓**，不再
+   以叙述代替。
