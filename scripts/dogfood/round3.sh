@@ -215,7 +215,10 @@ SHOW="$(m "SHOW CREATE TABLE $DB.docs_emb;" | tr '[:upper:]' '[:lower:]')"
 # ADD COLUMNs on every dimmed vector table.
 req POST "/api/datasources/$DDS/tables/$DB/docs_emb/ddl/evolve" '{}' "$TOKEN"
 EV_CODE="$CODE"
-EV_CHANGED="$(jq -r '.changed // empty' <<<"$BODY" 2>/dev/null)"
+# jq `// empty` swallows a literal false (recert run 1 finding — the server
+# answered the intended 200 changed=false yet the assertion read it empty);
+# tostring keeps it, same idiom as variant_vector.sh T1.4
+EV_CHANGED="$(jq -r '.changed | tostring' <<<"$BODY" 2>/dev/null)"
 { [ "$EV_CODE" = "200" ] && [ "$EV_CHANGED" = "false" ]; } \
   && step pass "D2.3 evolve on the dimmed table → 200 changed=false (dim invisible to DESC is not a retype — R9 review fix)" \
   || step fail "D2.3 evolve on dimmed table" "http=$EV_CODE body=$(head -c 300 <<<"$BODY")"

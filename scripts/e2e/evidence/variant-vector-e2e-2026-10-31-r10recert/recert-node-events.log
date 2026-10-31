@@ -1,0 +1,1 @@
+1793440958247	WARN	DECODE_BAD	pipeline#2	decoded bad rows total 3 (this batch 3) — quarantined to DLQ: /tmp/tailrace-vv-e2e/node-state/bad_rows/p2-s0.jsonl
