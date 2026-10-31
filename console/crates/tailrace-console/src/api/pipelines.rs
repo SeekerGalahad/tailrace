@@ -36,6 +36,12 @@ fn next_dispatch_id() -> u64 {
 
 // ---------------- DTOs ----------------
 
+/// Advanced config carried verbatim to the engine as the plan body's
+/// `options` (deploy: `plan["options"] = config_json`). The field set must
+/// mirror the engine's `PlanOptions` key for key: serde drops unknown keys
+/// silently on the way in, so a key missing here never reaches the engine
+/// (dogfooding round3 #4 — `badRowPolicy` was lost that way; the contract
+/// test `pipeline_config_wires_every_plan_options_key` pins the mirror).
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PipelineConfig {
@@ -44,6 +50,10 @@ pub struct PipelineConfig {
     pub tuning: Option<Value>,
     pub group_prefix: Option<String>,
     pub start_offset: Option<String>,
+    /// Bad decoded-row handling: `dlq` (default) / `fail` / `skip`. The
+    /// engine validates the value at deploy time (an invalid value rejects
+    /// the whole plan); the console only carries it.
+    pub bad_row_policy: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -2648,6 +2658,73 @@ mod tests {
             Some("http://127.0.0.1:1/api/ods/orders/_stream_load")
         );
         assert_eq!(t.option_str("groupCommit"), Some("off_mode"));
+    }
+
+    /// R10 (dogfooding round3 #4): the console `PipelineConfig` is the only
+    /// thing standing between a request's `config` and the engine's plan
+    /// `options` — serde drops any key the DTO does not declare, silently.
+    /// Two pins: (1) the DTO's key set equals the engine `PlanOptions` key
+    /// set (an engine-side addition fails here until the console mirrors
+    /// it); (2) the exact create/update → deploy round-trip
+    /// (`to_string(config)` stored as config_json, `from_str::<Value>`
+    /// pushed as `plan["options"]`) delivers `badRowPolicy` to the engine
+    /// type — the key R9 observed arriving as `bad_row_policy=dlq` despite
+    /// the request saying `fail`.
+    #[test]
+    fn pipeline_config_wires_every_plan_options_key() {
+        // (1) key-set mirror: both types serialize every field (nulls
+        // included), so an all-None instance exposes the full key set
+        let keys = |v: Value| -> std::collections::BTreeSet<String> {
+            v.as_object().expect("object").keys().cloned().collect()
+        };
+        let console_keys = keys(
+            serde_json::to_value(
+                serde_json::from_str::<PipelineConfig>("{}").expect("all-optional DTO"),
+            )
+            .unwrap(),
+        );
+        let engine_keys =
+            keys(serde_json::to_value(tailrace_catalog::PlanOptions::default()).unwrap());
+        assert_eq!(
+            console_keys, engine_keys,
+            "console PipelineConfig must mirror engine PlanOptions key for key"
+        );
+        assert!(console_keys.contains("badRowPolicy"));
+
+        // (2) the wire: request body → config_json (create/update) →
+        // plan["options"] (deploy) → engine PlanOptions
+        let body: PipelineUpsertBody = serde_json::from_str(
+            r#"{"name":"p","sqlContent":"INSERT INTO s SELECT * FROM t",
+                "config":{"badRowPolicy":"fail","startOffset":"latest",
+                          "recovery":{"autoRestart":false}}}"#,
+        )
+        .unwrap();
+        let config_json = serde_json::to_string(body.config.as_ref().unwrap()).unwrap();
+        let options: Value = serde_json::from_str(&config_json).unwrap();
+        assert_eq!(
+            options["badRowPolicy"], "fail",
+            "key survives the store round-trip"
+        );
+        let engine: tailrace_catalog::PlanOptions = serde_json::from_value(options).unwrap();
+        assert_eq!(engine.bad_row_policy.as_deref(), Some("fail"));
+        assert_eq!(engine.start_offset(), "latest");
+        assert_eq!(
+            engine.recovery.as_ref().and_then(|r| r.auto_restart),
+            Some(false),
+            "the pre-existing sections still ride along"
+        );
+        // absent in the request = null on the wire = engine default (the
+        // same shape the other five sections already had)
+        let body: PipelineUpsertBody = serde_json::from_str(
+            r#"{"name":"p","sqlContent":"x","config":{"startOffset":"latest"}}"#,
+        )
+        .unwrap();
+        let options: Value =
+            serde_json::from_str(&serde_json::to_string(body.config.as_ref().unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(options["badRowPolicy"], Value::Null);
+        let engine: tailrace_catalog::PlanOptions = serde_json::from_value(options).unwrap();
+        assert_eq!(engine.bad_row_policy, None);
     }
 
     /// T-A7 re-gate (R7 review): the gate over a statement set follows the

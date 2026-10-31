@@ -391,6 +391,21 @@ impl FlushError {
     }
 }
 
+/// BE memory-pressure refusal, matched on the lowercased `Status Reason`
+/// text. The patterns are the spellings Doris actually emits (live-observed
+/// on 3.1.4 during dogfooding round3; the older `Memory limit exceeded`
+/// status is kept for 2.x): the `MEM_LIMIT_EXCEEDED` status code, the
+/// process/sys low-water-mark refusal, and the allocator's `Cannot alloc`.
+/// Deliberately narrow — a wider net (e.g. bare `memory`) would also catch
+/// deterministic schema/quality messages that happen to mention memory.
+fn is_memory_pressure(lower: &str) -> bool {
+    lower.contains("mem_limit_exceeded")
+        || lower.contains("memory limit exceeded")
+        || lower.contains("memory exceed limit")
+        || lower.contains("low water mark")
+        || lower.contains("cannot alloc")
+}
+
 /// Doris sink (BE direct + label idempotency + Status: Success judgment).
 /// flush retries with bounded backoff (default 3 attempts, 2s→8s→30s) —
 /// transient faults (FE/BE restarts, network jitter) self-heal instead of
@@ -801,6 +816,19 @@ impl DorisSink {
             // converge to success (the data is in the warehouse); do not kill
             if lower.contains("label already exists") || lower.contains("has already been used") {
                 return Ok(FlushOutcome::Dedup);
+            }
+            // BE memory pressure (R10, dogfooding round3 #2): the BE refuses
+            // the load because IT is short of memory, not because the rows
+            // are bad — a transient resource fault on the same footing as a
+            // timeout. It used to fall through to the fatal branch below:
+            // fatal → statement error → restart loop → three restarts without
+            // cursor progress → the poison-data verdict killed a healthy
+            // pipeline during a 20-40 minute memory window. Classified before
+            // the generic patterns so the verdict is explicit and pinned.
+            if is_memory_pressure(&lower) {
+                return Err(FlushError::retry(format!(
+                    "BE memory pressure (transient): Status={st} Reason={reason}"
+                )));
             }
             if lower.contains("timeout") || lower.contains("too many") || status.is_server_error() {
                 return Err(FlushError::retry(format!("Status={st} Reason={reason}")));
@@ -1216,7 +1244,77 @@ mod tests {
         sink.write(vec![mk("g")?])?;
         assert!(sink.flush().is_ok());
         assert_eq!(m.hits.load(Ord2::Relaxed), 2);
+
+        // ⑧ BE memory pressure (R10, dogfooding round3 #2): the live 3.1.4
+        // refusal text is retryable — the same buffer is resent and the
+        // window passing turns into success, no statement error, no
+        // restart, no poison count
+        let mem_limit = r#"{"Status":"Fail","Message":"[MEM_LIMIT_EXCEEDED]PreCatch error code:11, [E11] Allocator sys memory check failed: Cannot alloc:1048576, consuming tracker:<Load#Id=...>, process memory used 1.23 GB exceed limit 6.40 GB or sys available memory 350.00 MB less than low water mark 400.00 MB"}"#;
+        let m = MockDoris::start(vec![
+            (200, mem_limit.into()),
+            (200, r#"{"Status":"Success"}"#.into()),
+        ]);
+        let mut sink = new_sink(m.url());
+        sink.retry_backoff_ms = vec![0, 0];
+        sink.write(vec![mk("h")?])?;
+        assert_eq!(sink.flush()?.rows, 1, "memory window passed → success");
+        assert_eq!(m.hits.load(Ord2::Relaxed), 2, "exactly one retry");
+        let bodies = m.bodies.lock().unwrap().clone();
+        assert_eq!(bodies[0], bodies[1], "the resend carries the same buffer");
+
+        // ⑧b a window outliving the backoff budget: the error is the
+        // retryable-exhausted shape (NOT "not retryable"), buffer kept so
+        // the statement-level restart replays it
+        let m = MockDoris::start(vec![
+            (200, mem_limit.into()),
+            (200, mem_limit.into()),
+            (200, mem_limit.into()),
+        ]);
+        let mut sink = new_sink(m.url());
+        sink.retry_backoff_ms = vec![0, 0];
+        sink.write(vec![mk("i")?])?;
+        let err = sink.flush().unwrap_err().to_string();
+        assert!(err.contains("retries exhausted"), "{err}");
+        assert!(!err.contains("not retryable"), "{err}");
+        assert!(err.contains("BE memory pressure"), "{err}");
+        assert_eq!(m.hits.load(Ord2::Relaxed), 3);
+        assert_eq!(sink.pending_rows, 1, "pending kept");
+        assert!(!sink.buf.is_empty(), "buffer kept");
         Ok(())
+    }
+
+    /// R10 (dogfooding round3 #2): the memory-pressure predicate pins the
+    /// Doris spellings it accepts and — as important — the deterministic
+    /// failures it must NOT absorb (those stay fatal = the poison-data path
+    /// of ⑥ above is unchanged).
+    #[test]
+    fn memory_pressure_classification_pins_doris_spellings() {
+        for s in [
+            // live 3.1.4 dogfooding round3 text (status code + low water mark)
+            "fail [mem_limit_exceeded]precatch error code:11, [e11] allocator sys memory check failed: cannot alloc:1048576, sys available memory 350.00 mb less than low water mark 400.00 mb",
+            // status code alone
+            "fail [mem_limit_exceeded] query memory exceeded",
+            // 2.x status spelling
+            "memory limit exceeded",
+            "fail memory exceed limit: load",
+            // allocator refusal without the status code
+            "fail cannot alloc: 65536",
+        ] {
+            assert!(is_memory_pressure(s), "must be transient: {s}");
+        }
+        for s in [
+            // ⑥'s strict-mode filter — deterministic
+            "fail insert has filtered data in strict mode",
+            "fail [data_quality_error]encountered unqualified data, stop processing",
+            "fail column count mismatch",
+            "fail [internal_error]label already exists",
+            // mentions memory without being a pressure refusal
+            "fail column memory_note is not nullable",
+            "fail [analysis_error]unknown column 'mem_usage'",
+            "",
+        ] {
+            assert!(!is_memory_pressure(s), "must stay deterministic: {s}");
+        }
     }
 
     /// T-A2 regression anchor: the default (ProcessScoped) mode must keep
