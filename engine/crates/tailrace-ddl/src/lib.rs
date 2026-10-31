@@ -481,7 +481,17 @@ pub fn doris_type(vocab: &str) -> Option<String> {
                 match dim {
                     None => Some("ARRAY<FLOAT>".to_string()),
                     Some(d) => {
-                        let d: u32 = d.parse().ok().filter(|d| *d >= 1)?;
+                        // local mirror of tailrace-ir's MAX_VECTOR_DIM cap
+                        // (this crate deliberately does not depend on that
+                        // one) — dims past it are rejected with the same
+                        // explicit-error-no-fold contract (R9 review fix:
+                        // an unbounded dim is an unbounded decoder
+                        // pre-allocation)
+                        const MAX_VECTOR_DIM: u32 = 65_536;
+                        let d: u32 = d
+                            .parse()
+                            .ok()
+                            .filter(|d| (1..=MAX_VECTOR_DIM).contains(d))?;
                         Some(format!("ARRAY<FLOAT> COMMENT 'vector dim={d}'"))
                     }
                 }

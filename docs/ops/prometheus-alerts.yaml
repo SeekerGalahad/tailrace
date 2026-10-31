@@ -10,15 +10,29 @@
 # Differences from the console engine, on purpose:
 #   * `for:` adds Prometheus-side hysteresis; the console evaluates on every
 #     pass (15s default) and de-floods at the episode level instead (one
-#     alert_event row per firing episode, never per tick).
+#     alert_event row per firing episode, never per tick). Both alert PER
+#     SERIES (one episode per matching pipeline/statement/node).
 #   * The window rules use `increase()`, which extrapolates across the
 #     window; the console computes a plain latest − base over its in-memory
 #     sample history (no extrapolation, counter resets credited as the
-#     post-reset value).
+#     post-reset value, and a sample gap larger than 60s past the window
+#     cutoff makes the tick "not evaluated" rather than a gap-inflated
+#     increment). A console window threshold of 0 is legal and means the
+#     same as the `> 0` below (any single row in the window).
 #   * `TailracePipelineLagOverSlo` has no console twin by design: the
 #     console's lag rule threshold IS the SLO target it exposes as
 #     `tailrace_slo_lag_target_seconds` (same labels as the lag series), so a
 #     Prometheus user compares the two series directly.
+#   * NODE DOWN: the console proxy drops an unreachable node's whole block
+#     (its series simply vanish from this scrape), so no `expr` on a node
+#     series can fire for a node that is gone. The console engine covers
+#     that itself — its `heartbeat_age` rule is evaluated on the console's
+#     own receive clock (`node.last_heartbeat`), not on the node-reported
+#     series below, and it holds (never falsely resolves) open episodes
+#     while a node is unreachable. In Prometheus, pair
+#     `TailraceNodeHeartbeatStale` with an absence check per node you
+#     expect, e.g. `absent(tailrace_up{node="edge-1"})` — Prometheus has
+#     no "expected set" without such a hint.
 groups:
   - name: tailrace
     rules:
@@ -56,6 +70,12 @@ groups:
           description: "ControlFlags 0=RUNNING 1=PAUSED 2=STOPPED 3=FAILED. Recover via POST /api/pipelines/{id}/recover after fixing the cause (engine logs: GET /api/pipelines/{id}/logs)."
 
       # ---- heartbeat_age: tailrace_node_heartbeat_age_seconds > threshold ----
+      # The series here is the NODE's self-report (seconds since its last
+      # accepted control-plane beat), so it catches a stuck heartbeat loop
+      # while /metrics still answers — and disappears entirely when the node
+      # is down (see the NODE DOWN note in the header for the absence check
+      # to pair it with). The console's own heartbeat_age rule uses the
+      # console's receive clock instead and does fire for a down node.
       - alert: TailraceNodeHeartbeatStale
         expr: tailrace_node_heartbeat_age_seconds > 90
         for: 1m
@@ -63,7 +83,7 @@ groups:
           severity: critical
         annotations:
           summary: "node {{ $labels.node }} ({{ $labels.node_id }}) last heartbeat {{ $value | humanizeDuration }} ago"
-          description: "90s is the console's OFFLINE threshold (GET /api/nodes). Also fires when the node is still exposing /metrics but its control-plane heartbeat loop is stuck."
+          description: "90s is also the console's OFFLINE display threshold (GET /api/nodes, 90s of heartbeat silence). This PromQL only sees nodes that still serve /metrics; a node that is down vanishes from the proxy — alert on its absence separately."
 
       # ---- dlq_window: increase(tailrace_dlq_rows_total) over the window > N ----
       - alert: TailraceDlqBurst

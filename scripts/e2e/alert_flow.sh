@@ -315,10 +315,16 @@ done
   && step pass "P1.2 first row flushed to the sink file (last_data_ms stamped — the lag gauge's basis)" \
   || step fail "P1.2 first flush" "rows=$WROWS node.log=$(tail -5 "$WORK/node.log" 2>/dev/null)"
 LAGLINE="$(node_metric 'tailrace_pipeline_lag_seconds{.*pipeline="'"$LAG_PID"'".*}')"
+# R9 review fix: compare the CONSOLE-side lag line (node label injected by
+# the proxy) with the SLO line, label body to label body — "same labels" is
+# asserted, not just "both lines exist".
+CLAGLINE="$(curl -s "http://$CONSOLE_ADDR/metrics" | grep "^tailrace_pipeline_lag_seconds{.*pipeline=\"$LAG_PID\"" | head -1)"
 SLOLINE="$(curl -s "http://$CONSOLE_ADDR/metrics" | grep "^tailrace_slo_lag_target_seconds{.*pipeline=\"$LAG_PID\"" | head -1)"
-{ [ -n "$LAGLINE" ] && [ -n "$SLOLINE" ]; } \
-  && step pass "P1.3 console /metrics: lag series $LAGLINE with the SLO target beside it $SLOLINE (same labels — T-E2 SLO v1)" \
-  || step fail "P1.3 metrics surface" "lag='$LAGLINE' slo='$SLOLINE'"
+LAG_LABELS="$(sed -E 's/^[^{]*(\{[^}]*\}).*/\1/' <<<"$CLAGLINE")"
+SLO_LABELS="$(sed -E 's/^[^{]*(\{[^}]*\}).*/\1/' <<<"$SLOLINE")"
+{ [ -n "$LAGLINE" ] && [ -n "$CLAGLINE" ] && [ -n "$SLOLINE" ] && [ "$LAG_LABELS" = "$SLO_LABELS" ]; } \
+  && step pass "P1.3 console /metrics: lag series $CLAGLINE with the SLO target beside it $SLOLINE — identical label set $LAG_LABELS (T-E2 SLO v1)" \
+  || step fail "P1.3 metrics surface" "node_lag='$LAGLINE' console_lag='$CLAGLINE' slo='$SLOLINE' lag_labels='$LAG_LABELS' slo_labels='$SLO_LABELS'"
 S="$(wait_rule af-lag inactive 10)"
 [ "$S" = "inactive" ] \
   && step pass "P1.4 rule state inactive while the data flows (lag ≈ 0 < 6)" \
@@ -464,25 +470,31 @@ req POST "/api/pipelines/$FAIL_PID/stop" '{}' "$TOKEN"
   || step fail "F3.0 stop" "http=$CODE body=$BODY"
 S="$(wait_rule af-failed inactive 20)"
 [ "$S" = "inactive" ] \
-  && step pass "F3.1 CORE resolved the honest way: an ABSENT series never fires (the engine is down to the alert exactly as long as it is down)" \
+  && step pass "F3.1 CORE resolved the honest way: the series is ABSENT while its node still answers /metrics → reason=series_absent (R9 review fix: a node that is DOWN would HOLD the episode instead of faking a recovery)" \
   || step fail "F3.1 failed resolved" "state=$S"
 N="$(wait_hook 4 15)"
-if [ "$N" = "4" ] && jq -e 'select(.event_header=="resolved")' <(tail -1 "$WORK/hook.jsonl") >/dev/null 2>&1; then
-  step pass "F3.2 webhook notice #4 received (state_failed resolved) — 4 notices total across two episodes, every one a transition"
+if [ "$N" = "4" ] && jq -e 'select(.event_header=="resolved") | (.body|fromjson|.sample.reason) == "series_absent"' <(tail -1 "$WORK/hook.jsonl") >/dev/null 2>&1; then
+  step pass "F3.2 webhook notice #4 received (state_failed resolved, sample.reason=series_absent) — 4 notices total across two episodes, every one a transition"
 else
   step fail "F3.2 webhook #4" "n=$N last=$(tail -1 "$WORK/hook.jsonl" 2>/dev/null | head -c 200)"
 fi
 
 # ---------- cleanup of the rule face ----------
+# R9 review fix: DELETE closes any open episode with reason=deleted and
+# delivers its resolved notice BEFORE the row goes. Nothing is firing here
+# (both episodes resolved above), so the hook count must stay at 4 — a 5th
+# notice would mean a phantom resolved.
 req DELETE "/api/alerts/rules/$LAG_ID" "" "$TOKEN"
 D1="$CODE"
 req DELETE "/api/alerts/rules/$ST_ID" "" "$TOKEN"
 D2="$CODE"
 req GET /api/alerts "" "$TOKEN"
 NR="$(jq -r '.rules | length' <<<"$BODY" 2>/dev/null)"
-{ [ "$D1" = "204" ] && [ "$D2" = "204" ] && [ "$NR" = "0" ]; } \
-  && step pass "S3.1 rules deleted (204 ×2) → empty rule set (episodes cascade; a firing rule resolves via reason=disabled first — none was firing here)" \
-  || step fail "S3.1 rule cleanup" "d1=$D1 d2=$D2 rules=$NR"
+sleep 2
+NH="$(wc -l < "$WORK/hook.jsonl" 2>/dev/null | tr -d ' ')"
+{ [ "$D1" = "204" ] && [ "$D2" = "204" ] && [ "$NR" = "0" ] && [ "$NH" = "4" ]; } \
+  && step pass "S3.1 rules deleted (204 ×2) → empty rule set; no extra notice (none was firing — a firing rule would have been closed with reason=deleted and its resolved delivered first)" \
+  || step fail "S3.1 rule cleanup" "d1=$D1 d2=$D2 rules=$NR hook_notices=$NH"
 
 TOTAL=$((PASS+FAIL))
 echo "== alert_flow e2e summary: $PASS/$TOTAL steps passed =="

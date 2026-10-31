@@ -1706,7 +1706,13 @@ fn ddl_key_clause(ddl: &str) -> Option<tailrace_ddl::KeyModel> {
 /// folded through the type vocabulary (A3-narrowed — widths/decimals/time
 /// types survive the fold, so the diff sees real type differences),
 /// `target` = registered columns_json. Names compare case-insensitively
-/// (Doris column names are), types exactly.
+/// (Doris column names are), types exactly — except the vector dim: a
+/// registered `list<float32,N>` arrives from `DESC` as `array<float>`,
+/// which folds back to a bare `list<float32>` (the dim lives in the column
+/// COMMENT, not the type), so the dim is invisible to the diff and must
+/// not read as a retype (R9 review fix — otherwise every dimmed vector
+/// table could never evolve: one phantom MODIFY would 409 the whole plan
+/// and block even pure ADD COLUMNs).
 #[derive(Debug, Default, PartialEq, Eq)]
 struct EvolvePlan {
     /// In target, not in current — the only change evolve executes.
@@ -1716,6 +1722,21 @@ struct EvolvePlan {
     /// Same name, different vocabulary — `(name, registered, current)`;
     /// `MODIFY COLUMN` suggestion, never executed.
     retyped: Vec<(String, String, String)>,
+}
+
+/// Registered vs DESC-folded type equality. Exact, except
+/// `list<float32,N> == list<float32>`: the dim annotation is a
+/// registration-side guard the live table cannot contradict (Doris itself
+/// does not carry it in the type), so it is not a retype. Everything else
+/// — including a real dim change or any other type change — still reads as
+/// retyped once the DESC side could show it.
+fn type_matches(registered: &str, current: &str) -> bool {
+    if registered == current {
+        return true;
+    }
+    registered.starts_with("list<float32,")
+        && registered.ends_with('>')
+        && current == "list<float32>"
 }
 
 fn diff_columns(current: &[(String, String)], target: &[(String, String)]) -> EvolvePlan {
@@ -1728,7 +1749,9 @@ fn diff_columns(current: &[(String, String)], target: &[(String, String)]) -> Ev
     for (name, ty) in target {
         match find(current, name) {
             None => plan.added.push((name.clone(), ty.clone())),
-            Some((_, have)) if &have != ty => plan.retyped.push((name.clone(), ty.clone(), have)),
+            Some((_, have)) if !type_matches(ty, &have) => {
+                plan.retyped.push((name.clone(), ty.clone(), have))
+            }
             Some(_) => {}
         }
     }
@@ -2450,6 +2473,39 @@ mod tests {
         let current = cols(&[("id", "int64"), ("Name", "utf8")]);
         let target = cols(&[("ID", "int64"), ("name", "utf8")]);
         assert_eq!(diff_columns(&current, &target), EvolvePlan::default());
+    }
+
+    /// R9 review fix: a registered `list<float32,N>` (the A5 recommended
+    /// vector shape) reads back from `DESC` as bare `list<float32>` — the
+    /// dim lives in the column COMMENT, not the type — so it must not be
+    /// flagged retyped: evolve on a dimmed table stays add-only (no phantom
+    /// MODIFY, no 409), and a bare registered list is NOT treated as a
+    /// dimmed one in either direction.
+    #[test]
+    fn evolve_dimmed_vector_column_is_not_a_retype() {
+        // registered dimmed, DESC folded bare → match, and a new column is
+        // still addable (the case T1.4/D2.3 hit as a 409)
+        let current = cols(&[("id", "int64"), ("vec", "list<float32>")]);
+        let target = cols(&[("id", "int64"), ("vec", "list<float32,3>"), ("tag", "utf8")]);
+        let plan = diff_columns(&current, &target);
+        assert_eq!(plan.added, cols(&[("tag", "utf8")]));
+        assert!(
+            plan.retyped.is_empty(),
+            "dim invisible to DESC is not a retype: {plan:?}"
+        );
+        assert!(plan.removed.is_empty());
+        // a REAL type change on the same column still reads as retyped
+        let target = cols(&[("id", "int64"), ("vec", "list<float32,3>"), ("n", "int32")]);
+        let current = cols(&[("id", "int64"), ("vec", "int64")]);
+        let plan = diff_columns(&current, &target);
+        assert_eq!(
+            plan.retyped,
+            vec![(
+                "vec".to_string(),
+                "list<float32,3>".to_string(),
+                "int64".to_string()
+            )]
+        );
     }
 
     /// ALTER text hygiene: a type outside the four-type vocabulary is an

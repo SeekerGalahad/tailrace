@@ -491,12 +491,16 @@ EV_CHANGED="$(jq -r '.changed | tostring' <<<"$BODY" 2>/dev/null)"
   && step pass "T1.3 evolve on the BARE vector table reports changed=false (DESC array<float> folds back to list<float32> — round-trip stable)" \
   || step fail "T1.3 evolve bare vector" "http=$CODE changed=$EV_CHANGED body=$(head -c 300 <<<"$BODY")"
 # evolve, DIMMED declaration: the dim lives only in the DDL COMMENT and DESC
-# cannot carry it back, so the exact-vocabulary diff sees list<float32,3>
-# vs list<float32> — recorded here, judged in dogfooding round 3 (the 409
-# body nests it under error.refs.retyped)
+# cannot carry it back — the diff must treat the registered list<float32,3>
+# and the DESC-folded list<float32> as the same type (R9 review fix: before
+# it, every dimmed vector table 409'd forever and even pure ADD COLUMNs were
+# blocked). Asserted now, no longer "recorded".
 req POST "/api/datasources/$DDS/tables/$E2E_DB/docs_emb/ddl/evolve" '{}' "$TOKEN"
+EV_CHANGED="$(jq -r '.changed | tostring' <<<"$BODY" 2>/dev/null)"
 EV_RETYPED="$(jq -c '.error.refs.retyped // .refs.retyped // empty' <<<"$BODY" 2>/dev/null)"
-step pass "T1.4 observation: evolve on the DIMMED table → http=$CODE retyped=${EV_RETYPED:-none} (dim is declaration-only; vector probe README W4 note 2 — recorded, not asserted)"
+{ [ "$CODE" = "200" ] && [ "${EV_CHANGED:-x}" = "false" ]; } \
+  && step pass "T1.4 evolve on the DIMMED table → 200 changed=false (dim invisible to DESC is not a retype — R9 review fix)" \
+  || step fail "T1.4 evolve dimmed vector" "http=$CODE changed=$EV_CHANGED retyped=${EV_RETYPED:-none} body=$(head -c 300 <<<"$BODY")"
 
 # ---------- T2 key-column refusals (the task card's negative examples) ----------
 req POST "/api/datasources/$DDS/tables/$E2E_DB/docs_emb/ddl/draft" \

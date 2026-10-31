@@ -245,12 +245,16 @@ pub struct AlertRule {
     pub updated_at: String,
 }
 
-/// An `alert_event` row (T-E2): one alert episode — inserted on the
-/// inactive → firing transition, flipped to `resolved` on the way back.
+/// An `alert_event` row (T-E2): one alert episode of one SERIES — inserted
+/// on the inactive → firing transition, flipped to `resolved` on the way
+/// back. `series_key` is the evaluator's rendered series identity
+/// (`metric{label="value",…}`); `""` only on rows written before migration
+/// 05 (adopted or closed by the first pass that sees them).
 #[derive(Debug, Clone)]
 pub struct AlertEvent {
     pub id: i64,
     pub rule_id: i64,
+    pub series_key: String,
     pub state: String,
     pub first_seen_at: String,
     pub last_seen_at: String,

@@ -1,9 +1,11 @@
 //! T-E2 alerting contract tests: rules CRUD + audit, the evaluator state
 //! machine driven by mock snapshots (threshold boundary, event rows only on
 //! transitions, resolved always reachable, disable mid-flight), window
-//! rules over mock counter history, webhook delivery (received / unreachable
-//! never fails the pass), the SSE hub, and the `/metrics` SLO target riding
-//! the lag series' label set end to end through a mock node.
+//! rules over mock counter history (incl. restart/gap holds — R9 review
+//! fix), per-series episodes and node-unreachable holds, webhook delivery
+//! (received / unreachable never fails the pass), the SSE hub, and the
+//! `/metrics` SLO target riding the lag series' label set end to end
+//! through a mock node.
 
 mod common;
 
@@ -15,12 +17,25 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use common::{app, req, TestApp};
 use serde_json::{json, Value};
-use tailrace_console::alerting::{parse_samples, Evaluator, Sample};
+use tailrace_console::alerting::{parse_samples, Evaluator, Sample, Snapshot};
 use tower::ServiceExt;
 
 /// Realistic epoch-ms origin (a 0 origin would let u64 saturation fabricate
 /// a window base at the cutoff).
 const T0: u64 = 1_700_000_000_000;
+
+/// Poll a condition for up to ~4s (webhook deliveries are spawned — the
+/// evaluation pass never blocks on them — so a test observes them
+/// eventually rather than inline).
+async fn eventually(what: &str, f: impl Fn() -> bool) {
+    for _ in 0..200 {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(f(), "condition never met: {what}");
+}
 
 fn lag_snapshot(node: &str, pipeline: &str, lag: f64) -> Vec<Sample> {
     parse_samples(
@@ -36,6 +51,34 @@ async fn create_rule(app: &TestApp, body: Value) -> i64 {
     let (s, b) = req(app, "POST", "/api/alerts/rules", Some(body)).await;
     assert_eq!(s, StatusCode::CREATED, "{b}");
     b["id"].as_i64().unwrap()
+}
+
+/// A local webhook receiver recording `x-tailrace-event` + notice JSON per
+/// POST. Returns its port and the received list.
+async fn spawn_hook() -> (u16, Arc<Mutex<Vec<(String, Value)>>>) {
+    let received: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = received.clone();
+    let hook = Router::new().route(
+        "/hook",
+        post(
+            move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
+                let sink = sink.clone();
+                async move {
+                    let ev = headers
+                        .get("x-tailrace-event")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    sink.lock().unwrap().push((ev, body));
+                    StatusCode::NO_CONTENT
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, hook).await.unwrap() });
+    (port, received)
 }
 
 fn audit_actions(app: &TestApp) -> Vec<String> {
@@ -302,12 +345,14 @@ async fn evaluator_episodes_land_only_on_transitions_and_resolve() {
     assert_eq!(events[0]["state"], "firing", "newest first: {events:?}");
     assert_eq!(events[1]["state"], "resolved");
 
-    // absent series (node stopped exposing) is not a violation → resolves
+    // series absent while its node still answers (empty snapshot, nothing
+    // unreachable) resolves with the reason — a pipeline that stopped
+    // exposing lag is not lagging anymore
     let (now, _) = tick(0.0);
     let notices = ev.run_pass(&app.state, &[], now).await.unwrap();
     assert_eq!(notices.len(), 1);
     assert_eq!(notices[0].event, "resolved");
-    assert!(notices[0].sample["value"].is_null());
+    assert_eq!(notices[0].sample["reason"], "series_absent");
 
     // disable while firing → next pass resolves with the reason
     let (now, snap) = tick(99.0);
@@ -432,28 +477,7 @@ async fn window_and_state_rules_from_mock_snapshots() {
 /// (the transition still lands and is still returned).
 #[tokio::test]
 async fn webhook_receives_firing_and_resolved() {
-    let received: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
-    let sink = received.clone();
-    let hook = Router::new().route(
-        "/hook",
-        post(
-            move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
-                let sink = sink.clone();
-                async move {
-                    let ev = headers
-                        .get("x-tailrace-event")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or_default()
-                        .to_string();
-                    sink.lock().unwrap().push((ev, body));
-                    StatusCode::NO_CONTENT
-                }
-            },
-        ),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, hook).await.unwrap() });
+    let (port, received) = spawn_hook().await;
 
     let app = app().await;
     let id = create_rule(
@@ -491,6 +515,12 @@ async fn webhook_receives_firing_and_resolved() {
         .unwrap();
     assert_eq!(notices.len(), 2);
 
+    // deliveries are spawned (a black-holed webhook must not stall the
+    // pass) — the receiver observes them shortly after
+    eventually("webhook receiver got both POSTs", || {
+        received.lock().unwrap().len() >= 2
+    })
+    .await;
     let got = received.lock().unwrap().clone();
     assert_eq!(got.len(), 2, "one POST per transition: {got:?}");
     assert_eq!(got[0].0, "firing");
@@ -687,4 +717,431 @@ async fn metrics_exposes_slo_target_next_to_lag_and_evaluator_sees_same_snapshot
     .await;
     assert_eq!(s, StatusCode::OK);
     assert!(!scrape().await.contains("tailrace_slo_lag_target_seconds"));
+}
+
+/// R9 review fix (high): a node whose /metrics could not be fetched does
+/// not turn into a false resolved. The firing episode is held while the
+/// node is unreachable, continues (same episode) when it returns still
+/// violating, and only resolves once the node answers AND the condition
+/// cleared.
+#[tokio::test]
+async fn unreachable_node_holds_open_episodes_instead_of_false_resolving() {
+    let app = app().await;
+    create_rule(
+        &app,
+        json!({"name": "lag", "ruleType": "lag_seconds", "params": {"threshold": 30}}),
+    )
+    .await;
+    let mut ev = Evaluator::new();
+    let snap = Snapshot {
+        samples: lag_snapshot("edge-1", "3", 45.0),
+        unreachable_nodes: vec![],
+    };
+    let notices = ev.run_pass_snapshot(&app.state, &snap, T0).await.unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].event, "firing");
+    let firing_event = notices[0].event_id;
+
+    // the node goes dark: its series vanish BECAUSE the scrape failed —
+    // the episode holds (no resolved notice, no state flip, same row)
+    let dark = Snapshot {
+        samples: vec![],
+        unreachable_nodes: vec!["edge-1".to_string()],
+    };
+    let notices = ev
+        .run_pass_snapshot(&app.state, &dark, T0 + 15_000)
+        .await
+        .unwrap();
+    assert!(
+        notices.is_empty(),
+        "a down node is not a recovery: {notices:?}"
+    );
+    let (_, b) = req(&app, "GET", "/api/alerts", None).await;
+    assert_eq!(
+        b["rules"][0]["state"], "firing",
+        "episode held while unreachable"
+    );
+    assert_eq!(b["rules"][0]["openEvent"]["id"], firing_event);
+
+    // the node comes back still violating: the SAME episode continues —
+    // no duplicate firing, no firing/resolved churn
+    let notices = ev
+        .run_pass_snapshot(&app.state, &snap, T0 + 30_000)
+        .await
+        .unwrap();
+    assert!(notices.is_empty(), "same episode continues: {notices:?}");
+    let (_, b) = req(&app, "GET", "/api/alerts", None).await;
+    assert_eq!(b["rules"][0]["state"], "firing");
+    assert_eq!(b["rules"][0]["openEvent"]["id"], firing_event);
+
+    // back and recovered: resolved on the same row
+    let recovered = Snapshot {
+        samples: lag_snapshot("edge-1", "3", 3.0),
+        unreachable_nodes: vec![],
+    };
+    let notices = ev
+        .run_pass_snapshot(&app.state, &recovered, T0 + 45_000)
+        .await
+        .unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].event, "resolved");
+    assert_eq!(notices[0].event_id, firing_event);
+    assert_eq!(notices[0].sample["value"], 3.0);
+}
+
+/// R9 review fix (medium): deleting a firing rule first closes its open
+/// episodes (reason `deleted`) and DELIVERS the resolved notice — the
+/// webhook receiver never keeps a firing alert for a rule that no longer
+/// exists. The episode rows then go with the rule (CASCADE).
+#[tokio::test]
+async fn deleting_a_firing_rule_delivers_resolved_notices() {
+    let (port, received) = spawn_hook().await;
+    let app = app().await;
+    let id = create_rule(
+        &app,
+        json!({"name": "failed", "ruleType": "state_failed",
+               "webhookUrl": format!("http://127.0.0.1:{port}/hook")}),
+    )
+    .await;
+    let state = |v: f64| {
+        parse_samples(
+            &format!("tailrace_pipeline_state{{pipeline=\"7\"}} {v}\n"),
+            Some("edge-1"),
+        )
+    };
+    let mut ev = Evaluator::new();
+    let notices = ev.run_pass(&app.state, &state(3.0), T0).await.unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].event, "firing");
+    let firing_event = notices[0].event_id;
+    eventually("firing POST observed", || {
+        !received.lock().unwrap().is_empty()
+    })
+    .await;
+
+    // DELETE while firing: 204, and the receiver learns the alert is over
+    let (s, _) = req(&app, "DELETE", &format!("/api/alerts/rules/{id}"), None).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    eventually("resolved-after-delete POST observed", || {
+        received
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(h, b)| h == "resolved" && b["eventId"] == firing_event)
+    })
+    .await;
+    let resolved: Vec<(String, Value)> = received
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(h, _)| h == "resolved")
+        .cloned()
+        .collect();
+    assert_eq!(resolved.len(), 1, "exactly one resolved notice");
+    assert_eq!(resolved[0].1["sample"]["reason"], "deleted");
+    assert!(
+        resolved[0].1["seriesKey"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("pipeline=\"7\""),
+        "resolved notice names the series: {:?}",
+        resolved[0].1["seriesKey"]
+    );
+    // the rule and its episode rows are gone together
+    let (s, b) = req(&app, "GET", "/api/alerts", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(b["rules"].as_array().unwrap().len(), 0);
+    assert_eq!(b["events"].as_array().unwrap().len(), 0);
+}
+
+/// R9 review fix (medium): a window rule with no usable base sample (a
+/// console restart wipes the in-memory history; a sample gap pushes the
+/// only base candidate far before the cutoff) HOLDS the current state — a
+/// firing episode is not falsely resolved, and a gap-spanning difference
+/// does not fire as a window increment.
+#[tokio::test]
+async fn window_rules_hold_state_across_restart_and_sample_gaps() {
+    let app = app().await;
+    create_rule(
+        &app,
+        json!({"name": "dlq", "ruleType": "dlq_window",
+               "params": {"threshold": 10, "windowSecs": 60}}),
+    )
+    .await;
+    let dlq = |v: f64| {
+        parse_samples(
+            &format!("tailrace_dlq_rows_total{{pipeline=\"1\",statement=\"0\"}} {v}\n"),
+            Some("edge-1"),
+        )
+    };
+
+    // fire honestly: base at t=0 (100), latest t=60 (112) → inc 12
+    let mut ev = Evaluator::new();
+    ev.run_pass(&app.state, &dlq(100.0), T0).await.unwrap();
+    let notices = ev
+        .run_pass(&app.state, &dlq(112.0), T0 + 60_000)
+        .await
+        .unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].event, "firing");
+    assert_eq!(notices[0].sample["increment"], 12.0);
+    let firing_event = notices[0].event_id;
+
+    // console restarts (fresh evaluator → no history): the open episode
+    // must NOT get a false resolved — no base, verdict Unknown, held
+    let mut ev2 = Evaluator::new();
+    let notices = ev2
+        .run_pass(&app.state, &dlq(112.0), T0 + 75_000)
+        .await
+        .unwrap();
+    assert!(notices.is_empty(), "restart tick holds: {notices:?}");
+    let (_, b) = req(&app, "GET", "/api/alerts", None).await;
+    assert_eq!(b["rules"][0]["state"], "firing", "held across the restart");
+    assert_eq!(b["rules"][0]["openEvent"]["id"], firing_event);
+
+    // a 10-minute outage follows (the counter kept growing upstream): the
+    // first tick back has no base within the slack — still held, and the
+    // gap-spanning difference (55 rows) must NOT fire as a 60s increment
+    let notices = ev2
+        .run_pass(&app.state, &dlq(167.0), T0 + 675_000)
+        .await
+        .unwrap();
+    assert!(
+        notices.is_empty(),
+        "gap-spanning increment is not a window increment: {notices:?}"
+    );
+    let (_, b) = req(&app, "GET", "/api/alerts", None).await;
+    assert_eq!(b["rules"][0]["state"], "firing");
+
+    // an honest base re-enters the window and the increment is small →
+    // the held episode resolves once the rule can truly evaluate again
+    let notices = ev2
+        .run_pass(&app.state, &dlq(170.0), T0 + 735_000)
+        .await
+        .unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].event, "resolved");
+    assert_eq!(notices[0].event_id, firing_event);
+    assert_eq!(notices[0].sample["increment"], 3.0);
+}
+
+/// R9 review fix (medium): episodes are PER SERIES. One unfiltered rule
+/// matching two pipelines: both fire (two notices, two episodes), the
+/// first recovery resolves ONLY its own episode (the rule stays firing),
+/// the second resolves the rule — and every notice carries the series it
+/// belongs to.
+#[tokio::test]
+async fn episodes_and_notices_are_per_series() {
+    let app = app().await;
+    create_rule(&app, json!({"name": "failed", "ruleType": "state_failed"})).await;
+    let two = |p1: f64, p2: f64| {
+        parse_samples(
+            &format!(
+                "tailrace_pipeline_state{{pipeline=\"1\"}} {p1}\n\
+                 tailrace_pipeline_state{{pipeline=\"2\"}} {p2}\n"
+            ),
+            Some("edge-1"),
+        )
+    };
+    let mut ev = Evaluator::new();
+    let notices = ev.run_pass(&app.state, &two(3.0, 3.0), T0).await.unwrap();
+    assert_eq!(
+        notices.len(),
+        2,
+        "one firing per violating series: {notices:?}"
+    );
+    let key = |n: &tailrace_console::alerting::AlertNotice| n.series_key.clone();
+    assert!(
+        key(&notices[0]).contains("pipeline=\"1\"") || key(&notices[0]).contains("pipeline=\"2\"")
+    );
+    assert_ne!(key(&notices[0]), key(&notices[1]), "distinct series");
+    assert_ne!(
+        notices[0].event_id, notices[1].event_id,
+        "distinct episodes"
+    );
+    let ep = |n: &tailrace_console::alerting::AlertNotice| n.event_id;
+    let ep1 = if key(&notices[0]).contains("pipeline=\"1\"") {
+        ep(&notices[0])
+    } else {
+        ep(&notices[1])
+    };
+    let ep2 = if ep1 == ep(&notices[0]) {
+        ep(&notices[1])
+    } else {
+        ep(&notices[0])
+    };
+    let (_, b) = req(&app, "GET", "/api/alerts", None).await;
+    assert_eq!(
+        b["rules"][0]["openEvents"].as_array().unwrap().len(),
+        2,
+        "one open episode per series"
+    );
+
+    // pipeline 1 recovers: exactly one resolved — for pipeline 1's series,
+    // with pipeline 1's episode id — and the rule stays firing
+    let notices = ev
+        .run_pass(&app.state, &two(0.0, 3.0), T0 + 15_000)
+        .await
+        .unwrap();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0].event, "resolved");
+    assert_eq!(notices[0].event_id, ep1);
+    assert!(notices[0].series_key.contains("pipeline=\"1\""));
+    let (_, b) = req(&app, "GET", "/api/alerts", None).await;
+    assert_eq!(
+        b["rules"][0]["state"], "firing",
+        "pipeline 2 still violating"
+    );
+    assert_eq!(b["rules"][0]["openEvents"].as_array().unwrap().len(), 1);
+
+    // pipeline 2 recovers: the second episode resolves, rule inactive
+    let notices = ev
+        .run_pass(&app.state, &two(0.0, 0.0), T0 + 30_000)
+        .await
+        .unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].event_id, ep2);
+    assert!(notices[0].series_key.contains("pipeline=\"2\""));
+    let (_, b) = req(&app, "GET", "/api/alerts", None).await;
+    assert_eq!(b["rules"][0]["state"], "inactive");
+    let events = b["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2, "one episode per series, both resolved");
+    assert!(events.iter().all(|e| e["state"] == "resolved"));
+}
+
+/// R9 review fix (medium): window thresholds accept 0 — an integer counter
+/// with `threshold: 0` fires on ANY single row in the window ("alert the
+/// first failed flush", matching the Prometheus example's `> 0`).
+#[tokio::test]
+async fn window_threshold_zero_fires_on_a_single_row() {
+    let app = app().await;
+    create_rule(
+        &app,
+        json!({"name": "flush", "ruleType": "flush_errors_window",
+               "params": {"threshold": 0, "windowSecs": 60}}),
+    )
+    .await;
+    let err = |v: f64| {
+        parse_samples(
+            &format!("tailrace_flush_total{{pipeline=\"1\",result=\"error\"}} {v}\n"),
+            Some("edge-1"),
+        )
+    };
+    let mut ev = Evaluator::new();
+    ev.run_pass(&app.state, &err(0.0), T0).await.unwrap();
+    let notices = ev
+        .run_pass(&app.state, &err(1.0), T0 + 60_000)
+        .await
+        .unwrap();
+    assert_eq!(notices.len(), 1, "one row in the window fires: {notices:?}");
+    assert_eq!(notices[0].event, "firing");
+    assert_eq!(notices[0].sample["increment"], 1.0);
+}
+
+/// R9 review fix (low): filters the kind's series can never carry are
+/// rejected with the params-invalid envelope instead of silently accepted
+/// (a heartbeat rule scoped to a pipeline would never match anything).
+#[tokio::test]
+async fn impossible_filters_are_rejected() {
+    let app = app().await;
+    for body in [
+        json!({"name": "hb", "ruleType": "heartbeat_age",
+               "params": {"threshold": 90, "pipeline": "1"}}),
+        json!({"name": "sf", "ruleType": "state_failed",
+               "params": {"statement": "0"}}),
+    ] {
+        let (s, b) = req(&app, "POST", "/api/alerts/rules", Some(body)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["message_key"], "err.alert.params_invalid", "{b}");
+    }
+    let (_, b) = req(&app, "GET", "/api/alerts", None).await;
+    assert_eq!(b["rules"].as_array().unwrap().len(), 0);
+}
+
+/// R9 review fix (high): the evaluator's snapshot derives heartbeat age
+/// from the console's own receive clock (`node.last_heartbeat`), drops the
+/// node's self-report, and names the nodes it could not scrape — so a
+/// heartbeat_age rule rises exactly when a node goes quiet (a down node
+/// cannot report its own silence), and the evaluator can tell "series
+/// gone" from "node unreachable".
+#[tokio::test]
+async fn snapshot_derives_heartbeat_age_from_console_clock_and_flags_unreachable() {
+    let app = app().await;
+    // two nodes on record: edge-1 last beat 10 minutes ago, edge-2 just now
+    app.store
+        .with_conn(|c| {
+            c.execute(
+                "INSERT INTO node (node_key, name, register_mode, status) \
+                 VALUES ('sn-1', 'edge-1', 'manual', 'ONLINE')",
+                [],
+            )?;
+            c.execute(
+                "UPDATE node SET last_heartbeat = datetime('now', '-10 minutes') \
+                 WHERE node_key = 'sn-1'",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO node (node_key, name, register_mode, status) \
+                 VALUES ('sn-2', 'edge-2', 'manual', 'ONLINE')",
+                [],
+            )?;
+            c.execute(
+                "UPDATE node SET last_heartbeat = datetime('now') WHERE node_key = 'sn-2'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    // edge-1 answers /metrics but self-reports a fresh age (a stuck
+    // reporter must not mask a silent node); edge-2 is unreachable
+    let gathered = tailrace_console::metrics::Gathered {
+        console_text: String::new(),
+        blocks: vec![
+            (
+                "edge-1".to_string(),
+                Ok("tailrace_node_heartbeat_age_seconds{node_id=\"sn-1\"} 3\n".to_string()),
+            ),
+            ("edge-2".to_string(), Err("unreachable: boom".to_string())),
+        ],
+    };
+    let snap = tailrace_console::metrics::snapshot(&gathered, &app.state);
+    assert_eq!(snap.unreachable_nodes, vec!["edge-2".to_string()]);
+    let hb: Vec<&Sample> = snap
+        .samples
+        .iter()
+        .filter(|s| s.metric == "tailrace_node_heartbeat_age_seconds")
+        .collect();
+    assert_eq!(
+        hb.len(),
+        2,
+        "one synthesized age per registered node: {hb:?}"
+    );
+    let by_node = |n: &str| {
+        hb.iter()
+            .find(|s| s.labels.get("node").map(String::as_str) == Some(n))
+            .unwrap()
+    };
+    let e1 = by_node("edge-1");
+    assert_eq!(e1.labels.get("node_id").map(String::as_str), Some("sn-1"));
+    assert!(
+        (500.0..700.0).contains(&e1.value),
+        "console clock (~600s), not the self-report (3): {}",
+        e1.value
+    );
+    let e2 = by_node("edge-2");
+    assert!(e2.value < 90.0, "just-beat node is fresh: {}", e2.value);
+
+    // a heartbeat_age rule fires for the silent node on this snapshot
+    create_rule(
+        &app,
+        json!({"name": "hb", "ruleType": "heartbeat_age", "params": {"threshold": 90}}),
+    )
+    .await;
+    let notices = Evaluator::new()
+        .run_pass_snapshot(&app.state, &snap, T0)
+        .await
+        .unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].event, "firing");
+    assert!(notices[0].series_key.contains("node=\"edge-1\""));
 }

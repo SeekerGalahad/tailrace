@@ -209,10 +209,16 @@ SHOW="$(m "SHOW CREATE TABLE $DB.docs_emb;" | tr '[:upper:]' '[:lower:]')"
 { grep -q '`meta` variant' <<<"$SHOW" && grep -q 'vector dim=3' <<<"$SHOW"; } \
   && step pass "D2.2 executed on the live table (SHOW CREATE TABLE carries variant + the dim comment — zero hand DDL)" \
   || step fail "D2.2 execute" "$(head -c 300 <<<"$SHOW")"
-# the dim-vs-DESC evolve quirk, observed as an operator would hit it
+# R9 review fix: the registered list<float32,3> reads back from DESC as a
+# bare list<float32> (the dim lives in the COMMENT) — evolve must NOT read
+# that as a retype. Before the fix this 409'd forever and blocked even pure
+# ADD COLUMNs on every dimmed vector table.
 req POST "/api/datasources/$DDS/tables/$DB/docs_emb/ddl/evolve" '{}' "$TOKEN"
 EV_CODE="$CODE"
-step pass "D2.3 evolve on the dimmed table → http=$EV_CODE (DESC cannot carry the dim back; 409 retype suggestion — documented behaviour, dogfooding #2)"
+EV_CHANGED="$(jq -r '.changed // empty' <<<"$BODY" 2>/dev/null)"
+{ [ "$EV_CODE" = "200" ] && [ "$EV_CHANGED" = "false" ]; } \
+  && step pass "D2.3 evolve on the dimmed table → 200 changed=false (dim invisible to DESC is not a retype — R9 review fix)" \
+  || step fail "D2.3 evolve on dimmed table" "http=$EV_CODE body=$(head -c 300 <<<"$BODY")"
 
 # ---------- D3 pipeline: nested docs + vectors through the engine ----------
 # gate table for be_write_gate (raw stream loads only, never asserted on)
@@ -294,16 +300,30 @@ done
   || step fail "D3.3 dim guard" "n=$BN dlq=$DLQN node-events=$(grep -c DECODE_BAD "$WORK/node-state/events.log" 2>/dev/null)"
 
 # ---------- D4 one alert rule, really fired and really resolved ----------
+# R9 review fix: episodes are per series, so the rule is scoped to THIS
+# pipeline — unscoped it would also match the dim-guard pipeline ($B_ID),
+# whose static input makes its lag grow forever (that is what put a
+# pipeline=2 sample into the round-3 evidence), and the rule could never
+# read inactive again.
 req POST /api/alerts/rules \
-  "{\"name\":\"df3-lag\",\"ruleType\":\"lag_seconds\",\"params\":{\"threshold\":6},\"webhookUrl\":\"http://127.0.0.1:$WEBHOOK_PORT/hook\"}" "$TOKEN"
+  "{\"name\":\"df3-lag\",\"ruleType\":\"lag_seconds\",\"params\":{\"threshold\":6,\"pipeline\":\"$P_ID\"},\"webhookUrl\":\"http://127.0.0.1:$WEBHOOK_PORT/hook\"}" "$TOKEN"
 RULE_ID="$(jq -r '.id // empty' <<<"$BODY" 2>/dev/null)"
-[ -n "$RULE_ID" ] && step pass "D4.1 lag rule (threshold 6s) + webhook created (#$RULE_ID)" || step fail "D4.1 rule" "body=$(head -c 200 <<<"$BODY")"
-SLO="$(curl -s "http://$CONSOLE_ADDR/metrics" | grep "^tailrace_slo_lag_target_seconds{.*pipeline=\"$P_ID\"" | head -1)"
-step pass "D4.2 /metrics exposes the SLO target beside the lag series: ${SLO:-<none yet — first flush pending>}"
+[ -n "$RULE_ID" ] && step pass "D4.1 lag rule (threshold 6s, pipeline=$P_ID) + webhook created (#$RULE_ID)" || step fail "D4.1 rule" "body=$(head -c 200 <<<"$BODY")"
 # pause only once the first data has actually flushed (last_data_ms is the
 # lag gauge's basis; pausing before it leaves the series absent, not stale)
 F1=""
 for i in $(seq 1 30); do F1="$(q "SELECT COUNT(*) FROM $DB.docs_emb;")"; [ "$F1" = "3" ] && break; sleep 2; done
+# R9 review fix: the SLO target line follows the lag series, which only
+# exists after the first flush — assert it HERE (after F1), and fail when
+# it is absent instead of printing "none yet" as a pass.
+SLO=""
+for i in $(seq 1 10); do
+  SLO="$(curl -s "http://$CONSOLE_ADDR/metrics" | grep "^tailrace_slo_lag_target_seconds{.*pipeline=\"$P_ID\"" | head -1)"
+  [ -n "$SLO" ] && break; sleep 1
+done
+[ -n "$SLO" ] \
+  && step pass "D4.2 /metrics exposes the SLO target beside the lag series: $SLO" \
+  || step fail "D4.2 SLO target line" "no tailrace_slo_lag_target_seconds for pipeline=$P_ID after first flush (rows=$F1)"
 be_write_gate d4 >/dev/null
 req POST "/api/pipelines/$P_ID/pause" '{}' "$TOKEN"
 grep -q '"PAUSED"' <<<"$BODY" && step pass "D4.3 pipeline paused (manufacturing the lag)" || step fail "D4.3 pause" "http=$CODE"
@@ -351,14 +371,26 @@ H="$(hook_seen)"
 FIRST2="$(jq -r '.event_header' "$WORK/hook.jsonl" 2>/dev/null | head -2 | paste -sd, -)"
 EV1="$(jq -r '(.body|fromjson).eventId' "$WORK/hook.jsonl" 2>/dev/null | head -1)"
 EV2="$(jq -r '(.body|fromjson).eventId' "$WORK/hook.jsonl" 2>/dev/null | sed -n 2p)"
+# R9 review fix: episodes are per series — both notices must name the SAME
+# series (previously the resolved sample could belong to another pipeline)
+SK1="$(jq -r '(.body|fromjson).seriesKey // empty' "$WORK/hook.jsonl" 2>/dev/null | head -1)"
+SK2="$(jq -r '(.body|fromjson).seriesKey // empty' "$WORK/hook.jsonl" 2>/dev/null | sed -n 2p)"
 SEQ="$(jq -rc '.event_header' "$WORK/hook.jsonl" 2>/dev/null | paste -sd, -)"
-if [ "$FIRST2" = "firing,resolved" ] && [ -n "$EV1" ] && [ "$EV1" = "$EV2" ]; then
-  step pass "D4.7 webhook carries the episode's 2 notices (firing then resolved, SAME episode id $EV1) — sequence [$SEQ], total $H"
+if [ "$FIRST2" = "firing,resolved" ] && [ -n "$EV1" ] && [ "$EV1" = "$EV2" ] && [ -n "$SK1" ] && [ "$SK1" = "$SK2" ] && grep -q "pipeline=\"$P_ID\"" <<<"$SK1"; then
+  step pass "D4.7 webhook carries the episode's 2 notices (firing then resolved, SAME episode id $EV1, SAME series $SK1) — sequence [$SEQ], total $H"
 else
-  step fail "D4.7 webhook" "first2=$FIRST2 ev1=$EV1 ev2=$EV2 seq=[$SEQ]"
+  step fail "D4.7 webhook" "first2=$FIRST2 ev1=$EV1 ev2=$EV2 sk1=$SK1 sk2=$SK2 seq=[$SEQ]"
 fi
+# R9 review fix: DELETE closes an open episode with reason=deleted and
+# delivers resolved before the row goes; the rule is already resolved here,
+# so the hook count must not grow (a 3rd notice would be a phantom).
 req DELETE "/api/alerts/rules/$RULE_ID" "" "$TOKEN"
-[ "$CODE" = "204" ] && step pass "D4.8 rule deleted (204)" || step fail "D4.8 delete" "http=$CODE"
+DEL_CODE="$CODE"
+sleep 2
+H2="$(hook_seen)"
+{ [ "$DEL_CODE" = "204" ] && [ "$H2" = "$H" ]; } \
+  && step pass "D4.8 rule deleted (204), no phantom notice (hook total stays $H2)" \
+  || step fail "D4.8 delete" "http=$DEL_CODE hook_before=$H hook_after=$H2"
 
 # ---------- D5 teardown ----------
 [ -n "$NODE_PID" ] && kill -TERM "$NODE_PID" 2>/dev/null; NODE_PID=""

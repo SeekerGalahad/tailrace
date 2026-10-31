@@ -84,7 +84,7 @@ pub async fn gather(state: &AppState) -> Gathered {
 }
 
 /// All reachable-node samples of one gathering round, with the `node` label
-/// injected — the evaluator's input.
+/// injected — the raw proxy input.
 pub fn node_samples(gathered: &Gathered) -> Vec<crate::alerting::Sample> {
     gathered
         .blocks
@@ -97,6 +97,58 @@ pub fn node_samples(gathered: &Gathered) -> Vec<crate::alerting::Sample> {
         })
         .flatten()
         .collect()
+}
+
+/// The evaluator's input for one gathering round (R9 review fix).
+///
+/// - `unreachable_nodes` — every registered node whose `/metrics` could not
+///   be fetched (down, partitioned, or one 3s scrape timeout). Their series
+///   are absent for a reason that is not "the condition cleared", so the
+///   evaluator holds open episodes on them instead of resolving.
+/// - `heartbeat_age` switches to the CONSOLE-observed clock: the node's
+///   self-reported `tailrace_node_heartbeat_age_seconds` is dropped and one
+///   sample per registered node is synthesized from `node.last_heartbeat`
+///   (the moment the console last accepted a heartbeat). A node that is
+///   down cannot report its own silence; the console's own receive time
+///   keeps rising, so a `heartbeat_age` rule fires exactly when the node
+///   goes quiet — the node-side series only covered a stuck heartbeat loop
+///   while /metrics still answered. The scrape output (`assemble`) still
+///   proxies the node's self-report untouched; only the evaluator's view is
+///   replaced. Nodes that never heartbeated have no age (no false alarm on
+///   fresh registrations).
+pub fn snapshot(gathered: &Gathered, state: &AppState) -> crate::alerting::Snapshot {
+    let mut samples = node_samples(gathered);
+    samples.retain(|s| s.metric != "tailrace_node_heartbeat_age_seconds");
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    for n in state.store().list_nodes().unwrap_or_default() {
+        let Some(last) = n
+            .last_heartbeat
+            .as_deref()
+            .and_then(crate::api::nodes_admin::sqlite_ts_to_epoch)
+        else {
+            continue;
+        };
+        samples.push(crate::alerting::Sample {
+            metric: "tailrace_node_heartbeat_age_seconds".to_string(),
+            labels: [("node", n.name.as_str()), ("node_id", n.node_key.as_str())]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            value: (now_epoch - last).max(0) as f64,
+        });
+    }
+    let unreachable_nodes = gathered
+        .blocks
+        .iter()
+        .filter_map(|(name, result)| result.as_ref().err().map(|_| name.clone()))
+        .collect();
+    crate::alerting::Snapshot {
+        samples,
+        unreachable_nodes,
+    }
 }
 
 /// `GET /metrics` — open (no session; exporter convention, like /healthz).

@@ -250,6 +250,14 @@ pub fn is_variant_field(field: &Field) -> bool {
 /// `list<float32>` — any length is legal there.
 pub const VECTOR_DIM_FIELD_METADATA: &str = "tailrace.vector_dim";
 
+/// Upper bound of a declared vector dimension (R9 review fix). Every real
+/// embedding dim sits far below this; the bound exists because the dim is
+/// a guard AND a decoder pre-allocation hint — an unbounded `u32` would
+/// let one typo'd declaration (`list<float32,7680000>`) demand a ~61GB
+/// first batch. The DDL mapper (`tailrace-ddl`) mirrors this cap locally —
+/// that crate deliberately does not depend on this one.
+pub const MAX_VECTOR_DIM: u32 = 65_536;
+
 /// Whether a field is the vector column shape — arrow `List` of `Float32`,
 /// the `to_arrow` image of `list<float32[,dim]>`. Type-based (no marker
 /// needed): nothing else in the vocabulary lands a List.
@@ -425,8 +433,15 @@ impl<'a> Parser<'a> {
                 let dim = if self.bytes.get(self.pos) == Some(&b',') {
                     self.expect(b',')?;
                     let d = self.uint()?;
+                    // reject 0 AND anything beyond the cap BEFORE the
+                    // u32 cast — `d as u32` on a u64 ≥ 2^32 silently
+                    // wraps (4294967296 would become 0 and turn every
+                    // non-empty vector into a bad row, R9 review fix)
                     if d == 0 {
                         anyhow::bail!("list dimension must be ≥ 1 (got 0)");
+                    }
+                    if d > MAX_VECTOR_DIM as u64 {
+                        anyhow::bail!("list dimension must be ≤ {MAX_VECTOR_DIM} (got {d})");
                     }
                     Some(d as u32)
                 } else {
@@ -676,6 +691,37 @@ mod tests {
             let f = arrow_field_or_utf8("c", word).unwrap();
             assert!(!is_vector_field(&f), "{word} is not a vector field");
             assert_eq!(vector_dim(&f), None, "{word} carries no dimension");
+        }
+    }
+
+    /// R9 review fix: a dimension past `MAX_VECTOR_DIM` is rejected at
+    /// parse time — including the u64 ≥ 2^32 values whose `as u32` cast
+    /// used to wrap to a small/zero dim (4294967296 → 0 would have made
+    /// the guard fail every non-empty vector; 4294967299 → 3 likewise).
+    #[test]
+    fn vector_dim_cap_and_u32_wraparound_rejected() {
+        // the cap itself is legal and carries its dimension through
+        let at_cap = ColumnType::parse(&format!("list<float32,{MAX_VECTOR_DIM}>")).unwrap();
+        assert_eq!(
+            at_cap,
+            ColumnType::ListFloat32 {
+                dim: Some(MAX_VECTOR_DIM)
+            }
+        );
+        // `parse` is the strict entry (the `*_or_utf8` entries fold any parse
+        // failure to Utf8 inside the G2 migration window — not what this
+        // test is about)
+        for bad in [
+            format!("{}", MAX_VECTOR_DIM as u64 + 1),
+            "4294967295".to_string(), // u32::MAX, over the cap
+            "4294967296".to_string(), // 2^32 — used to wrap to 0
+            "4294967299".to_string(), // 2^32+3 — used to wrap to 3
+        ] {
+            let e = ColumnType::parse(&format!("list<float32,{bad}>")).unwrap_err();
+            assert!(
+                e.to_string().contains("≤"),
+                "cap message for dim {bad}: {e}"
+            );
         }
     }
 

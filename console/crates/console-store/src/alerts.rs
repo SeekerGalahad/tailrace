@@ -1,11 +1,18 @@
 //! Alert repository (T-E2, `alert_rule` + `alert_event` tables): rule CRUD
 //! plus the episode state machine the console-side evaluator drives. The
-//! three transition writers below are the ONLY writers of `alert_rule.state`
-//! and of `alert_event` rows; each runs in one `with_tx` so a rule's state
-//! flip and its episode row can never disagree. An episode row is inserted
-//! on inactive → firing and flipped to `resolved` on firing → inactive;
-//! ticks that keep a rule firing touch the open row (last_seen_at / sample)
-//! and never add a row — the anti-flood contract the API surface relies on.
+//! transition writers below are the ONLY writers of `alert_rule.state` and
+//! of `alert_event` rows; each runs in one `with_tx` so a rule's state and
+//! its episode rows can never disagree.
+//!
+//! Episodes are PER SERIES (R9 review fix): one open (`firing`) row per
+//! `(rule_id, series_key)` — a rule matching three pipelines keeps three
+//! independent episodes, each with its own firing/resolved notice.
+//! `alert_rule.state` is the rule-level aggregate: `firing` while any
+//! episode of the rule is open, `inactive` once the last one resolves.
+//! A row is inserted on a series' inactive → firing, flipped to `resolved`
+//! on the way back; ticks that keep a series firing touch its open row
+//! (last_seen_at / sample) and never add a row — the anti-flood contract the
+//! API surface relies on.
 
 use anyhow::Result;
 
@@ -14,8 +21,8 @@ use super::Store;
 
 const RULE_COLS: &str =
     "id, name, rule_type, params_json, enabled, webhook_url, state, created_at, updated_at";
-const EVENT_COLS: &str = "id, rule_id, state, first_seen_at, last_seen_at, resolved_at, \
-                          sample_json, resolved_sample_json";
+const EVENT_COLS: &str = "id, rule_id, series_key, state, first_seen_at, last_seen_at, \
+                          resolved_at, sample_json, resolved_sample_json";
 
 fn rule_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlertRule> {
     Ok(AlertRule {
@@ -35,12 +42,13 @@ fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlertEvent> {
     Ok(AlertEvent {
         id: row.get(0)?,
         rule_id: row.get(1)?,
-        state: row.get(2)?,
-        first_seen_at: row.get(3)?,
-        last_seen_at: row.get(4)?,
-        resolved_at: row.get(5)?,
-        sample_json: row.get(6)?,
-        resolved_sample_json: row.get(7)?,
+        series_key: row.get(2)?,
+        state: row.get(3)?,
+        first_seen_at: row.get(4)?,
+        last_seen_at: row.get(5)?,
+        resolved_at: row.get(6)?,
+        sample_json: row.get(7)?,
+        resolved_sample_json: row.get(8)?,
     })
 }
 
@@ -51,6 +59,18 @@ pub enum AlertRuleWrite {
     Written(i64),
     NameConflict,
     NotFound,
+}
+
+/// `alert_rule.state` ← aggregate of the rule's open episodes (same
+/// connection/transaction as the caller's episode write).
+fn sync_rule_state(conn: &rusqlite::Connection, rule_id: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE alert_rule SET state = CASE WHEN EXISTS(\
+             SELECT 1 FROM alert_event WHERE rule_id = ?1 AND state = 'firing') \
+         THEN 'firing' ELSE 'inactive' END WHERE id = ?1",
+        [rule_id],
+    )?;
+    Ok(())
 }
 
 impl Store {
@@ -105,7 +125,7 @@ impl Store {
     }
 
     /// Replace every user-editable field of a rule. `state` is untouched —
-    /// an open episode keeps running under the new parameters and resolves
+    /// open episodes keep running under the new parameters and resolve
     /// (or not) on the next evaluation, so an edit never silently drops a
     /// firing alert.
     pub fn update_alert_rule(
@@ -149,34 +169,46 @@ impl Store {
         })
     }
 
-    /// Delete a rule; its episodes go with it (ON DELETE CASCADE).
+    /// Delete a rule; its episode rows go with it (ON DELETE CASCADE). The
+    /// API layer closes any open episode (resolved, reason `deleted`) and
+    /// delivers the notices BEFORE calling this, so a receiver never keeps
+    /// a firing alert for a rule that no longer exists.
     pub fn delete_alert_rule(&self, id: i64) -> Result<bool> {
         self.with_conn(|conn| Ok(conn.execute("DELETE FROM alert_rule WHERE id = ?1", [id])? > 0))
     }
 
-    /// The rule's open (state=firing) episode, if any — at most one exists
-    /// by construction of the transition writers.
-    pub fn open_alert_episode(&self, rule_id: i64) -> Result<Option<AlertEvent>> {
+    /// The rule's open (state=firing) episodes, oldest first — one per
+    /// series by construction of the transition writers.
+    pub fn open_alert_episodes(&self, rule_id: i64) -> Result<Vec<AlertEvent>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {EVENT_COLS} FROM alert_event WHERE rule_id = ?1 AND state = 'firing' \
-                 ORDER BY id DESC LIMIT 1"
+                 ORDER BY id"
             ))?;
-            let mut rows = stmt.query([rule_id])?;
-            match rows.next()? {
-                Some(row) => Ok(Some(event_from_row(row)?)),
-                None => Ok(None),
-            }
+            let rows = stmt.query_map([rule_id], event_from_row)?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         })
     }
 
-    /// inactive → firing: insert the episode row and flip the rule state,
-    /// atomically. Returns the new event id.
-    pub fn begin_alert_episode(&self, rule_id: i64, sample_json: &str) -> Result<i64> {
+    /// The rule's oldest open episode, if any (the `openEvent` the API
+    /// shows first; `open_alert_episodes` has them all).
+    pub fn open_alert_episode(&self, rule_id: i64) -> Result<Option<AlertEvent>> {
+        Ok(self.open_alert_episodes(rule_id)?.into_iter().next())
+    }
+
+    /// A series' inactive → firing: insert its episode row and mark the
+    /// rule firing, atomically. Returns the new event id.
+    pub fn begin_alert_episode(
+        &self,
+        rule_id: i64,
+        series_key: &str,
+        sample_json: &str,
+    ) -> Result<i64> {
         self.with_tx(|conn| {
             conn.execute(
-                "INSERT INTO alert_event (rule_id, state, sample_json) VALUES (?1, 'firing', ?2)",
-                rusqlite::params![rule_id, sample_json],
+                "INSERT INTO alert_event (rule_id, series_key, state, sample_json) \
+                 VALUES (?1, ?2, 'firing', ?3)",
+                rusqlite::params![rule_id, series_key, sample_json],
             )?;
             let id = conn.last_insert_rowid();
             conn.execute(
@@ -187,36 +219,63 @@ impl Store {
         })
     }
 
-    /// firing → firing: bump the open episode's last_seen_at and latest
-    /// sample. No new row. Ok(false) = no open episode (nothing touched).
-    pub fn touch_alert_episode(&self, rule_id: i64, sample_json: &str) -> Result<bool> {
+    /// firing → firing: bump an open episode's last_seen_at and latest
+    /// sample. No new row. Ok(false) = no such open episode (nothing touched).
+    pub fn touch_alert_episode(&self, event_id: i64, sample_json: &str) -> Result<bool> {
         self.with_conn(|conn| {
             Ok(conn.execute(
                 "UPDATE alert_event SET last_seen_at = datetime('now'), sample_json = ?2 \
-                 WHERE rule_id = ?1 AND state = 'firing'",
-                rusqlite::params![rule_id, sample_json],
+                 WHERE id = ?1 AND state = 'firing'",
+                rusqlite::params![event_id, sample_json],
             )? > 0)
         })
     }
 
-    /// firing → inactive: close the open episode (state=resolved, resolved_at,
-    /// resolving sample) and flip the rule state, atomically. Ok(false) = the
-    /// rule had no open episode (state is still forced to inactive so a
-    /// stray `firing` flag can never outlive its episode).
-    pub fn resolve_alert_episode(&self, rule_id: i64, sample_json: &str) -> Result<bool> {
+    /// Give a pre-migration-05 episode (`series_key = ''`) the identity of
+    /// the series the evaluator now sees firing for its rule. Ok(false) =
+    /// the row is not an open legacy episode.
+    pub fn adopt_alert_episode(&self, event_id: i64, series_key: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            Ok(conn.execute(
+                "UPDATE alert_event SET series_key = ?2 \
+                 WHERE id = ?1 AND state = 'firing' AND series_key = ''",
+                rusqlite::params![event_id, series_key],
+            )? > 0)
+        })
+    }
+
+    /// A series' firing → inactive: close its episode (state=resolved,
+    /// resolved_at, resolving sample) and re-derive the rule state from the
+    /// episodes still open, atomically. Ok(false) = the row was not an open
+    /// episode (the rule state is still re-derived, so a stray `firing` flag
+    /// can never outlive its episodes).
+    pub fn resolve_alert_episode(&self, event_id: i64, sample_json: &str) -> Result<bool> {
         self.with_tx(|conn| {
+            let rule_id: Option<i64> = conn
+                .query_row(
+                    "SELECT rule_id FROM alert_event WHERE id = ?1",
+                    [event_id],
+                    |r| r.get(0),
+                )
+                .ok();
             let closed = conn.execute(
                 "UPDATE alert_event SET state = 'resolved', resolved_at = datetime('now'), \
                  last_seen_at = datetime('now'), resolved_sample_json = ?2 \
-                 WHERE rule_id = ?1 AND state = 'firing'",
-                rusqlite::params![rule_id, sample_json],
+                 WHERE id = ?1 AND state = 'firing'",
+                rusqlite::params![event_id, sample_json],
             )?;
-            conn.execute(
-                "UPDATE alert_rule SET state = 'inactive' WHERE id = ?1",
-                [rule_id],
-            )?;
+            if let Some(rule_id) = rule_id {
+                sync_rule_state(conn, rule_id)?;
+            }
             Ok(closed > 0)
         })
+    }
+
+    /// Re-derive `alert_rule.state` from the rule's open episodes (the
+    /// evaluator calls it once per rule per pass as a belt-and-braces
+    /// against a flag left behind by an older writer).
+    pub fn sync_alert_rule_state(&self, rule_id: i64) -> Result<()> {
+        self.with_conn(|conn| Ok(sync_rule_state(conn, rule_id)?))
     }
 
     /// Most recent episodes across all rules, newest first (the
@@ -251,6 +310,9 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const S1: &str = "tailrace_pipeline_lag_seconds{node=\"a\",pipeline=\"1\",statement=\"0\"}";
+    const S2: &str = "tailrace_pipeline_lag_seconds{node=\"a\",pipeline=\"2\",statement=\"0\"}";
 
     fn rule(store: &Store, name: &str) -> i64 {
         match store
@@ -302,7 +364,7 @@ mod tests {
 
         // firing, then edit: state survives the edit (an edit must not drop
         // a firing alert on the floor)
-        store.begin_alert_episode(a, r#"{"lag":99}"#).unwrap();
+        store.begin_alert_episode(a, S1, r#"{"lag":99}"#).unwrap();
         assert_eq!(
             store
                 .update_alert_rule(
@@ -339,22 +401,23 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let id = rule(&store, "lag");
         assert!(store.open_alert_episode(id).unwrap().is_none());
-        // touching / resolving with nothing open is a no-op (Ok(false))
-        assert!(!store.touch_alert_episode(id, "{}").unwrap());
-        assert!(!store.resolve_alert_episode(id, "{}").unwrap());
+        // touching / resolving a row that does not exist is a no-op (Ok(false))
+        assert!(!store.touch_alert_episode(999, "{}").unwrap());
+        assert!(!store.resolve_alert_episode(999, "{}").unwrap());
         assert_eq!(store.alert_rule(id).unwrap().unwrap().state, "inactive");
 
-        let ev = store.begin_alert_episode(id, r#"{"lag":45}"#).unwrap();
+        let ev = store.begin_alert_episode(id, S1, r#"{"lag":45}"#).unwrap();
         assert_eq!(store.alert_rule(id).unwrap().unwrap().state, "firing");
         let open = store.open_alert_episode(id).unwrap().unwrap();
         assert_eq!((open.id, open.state.as_str()), (ev, "firing"));
+        assert_eq!(open.series_key, S1);
         assert_eq!(open.sample_json, r#"{"lag":45}"#);
         assert_eq!(open.resolved_at, None);
 
         // five more firing ticks: still exactly one row, latest sample kept
         for lag in [46, 47, 48, 49, 50] {
             assert!(store
-                .touch_alert_episode(id, &format!(r#"{{"lag":{lag}}}"#))
+                .touch_alert_episode(ev, &format!(r#"{{"lag":{lag}}}"#))
                 .unwrap());
         }
         let events = store.list_alert_events_for_rule(id, 10).unwrap();
@@ -362,9 +425,11 @@ mod tests {
         assert_eq!(events[0].sample_json, r#"{"lag":50}"#);
 
         // resolve: same row flips, resolving sample recorded, rule inactive
-        assert!(store.resolve_alert_episode(id, r#"{"lag":3}"#).unwrap());
+        assert!(store.resolve_alert_episode(ev, r#"{"lag":3}"#).unwrap());
         assert_eq!(store.alert_rule(id).unwrap().unwrap().state, "inactive");
         assert!(store.open_alert_episode(id).unwrap().is_none());
+        // resolving twice is a no-op
+        assert!(!store.resolve_alert_episode(ev, r#"{"lag":3}"#).unwrap());
         let events = store.list_alert_events_for_rule(id, 10).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].state, "resolved");
@@ -379,7 +444,7 @@ mod tests {
         );
 
         // a second firing is a second row; the resolved one is immutable
-        let ev2 = store.begin_alert_episode(id, r#"{"lag":70}"#).unwrap();
+        let ev2 = store.begin_alert_episode(id, S1, r#"{"lag":70}"#).unwrap();
         assert_ne!(ev2, ev);
         let events = store.list_alert_events_for_rule(id, 10).unwrap();
         assert_eq!(events.len(), 2);
@@ -387,9 +452,62 @@ mod tests {
         assert_eq!(events.iter().filter(|e| e.state == "resolved").count(), 1);
         // cross-rule listing, newest first, honours the limit
         let other = rule(&store, "other");
-        store.begin_alert_episode(other, "{}").unwrap();
+        store.begin_alert_episode(other, S1, "{}").unwrap();
         let all = store.list_alert_events(2).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].rule_id, other, "newest first");
+    }
+
+    /// Per-series episodes (R9 review fix): two series of one rule keep two
+    /// open rows; resolving one leaves the rule firing, resolving the last
+    /// flips it inactive; a legacy '' row is adopted by a series.
+    #[test]
+    fn episodes_are_per_series_and_rule_state_aggregates() {
+        let store = Store::open_in_memory().unwrap();
+        let id = rule(&store, "lag");
+        let e1 = store.begin_alert_episode(id, S1, "{}").unwrap();
+        let e2 = store.begin_alert_episode(id, S2, "{}").unwrap();
+        let open = store.open_alert_episodes(id).unwrap();
+        assert_eq!(
+            open.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![e1, e2],
+            "oldest first"
+        );
+        assert_eq!(open[0].series_key, S1);
+        assert_eq!(open[1].series_key, S2);
+        assert_eq!(store.open_alert_episode(id).unwrap().unwrap().id, e1);
+
+        assert!(store.resolve_alert_episode(e1, "{}").unwrap());
+        assert_eq!(
+            store.alert_rule(id).unwrap().unwrap().state,
+            "firing",
+            "one series still open keeps the rule firing"
+        );
+        assert_eq!(store.open_alert_episodes(id).unwrap().len(), 1);
+        assert!(store.resolve_alert_episode(e2, "{}").unwrap());
+        assert_eq!(store.alert_rule(id).unwrap().unwrap().state, "inactive");
+        assert!(store.open_alert_episodes(id).unwrap().is_empty());
+
+        // legacy row (pre-05 shape) is adopted once, by one series only
+        let legacy = store.begin_alert_episode(id, "", "{}").unwrap();
+        assert!(store.adopt_alert_episode(legacy, S2).unwrap());
+        assert!(!store.adopt_alert_episode(legacy, S1).unwrap());
+        assert_eq!(
+            store.open_alert_episode(id).unwrap().unwrap().series_key,
+            S2
+        );
+        // a stray flag is re-derived from the rows
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE alert_event SET state = 'resolved' WHERE id = ?1",
+                    [legacy],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(store.alert_rule(id).unwrap().unwrap().state, "firing");
+        store.sync_alert_rule_state(id).unwrap();
+        assert_eq!(store.alert_rule(id).unwrap().unwrap().state, "inactive");
     }
 }

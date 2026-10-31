@@ -92,14 +92,19 @@ impl ColBatch {
                 // builder's default item field happens to match, but
                 // RecordBatch::try_new compares fields exactly). Values
                 // capacity = rows × the declared dim when there is one — a
-                // vector column's natural size; the builder grows past a
-                // wrong guess either way.
+                // vector column's natural size, clamped so the HINT can
+                // never demand absurd memory on its own (the declared dim
+                // is capped at tailrace_ir::MAX_VECTOR_DIM by the parser,
+                // and the builder grows past a wrong guess either way).
                 DataType::List(item) if item.data_type() == &DataType::Float32 => {
                     let dim = tailrace_ir::vector_dim(f).map_or(16, |d| d as usize);
+                    let rows_hint = rows.min(2000);
                     Box::new(
                         ListBuilder::with_capacity(
-                            Float32Builder::with_capacity(rows.min(2000) * dim),
-                            rows.min(2000),
+                            Float32Builder::with_capacity(
+                                rows_hint.saturating_mul(dim).min(1 << 20),
+                            ),
+                            rows_hint,
                         )
                         .with_field(item.clone()),
                     )
@@ -873,8 +878,15 @@ fn check_vector_cell(
         }
     }
     // cast_f64 is Some for every JSON number shape (i64 / u64 / f64) and
-    // None for everything else — the one-call "is a number" test
-    if let Some(index) = items.iter().position(|e| e.cast_f64().is_none()) {
+    // None for everything else — the one-call "is a number" test. A number
+    // that cannot land in an f32 without degrading — non-finite as f64
+    // (|v| past f64::MAX parses to inf), or |v| past f32::MAX (e.g. 1e39,
+    // which would silently become inf) — fails the same way: a bad row to
+    // quarantine, not a silent [inf,…] cell into the sink (R9 review fix).
+    if let Some(index) = items.iter().position(|e| {
+        e.cast_f64()
+            .is_none_or(|f| !f.is_finite() || f.abs() > f32::MAX as f64)
+    }) {
         return Err(VectorCellError::Element { index });
     }
     Ok(())
@@ -2250,6 +2262,24 @@ mod tests {
         assert_eq!(
             guard(r#"{"v":[1,2,"3"]}"#, None),
             Err(E::Element { index: 2 })
+        );
+        // a number that cannot land in an f32 without degrading — past
+        // f32::MAX (1e39 → inf after the cast) or non-finite as f64 — is a
+        // bad row, not a silent [inf,…] cell (R9 review fix)
+        assert_eq!(
+            guard(r#"{"v":[0.1,1e39,0.3]}"#, d3),
+            Err(E::Element { index: 1 })
+        );
+        assert_eq!(
+            guard(r#"{"v":[-1e300,0.2]}"#, None),
+            Err(E::Element { index: 0 })
+        );
+        // f32::MAX itself still passes (the boundary is exclusive only
+        // past what f32 can hold)
+        let f32_max = format!("{:e}", f32::MAX as f64);
+        assert_eq!(
+            guard(&format!(r#"{{"v":[{f32_max},0.2,0.3]}}"#), d3),
+            Ok(())
         );
         // the first offender is the one named
         assert_eq!(

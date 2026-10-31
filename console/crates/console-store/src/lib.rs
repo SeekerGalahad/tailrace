@@ -57,6 +57,9 @@ fn migrations() -> Migrations<'static> {
         // T-E2: alert_rule + alert_event — evaluator rules and their
         // episodes (rows land on state transitions only).
         M::up(include_str!("../migrations/04_alert.sql")),
+        // R9 review fix: alert_event.series_key — episodes are per series
+        // (one rule matching N pipelines keeps N independent episodes).
+        M::up(include_str!("../migrations/05_alert_series.sql")),
     ])
 }
 
@@ -248,6 +251,8 @@ mod tests {
                     "alert_rule",
                     "alert_event",
                     "idx_alert_event_rule",
+                    // R9 review fix (migration 05)
+                    "idx_alert_event_open",
                 ] {
                     assert!(
                         names.contains(&expected.to_string()),
@@ -256,8 +261,8 @@ mod tests {
                 }
                 let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
                 assert_eq!(
-                    version, 5,
-                    "user_version must be 5 after 00_init + 01_sequence + 02_backfill_job + 03_key_model + 04_alert"
+                    version, 6,
+                    "user_version must be 6 after 00_init + 01_sequence + 02_backfill_job + 03_key_model + 04_alert + 05_alert_series"
                 );
                 Ok(())
             })

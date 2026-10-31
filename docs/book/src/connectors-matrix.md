@@ -46,11 +46,19 @@ post-R8 为**十六词**线契约（`engine/crates/tailrace-ir/src/column_type.r
 | `date` | Date32 | DATE |
 | `bool`（旧） | Boolean | BOOLEAN |
 | `binary` | Binary | STRING（base64 约定） |
-| `list<float32[,dim]>` | List(Float32)，dim 仅声明注记 | **未映射**（A5 向量列的 Doris ARRAY 落地留后续轮） |
-| `variant` | Utf8（原始 JSON 透传） | **未映射**（A4 VARIANT 直写留后续轮） |
-| `null` | Null | **未映射** |
+| `list<float32[,dim]>` | List(Float32)，dim 走字段元数据（`tailrace.vector_dim`，decoder 侧维度守卫的依据） | `ARRAY<FLOAT>`（A5，DESC 回读折为 `array<float>` → `list<float32>`，dim 不在类型里——evolve 对 `list<float32,N>` 不判改型）；带 dim 时附列 COMMENT `'vector dim=N'`；dim 上限 65536 |
+| `variant` | Utf8（原始 JSON 透传） | `VARIANT`（A4，DESC 回读 `variant`，2.1.7/3.1.4 双版本探针实测） |
+| `null` | Null | **未映射**（显式报错不折叠） |
 
-未知词：一个 minor 版本的迁移窗内 warn（列名 + 已知词表）并折为 `utf8`——与 G2 前 `_ => Utf8` 臂行为一致；窗口常量翻转后转硬错误、装配期拒绝（`column_type.rs:14-20`）。建表闭环对三个未映射词**显式报错不折叠**。`infer-schema` 对 SQL 后端的 DDL 列型按同一词表收窄（`engine/crates/tailrace-metadata/src/infer.rs:257` `ddl_arrow_type` / `:296` `pg_arrow_type`）。
+未知词：一个 minor 版本的迁移窗内 warn（列名 + 已知词表）并折为 `utf8`——与 G2 前 `_ => Utf8` 臂行为一致；窗口常量翻转后转硬错误、装配期拒绝（`column_type.rs:14-20`）。建表闭环对唯一未映射词 `null` **显式报错不折叠**。`infer-schema` 对 SQL 后端的 DDL 列型按同一词表收窄（`engine/crates/tailrace-metadata/src/infer.rs:257` `ddl_arrow_type` / `:296` `pg_arrow_type`；`array<float>` 折回 `list<float32>`，dim 对 DESC 不可见）。
+
+### 3.1 VARIANT 与向量列的读回语义（探针实测，如实入档）
+
+VARIANT 列写入时引擎把**整段原始 JSON 子文档**序列化为字符串直写（不解析叶子），Doris 服务端再把内容解析为 variant 结构。由此产生的服务端行为（探针证据 `scripts/e2e/evidence/variant-probe-2026-10-30/`，2.1.7 与 3.1.4 双版本）：
+
+- **根级 JSON 字符串值不保真**：引擎对字符串单元格原样（不加引号）写入，服务端会把其内容**再当 JSON 解析一遍**——空串与字串 `null` 落成 `{}`、数字字串落成数值、布尔字串落成 `1`。对象内部的字符串叶**不受影响**。这是为 Debezium 把 MySQL JSON 列编码成字符串的场景让路的显式取舍（该场景下「字符串→再解析」恰是期望语义）；若上游根级值本身是字符串载荷，勿用 variant 列承载。
+- **点键（子列）的 raw 回显不可信**：3.1.4 上 `SELECT col['key']` 的 raw 显示与写入形态有出入，以结构比对为准；数组 raw 回显在 2.1.7 与 3.1.4 之间有版本差。
+- **向量列的 dim 只是登记侧守卫**：decoder 在入口按声明 dim 校验行（长度不符、非数值元素、或 |v| 超过 f32::MAX 的元素 → DLQ），Doris 自身不持有数组维度——5 元素数组能装进 dim=3 列（探针 B9）；维度契约由引擎侧守卫执行，`ARRAY<FLOAT>` 的列 COMMENT 仅为读 SHOW CREATE TABLE 的人记录该契约。
 
 ## 四、表对象的 `options`（R8 G1）
 

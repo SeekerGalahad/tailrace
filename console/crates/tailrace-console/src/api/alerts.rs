@@ -42,12 +42,15 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AlertEventItem {
     pub id: i64,
     pub rule_id: i64,
     pub rule_name: String,
+    /// The series this episode belongs to (`metric{label="value",…}`) —
+    /// rules matching several pipelines keep one episode per series.
+    pub series_key: String,
     /// firing | resolved
     pub state: String,
     pub first_seen_at: String,
@@ -68,10 +71,15 @@ pub struct AlertRuleItem {
     pub params: Value,
     pub enabled: bool,
     pub webhook_url: Option<String>,
-    /// inactive | firing (evaluator-owned current state)
+    /// inactive | firing (evaluator-owned current state: firing while ANY
+    /// series episode of the rule is open)
     pub state: String,
-    /// The open episode while firing.
+    /// The oldest open episode while firing (compat single-series view of
+    /// `open_events`).
     pub open_event: Option<AlertEventItem>,
+    /// Every open episode — one per matching series (R9 review fix: a rule
+    /// without filters matching three pipelines keeps three).
+    pub open_events: Vec<AlertEventItem>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -104,6 +112,7 @@ fn event_item(e: AlertEvent, rule_name: &str) -> AlertEventItem {
         id: e.id,
         rule_id: e.rule_id,
         rule_name: rule_name.to_string(),
+        series_key: e.series_key,
         state: e.state,
         first_seen_at: iso(Some(&e.first_seen_at)).unwrap_or(e.first_seen_at),
         last_seen_at: iso(Some(&e.last_seen_at)).unwrap_or(e.last_seen_at),
@@ -116,8 +125,11 @@ fn event_item(e: AlertEvent, rule_name: &str) -> AlertEventItem {
     }
 }
 
-fn rule_item(r: AlertRule, open: Option<AlertEvent>) -> AlertRuleItem {
-    let open_event = open.map(|e| event_item(e, &r.name));
+fn rule_item(r: AlertRule, open: Vec<AlertEvent>) -> AlertRuleItem {
+    let open_events: Vec<AlertEventItem> = open
+        .iter()
+        .map(|e| event_item(e.clone(), &r.name))
+        .collect();
     AlertRuleItem {
         id: r.id,
         name: r.name,
@@ -126,7 +138,8 @@ fn rule_item(r: AlertRule, open: Option<AlertEvent>) -> AlertRuleItem {
         enabled: r.enabled,
         webhook_url: r.webhook_url,
         state: r.state,
-        open_event,
+        open_event: open_events.first().cloned(),
+        open_events,
         created_at: iso(Some(&r.created_at)).unwrap_or(r.created_at),
         updated_at: iso(Some(&r.updated_at)).unwrap_or(r.updated_at),
     }
@@ -191,9 +204,9 @@ pub async fn list(State(state): State<AppState>) -> Response {
     let mut items = Vec::with_capacity(rules.len());
     for r in rules {
         let open = if r.state == "firing" {
-            store.open_alert_episode(r.id).ok().flatten()
+            store.open_alert_episodes(r.id).unwrap_or_default()
         } else {
-            None
+            Vec::new()
         };
         items.push(rule_item(r, open));
     }
@@ -350,15 +363,17 @@ pub async fn update(
         return super::messages::not_found("err.alert.not_found", &[&id.to_string()]);
     };
     let open = if rule.state == "firing" {
-        store.open_alert_episode(id).ok().flatten()
+        store.open_alert_episodes(id).unwrap_or_default()
     } else {
-        None
+        Vec::new()
     };
     Json(rule_item(rule, open)).into_response()
 }
 
-/// `DELETE /api/alerts/rules/{id}` — 204; episodes cascade. Audited
-/// ALERT_RULE_DELETE.
+/// `DELETE /api/alerts/rules/{id}` — 204. Open episodes are closed first
+/// (resolved, `reason:"deleted"`) and their notices delivered (webhook +
+/// SSE) — resolved 必达 — then the rule and its episode rows go together
+/// (CASCADE). Audited ALERT_RULE_DELETE.
 #[utoipa::path(
     delete,
     path = "/api/alerts/rules/{id}",
@@ -375,6 +390,18 @@ pub async fn remove(
     let Some(rule) = store.alert_rule(id).ok().flatten() else {
         return super::messages::not_found("err.alert.not_found", &[&id.to_string()]);
     };
+    // resolved 必达 (R9 review fix): a firing rule being deleted closes its
+    // open episodes FIRST (reason `deleted`) and delivers the notices, so an
+    // external receiver never keeps a firing alert for a rule that no
+    // longer exists. The episode rows then go with the rule (CASCADE).
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let resolved = match crate::alerting::resolve_rule_episodes(&state, &rule, "deleted", now_ms) {
+        Ok(v) => v.len(),
+        Err(e) => return ApiError::internal(&e).into_response(),
+    };
     match store.delete_alert_rule(id) {
         Ok(true) => {}
         Ok(false) => return super::messages::not_found("err.alert.not_found", &[&id.to_string()]),
@@ -386,7 +413,11 @@ pub async fn remove(
         "ALERT_RULE_DELETE",
         "alert_rule",
         Some(id.to_string()),
-        Some(json!({"name": rule.name, "ruleType": rule.rule_type}).to_string()),
+        Some(
+            json!({"name": rule.name, "ruleType": rule.rule_type,
+                   "resolvedEpisodes": resolved})
+            .to_string(),
+        ),
     );
     axum::http::StatusCode::NO_CONTENT.into_response()
 }
