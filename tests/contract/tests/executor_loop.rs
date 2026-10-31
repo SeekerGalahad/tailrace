@@ -232,6 +232,142 @@ fn bad_row_policy_branches() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// T-V2 replay storm, end to end through the registry's restart loop: a
+/// batch of 2 good + 3 bad rows whose flush fails (the sink target is a
+/// directory) is re-polled from the uncommitted cursor on every
+/// auto-restart, so the same three bad rows are isolated once per attempt.
+/// The side file must hold each bad row ONCE (row-key dedup — each attempt
+/// builds a fresh writer, so the index is seeded from disk), while
+/// `stats.totals.bad` and the `tailrace_dlq_rows_total` series keep
+/// counting every attempt (3 × attempts): the audit face never loses the
+/// storm, the table never duplicates. Repairing the sink lands the good
+/// rows and commits the cursor.
+#[test]
+fn dlq_replay_storm_dedups_rows_but_counts_attempts() -> anyhow::Result<()> {
+    let work = tmp_workdir("dlqstorm");
+    let _cwd = CwdGuard::enter(&work);
+    let state_dir = work.join("state");
+    let reg = std::sync::Arc::new(tailrace_runtime::registry::PipelineRegistry::new(
+        &state_dir,
+    ));
+    append_jsonl("orders_in", &good_rows(1, 2));
+    use std::io::Write;
+    {
+        let mut f = std::fs::OpenOptions::new().append(true).open("orders_in")?;
+        writeln!(f, "{{broken-1")?;
+        writeln!(f, "not json at all")?;
+        writeln!(f, "{{\"unterminated\": ")?;
+    }
+    // the sink target is a DIRECTORY → every jsonl append fails → the
+    // statement errors after isolating the bad rows and the registry
+    // restarts it from the never-committed cursor (= replay)
+    std::fs::create_dir_all("orders_out")?;
+    let opts = tailrace_catalog::PlanOptions {
+        recovery: Some(tailrace_catalog::RecoveryOptions {
+            // fast first retry; a wide second backoff is the repair window
+            // (the third consecutive no-progress failure would be terminal)
+            restart_backoff_secs: Some(vec![1, 8]),
+            auto_restart_max: Some(5),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    reg.deploy(
+        5401,
+        1,
+        file_statements(),
+        file_tables(),
+        Some(1000),
+        Some(opts),
+        None,
+        false,
+    )?;
+    let dlq_path = state_dir.join("bad_rows").join("p5401-s0.jsonl");
+    let dlq_lines = || -> usize {
+        std::fs::read_to_string(&dlq_path)
+            .map(|t| t.lines().filter(|l| !l.trim().is_empty()).count())
+            .unwrap_or(0)
+    };
+    // two isolation attempts observed (first run + restart #1): the attempt
+    // counter has doubled while the side file has not grown
+    let bad_after_two = poll_until(Duration::from_secs(15), || {
+        let bad = reg.stats(5401)?.totals.bad;
+        (bad >= 6).then_some(bad)
+    })
+    .expect("the replay re-isolates the bad rows on restart");
+    assert_eq!(bad_after_two, 6, "3 bad rows × 2 attempts");
+    assert_eq!(
+        dlq_lines(),
+        3,
+        "replayed bad rows did not duplicate the side file"
+    );
+    // repair the sink inside the second backoff → the next attempt flushes
+    std::fs::remove_dir_all("orders_out")?;
+    let committed = poll_until(Duration::from_secs(20), || {
+        let v = reg.offsets(5401).ok()?;
+        let pos = v["statements"][0]["ledger"]["cursor"]["File"]["byte_pos"]
+            .as_u64()
+            .unwrap_or(0);
+        (pos > 0).then_some(pos)
+    })
+    .expect("after the repair the cursor commits (pipeline not FAILED)");
+    assert_eq!(
+        committed,
+        std::fs::metadata("orders_in")?.len(),
+        "cursor at EOF once the storm is over"
+    );
+    assert_eq!(line_count("orders_out"), 2, "the good rows landed once");
+    let stats = reg.stats(5401).expect("pipeline still registered");
+    let attempts = stats.totals.bad / 3;
+    // the repair may land inside attempt 2's own flush window (no restart
+    // after it) or in the backoff (one more replayed attempt) — either way
+    // the attempt count and the file part ways
+    assert!(
+        attempts >= 2 && stats.totals.bad == attempts * 3,
+        "every attempt counted: bad={} (= 3 bad rows × {attempts} attempts)",
+        stats.totals.bad
+    );
+    assert_eq!(
+        dlq_lines(),
+        3,
+        "side file = unique bad rows, not isolation attempts"
+    );
+    // the metric surface says the same thing: the counter is the attempt
+    // count, the file is the row set
+    let metrics = tailrace_api::metrics::node_metrics_text(&reg);
+    assert!(
+        metrics.contains(&format!(
+            "tailrace_dlq_rows_total{{pipeline=\"5401\",statement=\"0\"}} {}\n",
+            stats.totals.bad
+        )),
+        "{metrics}"
+    );
+    // and the three rows are the three distinct bad lines
+    let raws: std::collections::BTreeSet<Vec<u8>> = std::fs::read_to_string(&dlq_path)?
+        .lines()
+        .map(|l| {
+            use base64::Engine as _;
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            base64::engine::general_purpose::STANDARD
+                .decode(v["rawB64"].as_str().unwrap())
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        raws,
+        [
+            b"{broken-1".to_vec(),
+            b"not json at all".to_vec(),
+            b"{\"unterminated\":".to_vec(),
+        ]
+        .into_iter()
+        .collect()
+    );
+    reg.stop_pipeline(5401);
+    let _ = std::fs::remove_dir_all(&work);
+    Ok(())
+}
+
 /// deploy idempotency: a repeated dispatch_id while the pipeline runs is
 /// rejected; a fresh dispatch replaces it.
 #[test]

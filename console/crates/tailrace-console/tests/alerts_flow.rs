@@ -2,10 +2,11 @@
 //! machine driven by mock snapshots (threshold boundary, event rows only on
 //! transitions, resolved always reachable, disable mid-flight), window
 //! rules over mock counter history (incl. restart/gap holds — R9 review
-//! fix), per-series episodes and node-unreachable holds, webhook delivery
-//! (received / unreachable never fails the pass), the SSE hub, and the
-//! `/metrics` SLO target riding the lag series' label set end to end
-//! through a mock node.
+//! fix), per-series episodes and node-unreachable holds, the T-V1 idle hold
+//! (lag episodes neither fired nor resolved while the source reports idle),
+//! webhook delivery (received / unreachable never fails the pass), the SSE
+//! hub, and the `/metrics` SLO target riding the lag series' label set end
+//! to end through a mock node.
 
 mod common;
 
@@ -45,6 +46,19 @@ fn lag_snapshot(node: &str, pipeline: &str, lag: f64) -> Vec<Sample> {
         ),
         Some(node),
     )
+}
+
+/// Lag plus the T-V1 idle gauge for one statement, as a node renders them
+/// (same label set); `idle` None omits the idle series (no verdict).
+fn lag_idle_snapshot(node: &str, pipeline: &str, lag: f64, idle: Option<u8>) -> Vec<Sample> {
+    let mut text =
+        format!("tailrace_pipeline_lag_seconds{{pipeline=\"{pipeline}\",statement=\"0\"}} {lag}\n");
+    if let Some(i) = idle {
+        text.push_str(&format!(
+            "tailrace_pipeline_source_idle{{pipeline=\"{pipeline}\",statement=\"0\"}} {i}\n"
+        ));
+    }
+    parse_samples(&text, Some(node))
 }
 
 async fn create_rule(app: &TestApp, body: Value) -> i64 {
@@ -382,6 +396,111 @@ async fn evaluator_episodes_land_only_on_transitions_and_resolve() {
         .await
         .unwrap()
         .is_empty());
+}
+
+/// T-V1 idle hold through the driver: an episode opened under real backlog
+/// is neither re-fired nor resolved while the source reports idle (the lag
+/// gauge keeps climbing on the clock — the positional verdict says nothing
+/// is behind the cursor); it resolves on the first Clear once rows flow
+/// again. A pipeline idle from the start never opens an episode, however
+/// long the silence. Episode rows and the rule's aggregate state are read
+/// back through the API to pin the store side of "hold".
+#[tokio::test]
+async fn evaluator_holds_lag_episodes_while_source_idle() {
+    let app = app().await;
+    create_rule(
+        &app,
+        json!({"name": "lag", "ruleType": "lag_seconds", "params": {"threshold": 30}}),
+    )
+    .await;
+    let mut ev = Evaluator::new();
+    let mut t = T0;
+
+    // real backlog (idle 0) and lag over threshold → firing
+    t += 15_000;
+    let notices = ev
+        .run_pass(
+            &app.state,
+            &lag_idle_snapshot("edge-1", "3", 45.0, Some(0)),
+            t,
+        )
+        .await
+        .unwrap();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0].event, "firing");
+    let episode = notices[0].event_id;
+
+    // caught up: idle 1 while the lag climbs through an hour of silence →
+    // no notice of either kind, the one episode stays open
+    for lag in [60.0, 300.0, 900.0, 3600.0] {
+        t += 15_000;
+        let n = ev
+            .run_pass(
+                &app.state,
+                &lag_idle_snapshot("edge-1", "3", lag, Some(1)),
+                t,
+            )
+            .await
+            .unwrap();
+        assert!(
+            n.is_empty(),
+            "idle hold must emit nothing at lag {lag}: {n:?}"
+        );
+    }
+    let (_, b) = req(&app, "GET", "/api/alerts", None).await;
+    assert_eq!(b["rules"][0]["state"], "firing", "held open, not resolved");
+    assert_eq!(b["rules"][0]["openEvent"]["id"], episode);
+    let events = b["events"].as_array().unwrap();
+    assert_eq!(
+        events.len(),
+        1,
+        "no duplicate episode under hold: {events:?}"
+    );
+    assert_eq!(events[0]["state"], "firing");
+    assert_eq!(
+        events[0]["sample"]["value"], 45.0,
+        "a held tick does not touch the open row's sample"
+    );
+
+    // rows flow again (idle 0) and the flush refreshed the lag → resolved
+    // on the same row
+    t += 15_000;
+    let notices = ev
+        .run_pass(
+            &app.state,
+            &lag_idle_snapshot("edge-1", "3", 2.0, Some(0)),
+            t,
+        )
+        .await
+        .unwrap();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0].event, "resolved");
+    assert_eq!(notices[0].event_id, episode);
+
+    // a pipeline that is idle from its first sample never fires — the
+    // "running but no data" pipeline that used to page on lag forever
+    for lag in [100.0, 10_000.0, 86_400.0] {
+        t += 15_000;
+        let n = ev
+            .run_pass(
+                &app.state,
+                &lag_idle_snapshot("edge-1", "4", lag, Some(1)),
+                t,
+            )
+            .await
+            .unwrap();
+        assert!(
+            n.is_empty(),
+            "idle-from-start never opens an episode: {n:?}"
+        );
+    }
+    let (_, b) = req(&app, "GET", "/api/alerts", None).await;
+    assert_eq!(b["rules"][0]["state"], "inactive");
+    assert_eq!(
+        b["events"].as_array().unwrap().len(),
+        1,
+        "still only pipeline 3's (resolved) episode"
+    );
 }
 
 /// Window rules over mock counter snapshots: no base inside the window →

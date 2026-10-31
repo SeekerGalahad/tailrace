@@ -203,7 +203,10 @@
      （`tailrace-console/src/alerting.rs`）以周期任务（`TAILRACE_ALERT_INTERVAL_SECS`，默认 15s，`main.rs` 与回填孤儿清扫同一启动
      槽位拉起）拉**同一份** `metrics::gather` 快照评估——scrape 看到什么、评估器就评什么，不存在第二条采样路径。单机边缘、无
      Prometheus 栈也能告警是定位；有 Prometheus 的用户用 `docs/ops/prometheus-alerts.yaml` 等价规则 + `docs/ops/grafana-dashboard.json`。
-   - **五类规则 v1**：`lag_seconds`（`tailrace_pipeline_lag_seconds > threshold`）、`state_failed`（`tailrace_pipeline_state == 3`）、
+   - **五类规则 v1**：`lag_seconds`（`tailrace_pipeline_lag_seconds > threshold`；**v1.3 T-V1 idle 感知**：同标签 node/pipeline/statement 的
+     `tailrace_pipeline_source_idle == 1`——引擎侧**位置判据**：文件源读到 EOF / kafka 消费位连续 3 次检查等于各分区 end-offset，非时间判据，
+     慢消费者游标前仍有行时永不判 idle——该序列本拍 **Unknown/hold**（不 firing 不 resolve，sample 记 `reason:"source_idle"`）；
+     idle 序列缺失或为 0 时规则行为与 v1.2 完全一致）、`state_failed`（`tailrace_pipeline_state == 3`）、
      `heartbeat_age`（**console 侧**心跳年龄 > threshold——R9 评审修复：评估器输入里该序列由 `metrics::snapshot` 按 `node.last_heartbeat`
      （console 最后一次收到心跳的时刻）为每个登记节点**合成**（标签 node/node_id），节点自报的 `tailrace_node_heartbeat_age_seconds`
      在评估输入中被替换——宕机的节点无法自报自己的沉默，console 自己的接收时钟却会一直涨，于是节点掉线恰好由本规则触发；
@@ -212,7 +215,9 @@
      边界由单测钉住；两窗口类阈值允许 `0`——计数器为整数，`0` 即「窗口内出现任意一行就触发」）。**裁决逐序列、三态**（R9 评审修复）：
      规则匹配到的每条序列各自得到 Firing / Clear / **Unknown** 之一，Unknown = 本拍不评估、**保持现状**（既不开新事件也不关闭进行中事件）——
      它覆盖 (a) 窗口类无可用基线（见下）、(b) 序列所属节点本拍不可达（`Snapshot.unreachable_nodes`：`gather` 对该节点 `/metrics` 取得
-     Err——宕机/分区/一次 3s 抓取超时——节点掉线**不是**条件消失，其进行中事件保持直到节点再次应答或规则被删/禁）。
+     Err——宕机/分区/一次 3s 抓取超时——节点掉线**不是**条件消失，其进行中事件保持直到节点再次应答或规则被删/禁）、(c) **lag 序列的源报 idle**
+     （v1.3 T-V1：lag 是最近含数 flush 以来的墙钟，运行中但无数据的管道会「永远滞后」；引擎的位置裁决说游标后无积压，沉默上的 lag 不是迟到的行——
+     hold，既不新开也不关闭；真有积压（idle=0）或源不可判（无 idle 序列）时照常评估，故真 lag 照常 firing）。
      **序列缺失而其节点可达**才按条件消失处理（管道不再暴露 lag 即不再滞后：resolved，sample 记 `reason:"series_absent"`）。
      `flush_errors_window` 在引擎只发 `result="success"` 的现状下处于**休眠**（A6 注明 Dedup/Retry/Error 拆分随 A2 确定性标签落地）——
      评估契约由 mock 快照单测钉住，不是空实现。该类序列不可能携带的过滤（state_failed+statement、heartbeat_age+pipeline/statement）在 POST/PUT 即 400。
@@ -259,9 +264,9 @@
    - **审计**：真实写逐对象落行（既有动作名 + detail `"via":"apply"`；表对象字段更新为新动作 TABLE_UPDATE），另有 APPLY 汇总行——**仅在实际有写时落**（零变更 apply 不审计，防 CI 轮询刷屏）；dry-run 不审计。
    - **验收**：契约测试 `tests/apply_flow.rs` 6 例——dry-run 三态真实性（新表 create/改列 update 只点名列/orphan 提示/零副作用零审计）、二连 apply 幂等（零变更零审计、generation/状态不动）+ 漂移三字段精确更新、凭据 redacted 回显+幂等+轮换、全文件校验拒绝（9 类 400 键钉死）、缺省节不管（响应省键、不报 orphan、apply 零写零审计）、同一文件经 API 与 CLI（真 HTTP 对 served router）结果一致 + CLI apply 后 API 见零漂移；CLI 渲染与旗标解析另由 `apply_cli.rs` 单测钉住。
 
-13. **DLQ 是 at-least-once 记账 + badRowPolicy 六段透传**（2026-10-31 增补，R10 尾债包——dogfooding round3 #3/#4 的如实披露，行为零改动）：
-   - **同一坏行可能被隔离多次**：坏行进 DLQ 时游标照常越过，但**越过的是已持久化 DLQ 记录对应的游标**——flush 失败重启后的重放窗口从「上一次成功 flush 的游标」起算，窗口内已隔离过的坏行会随重放**再隔离一次**（侧文件追加式，不去重）。实测（dogfooding round3 #3，`run1-dlq-p2-s0.jsonl`）：首批 2 好 3 坏 → flush 撞 BE MEM_LIMIT 窗口 → 重启重放两次 → 侧文件与 `tailrace_dlq_rows_total` 记到 **9**（3 坏行 × 3 次隔离），三组时间戳、游标相同。
-   - **消费方须知**：侧文件与指标计的是**隔离次数**，不是坏行数；下游消费/回放 DLQ 必须以记录里的 **`rawB64`（原始字节）为幂等键去重**（同一坏行的重放记录 `cursor` 亦相同，可作辅助校验）。`dlq_window` 告警规则同样按隔离次数计数——重放风暴期其增量按次数放大，属预期。v1.3 若做 DLQ 回放工具将内置去重。
+13. **DLQ 是 at-least-once 记账 + badRowPolicy 六段透传**（2026-10-31 增补，R10 尾债包——dogfooding round3 #3/#4 的如实披露；**v1.3 T-V2 起侧文件按行键去重**，见末条）：
+   - **同一坏行可能被隔离多次**：坏行进 DLQ 时游标照常越过，但**越过的是已持久化 DLQ 记录对应的游标**——flush 失败重启后的重放窗口从「上一次成功 flush 的游标」起算，窗口内已隔离过的坏行会随重放**再隔离一次**。实测（dogfooding round3 #3，`run1-dlq-p2-s0.jsonl`）：首批 2 好 3 坏 → flush 撞 BE MEM_LIMIT 窗口 → 重启重放两次 → 侧文件与 `tailrace_dlq_rows_total` 记到 **9**（3 坏行 × 3 次隔离），三组时间戳、游标相同。**（v1.3 T-V2 起，此状只存在于指标面：侧文件按行键唯一化，重放不再追加行。）**
+   - **消费方须知**：`tailrace_dlq_rows_total` 与 stats 的 `bad` 计的是**隔离尝试次数**，不是（v1.3 起）坏行数；**侧文件则是唯一坏行集**——行键 `(statement, cursor, rawB64)`，同一坏字节在同一 poll 时点游标只能经重放复现，故重放窗口内同一坏行只落一行（去重索引在内存、首写时从 side 文件播种，语句/进程重启后依然去重）。下游消费/回放 DLQ 以 `rawB64` 为幂等键的习惯保持不变（现在引擎侧已替你做了）；`dlq_window` 告警规则按隔离尝试次数计数——重放风暴期其增量按次数放大、大于文件行数，属预期且**有意保留**（审计面不丢风暴）。e2e 钉住：重放风暴下 DLQ 行数 = 唯一坏行数，指标 = 尝试次数（`tests/contract/tests/executor_loop.rs` `dlq_replay_storm_dedups_rows_but_counts_attempts`）。
    - **badRowPolicy 透传补齐**：`PipelineConfig` DTO 增 `badRowPolicy` 键（此前五段 DTO 无该键，请求携带即被 serde 静默丢弃——落库 config_json 与推给引擎的 plan `options` 均不见它，`fail` 策略实际按默认 `dlq` 执行，dogfooding round3 #4）。现 DTO 与引擎 `PlanOptions` 键对键镜像，由契约测试 `pipeline_config_wires_every_plan_options_key` 钉住（引擎侧未来加键、console 未跟即测试失败）；取值校验在引擎 deploy 期（非法值整体拒绝 plan）。**非默认值的引擎行为**由 e2e `alert_flow.sh` B 段端到端钉住（R10 评审修复轮，50/50）：skip → 坏行丢弃只计数、不建 `bad_rows/`、管道保持 RUNNING；fail → `STATEMENT_FAILED` 带引擎原文、同批好行不越过游标；`"drop"` → 502 `ENGINE_REJECTED` 点名 `options.badRowPolicy`——证据 `scripts/e2e/evidence/alert-flow-e2e-2026-10-31-r10review/`。
 
 ## 四、未决 / 后续

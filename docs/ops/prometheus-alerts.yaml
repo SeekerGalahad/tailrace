@@ -33,25 +33,41 @@
 #     `TailraceNodeHeartbeatStale` with an absence check per node you
 #     expect, e.g. `absent(tailrace_up{node="edge-1"})` — Prometheus has
 #     no "expected set" without such a hint.
+#   * IDLE SOURCES (v1.3 T-V1): the lag gauge is wall time since the last
+#     data-carrying flush, so a running pipeline with nothing arriving "lags"
+#     forever. Nodes export `tailrace_pipeline_source_idle` (1 = the source
+#     reports no backlog behind the cursor — file at EOF / kafka next offsets
+#     at the end offsets; 0 = backlog; absent = the source cannot tell). The
+#     console's lag_seconds rule HOLDS such series (neither fires nor
+#     resolves — Unknown); the `unless` clause below is the PromQL twin. A
+#     source without the gauge is evaluated exactly as before.
 groups:
   - name: tailrace
     rules:
-      # ---- lag_seconds: tailrace_pipeline_lag_seconds > threshold ----
+      # ---- lag_seconds: tailrace_pipeline_lag_seconds > threshold, held
+      #      while the source reports idle (same label set) ----
       - alert: TailracePipelineLagHigh
-        expr: tailrace_pipeline_lag_seconds > 30
+        expr: >
+          tailrace_pipeline_lag_seconds > 30
+            unless on (node, pipeline, statement)
+          tailrace_pipeline_source_idle == 1
         for: 2m
         labels:
           severity: warning
         annotations:
           summary: "pipeline {{ $labels.pipeline }} statement {{ $labels.statement }} on {{ $labels.node }} lags {{ $value | humanizeDuration }}"
-          description: "Wall time since the last data-carrying flush exceeds 30s (A6 lag basis is last_data_ms, not payload event time)."
+          description: "Wall time since the last data-carrying flush exceeds 30s (A6 lag basis is last_data_ms, not payload event time) while the source still has backlog (tailrace_pipeline_source_idle != 1)."
 
       # ---- SLO v1: current lag vs the console-exposed target (same labels) ----
       - alert: TailracePipelineLagOverSlo
         expr: >
-          tailrace_pipeline_lag_seconds
-            > on (node, pipeline, statement)
-          tailrace_slo_lag_target_seconds
+          (
+            tailrace_pipeline_lag_seconds
+              > on (node, pipeline, statement)
+            tailrace_slo_lag_target_seconds
+          )
+            unless on (node, pipeline, statement)
+          tailrace_pipeline_source_idle == 1
         for: 2m
         labels:
           severity: warning

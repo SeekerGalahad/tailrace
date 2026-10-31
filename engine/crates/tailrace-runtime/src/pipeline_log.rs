@@ -312,6 +312,9 @@ impl tracing::field::Visit for FieldGrab {
 /// (the most recent flush's duration) feed `tailrace_flush_duration_seconds`
 /// (v1 histogram→gauge+counter simplification); `last_data_ms` (wall time of
 /// the last flush that acked rows > 0) feeds `tailrace_pipeline_lag_seconds`.
+/// T-V1: `source_idle` carries the source's positional idle verdict
+/// ([`SOURCE_IDLE_UNKNOWN`] / [`SOURCE_IDLE_BACKLOG`] / [`SOURCE_IDLE_IDLE`])
+/// and feeds `tailrace_pipeline_source_idle`.
 #[derive(Debug, Default)]
 pub struct StatementCounters {
     pub consumed: AtomicU64,
@@ -327,6 +330,33 @@ pub struct StatementCounters {
     pub last_flush_dur_ms: AtomicU64,
     /// wall-ms of the last flush that acked rows > 0 (lag basis) — A6
     pub last_data_ms: AtomicU64,
+    /// source idle verdict code (`SOURCE_IDLE_*`) — T-V1
+    pub source_idle: AtomicU64,
+}
+
+/// `source_idle` codes (T-V1): the atomic cannot hold an `Option<bool>`, so
+/// the three verdicts are numbered; [`source_idle_code`] /
+/// [`source_idle_from_code`] convert at the two boundaries.
+pub const SOURCE_IDLE_UNKNOWN: u64 = 0;
+pub const SOURCE_IDLE_BACKLOG: u64 = 1;
+pub const SOURCE_IDLE_IDLE: u64 = 2;
+
+/// `Source::idle()` verdict → `source_idle` code.
+pub fn source_idle_code(idle: Option<bool>) -> u64 {
+    match idle {
+        None => SOURCE_IDLE_UNKNOWN,
+        Some(false) => SOURCE_IDLE_BACKLOG,
+        Some(true) => SOURCE_IDLE_IDLE,
+    }
+}
+
+/// `source_idle` code → verdict (unknown codes read as unknown).
+pub fn source_idle_from_code(code: u64) -> Option<bool> {
+    match code {
+        SOURCE_IDLE_BACKLOG => Some(false),
+        SOURCE_IDLE_IDLE => Some(true),
+        _ => None,
+    }
 }
 
 impl StatementCounters {
@@ -341,6 +371,7 @@ impl StatementCounters {
             flush_ms_total: self.flush_ms_total.load(Ordering::Relaxed),
             last_flush_dur_ms: self.last_flush_dur_ms.load(Ordering::Relaxed),
             last_data_ms: self.last_data_ms.load(Ordering::Relaxed),
+            source_idle: source_idle_from_code(self.source_idle.load(Ordering::Relaxed)),
         }
     }
 }
@@ -364,6 +395,11 @@ pub struct StatementCountersSnapshot {
     /// wall-ms of the last data-carrying flush — A6 (additive stats field)
     #[serde(rename = "lastDataMs")]
     pub last_data_ms: u64,
+    /// source idle verdict — T-V1 (additive stats field): `true` = no
+    /// backlog behind the cursor, `false` = backlog, `null` = the source
+    /// cannot tell / not polled yet
+    #[serde(rename = "sourceIdle")]
+    pub source_idle: Option<bool>,
 }
 
 /// Pipeline-level counters (Arc-shared: the registry holds them, statement
@@ -404,7 +440,9 @@ impl PipeCounters {
         }
     }
 
-    /// Aggregate (totals = per-statement sums).
+    /// Aggregate (totals = per-statement sums). `source_idle` folds
+    /// conservatively: any statement with backlog → `Some(false)`; every
+    /// statement idle → `Some(true)`; otherwise (some unknown) `None`.
     pub fn totals(&self) -> StatementCountersSnapshot {
         let mut t = StatementCountersSnapshot {
             consumed: 0,
@@ -416,7 +454,10 @@ impl PipeCounters {
             flush_ms_total: 0,
             last_flush_dur_ms: 0,
             last_data_ms: 0,
+            source_idle: None,
         };
+        let mut any_backlog = false;
+        let mut all_idle = !self.statements.is_empty();
         for s in &self.statements {
             let s = s.snapshot();
             t.consumed += s.consumed;
@@ -428,7 +469,16 @@ impl PipeCounters {
             t.last_flush_ms = t.last_flush_ms.max(s.last_flush_ms);
             t.last_flush_dur_ms = t.last_flush_dur_ms.max(s.last_flush_dur_ms);
             t.last_data_ms = t.last_data_ms.max(s.last_data_ms);
+            any_backlog |= s.source_idle == Some(false);
+            all_idle &= s.source_idle == Some(true);
         }
+        t.source_idle = if any_backlog {
+            Some(false)
+        } else if all_idle {
+            Some(true)
+        } else {
+            None
+        };
         t
     }
 }
@@ -501,6 +551,62 @@ mod tests {
         assert_eq!(t.flush_ms_total, 150, "cumulative duration");
         assert_eq!(t.last_flush_dur_ms, 30, "last duration");
         assert_eq!(t.last_data_ms, 1_000, "data-time basis for lag");
+    }
+
+    /// T-V1: the idle verdict round-trips through the atomic code (unknown
+    /// by default — a source that never reported stays unknown) and the
+    /// pipeline aggregate folds conservatively: one statement with backlog
+    /// makes the pipeline not idle, all idle makes it idle, an unknown
+    /// statement among idle ones keeps the aggregate unknown.
+    #[test]
+    fn source_idle_codes_and_totals_fold() {
+        assert_eq!(source_idle_from_code(source_idle_code(None)), None);
+        assert_eq!(
+            source_idle_from_code(source_idle_code(Some(false))),
+            Some(false)
+        );
+        assert_eq!(
+            source_idle_from_code(source_idle_code(Some(true))),
+            Some(true)
+        );
+        assert_eq!(
+            source_idle_from_code(99),
+            None,
+            "foreign code reads unknown"
+        );
+        let pc = PipeCounters::new(3);
+        assert_eq!(
+            pc.statements[0].snapshot().source_idle,
+            None,
+            "default unknown"
+        );
+        assert_eq!(pc.totals().source_idle, None, "all unknown → unknown");
+        for s in &pc.statements {
+            s.source_idle
+                .store(source_idle_code(Some(true)), Ordering::Relaxed);
+        }
+        assert_eq!(pc.totals().source_idle, Some(true), "all idle → idle");
+        pc.statements[1]
+            .source_idle
+            .store(source_idle_code(None), Ordering::Relaxed);
+        assert_eq!(
+            pc.totals().source_idle,
+            None,
+            "one unknown among idle → unknown"
+        );
+        pc.statements[1]
+            .source_idle
+            .store(source_idle_code(Some(false)), Ordering::Relaxed);
+        assert_eq!(
+            pc.totals().source_idle,
+            Some(false),
+            "one statement with backlog → the pipeline is not idle"
+        );
+        assert_eq!(
+            PipeCounters::new(0).totals().source_idle,
+            None,
+            "no statements"
+        );
     }
 
     #[test]

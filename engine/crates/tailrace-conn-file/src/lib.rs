@@ -107,6 +107,12 @@ pub struct FileSource {
     miss_streak: u32,
     /// truncation/rotation event count (observability)
     truncated_events: u32,
+    /// T-V1 idle verdict of the last poll: `Some(true)` once the poll ran
+    /// into EOF (everything on disk is behind the cursor — a file that does
+    /// not exist yet counts: nothing is arriving), `Some(false)` when the
+    /// poll stopped on max_rows/deadline with bytes still unread, `None`
+    /// before the first poll.
+    idle: Option<bool>,
 }
 
 /// Consecutive missing-file tolerance (one poll per second-ish — "not created
@@ -123,6 +129,7 @@ impl FileSource {
             partial: Vec::new(),
             miss_streak: 0,
             truncated_events: 0,
+            idle: None,
         }
     }
 
@@ -137,6 +144,7 @@ impl FileSource {
             partial: Vec::new(),
             miss_streak: 0,
             truncated_events: 0,
+            idle: None,
         }
     }
 
@@ -206,6 +214,7 @@ impl Source for FileSource {
                 Ok(d) => d,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     self.note_missing("parquet")?;
+                    self.idle = Some(true);
                     return Ok(vec![]);
                 }
                 Err(e) => {
@@ -218,6 +227,7 @@ impl Source for FileSource {
             self.miss_streak = 0;
             let len = data.len() as u64;
             if len == 0 || self.byte_pos == len {
+                self.idle = Some(true);
                 return Ok(vec![]); // no new data (or already fully read)
             }
             if self.byte_pos > len {
@@ -233,6 +243,8 @@ impl Source for FileSource {
             }
             let take = &data[self.byte_pos as usize..];
             self.byte_pos = data.len() as u64;
+            // batch-shaped: the whole file left the cursor behind in one go
+            self.idle = Some(true);
             let _ = (max_rows, deadline); // batch-shaped: one file per batch, micro-batch args unused
             return Ok(vec![SourceChunk::plain(take.to_vec())]);
         }
@@ -247,6 +259,7 @@ impl Source for FileSource {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     self.note_missing("text")?;
+                    self.idle = Some(true);
                     return Ok(vec![]);
                 }
                 Err(e) => {
@@ -286,10 +299,14 @@ impl Source for FileSource {
         // moves into the chunk as-is. The old String-based stack copied every
         // line twice (extend into `full` + `from_utf8_lossy(..).to_vec()`).
         let mut line: Vec<u8> = Vec::new();
+        // not idle until this poll proves it ran out of bytes — a poll cut
+        // short by max_rows/deadline leaves backlog on disk
+        self.idle = Some(false);
         while out.len() < max_rows && started.elapsed() < deadline {
             line.clear();
             let n = reader.read_until(b'\n', &mut line)?;
             if n == 0 {
+                self.idle = Some(true);
                 break; // EOF (read everything this round; a half line stays buffered)
             }
             if line.last() == Some(&b'\n') {
@@ -319,6 +336,11 @@ impl Source for FileSource {
             path: self.path.display().to_string(),
             byte_pos: self.byte_pos,
         }
+    }
+
+    /// T-V1: EOF is the file source's "no backlog" — see the `idle` field.
+    fn idle(&self) -> Option<bool> {
+        self.idle
     }
 }
 
@@ -734,6 +756,59 @@ mod tests {
         let out = src.poll(10, Duration::from_millis(200))?;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].raw, b"m");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// T-V1 idle verdict: unknown before the first poll; EOF (even on the
+    /// poll that delivered the last rows) = idle; a poll cut short by
+    /// max_rows with bytes still on disk = not idle; a missing file = idle
+    /// (nothing is arriving); appended data flips it back only until EOF.
+    #[test]
+    fn file_source_idle_follows_eof_not_the_clock() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("tailrace-src-idle-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir)?;
+        let f = dir.join("in.jsonl");
+        std::fs::write(&f, b"a\nb\nc\n")?;
+        let mut src = FileSource::new(&f);
+        assert_eq!(src.idle(), None, "no verdict before the first poll");
+        src.open(&Cursor::None)?;
+        // max_rows=1 stops the poll with two lines unread → backlog
+        assert_eq!(src.poll(1, Duration::from_secs(1))?.len(), 1);
+        assert_eq!(src.idle(), Some(false), "rows left behind the cursor");
+        // the rest drains and the same poll runs into EOF → idle
+        assert_eq!(src.poll(10, Duration::from_secs(1))?.len(), 2);
+        assert_eq!(src.idle(), Some(true), "EOF reached in the delivering poll");
+        // the silent period: empty polls at EOF stay idle (lag would grow
+        // on the clock — the verdict is positional and does not)
+        assert!(src.poll(10, Duration::from_millis(20))?.is_empty());
+        assert_eq!(src.idle(), Some(true));
+        // new bytes: a poll that drains them to EOF is idle again; one that
+        // is capped before EOF is not
+        {
+            use std::io::Write;
+            let mut w = std::fs::OpenOptions::new().append(true).open(&f)?;
+            w.write_all(b"d\ne\n")?;
+        }
+        assert_eq!(src.poll(1, Duration::from_secs(1))?.len(), 1);
+        assert_eq!(src.idle(), Some(false));
+        assert_eq!(src.poll(10, Duration::from_secs(1))?.len(), 1);
+        assert_eq!(src.idle(), Some(true));
+        // a file that does not exist yet has no backlog
+        let mut late = FileSource::new(dir.join("late.jsonl"));
+        late.open(&Cursor::None)?;
+        assert!(late.poll(10, Duration::from_millis(20))?.is_empty());
+        assert_eq!(late.idle(), Some(true), "missing file = nothing arriving");
+        // parquet shape: the single-batch delivery leaves the cursor at EOF
+        let p = dir.join("in.parquet");
+        std::fs::write(&p, b"PAR1-bytes")?;
+        let mut pq = FileSource::parquet(&p);
+        pq.open(&Cursor::None)?;
+        assert_eq!(pq.poll(10, Duration::from_millis(20))?.len(), 1);
+        assert_eq!(pq.idle(), Some(true), "whole file consumed in one batch");
+        assert!(pq.poll(10, Duration::from_millis(20))?.is_empty());
+        assert_eq!(pq.idle(), Some(true));
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

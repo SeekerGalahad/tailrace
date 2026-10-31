@@ -5,6 +5,70 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+_v1.3 development line (`feature/v1.3-dev`, R11 §二). Anchors are
+`path:line` in this tree._
+
+### Added
+
+- **Idle-aware alerting** (T-V1, dogfooding #5 — the "running pipeline with
+  no data pages on lag forever" friction). Sources carry a positional idle
+  verdict (`Source::idle() -> Option<bool>`,
+  `engine/crates/tailrace-connector/src/source.rs`): the file source reports
+  idle once a poll ran into EOF (a poll cut short by `max_rows`/deadline with
+  bytes still on disk is not idle; a file not created yet is), the Kafka
+  source once its next offsets have matched every partition's end offset for
+  3 consecutive checks (`IdleTracker` in
+  `engine/crates/tailrace-conn-kafka/src/lib.rs` — checks run on empty polls
+  only, at most once per second, one `fetch_watermarks` per partition; a
+  failed check holds the previous verdict, arriving rows or a positive gap
+  reset the streak). The criterion
+  is a **position** comparison, never a clock: a slow consumer with rows
+  still ahead of it is lagging, not idle. The serve loop publishes the
+  verdict after every successful poll and resets it to unknown on a poll
+  error (`tailrace-runtime/src/lib.rs` `obs_idle`); it reaches `/metrics` as
+  `tailrace_pipeline_source_idle{pipeline,statement}` (gauge, 1 idle / 0
+  backlog, **omitted** while the source cannot tell — the 10th series of the
+  node surface, `tailrace-api/src/metrics.rs`) and the stats JSON as the
+  additive `sourceIdle: true|false|null` (pipeline totals fold
+  conservatively: any backlog → false, all idle → true, else null). The
+  console's `lag_seconds` rule holds a series whose idle gauge is 1 (same
+  node/pipeline/statement labels): verdict Unknown — never fires, never
+  resolves, sample tagged `reason:"source_idle"`
+  (`console/crates/tailrace-console/src/alerting.rs`, verdict (c) in the
+  module doc); an absent or 0 idle series leaves the rule exactly as in
+  1.2.0, so connectors without a verdict are unaffected. `docs/ops/prometheus-alerts.yaml` gains
+  the PromQL twin (`unless on (node, pipeline, statement)
+  tailrace_pipeline_source_idle == 1`). Tests: file EOF silent period and
+  kafka catch-up hold while real backlog still fires (alerting unit tests
+  ×3 + driver-level `evaluator_holds_lag_episodes_while_source_idle`), file
+  source EOF/backlog/missing verdicts, kafka streak logic, metrics mapping.
+
+### Changed
+
+- **DLQ side file is a set of bad rows, not a log of isolation attempts**
+  (T-V2, dogfooding #3). `BadRowDlq::write` dedups on the row key
+  `(statement, cursor, rawB64)` (`engine/crates/tailrace-runtime/src/dlq.rs`):
+  the same bad bytes at the same poll-time cursor can only recur through an
+  at-least-once replay (flush failure → restart from the last committed
+  cursor re-polls the batch), so one bad row now lands exactly once per
+  replay window. The dedup index is in memory and seeded from the side file
+  on first write, so a statement restart (fresh writer) or a process restart
+  still dedups; corrupt lines are skipped during seeding and never block
+  quarantine. **The attempt counters are unchanged**: `StatementCounters::bad`,
+  the stats `bad` field and `tailrace_dlq_rows_total` keep counting every
+  isolation attempt (the replay storm stays visible on the audit face;
+  `dlq_window` rules keep counting attempts) — only the table is unique.
+  Pinned end to end by `tests/contract/tests/executor_loop.rs`
+  `dlq_replay_storm_dedups_rows_but_counts_attempts` (a sink whose target is
+  a directory fails every flush → the registry replays the batch on each
+  auto-restart: side file = 3 rows, counter = 3 × attempts). The R10
+  disclosure in `docs/protocol/engine-v1.md` §二·五 and
+  `docs/protocol/console-api.md` 裁决 13 is updated to "表唯一化、计数不变";
+  the downstream `rawB64` idempotency habit stays valid but the engine no
+  longer produces duplicate rows.
+
 ## [1.2.0] - 2026-10-31
 
 _Scope: changes since v1.1.0 — six development rounds on the main line:

@@ -80,6 +80,69 @@ fn sink_factory(
 
 // ==================== source ====================
 
+/// T-V1 idle verdict from **position gaps** (the Kafka half of the
+/// file-EOF / kafka-end-offset pair). One check sums
+/// `max(end_offset − next_offset, 0)` over the consumer's partitions —
+/// [`IDLE_STREAK`] consecutive zero-gap checks declare idle; a poll that
+/// returned data or a check that found backlog restarts the streak. The
+/// criterion is positional on purpose: a slow consumer with rows still ahead
+/// of it never reads as idle (the console keeps evaluating its lag), a
+/// caught-up consumer on a quiet topic does.
+///
+/// Checks run only on empty polls and at most every [`IDLE_CHECK_INTERVAL`]
+/// (each is one `fetch_watermarks` round trip per partition). A failed
+/// check **holds** the previous verdict instead of dropping it — a transient
+/// watermark timeout on a long-idle pipeline must not blink the idle series
+/// off for one evaluator tick and let a stale lag fire; a broker that is
+/// really down fails the consumer poll itself, and the runtime resets the
+/// verdict to unknown on poll errors.
+#[derive(Debug, Default)]
+struct IdleTracker {
+    /// `Some(n)` = n consecutive zero-gap checks (0 after data / backlog);
+    /// `None` = no verdict yet.
+    zero_gap_streak: Option<u32>,
+    /// last watermark query (rate limit)
+    last_check: Option<Instant>,
+}
+
+/// Consecutive zero-gap checks before the kafka source reports idle.
+const IDLE_STREAK: u32 = 3;
+/// Minimum spacing between two watermark checks (empty polls only).
+const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// Per-partition watermark query timeout — short: a slow broker yields
+/// "no verdict change", never a stalled poll loop.
+const IDLE_WATERMARK_TIMEOUT: Duration = Duration::from_millis(300);
+
+impl IdleTracker {
+    /// Rows arrived in this poll: there was backlog, the streak restarts.
+    fn on_data(&mut self) {
+        self.zero_gap_streak = Some(0);
+    }
+
+    /// Is a watermark check due (rate limit elapsed or never checked)?
+    fn due(&self, now: Instant) -> bool {
+        self.last_check
+            .is_none_or(|t| now.duration_since(t) >= IDLE_CHECK_INTERVAL)
+    }
+
+    /// One positional check result: `Some(gap)` = summed backlog over the
+    /// assignment, `None` = the query failed (verdict held unchanged).
+    fn on_gap(&mut self, now: Instant, gap: Option<i64>) {
+        self.last_check = Some(now);
+        match gap {
+            Some(0) => {
+                self.zero_gap_streak = Some(self.zero_gap_streak.unwrap_or(0).saturating_add(1));
+            }
+            Some(_) => self.zero_gap_streak = Some(0),
+            None => {}
+        }
+    }
+
+    fn verdict(&self) -> Option<bool> {
+        self.zero_gap_streak.map(|n| n >= IDLE_STREAK)
+    }
+}
+
 /// Kafka source (rdkafka BaseConsumer, synchronous poll; group = the
 /// statement cursor group convention tr.p{pipeline}.s{stmt}).
 pub struct KafkaSource {
@@ -106,6 +169,8 @@ pub struct KafkaSource {
     /// without a cursor, and as the start position for newly discovered
     /// partitions.
     start_offset: String,
+    /// T-V1 idle verdict (position-gap streak, see [`IdleTracker`]).
+    idle: IdleTracker,
 }
 
 impl KafkaSource {
@@ -125,6 +190,7 @@ impl KafkaSource {
             paused: false,
             poll_interval_ms: 600_000,
             start_offset: "earliest".into(),
+            idle: IdleTracker::default(),
         }
     }
 
@@ -330,6 +396,17 @@ impl Source for KafkaSource {
         for (p, next) in pending_offsets {
             self.offsets.insert(p, next);
         }
+        // T-V1 idle verdict: rows mean backlog existed; an empty poll runs
+        // the (rate-limited) positional check against the end offsets
+        if !out.is_empty() {
+            self.idle.on_data();
+        } else {
+            let now = Instant::now();
+            if self.idle.due(now) {
+                let gap = backlog_gap(consumer, &self.topic, &self.offsets);
+                self.idle.on_gap(now, gap);
+            }
+        }
         Ok(out)
     }
 
@@ -339,6 +416,11 @@ impl Source for KafkaSource {
             group: self.group.clone(),
             offsets: self.offsets.clone(),
         }
+    }
+
+    /// T-V1: end-offset gap streak — see [`IdleTracker`].
+    fn idle(&self) -> Option<bool> {
+        self.idle.verdict()
     }
 
     fn pause(&mut self) -> bool {
@@ -388,6 +470,25 @@ impl Source for KafkaSource {
         // thread alive (evading group eviction) without consuming or committing
         let _ = self.poll(1, deadline);
     }
+}
+
+/// Σ `max(end_offset − next_offset, 0)` over the consumer's partitions, one
+/// `fetch_watermarks` round trip each (T-V1 positional idle check). `None`
+/// on the first failed query — the caller holds its previous verdict — and
+/// when no partition is known yet (subscribe mode before the first discovery
+/// pass): an empty assignment is "unknown", not "caught up".
+fn backlog_gap(consumer: &BaseConsumer, topic: &str, offsets: &BTreeMap<i32, i64>) -> Option<i64> {
+    if offsets.is_empty() {
+        return None;
+    }
+    let mut gap: i64 = 0;
+    for (partition, next) in offsets {
+        let (_, high) = consumer
+            .fetch_watermarks(topic, *partition, IDLE_WATERMARK_TIMEOUT)
+            .ok()?;
+        gap = gap.saturating_add((high - next).max(0));
+    }
+    Some(gap)
 }
 
 // ==================== sink ====================
@@ -579,6 +680,65 @@ mod tests {
     use super::*;
     use datafusion::arrow::array::StringArray;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+    /// T-V1 idle streak (broker-free): no verdict until the first
+    /// observation; `IDLE_STREAK` consecutive zero-gap checks declare idle;
+    /// backlog (gap > 0) or arriving rows restart the streak — a slow
+    /// consumer with rows ahead of it is never idle; a failed check holds
+    /// the previous verdict (no blink); the rate limit spaces checks by
+    /// `IDLE_CHECK_INTERVAL`.
+    #[test]
+    fn idle_tracker_is_positional_and_holds_on_failed_checks() {
+        let t0 = Instant::now();
+        let mut t = IdleTracker::default();
+        assert_eq!(t.verdict(), None, "no observation yet");
+        assert!(t.due(t0), "first check is always due");
+        // caught up three times in a row → idle (positions, not time)
+        t.on_gap(t0, Some(0));
+        t.on_gap(t0, Some(0));
+        assert_eq!(
+            t.verdict(),
+            Some(false),
+            "two zero-gap checks are not enough"
+        );
+        t.on_gap(t0, Some(0));
+        assert_eq!(
+            t.verdict(),
+            Some(true),
+            "{IDLE_STREAK} zero-gap checks = idle"
+        );
+        // a failed watermark query holds the verdict instead of dropping it
+        t.on_gap(t0, None);
+        assert_eq!(
+            t.verdict(),
+            Some(true),
+            "transient query failure holds idle"
+        );
+        // backlog appears (end offset moved ahead of the consumer) → not idle
+        t.on_gap(t0, Some(42));
+        assert_eq!(
+            t.verdict(),
+            Some(false),
+            "rows ahead of the cursor = lagging"
+        );
+        // consuming them: rows arriving keep the streak at zero
+        t.on_data();
+        assert_eq!(t.verdict(), Some(false));
+        // and the streak must be rebuilt from scratch after catching up
+        t.on_gap(t0, Some(0));
+        t.on_gap(t0, Some(0));
+        assert_eq!(t.verdict(), Some(false));
+        t.on_gap(t0, Some(0));
+        assert_eq!(t.verdict(), Some(true));
+        // rate limit: a check just performed is not due again before the
+        // interval, and is due once it elapsed
+        assert!(!t.due(t0 + Duration::from_millis(200)));
+        assert!(t.due(t0 + IDLE_CHECK_INTERVAL));
+        // a fresh tracker that only ever saw data knows it is not idle
+        let mut d = IdleTracker::default();
+        d.on_data();
+        assert_eq!(d.verdict(), Some(false));
+    }
 
     /// Live-gate probe: the documented precondition of the live tests is the
     /// seeded dev topic (runtime live gate rationale), not bare reachability.

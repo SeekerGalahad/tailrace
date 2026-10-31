@@ -84,4 +84,18 @@ pub trait Source: Send {
     fn keepalive(&mut self, deadline: Duration) {
         std::thread::sleep(deadline);
     }
+    /// Source-side idle verdict (T-V1 idle-aware alerting), read by the
+    /// runtime after every successful `poll`: `Some(true)` = no backlog
+    /// behind the cursor (a file read to EOF; a Kafka consumer whose next
+    /// offsets have matched the partition end offsets for several
+    /// consecutive checks), `Some(false)` = backlog known to exist, `None` =
+    /// the connector cannot tell (the default — the runtime then exports no
+    /// idle series and lag rules evaluate exactly as before).
+    ///
+    /// The verdict must be a **position** comparison, never a clock: a slow
+    /// consumer with rows still ahead of it is lagging, not idle, and the
+    /// console's lag rules must keep evaluating it.
+    fn idle(&self) -> Option<bool> {
+        None
+    }
 }

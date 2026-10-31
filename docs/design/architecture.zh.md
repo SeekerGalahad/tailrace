@@ -518,16 +518,17 @@ flowchart LR
 
 **/metrics（T-A6，手写 text format，零依赖）**：指标注册表是 `Mutex<HashMap>` 的 gauge/counter 存储（`MetricsRegistry`，engine/crates/tailrace-api/src/metrics.rs:60；类型冲突拒绝而非双 TYPE 行，:55-58 域）；node 侧 `/metrics` **在 scrape 时**从活注册表计数现建现渲（无全局态、无采样线程、无过期问题——flush 循环仍是唯一写点，:235 `node_metrics_text`；开放无 token，Prometheus 惯例，api/lib.rs:400-406）。
 
-**9 指标面**（metrics.rs:9-32 模块文档逐条）：
+**10 指标面**（metrics.rs 模块文档逐条；v1.2.0 为 9 项，v1.3 T-V1 增 idle gauge）：
 
 | 指标 | 型/标签 | 口径注记 |
 |---|---|---|
 | `tailrace_pipeline_lag_seconds` | gauge（pipeline/statement） | v1 基=last_data_ms（最近含数 flush 墙钟），非事件时间 |
+| `tailrace_pipeline_source_idle` | gauge（pipeline/statement） | **T-V1（v1.3）源空闲裁决，位置判据非时间**：1=游标后无积压（文件源读到 EOF / kafka 消费位连续 3 次检查等于各分区 end-offset），0=有积压；源不可判（未 poll/poll 失败/连接器无裁决）时**不出序列**。console `lag_seconds` 规则对同标签 idle=1 的序列 **hold**（不 firing 不 resolve，三态 Unknown 语义）——「运行中但无数据的管道 lag 反复触发」的根修 |
 | `tailrace_pipeline_rows_total` | counter（+result=ok\|dlq） | ok=flushed 行，dlq=解码坏行 |
 | `tailrace_pipeline_bytes_total` | — | **已声明未喂数**：sink 只报在途 buffered_bytes，累计字节待 ack 口径 |
 | `tailrace_flush_total` | counter（+result=success） | Dedup/Retry 拆分随 Deterministic label 落地面预留 |
 | `tailrace_flush_duration_seconds` | gauge | §7.4 直方图简化为 gauge+counter |
-| `tailrace_dlq_rows_total` | counter | 隔离坏行 |
+| `tailrace_dlq_rows_total` | counter | 隔离**尝试次数**（T-V2 后 side 文件按行键去重、本计数器不变——重放风暴下计数 > 文件行数属预期） |
 | `tailrace_pipeline_state` | gauge | ControlFlags u8：0=RUNNING 1=PAUSED 2=STOPPED 3=FAILED |
 | `tailrace_node_heartbeat_age_seconds` | gauge（node_id） | scrape 时从心跳便签计算 age |
 | `tailrace_console_db_write_seconds` | gauge（op） | **console 侧渲染**（见下） |

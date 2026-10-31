@@ -6,7 +6,8 @@
 //! endpoint builds a fresh registry **at scrape time** from the live
 //! [`tailrace_runtime::registry::PipelineRegistry`] counters (the flush loop
 //! stays the single write site — no sampling thread, no staleness) and
-//! renders it; nothing is global. The 9-metric surface:
+//! renders it; nothing is global. The 10-metric surface (9 at v1.2.0 plus
+//! the T-V1 idle gauge):
 //!
 //! - `tailrace_pipeline_lag_seconds` (gauge, pipeline/statement) — v1 basis
 //!   is `last_data_ms` (wall time of the last data-carrying flush), NOT
@@ -30,6 +31,13 @@
 //!   [`crate::heartbeat`] last-beat note; age is computed at scrape time.
 //! - `tailrace_console_db_write_seconds` — console-side (tailrace-console
 //!   renders it from its own store stats; it does not appear here).
+//! - `tailrace_pipeline_source_idle` (gauge, pipeline/statement; T-V1
+//!   idle-aware alerting) — the source's **positional** idle verdict: 1 =
+//!   no backlog behind the cursor (file at EOF / kafka next offsets at the
+//!   end offsets for several checks), 0 = backlog exists. Omitted while the
+//!   source cannot tell (never polled, poll failing, connector without a
+//!   verdict) so the console's lag rules evaluate exactly as before; at 1
+//!   they hold instead of firing on a lag that merely measures silence.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -283,6 +291,16 @@ pub fn render_pipeline_metrics(
                     now.saturating_sub(s.last_data_ms) as f64 / 1000.0,
                 );
             }
+            // T-V1: only a known verdict is exported — absence means "the
+            // source cannot tell", and the console treats absence as "not
+            // idle" (lag rules unchanged)
+            if let Some(idle) = s.source_idle {
+                m.set_gauge(
+                    "tailrace_pipeline_source_idle",
+                    ps,
+                    if idle { 1.0 } else { 0.0 },
+                );
+            }
         }
     }
     if let Some((node_id, age)) = heartbeat {
@@ -428,12 +446,14 @@ mod tests {
 
     /// The §7.4 mapping: counter snapshots → the 8 node-side series families
     /// (state / rows ok+dlq / flush success / duration / dlq / lag), plus
-    /// heartbeat age. lag omitted until data has actually landed.
+    /// heartbeat age. lag omitted until data has actually landed; the T-V1
+    /// idle gauge exported only for a known verdict (1 idle / 0 backlog),
+    /// omitted when the source cannot tell.
     #[test]
     fn pipeline_series_mapping() {
         use tailrace_runtime::pipeline_log::StatementCountersSnapshot as S;
         use tailrace_runtime::registry::PipelineMetricsSnapshot as P;
-        let mk = |flushed, bad, flushes, dur, data| S {
+        let mk = |flushed, bad, flushes, dur, data, idle| S {
             consumed: 0,
             flushed,
             skipped: 0,
@@ -443,17 +463,23 @@ mod tests {
             flush_ms_total: 0,
             last_flush_dur_ms: dur,
             last_data_ms: data,
+            source_idle: idle,
         };
         let pipes = vec![
             P {
                 pipeline_id: 3,
                 state: 1, // PAUSED
-                statements: vec![mk(100, 4, 7, 250, 1_000)],
+                statements: vec![mk(100, 4, 7, 250, 1_000, Some(true))],
             },
             P {
                 pipeline_id: 4,
                 state: 0,
-                statements: vec![mk(0, 0, 0, 0, 0)], // never flushed data
+                statements: vec![mk(0, 0, 0, 0, 0, None)], // never flushed data
+            },
+            P {
+                pipeline_id: 5,
+                state: 0,
+                statements: vec![mk(10, 0, 1, 5, 60_000, Some(false))],
             },
         ];
         let m = MetricsRegistry::new();
@@ -490,6 +516,24 @@ mod tests {
         assert!(
             !out.contains("tailrace_pipeline_lag_seconds{pipeline=\"4\""),
             "no lag series before the first data-carrying flush: {out}"
+        );
+        // T-V1 idle gauge: 1 for the idle source, 0 for a source with
+        // backlog, no series at all while the verdict is unknown
+        assert!(
+            out.contains("# TYPE tailrace_pipeline_source_idle gauge\n")
+                && out
+                    .contains("tailrace_pipeline_source_idle{pipeline=\"3\",statement=\"0\"} 1\n")
+                && out
+                    .contains("tailrace_pipeline_source_idle{pipeline=\"5\",statement=\"0\"} 0\n"),
+            "idle verdict exported as 1/0: {out}"
+        );
+        assert!(
+            !out.contains("tailrace_pipeline_source_idle{pipeline=\"4\""),
+            "unknown verdict exports no idle series: {out}"
+        );
+        assert!(
+            out.contains("tailrace_pipeline_lag_seconds{pipeline=\"5\",statement=\"0\"} 1\n"),
+            "the lag series itself is untouched by the idle verdict: {out}"
         );
     }
 }

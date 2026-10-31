@@ -43,10 +43,20 @@
 //!   one. Unknown covers (a) a window rule with no usable base sample
 //!   (console restart, or a sample gap: the base must lie within
 //!   [`BASE_SLACK_SECS`] before the cutoff — an increment spanning a
-//!   larger gap is not a window increment and must not fire), and (b) a
+//!   larger gap is not a window increment and must not fire), (b) a
 //!   series whose node was unreachable this pass ([`Snapshot`]):
 //!   a node down is not "condition cleared", so its open episodes hold
-//!   until the node answers again or is deleted.
+//!   until the node answers again or is deleted, and (c) a `lag_seconds`
+//!   series whose source reports idle (T-V1 idle-aware alerting:
+//!   `tailrace_pipeline_source_idle == 1` on the same node/pipeline/
+//!   statement labels). The lag gauge is wall time since the last
+//!   data-carrying flush, so a running pipeline with nothing arriving keeps
+//!   "lagging" forever — the engine's **positional** verdict (file at EOF /
+//!   kafka next offsets at the end offsets) says nothing is behind the
+//!   cursor, and a lag over silence is not a late row: hold, never fire,
+//!   never resolve on it (an episode opened under real backlog waits for a
+//!   real Clear). An idle series absent or at 0 leaves the rule exactly as
+//!   before, so sources without a verdict are unaffected.
 //! - **Strict comparison** (`value > threshold`): a value exactly at the
 //!   threshold does not fire (boundary pinned by tests). Window thresholds
 //!   accept `>= 0` — with an integer counter, `threshold: 0` means "any
@@ -554,11 +564,25 @@ pub fn evaluate_rule(
 ) -> Vec<SeriesVerdict> {
     match kind {
         RuleKind::LagSeconds => {
-            threshold_verdicts(samples, params, "tailrace_pipeline_lag_seconds")
+            // T-V1: the label sets whose source reports idle this pass —
+            // their lag is wall time over silence, not a late row (module
+            // doc, verdict (c)); matched on the full label set, which the
+            // node renders identically for both gauges
+            let idle: HashSet<&BTreeMap<String, String>> = samples
+                .iter()
+                .filter(|s| s.metric == "tailrace_pipeline_source_idle" && s.value == 1.0)
+                .map(|s| &s.labels)
+                .collect();
+            threshold_verdicts(samples, params, "tailrace_pipeline_lag_seconds", |s| {
+                idle.contains(&s.labels)
+            })
         }
-        RuleKind::HeartbeatAge => {
-            threshold_verdicts(samples, params, "tailrace_node_heartbeat_age_seconds")
-        }
+        RuleKind::HeartbeatAge => threshold_verdicts(
+            samples,
+            params,
+            "tailrace_node_heartbeat_age_seconds",
+            |_| false,
+        ),
         RuleKind::StateFailed => samples
             .iter()
             .filter(|s| s.metric == "tailrace_pipeline_state" && series_matches(s, params))
@@ -628,24 +652,36 @@ pub fn evaluate_rule(
     }
 }
 
-/// The two threshold-style kinds, per series: strict `> threshold`.
-fn threshold_verdicts(samples: &[Sample], params: &RuleParams, metric: &str) -> Vec<SeriesVerdict> {
+/// The two threshold-style kinds, per series: strict `> threshold`. A series
+/// for which `hold` is true is not evaluated this tick (Unknown, sample
+/// tagged `reason:"source_idle"`) — the T-V1 idle hold for lag; heartbeat
+/// passes `|_| false`.
+fn threshold_verdicts(
+    samples: &[Sample],
+    params: &RuleParams,
+    metric: &str,
+    hold: impl Fn(&Sample) -> bool,
+) -> Vec<SeriesVerdict> {
     samples
         .iter()
         .filter(|s| s.metric == metric && series_matches(s, params))
         .map(|s| {
-            let firing = s.value > params.threshold;
+            let mut sample = json!({
+                "metric": metric, "value": s.value,
+                "threshold": params.threshold, "labels": s.labels,
+            });
+            let outcome = if hold(s) {
+                sample["reason"] = json!("source_idle");
+                Outcome::Unknown
+            } else if s.value > params.threshold {
+                Outcome::Firing
+            } else {
+                Outcome::Clear
+            };
             SeriesVerdict {
                 series_key: series_key(s),
-                outcome: if firing {
-                    Outcome::Firing
-                } else {
-                    Outcome::Clear
-                },
-                sample: json!({
-                    "metric": metric, "value": s.value,
-                    "threshold": params.threshold, "labels": s.labels,
-                }),
+                outcome,
+                sample,
             }
         })
         .collect()
@@ -1138,6 +1174,202 @@ mod tests {
             0,
         );
         assert!(vs.is_empty());
+    }
+
+    /// T-V1 (a) — file source in its EOF silent period: the lag gauge keeps
+    /// growing on the clock while `tailrace_pipeline_source_idle` is 1 on
+    /// the same labels → Unknown (held, sample reason `source_idle`), never
+    /// Firing — however large the lag. Without the idle series (a connector
+    /// with no verdict, an older node) the same lag fires exactly as before.
+    #[test]
+    fn lag_rule_holds_while_file_source_is_idle_at_eof() {
+        let params = parse_params(RuleKind::LagSeconds, &json!({"threshold": 30})).unwrap();
+        let labels: &[(&str, &str)] = &[("node", "a"), ("pipeline", "7"), ("statement", "0")];
+        let lag = |v: f64| sample("tailrace_pipeline_lag_seconds", labels, v);
+        let idle = |v: f64| sample("tailrace_pipeline_source_idle", labels, v);
+        for silence in [31.0, 600.0, 86_400.0] {
+            let vs = evaluate_rule(
+                RuleKind::LagSeconds,
+                &params,
+                &[lag(silence), idle(1.0)],
+                &CounterWindows::default(),
+                0,
+            );
+            assert_eq!(vs.len(), 1, "{vs:?}");
+            assert_eq!(
+                vs[0].outcome,
+                Outcome::Unknown,
+                "lag {silence}s over an idle source is held, not fired"
+            );
+            assert_eq!(vs[0].sample["reason"], "source_idle");
+            assert_eq!(
+                vs[0].sample["value"], silence,
+                "observed lag still recorded"
+            );
+            assert!(
+                vs[0]
+                    .series_key
+                    .starts_with("tailrace_pipeline_lag_seconds{"),
+                "the episode key stays the lag series: {}",
+                vs[0].series_key
+            );
+        }
+        // no idle series at all → unchanged v1.2 behaviour
+        let vs = evaluate_rule(
+            RuleKind::LagSeconds,
+            &params,
+            &[lag(600.0)],
+            &CounterWindows::default(),
+            0,
+        );
+        assert_eq!(
+            vs[0].outcome,
+            Outcome::Firing,
+            "no verdict = evaluate as before"
+        );
+        assert!(vs[0].sample.get("reason").is_none());
+    }
+
+    /// T-V1 (b) — kafka consumer that caught up: with backlog (idle 0) and
+    /// lag over threshold the series fires; once the next offsets reach the
+    /// end offsets (idle 1) the lag — still over threshold on the clock —
+    /// is Unknown: not re-fired, and (driver contract) not resolved either.
+    /// Per series: a sibling statement that still has backlog fires in the
+    /// same pass, and the idle gauge of one statement never shields another.
+    #[test]
+    fn lag_rule_holds_once_kafka_source_caught_up() {
+        let params = parse_params(
+            RuleKind::LagSeconds,
+            &json!({"threshold": 30, "pipeline": "3"}),
+        )
+        .unwrap();
+        let s0: &[(&str, &str)] = &[("node", "a"), ("pipeline", "3"), ("statement", "0")];
+        let s1: &[(&str, &str)] = &[("node", "a"), ("pipeline", "3"), ("statement", "1")];
+        let w = CounterWindows::default();
+        // tick 1: both statements behind the end offsets → both fire
+        let vs = evaluate_rule(
+            RuleKind::LagSeconds,
+            &params,
+            &[
+                sample("tailrace_pipeline_lag_seconds", s0, 45.0),
+                sample("tailrace_pipeline_source_idle", s0, 0.0),
+                sample("tailrace_pipeline_lag_seconds", s1, 50.0),
+                sample("tailrace_pipeline_source_idle", s1, 0.0),
+            ],
+            &w,
+            0,
+        );
+        assert_eq!(vs.len(), 2);
+        assert!(vs.iter().all(|v| v.outcome == Outcome::Firing), "{vs:?}");
+        // tick 2: statement 0 caught up (idle 1); its lag keeps climbing on
+        // the clock → held. statement 1 still has rows ahead → still firing.
+        let vs = evaluate_rule(
+            RuleKind::LagSeconds,
+            &params,
+            &[
+                sample("tailrace_pipeline_lag_seconds", s0, 120.0),
+                sample("tailrace_pipeline_source_idle", s0, 1.0),
+                sample("tailrace_pipeline_lag_seconds", s1, 125.0),
+                sample("tailrace_pipeline_source_idle", s1, 0.0),
+            ],
+            &w,
+            0,
+        );
+        let by_stmt = |st: &str| {
+            vs.iter()
+                .find(|v| v.series_key.contains(&format!("statement=\"{st}\"")))
+                .unwrap()
+        };
+        assert_eq!(by_stmt("0").outcome, Outcome::Unknown, "caught up → hold");
+        assert_eq!(by_stmt("0").sample["reason"], "source_idle");
+        assert_eq!(
+            by_stmt("1").outcome,
+            Outcome::Firing,
+            "sibling backlog fires"
+        );
+        // tick 3: rows flow again on statement 0 (idle 0) and the flush
+        // refreshed the lag → Clear resolves the episode the driver kept open
+        let vs = evaluate_rule(
+            RuleKind::LagSeconds,
+            &params,
+            &[
+                sample("tailrace_pipeline_lag_seconds", s0, 2.0),
+                sample("tailrace_pipeline_source_idle", s0, 0.0),
+            ],
+            &w,
+            0,
+        );
+        assert_eq!(vs[0].outcome, Outcome::Clear);
+    }
+
+    /// T-V1 (c) — real lag: the end offset is ahead of the consumer (idle 0)
+    /// and the lag is over threshold → Firing exactly as before. Idle 0 is a
+    /// verdict, not a hold; so is an idle gauge on a different label set
+    /// (another node's same pipeline/statement must not shield this one).
+    #[test]
+    fn lag_rule_fires_on_real_backlog() {
+        let params = parse_params(RuleKind::LagSeconds, &json!({"threshold": 30})).unwrap();
+        let here: &[(&str, &str)] = &[("node", "a"), ("pipeline", "7"), ("statement", "0")];
+        let elsewhere: &[(&str, &str)] = &[("node", "b"), ("pipeline", "7"), ("statement", "0")];
+        let vs = evaluate_rule(
+            RuleKind::LagSeconds,
+            &params,
+            &[
+                sample("tailrace_pipeline_lag_seconds", here, 31.0),
+                sample("tailrace_pipeline_source_idle", here, 0.0),
+                // node b's statement is idle — a different series entirely
+                sample("tailrace_pipeline_lag_seconds", elsewhere, 900.0),
+                sample("tailrace_pipeline_source_idle", elsewhere, 1.0),
+            ],
+            &CounterWindows::default(),
+            0,
+        );
+        assert_eq!(vs.len(), 2);
+        let on = |node: &str| {
+            vs.iter()
+                .find(|v| v.series_key.contains(&format!("node=\"{node}\"")))
+                .unwrap()
+        };
+        assert_eq!(
+            on("a").outcome,
+            Outcome::Firing,
+            "backlog + lag > threshold fires"
+        );
+        assert!(on("a").sample.get("reason").is_none());
+        assert_eq!(on("b").outcome, Outcome::Unknown, "node b is the idle one");
+        // boundary unchanged under a backlog verdict: value == threshold is Clear
+        let vs = evaluate_rule(
+            RuleKind::LagSeconds,
+            &params,
+            &[
+                sample("tailrace_pipeline_lag_seconds", here, 30.0),
+                sample("tailrace_pipeline_source_idle", here, 0.0),
+            ],
+            &CounterWindows::default(),
+            0,
+        );
+        assert_eq!(vs[0].outcome, Outcome::Clear);
+        // heartbeat_age never consults the idle gauge (hold predicate is off)
+        let hb = parse_params(RuleKind::HeartbeatAge, &json!({"threshold": 90})).unwrap();
+        let vs = evaluate_rule(
+            RuleKind::HeartbeatAge,
+            &hb,
+            &[
+                sample(
+                    "tailrace_node_heartbeat_age_seconds",
+                    &[("node", "a"), ("node_id", "sn-1")],
+                    500.0,
+                ),
+                sample(
+                    "tailrace_pipeline_source_idle",
+                    &[("node", "a"), ("node_id", "sn-1")],
+                    1.0,
+                ),
+            ],
+            &CounterWindows::default(),
+            0,
+        );
+        assert_eq!(vs[0].outcome, Outcome::Firing, "idle is a lag-only hold");
     }
 
     /// state_failed is per series: only the FAILED series fires.

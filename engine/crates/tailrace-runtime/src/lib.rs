@@ -183,6 +183,19 @@ impl StatementRuntime {
             }
         }
     }
+
+    /// T-V1 idle signal → `source_idle` (feeds `tailrace_pipeline_source_idle`).
+    /// Called with the source's verdict after every successful poll and with
+    /// `None` when a poll fails: a source that cannot be read is not "idle",
+    /// so the console's lag rules must keep evaluating it.
+    fn obs_idle(&self, idle: Option<bool>) {
+        if let Some(c) = self.counters.as_ref() {
+            c.source_idle.store(
+                pipeline_log::source_idle_code(idle),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
 }
 
 fn now_ms() -> u64 {
@@ -213,7 +226,10 @@ fn sink_flush_span(pipeline_id: u64, st: &StatementRuntime) -> tracing::Span {
 /// batch; dlq → quarantine raw bytes + poll-time cursor + timestamp to the
 /// side file — a quarantine write failure is fatal for the same reason),
 /// counters, and the throttled DECODE_BAD event carrying the DLQ path (not a
-/// raw sample).
+/// raw sample). The attempt counter (`bad` → `tailrace_dlq_rows_total`) is
+/// bumped **before** the write and counts every isolation attempt; the side
+/// file dedups on the row key (T-V2) — a replay storm stays visible on the
+/// metric while the table holds each bad row once.
 #[allow(clippy::too_many_arguments)]
 fn handle_bad_rows(
     st: &StatementRuntime,
@@ -871,6 +887,8 @@ fn run_statement_serve(
         let chunks = match st.source.poll(options.poll_rows, options.poll_slice) {
             Ok(c) => c,
             Err(e) => {
+                // a source that cannot be read has no idle verdict (T-V1)
+                st.obs_idle(None);
                 // Flink exponential-delay pattern: back off and retry on
                 // transient errors instead of killing the pipeline
                 backoff_secs += 1;
@@ -907,6 +925,9 @@ fn run_statement_serve(
                           // backoff — resetting only on non-empty used to make
                           // long-idle healthy pipelines accumulate toward
                           // giving up
+                          // T-V1: publish the source's positional idle verdict (file EOF /
+                          // kafka end-offset gap) — the console holds lag rules while idle
+        st.obs_idle(st.source.idle());
         if chunks.is_empty() {
             // idle-poll sleep prevents spinning (100% CPU with a FileSource
             // at EOF)
