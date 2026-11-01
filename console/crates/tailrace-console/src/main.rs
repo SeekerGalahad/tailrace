@@ -50,7 +50,8 @@ fn usage() {
          \x20                             (default http://127.0.0.1:8080)\n\
          \x20 TAILRACE_DEPLOY_HEALTH_TIMEOUT_SECS  deploy health/register window (default 90)\n\
          \x20 TAILRACE_ALERT_INTERVAL_SECS  alert evaluator period in seconds (default 15, min 1;\n\
-         \x20                             T-E2 rules engine over the aggregated node /metrics)\n\
+         \x20                             T-E2 rules engine over the aggregated node /metrics;\n\
+         \x20                             also the SLO lag sampling period behind GET /api/slo)\n\
          \x20 TAILRACE_CONSOLE_TOKEN / _USER / _PASSWORD  the apply subcommand's credentials\n\
          \x20 RUST_LOG                   tracing filter (default info)"
     );
@@ -138,6 +139,20 @@ async fn main() -> Result<()> {
             "backfill jobs orphaned by the previous console process marked failed"
         ),
         Err(e) => tracing::warn!(error = %e, "orphaned backfill job sweep failed"),
+    }
+
+    // R11 T-V4 SLO sample ring (1h): every evaluator pass evicts the rows
+    // that fell out of the ring, but a console that was down longer than
+    // the retention comes back with a stale tail — sweep it here, same slot
+    // and shape as the orphan sweep above, before anything reads or writes
+    // the ring (disk guard independent of the evaluator's schedule).
+    match tailrace_console::slo::startup_prune(&store, tailrace_console::slo::now_ms()) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            samples = n,
+            "SLO lag samples older than the 1h ring pruned at startup"
+        ),
+        Err(e) => tracing::warn!(error = %e, "SLO lag sample startup prune failed"),
     }
 
     // Credential master key (§5.3): TAILRACE_MASTER_KEY env (32B base64) >

@@ -67,6 +67,45 @@ _v1.3 development line (`feature/v1.3-dev`, R11 §二). Anchors are
   re-apply auditing only the envelope (`tests/mcp_server.rs:595`).
   `initialize` instructions and `docs/protocol/console-api.md` §五's
   mirror table updated to the sixteen.
+- **SLO history: lag p50 / p95 / p99 over a 1 h sample ring** (T-V4, R11 —
+  the v1.3 item the R9 "no history p95" decision deferred; the target side,
+  `tailrace_slo_lag_target_seconds`, shipped in 1.2.0). Console-store
+  migration 06 adds `slo_lag_sample`
+  (`console/crates/console-store/migrations/06_slo_lag_sample.sql`); the
+  alert evaluator writes one row per (pipeline, statement) on every pass
+  (15 s default) from the very snapshot it evaluates
+  (`console/crates/tailrace-console/src/slo.rs:118` `record_pass`, called
+  from `alerting.rs:781` — best-effort, a failed write never blocks rule
+  evaluation). The SLO identity is (pipeline, statement): `node` is
+  provenance only, so a pipeline migrating between nodes keeps its history,
+  and two nodes reporting the same pair in one pass record the worse lag.
+  Idle series (T-V1 gauge at 1 on the same labels) are **not sampled** — a
+  lag over silence is not a late row, the alert rule holds on it and the
+  SLO does not count it. Quantiles are **nearest-rank over the stored
+  rows** (1-based rank ⌈n·q⌉ in integer per-mille arithmetic, no
+  interpolation, `slo.rs:133`): every reported quantile is one of the
+  samples, recomputable from the table. Ring retention is 1 h: each pass
+  inserts and prunes `ts_ms <= now − 1h` in one transaction (an empty pass
+  still prunes), and a startup sweep in the backfill-orphan-sweep slot
+  (`console/crates/tailrace-console/src/main.rs:149`) drops the tail a
+  downtime left behind. Surfaces: the console `/metrics` gains
+  `tailrace_slo_lag_p50_seconds` / `tailrace_slo_lag_p95_seconds` /
+  `tailrace_slo_lag_p99_seconds` + `tailrace_slo_lag_samples` (labels
+  `{pipeline,statement}`, whole ring, absent while empty —
+  `metrics.rs:270`); `GET /api/slo?windowSecs=&pipeline=&statement=`
+  (`api/slo.rs:93`) answers
+  `{windowSecs,fromMs,toMs,retentionSecs,intervalSecs,series[{pipeline,statement,node,samples,p50,p95,p99,oldestMs,newestMs}]}`
+  over the half-open window `(fromMs, toMs]` (`windowSecs` clamped to
+  1..=3600; OpenAPI operations 65 → 66). `docs/ops/grafana-dashboard.json`
+  gains an SLO row (panels 10–12: quantiles against the tightest lag target
+  folded `min by (pipeline, statement)`, plus a p95/p99/target/samples
+  table). Contract tests in `tests/alerts_flow.rs`: the API quantiles and
+  sample counts recomputed from the raw ring rows by an independent
+  nearest-rank (`:1324`), and window sliding + ring/empty-pass/startup
+  pruning on a deterministic clock (`:1491`); unit tests pin the
+  nearest-rank edges, observation extraction, the half-open window and
+  the store's batch/prune bounds. Semantics in
+  `docs/protocol/console-api.md` 裁决 14.
 
 ### Changed
 

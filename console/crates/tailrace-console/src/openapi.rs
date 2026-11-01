@@ -34,6 +34,7 @@ use crate::api::pipelines::{
     PipelineUpsertBody, PipelinesListResponse, PublishResponse, SqlTemplate, TemplatesResponse,
     TrendPoint, TrendResponse,
 };
+use crate::api::slo::{SloResponse, SloSeries};
 use crate::api::{ErrorBody, ErrorResponse};
 use crate::compile::{CompileDiag, DimJoinOut, StatementOut};
 
@@ -119,6 +120,8 @@ use crate::compile::{CompileDiag, DimJoinOut, StatementOut};
         crate::api::alerts::update,
         crate::api::alerts::remove,
         crate::api::alerts::stream,
+        // R11 T-V4 SLO history: lag quantiles over the 1h sample ring
+        crate::api::slo::summary,
         // T-G6 pipeline-as-code: declarative apply + dry-run diff
         crate::api::apply::apply,
         crate::api::apply::dry_run,
@@ -163,6 +166,8 @@ use crate::compile::{CompileDiag, DimJoinOut, StatementOut};
         BackfillJobsResponse,
         // T-E2 alerting DTOs
         AlertsResponse, AlertRuleItem, AlertEventItem, AlertRuleBody, AlertRuleCreated,
+        // R11 T-V4 SLO history DTOs
+        SloResponse, SloSeries,
         // T-G6 pipeline-as-code DTOs (bodies embed the REST CRUD DTOs above)
         ApplyFile, ApplyTable, ApplyResponse, ApplyItem, ApplyChange, ApplyOrphan, ApplySummary,
         // shared
@@ -592,6 +597,59 @@ mod tests {
                 props("AlertRuleBody").contains_key(k),
                 "AlertRuleBody missing {k}"
             );
+        }
+    }
+
+    /// R11 T-V4: the SLO history read is published with its three optional
+    /// query params, and the DTOs carry what a client needs to judge and
+    /// recompute the numbers — window bounds + retention + sampling period,
+    /// per series the three quantiles, their sample count and coverage.
+    #[test]
+    fn slo_surface_is_published() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("openapi serializes");
+        let get = doc
+            .pointer("/paths/~1api~1slo/get")
+            .expect("missing GET /api/slo");
+        let params: Vec<&str> = get["parameters"]
+            .as_array()
+            .expect("GET /api/slo parameters")
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+        for k in ["windowSecs", "pipeline", "statement"] {
+            assert!(params.contains(&k), "GET /api/slo missing param {k}");
+        }
+        let props = |schema: &str| {
+            doc.pointer(&format!("/components/schemas/{schema}/properties"))
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_else(|| panic!("{schema}.properties"))
+        };
+        for k in [
+            "windowSecs",
+            "fromMs",
+            "toMs",
+            "retentionSecs",
+            "intervalSecs",
+            "series",
+        ] {
+            assert!(
+                props("SloResponse").contains_key(k),
+                "SloResponse missing {k}"
+            );
+        }
+        for k in [
+            "pipeline",
+            "statement",
+            "node",
+            "samples",
+            "p50",
+            "p95",
+            "p99",
+            "oldestMs",
+            "newestMs",
+        ] {
+            assert!(props("SloSeries").contains_key(k), "SloSeries missing {k}");
         }
     }
 }

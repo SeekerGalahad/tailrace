@@ -84,8 +84,9 @@ pub const RULE_TYPES: &[&str] = &[
 ];
 
 /// Upper bound for a rule's `windowSecs` — also the retention of the
-/// in-memory counter history (bounded memory; a longer window would need
-/// the sample store v1 deliberately does not have).
+/// in-memory counter history (bounded memory; counter history is never
+/// persisted — the R11 T-V4 sample ring in [`crate::slo`] keeps lag samples
+/// only).
 pub const MAX_WINDOW_SECS: u64 = 3600;
 
 /// How far before the window cutoff the base sample may lie (R9 review
@@ -765,7 +766,9 @@ impl Evaluator {
 
     /// One evaluation pass: record counters, evaluate every rule per
     /// series, persist the state transitions, broadcast + webhook each
-    /// notice. Returns the notices emitted (contract-test surface).
+    /// notice. Returns the notices emitted (contract-test surface). The
+    /// pass also records the SLO lag samples of the same snapshot (R11
+    /// T-V4, [`crate::slo::record_pass`]).
     pub async fn run_pass_snapshot(
         &mut self,
         state: &AppState,
@@ -773,6 +776,11 @@ impl Evaluator {
         now_ms: u64,
     ) -> anyhow::Result<Vec<AlertNotice>> {
         self.windows.observe(&snap.samples, now_ms);
+        // R11 T-V4: the SLO sample ring rides this pass and this snapshot —
+        // best-effort, a failed sample write never blocks rule evaluation.
+        if let Err(e) = crate::slo::record_pass(state.store(), snap, now_ms) {
+            tracing::warn!(error = %e, "SLO lag sample write failed");
+        }
         let rules = state.store().list_alert_rules()?;
         let mut notices = Vec::new();
         let mut hooks: Vec<(String, AlertNotice)> = Vec::new();

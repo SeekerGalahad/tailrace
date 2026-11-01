@@ -262,3 +262,26 @@ pub struct AlertEvent {
     pub sample_json: String,
     pub resolved_sample_json: Option<String>,
 }
+
+/// One lag observation to record in the SLO sample ring (R11 T-V4): what
+/// the evaluator takes per (pipeline, statement) from one pass' snapshot.
+/// The pass time is supplied once per batch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewSloLagSample {
+    pub pipeline: String,
+    pub statement: String,
+    /// Reporting node (provenance; the SLO identity is pipeline/statement).
+    pub node: String,
+    pub lag_secs: f64,
+}
+
+/// A `slo_lag_sample` row (R11 T-V4): one recorded lag observation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SloLagSample {
+    pub pipeline: String,
+    pub statement: String,
+    pub node: String,
+    pub lag_secs: f64,
+    /// Evaluator pass time, epoch ms.
+    pub ts_ms: i64,
+}

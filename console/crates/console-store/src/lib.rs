@@ -17,6 +17,7 @@ mod password;
 mod pipelines;
 mod secretbox;
 mod sessions;
+mod slo;
 mod users;
 
 use std::path::Path;
@@ -33,9 +34,9 @@ pub use artifacts::ArtifactInsert;
 pub use datasources::DatasourceUpdate;
 pub use models::{
     AlertEvent, AlertRule, Artifact, AuditEntry, BackfillJob, Datasource, DatasourceCredential,
-    DeployLogRow, NewDeployedNode, NewNodeEvent, NewNodeMetrics, NewPipelineMetrics, Node,
-    NodeEventRow, NodeMetricPoint, Pipeline, PipelineTrendPoint, PipelineVersion, TableObject,
-    User,
+    DeployLogRow, NewDeployedNode, NewNodeEvent, NewNodeMetrics, NewPipelineMetrics,
+    NewSloLagSample, Node, NodeEventRow, NodeMetricPoint, Pipeline, PipelineTrendPoint,
+    PipelineVersion, SloLagSample, TableObject, User,
 };
 pub use password::{hash_password, verify_password};
 pub use pipelines::{PipelineFull, PipelineWrite};
@@ -60,6 +61,9 @@ fn migrations() -> Migrations<'static> {
         // R9 review fix: alert_event.series_key — episodes are per series
         // (one rule matching N pipelines keeps N independent episodes).
         M::up(include_str!("../migrations/05_alert_series.sql")),
+        // R11 T-V4: slo_lag_sample — the 1h lag sample ring behind the SLO
+        // p50/p95/p99 surface (written by the alert evaluator per pass).
+        M::up(include_str!("../migrations/06_slo_lag_sample.sql")),
     ])
 }
 
@@ -253,6 +257,10 @@ mod tests {
                     "idx_alert_event_rule",
                     // R9 review fix (migration 05)
                     "idx_alert_event_open",
+                    // R11 T-V4 (migration 06)
+                    "slo_lag_sample",
+                    "idx_slo_lag_sample_key",
+                    "idx_slo_lag_sample_ts",
                 ] {
                     assert!(
                         names.contains(&expected.to_string()),
@@ -261,8 +269,8 @@ mod tests {
                 }
                 let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
                 assert_eq!(
-                    version, 6,
-                    "user_version must be 6 after 00_init + 01_sequence + 02_backfill_job + 03_key_model + 04_alert + 05_alert_series"
+                    version, 7,
+                    "user_version must be 7 after 00_init + 01_sequence + 02_backfill_job + 03_key_model + 04_alert + 05_alert_series + 06_slo_lag_sample"
                 );
                 Ok(())
             })

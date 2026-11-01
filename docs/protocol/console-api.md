@@ -1,8 +1,8 @@
 # Console API — console-api
 
 > 管理面 REST 协议正典（`tailrace-console` 二进制）。随 utoipa 注解同步维护；
-> 机器可读正典 = 运行时 `/api-docs/openapi.json`（65 路径，`tailrace-console/src/openapi.rs` `paths(…)` 登记数，2026-10-31 实测），Swagger UI 在 `/swagger-ui/`。
-> 首版 2026-10-11；鉴权协议安全修复改版 2026-10-13；MCP 面正典化 + 维表（T-D1）动线增补 2026-10-27；建表闭环（T-A1）三端点增补 2026-10-28；回填（T-A2）两端点增补 2026-10-28；部分列更新（T-A7）控制面开关 + evolve 双向互斥 + keyModel 登记增补 2026-10-28；R8 类型地基轮同步 2026-10-30（MCP 10→14 工具 + 工具描述 OpenAPI 同源；建表闭环词汇映射 4→13（A3）；infer-schema 收 `debezium-json` + 列型按十六词词汇收窄；draft body 增 `columnTypes`）；R8.5 评审修复轮 2026-10-30（三处 pre-A3 时态残留清偿：openapi 路径计数 49→58、evolve 比对词汇「4 类」→十六词、分区候选规则改为 A3 名称×类型双判——`int64`/`date`/`timestamp` 皆可取 RANGE 键）；告警/SLO（T-E2）五端点增补 2026-10-31（openapi 路径计数 58→63；规则引擎在 console、五类规则、事件只在状态迁移落行、webhook+SSE 投递、`/metrics` 增 `tailrace_slo_lag_target_seconds`——详见语义裁决 11）；管道即代码（T-G6）两端点增补 2026-10-31（openapi 路径计数 63→65；`POST /api/apply[/dry-run]` 声明文件结构化 diff + 幂等 upsert、CLI 薄壳 `tailrace-console apply`、JSON-only v1——详见语义裁决 12 与 `docs/ops/pipeline-file.md`）；R11 MCP apply 对（T-V3）增补 2026-11-01（MCP 14→16 工具=9R+7W，≤16 预算用满；`apply`(W)/`apply_dry_run`(R) 复用同一 G6 端点与 `plan()`，dry-run 零域审计；openapi 路径计数不变——两路径 T-G6 已登记）。
+> 机器可读正典 = 运行时 `/api-docs/openapi.json`（66 路径，`tailrace-console/src/openapi.rs` `paths(…)` 登记数，2026-11-01 实测），Swagger UI 在 `/swagger-ui/`。
+> 首版 2026-10-11；鉴权协议安全修复改版 2026-10-13；MCP 面正典化 + 维表（T-D1）动线增补 2026-10-27；建表闭环（T-A1）三端点增补 2026-10-28；回填（T-A2）两端点增补 2026-10-28；部分列更新（T-A7）控制面开关 + evolve 双向互斥 + keyModel 登记增补 2026-10-28；R8 类型地基轮同步 2026-10-30（MCP 10→14 工具 + 工具描述 OpenAPI 同源；建表闭环词汇映射 4→13（A3）；infer-schema 收 `debezium-json` + 列型按十六词词汇收窄；draft body 增 `columnTypes`）；R8.5 评审修复轮 2026-10-30（三处 pre-A3 时态残留清偿：openapi 路径计数 49→58、evolve 比对词汇「4 类」→十六词、分区候选规则改为 A3 名称×类型双判——`int64`/`date`/`timestamp` 皆可取 RANGE 键）；告警/SLO（T-E2）五端点增补 2026-10-31（openapi 路径计数 58→63；规则引擎在 console、五类规则、事件只在状态迁移落行、webhook+SSE 投递、`/metrics` 增 `tailrace_slo_lag_target_seconds`——详见语义裁决 11）；管道即代码（T-G6）两端点增补 2026-10-31（openapi 路径计数 63→65；`POST /api/apply[/dry-run]` 声明文件结构化 diff + 幂等 upsert、CLI 薄壳 `tailrace-console apply`、JSON-only v1——详见语义裁决 12 与 `docs/ops/pipeline-file.md`）；R11 MCP apply 对（T-V3）增补 2026-11-01（MCP 14→16 工具=9R+7W，≤16 预算用满；`apply`(W)/`apply_dry_run`(R) 复用同一 G6 端点与 `plan()`，dry-run 零域审计；openapi 路径计数不变——两路径 T-G6 已登记）；R11 SLO 历史分位（T-V4）增补 2026-11-01（openapi 路径计数 65→66；console-store 迁移 06 `slo_lag_sample` 1h 环形样本表、告警评估拍顺带写入、启动清扫裁剪；`GET /api/slo` + `/metrics` 增 `tailrace_slo_lag_p50/p95/p99_seconds` 与 `tailrace_slo_lag_samples`——详见语义裁决 14）。
 
 ## 一、通用约定
 
@@ -49,6 +49,7 @@
 | ✅ | **管道即代码（T-G6，2026-10-31）** `POST /api/apply/dry-run`（声明文件对 store 算结构化 diff：逐对象三态 `create`/`update`（`changes[]` 逐字段 from→to，connJson 按**子键**一行一条、凭据只报 `<redacted>` 不回显）/`unchanged`，orphan 条目单列——**零副作用零审计**）· `POST /api/apply`（幂等 upsert：缺则建、漂移则改、已匹配**字节不动**——数据源 generation 不无谓 +1、管道不翻 PENDING_CHANGES、零审计行；**永不删除**，v1 无 prune）；body = 声明文件 `{datasources?,tables?,pipelines?}`（**键缺省=不管该类；键存在（含空数组）=该类全集**，未点名者报 orphan），条目 DTO 与 REST 建/改端点同源 serde（datasources/pipelines 直接复用 upsert body，tables = 登记体 + 属主 `datasource` **名称**字段；dsMapping 值可写数据源名或数字 id）；身份 = 业务键（数据源 name / 表 (数据源名,db,table) / 管道 name），跨环境可移植；全文件校验前置（任一未知引用 → 整文件 400 `err.apply.*` 一个不写）；执行顺序 datasources→tables→pipelines，跨对象非单事务（中断重跑即收敛）；凭据声明与库内解密比对（相同=unchanged，不重封）；CLI 薄壳 `tailrace-console apply -f <file> [--dry-run] [--server URL]`（diff 人类可读打印，`--token`/`--user --password` 认证）——详见语义裁决 12 与 `docs/ops/pipeline-file.md` |
 | ⛔ 501 | POST /api/nodes/ticket（票据链——依赖凭据加密与引擎侧 CredentialProvider，未在本阶段交付） |
 | ✅ | **告警/SLO（T-E2，2026-10-31；R9 评审修复轮改为逐序列状态机——详见语义裁决 11）** `GET /api/alerts`（`{ruleTypes[5],intervalSecs,rules[],events[]}`：rules 行 `{id,name,ruleType,params,enabled,webhookUrl,state:"inactive"\|"firing",openEvent\|null,openEvents[],createdAt,updatedAt}`——`state` 为评估器所有的规则级聚合态（任一序列事件进行中即 firing），`openEvent` 为最早的进行中事件（单序列兼容视图）、`openEvents` 为**逐序列**的全部进行中事件；events 为跨规则最近 50 条事件（新到旧）`{id,ruleId,ruleName,seriesKey,state:"firing"\|"resolved",firstSeenAt,lastSeenAt,resolvedAt,sample,resolvedSample}`，`seriesKey` 为事件所属序列 `metric{label="value",…}`） · `POST /api/alerts/rules`（body `{name,ruleType,params,enabled?=true,webhookUrl?}`；`ruleType` ∈ lag_seconds / state_failed / heartbeat_age / dlq_window / flush_errors_window；`params` 按类型校验：lag/heartbeat 要 `threshold>0`（秒）、两窗口类要 `threshold>=0`（行数；计数器为整数、比较严格 `>`，故 `0` = 窗口内出现任意一行即触发——与 `prometheus-alerts.yaml` 的 `> 0` 示例同义）+ `windowSecs` 1..=3600、state_failed 无必填，三类可选过滤 `pipeline`/`statement`/`node`（匹配 console 聚合后的同名标签；**该类序列不可能携带的过滤——state_failed 带 statement、heartbeat_age 带 pipeline/statement——400 拒收而非静默接受**）；`webhookUrl` 须 http(s)；201 `{id}`、400 `err.alert.*`、重名 409 CONFLICT；审计 ALERT_RULE_CREATE） · `PUT /api/alerts/rules/{id}`（整体替换可编辑字段，**评估器状态保留**——改参数不会把正在触发的告警无声丢掉，下一轮按新参数重评；200 规则行、404、重名 409；审计 ALERT_RULE_UPDATE） · `DELETE /api/alerts/rules/{id}`（204：**先**把进行中的事件以 `reason:"deleted"` 关闭并投递 resolved（webhook + SSE，resolved 必达），**再**删除规则——事件行随规则级联删除；审计 ALERT_RULE_DELETE，detail 带 `resolvedEpisodes` 计数） · `GET /api/alerts/stream`（SSE，Cookie 鉴权：每次 firing/resolved 迁移一条 `event: alert`，data = 与 webhook 同一份通知 JSON `{event,eventId,ruleId,ruleName,ruleType,seriesKey,params,sample,tsMs}`；订阅方落后于 64 条缓冲时收 `event: lagged` `{skipped}`；15s `: keepalive`） · **`GET /metrics` 增 `tailrace_slo_lag_target_seconds`**（gauge：每条启用的 lag_seconds 规则的阈值，**与其监视的 `tailrace_pipeline_lag_seconds` 序列同一标签集**（node/pipeline/statement）逐序列暴露——多规则命中同一序列取最紧阈值；无规则监视的 lag 序列不出目标线；无规则时整个 family 不出现） |
+| ✅ | **SLO 历史分位（R11 T-V4，2026-11-01——详见语义裁决 14）** `GET /api/slo`（会话鉴权；query `windowSecs?`（秒，截断到 1..=3600，缺省或不可解析 = 3600 即整环）、`pipeline?`、`statement?`（按标签值精确过滤）；200 `{windowSecs,fromMs,toMs,retentionSecs:3600,intervalSecs,series[]}`——窗口为半开区间 `(fromMs, toMs]`（epoch ms，`toMs` = 请求时 console 时钟），`intervalSecs` = 采样周期（即告警评估周期，满覆盖窗口约 windowSecs/intervalSecs 个样本）；series 行 `{pipeline,statement,node,samples,p50,p95,p99,oldestMs,newestMs}`，按 pipeline id、statement 序号数值序，只列窗口内至少一个样本的 (pipeline, statement)——`samples` 为分位数的样本支撑，p50/p95/p99 为 **nearest-rank**（升序第 ⌈samples·q⌉ 个，无插值——每个分位值都是一条存储样本，可由环内原始行复算），`node` 为窗口内最新样本的上报节点（仅来源记录，SLO 身份是 pipeline+statement），`oldestMs/newestMs` 为窗口内样本覆盖区间（刚启动的 console 只有几分钟历史）） · **`GET /metrics` 增 `tailrace_slo_lag_p50_seconds` / `tailrace_slo_lag_p95_seconds` / `tailrace_slo_lag_p99_seconds` + `tailrace_slo_lag_samples`**（gauge，console 本地序列：整环（1h）窗口的同一组分位数与样本数，标签 `{pipeline,statement}`（**不带 node**——管道换节点不断档）；环为空时四个 family 都不出现（absent ≠ 0，同目标线惯例）） |
 
 ## 三、关键语义裁决
 
@@ -223,7 +224,8 @@
      评估契约由 mock 快照单测钉住，不是空实现。该类序列不可能携带的过滤（state_failed+statement、heartbeat_age+pipeline/statement）在 POST/PUT 即 400。
    - **窗口算法**（两窗口类）：增量 = 最新值 − 「`now − windowSecs` 时点或之前最近一个样本，**且该样本不早于 `now − windowSecs − 60s`**
      （`BASE_SLACK_SECS`，R9 评审修复：缺样后恢复的首拍若唯一候选基线落在缺口之前，差值跨的是整个缺口而非窗口，此时 Unknown 而非误报）」；
-     样本史只在评估器内存（`CounterWindows`，上限 `MAX_WINDOW_SECS`=3600，无样本存储——蓝图「不做历史 p95」裁决，记 v1.3 候选）；
+     样本史只在评估器内存（`CounterWindows`，上限 `MAX_WINDOW_SECS`=3600，计数器窗口不落库——蓝图「不做历史 p95」裁决；该裁决的 lag 半边已由
+     v1.3 T-V4 兑现为 1h 环形 lag 样本表，计数器窗口仍只在内存，见裁决 14）；
      **窗口内没有可用基线 → Unknown → 保持现状**（console 刚重启的前 windowSecs 内绝不误报，**也不再**把重启前正在触发的窗口类告警假 resolved——
      R9 评审修复前的「先 resolved、窗口填满后再 firing」已消除）；计数器重置（最新值 < 基线）按重置后值计——它是窗口内真实增量的下界，不会误报。
    - **事件逐序列、只在状态迁移时落行**（防刷屏；R9 评审修复把 episode 从「每规则一条」改为「每 (规则, 序列) 一条」，`alert_event.series_key`
@@ -243,7 +245,7 @@
    - **SLO v1（克制）**：lag 规则的阈值即 lag_target——`/metrics` 对每条启用的 lag 规则命中的每条 lag 序列，以**同一标签集**
      （node/pipeline/statement，按代理重标签后的顺序）暴露 `tailrace_slo_lag_target_seconds`；多规则命中同一序列取最紧阈值
      （文本格式不许重复序列）；规则禁用即目标线消失。Grafana 面板 1 据此在同一标签下叠画现值与目标，Prometheus 规则示例给出
-     `lag > on(node,pipeline,statement) target` 的对照写法。
+     `lag > on(node,pipeline,statement) target` 的对照写法。**达成侧（历史 p50/p95/p99）自 v1.3 T-V4 起由样本环提供**——见裁决 14。
    - **验收**（R9 评审重点）：契约测试 `tests/alerts_flow.rs` 13 例——CRUD+审计、阈值边界/迁移才落行/resolved 必达/禁用即关闭、
      窗口对齐（无基线不评、基线滑动、重置下界）、webhook 收到两次迁移且不可达 webhook 不影响迁移、SSE 枢纽广播 + 流端点鉴权、
      mock 节点 → `/metrics` 目标线与 lag 序列同标签 + 评估器消费同一快照并触发；R9 评审修复轮加 6 例——节点不可达保持（不假恢复、
@@ -269,12 +271,39 @@
    - **消费方须知**：`tailrace_dlq_rows_total` 与 stats 的 `bad` 计的是**隔离尝试次数**，不是（v1.3 起）坏行数；**侧文件则是唯一坏行集**——行键 `(statement, cursor, rawB64)`，同一坏字节在同一 poll 时点游标只能经重放复现，故重放窗口内同一坏行只落一行（去重索引在内存、首写时从 side 文件播种，语句/进程重启后依然去重）。下游消费/回放 DLQ 以 `rawB64` 为幂等键的习惯保持不变（现在引擎侧已替你做了）；`dlq_window` 告警规则按隔离尝试次数计数——重放风暴期其增量按次数放大、大于文件行数，属预期且**有意保留**（审计面不丢风暴）。e2e 钉住：重放风暴下 DLQ 行数 = 唯一坏行数，指标 = 尝试次数（`tests/contract/tests/executor_loop.rs` `dlq_replay_storm_dedups_rows_but_counts_attempts`）。
    - **badRowPolicy 透传补齐**：`PipelineConfig` DTO 增 `badRowPolicy` 键（此前五段 DTO 无该键，请求携带即被 serde 静默丢弃——落库 config_json 与推给引擎的 plan `options` 均不见它，`fail` 策略实际按默认 `dlq` 执行，dogfooding round3 #4）。现 DTO 与引擎 `PlanOptions` 键对键镜像，由契约测试 `pipeline_config_wires_every_plan_options_key` 钉住（引擎侧未来加键、console 未跟即测试失败）；取值校验在引擎 deploy 期（非法值整体拒绝 plan）。**非默认值的引擎行为**由 e2e `alert_flow.sh` B 段端到端钉住（R10 评审修复轮，50/50）：skip → 坏行丢弃只计数、不建 `bad_rows/`、管道保持 RUNNING；fail → `STATEMENT_FAILED` 带引擎原文、同批好行不越过游标；`"drop"` → 502 `ENGINE_REJECTED` 点名 `options.badRowPolicy`——证据 `scripts/e2e/evidence/alert-flow-e2e-2026-10-31-r10review/`。
 
+14. **SLO 历史分位（R11 T-V4）：lag 样本环、分位口径与裁剪**（2026-11-01 增补，R11 详案 §二 T-V4 照实施——兑现 R9「不做历史 p95」裁决记下的 v1.3 候选）：
+   - **采样位置 = 告警评估拍**：评估器每一拍（`TAILRACE_ALERT_INTERVAL_SECS`，默认 15s）在 `run_pass_snapshot` 里把**同一份**快照交给
+     `slo::record_pass`（`tailrace-console/src/slo.rs:118`，调用点 `alerting.rs:781`）——不存在第二条采样路径，告警评估看到什么、样本环就记什么；
+     写失败只记 warn，**绝不阻断规则评估**。样本落 console-store 迁移 06 的 `slo_lag_sample`（`pipeline, statement, node, lag_secs, ts_ms`；
+     索引 `(pipeline, statement, ts_ms)` 与 `(ts_ms)`）。
+   - **SLO 身份 = (pipeline, statement)**：console 注入的 `node` 标签只作来源记录（逐样本存储、API 报窗口内最新样本的节点）——管道在节点间迁移
+     不断档；同一拍内两个节点上报同一对（迁移中仍在跑旧副本的节点）记**较差（max）**的 lag：每对每拍至多一个样本，保守读法。
+   - **idle 不采样**（与 T-V1 一致）：同标签集上 `tailrace_pipeline_source_idle == 1` 的 lag 序列量的是沉默墙钟、不是迟到的行——lag 规则对其 hold，
+     SLO 也不计入（否则一夜安静就把每条 p95 拖到小时级）；idle 缺失或为 0 照常采样；节点本拍不可达则其序列不在快照里，不留样本；
+     非有限值/负值/缺 pipeline 或 statement 标签的序列不算 lag 读数。
+   - **分位口径 = nearest-rank，无插值**：n 个样本升序后的 q 分位 = 第 ⌈n·q⌉ 个（1 起计，夹到 [1, n]；实现用整数千分比 `(n·permille).div_ceil(1000)`，
+     秩计算无浮点舍入，`slo.rs:133`）。**每个分位值都是一条存储样本**——拿 `GET /api/slo` 报出的窗口 `(fromMs, toMs]` 去环里取原始行即可逐值复算；
+     例：1..=20 → p50 10 / p95 19 / p99 20。p50/p95/p99 三档固定。
+   - **窗口与环**：读窗口为半开区间 `(now − windowSecs, now]`，`windowSecs` 截断到 1..=3600；**环形保留 1h**（`RETENTION_SECS`，`slo.rs:48`）：
+     每拍在**同一事务**里插入本拍样本并删除 `ts_ms <= now − 1h` 的行（无 lag 序列的空拍也照删，单条 autocommit DELETE、不进 with_tx 计时）；
+     **启动清扫**（`slo::startup_prune`，`main.rs:149`——与回填孤儿清扫同槽位、同 `Ok(0)/Ok(n)/Err` 形态）在监听绑定前删掉停机期间落出环的尾巴，
+     磁盘防线与评估器调度无关。表规模有界：默认间隔每 (pipeline, statement) 约 240 行。
+   - **暴露两面**：`GET /api/slo`（`api/slo.rs:93`，见端点清单）与 `/metrics` 的 `tailrace_slo_lag_p50/p95/p99_seconds` + `tailrace_slo_lag_samples`
+     （`metrics.rs:270` `slo_quantile_lines`，抓取时按整环窗口现算；标签 `{pipeline,statement}`、不带 node；环空则四个 family 都不出现）。
+     目标线 `tailrace_slo_lag_target_seconds` 仍带 node（它镜像 lag 序列标签集）——Grafana 的 SLO 行（`docs/ops/grafana-dashboard.json` 面板 10–12）
+     用 `min by (pipeline, statement)` 把目标折到同一身份上与分位数对照，另有一张 p95/p99/target/samples 合表。
+   - **验收**：契约测试（`tests/alerts_flow.rs` 两例）——`slo_quantiles_recompute_from_the_ring_over_api_and_metrics`（`:1324`：20 拍间隔 15s
+     顺带写环，API 的 p50/p95/p99 与样本数由测试**直接读表**按独立 nearest-rank 复算逐值相等且均为存储样本、idle 拍不留样本、双节点同拍取 max、
+     过滤与窗口截断、`/metrics` 同值同标签、空环无 family）、`slo_window_slides_and_ring_prunes_on_write_and_at_startup`（`:1491`：确定性时钟下
+     窗口随 now 滑动——早期大 lag 未经裁剪即离开窗口、写拍裁剪 1h 尾、空拍照裁、启动清扫幂等）；纯函数单测另钉 nearest-rank 边界、观测提取、
+     汇总排序、半开窗口，store 单测钉批写/半开读/裁剪包含边界，OpenAPI 单测钉路径与 DTO 字段。
+
 ## 四、未决 / 后续
 
 - web 客户端类型（`web/src/api/datasources.ts` 的 `DdlEvolveResponse`、pipelines 的 `StatementOut`/表对象 DTO）尚未同步 T-A7 新字段（`partialUpdatePipelines`、`partialColumns`、`keyModel`）与新端点 PUT /tables/{id}——TS 类型非穷尽校验，运行时忽略多出字段不致破坏，但向导/编辑器尚无 UI 呈现；web 不在 W3 文件域，留后续波。
 - ticket 端点（票据链，600s 单次票据）仍未交付——凭据加密静态半边已落地（见「关键语义裁决」3），票据链为 v1.x 结构性修复。
 - ~~SSH 部署链八步 + 节点进程动作~~（T35 已交付，见端点清单；「逐条暂停→执行→自动恢复」的管道级暂停编排仍留 v1.x——当前动作直接作用于进程，不自动暂停在跑管道）。
-- catalog 快照浏览 / 样本预览 / ~~lag 告警规则~~（T-E2 2026-10-31 交付五类规则引擎 + webhook/SSE + SLO 暴露，见端点清单与裁决 11；web 告警页与历史 p95 不在本波——前者留 web 波，后者记 v1.3 候选）/ SQL 片段助手（后续版本族；discover / infer-schema 已于 T14 交付）。~~jdbc 管道 console 端到端未通~~（T-D1 2026-10-27 清偿大半：plan 下推对 dim/jdbc 表由 connJson `jdbcUrl`（去 `jdbc:` 前缀）填 `bootstrap`、由表对象 `sequence_column` 列填 `sequence_column`——正是 jdbc 源工厂必填两键；维表动线有 console e2e 测试钉住，jdbc 流式批源动线仍未有 console 侧 e2e 覆盖，留后续补）。
+- catalog 快照浏览 / 样本预览 / ~~lag 告警规则~~（T-E2 2026-10-31 交付五类规则引擎 + webhook/SSE + SLO 暴露，见端点清单与裁决 11；web 告警页不在本波（留 web 波）；~~历史 p95~~（v1.3 T-V4 2026-11-01 交付 1h 样本环 + `GET /api/slo` + `/metrics` p50/p95/p99，见裁决 14；web 的 SLO 呈现同留 web 波））/ SQL 片段助手（后续版本族；discover / infer-schema 已于 T14 交付）。~~jdbc 管道 console 端到端未通~~（T-D1 2026-10-27 清偿大半：plan 下推对 dim/jdbc 表由 connJson `jdbcUrl`（去 `jdbc:` 前缀）填 `bootstrap`、由表对象 `sequence_column` 列填 `sequence_column`——正是 jdbc 源工厂必填两键；维表动线有 console e2e 测试钉住，jdbc 流式批源动线仍未有 console 侧 e2e 覆盖，留后续补）。
 - 90s OFFLINE 目前为读时计算；未做后台定时器回写。
 - 回填（T-A2）kafka 源暂 422（分区级 from 寻址未做，见语义裁决 9）；同区间重放
   行数不变（DUPLICATE KEY 实表）与「回填期间主管道持续写入」两条验收由
