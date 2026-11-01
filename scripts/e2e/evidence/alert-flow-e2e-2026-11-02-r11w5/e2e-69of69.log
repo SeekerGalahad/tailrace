@@ -1,0 +1,72 @@
+== alert_flow e2e: work=/tmp/tailrace-af-final console=127.0.0.1:18088 node=127.0.0.1:18108 webhook=127.0.0.1:18190 ==
+  ok    02:21:14  S0.1 console binary /Users/wagic/GLMProjects/tailrace/target/release/tailrace-console
+  ok    02:21:14  S0.2 engine node binary /Users/wagic/GLMProjects/tailrace/target/release/tailrace-node
+  ok    02:21:14  S1.1 mock webhook listening on 127.0.0.1:18190 (records every POST to hook.jsonl)
+  ok    02:21:15  S2.1 console booted (fresh data-dir, TAILRACE_ALERT_INTERVAL_SECS=2)
+  ok    02:21:15  S2.2 login → 200 + token
+  ok    02:21:15  S2.3 file datasource (f=1) — the whole e2e is file→file, no third-party server in the path
+  ok    02:21:16  S2.4 engine node up (serve)
+  ok    02:21:17  S2.5 node ONLINE
+  ok    02:21:17  S2.6 console log carries 'alert evaluator started' (the periodic task is live)
+  ok    02:21:17  R0.1 GET /api/alerts: ruleTypes=5 kinds, intervalSecs=2, empty rule set
+  ok    02:21:17  R0.2 lag rule created (threshold=6s, webhook → mock) id=1
+  ok    02:21:17  R0.3 negative: threshold=0 → 400 (strictly positive required)
+  ok    02:21:17  R0.4 negative: unknown ruleType → 400
+  ok    02:21:18  P1.1 file→file pipeline af-lag-pipe deployed → RUNNING (pipeline #1; tuning pollRows=1/flushRows=1, recovery backoff 20s — section L's rig)
+  ok    02:21:20  P1.2 first row flushed to the sink file (last_data_ms stamped — the lag gauge's basis)
+  ok    02:21:20  P1.3 console /metrics: lag series tailrace_pipeline_lag_seconds{node="engine-node",pipeline="1",statement="0"} 0.049 with the SLO target beside it tailrace_slo_lag_target_seconds{node="engine-node",pipeline="1",statement="0"} 6 — identical label set {node="engine-node",pipeline="1",statement="0"} (T-E2 SLO v1)
+  ok    02:21:20  P1.4 rule state inactive while the data flows (lag ≈ 0 < 6)
+  ok    02:21:20  I1.1 CORE source idle verdict: node tailrace_pipeline_source_idle{pipeline="1",statement="0"} 1 → console tailrace_pipeline_source_idle{node="engine-node",pipeline="1",statement="0"} 1 — gauge 1 on the lag series' own label set {node="engine-node",pipeline="1",statement="0"} (file read to EOF = nothing behind the cursor)
+  ok    02:21:26  I1.2 the lag gauge climbed to 6.36s > threshold 6 while idle stayed 1 — wall time over silence, not a late row
+  ok    02:21:31  I1.3 CORE HELD: ≥2 evaluator passes over lag 11.447s > 6 with idle=1 → rule state=inactive, webhook 0 notices (1.2.0 fired here — the R11 W5 baseline of the pre-revision script read L1.1 state=inactive for the same reason)
+  ok    02:21:31  I2.1 pipeline paused via the console proxy (engine verdict PAUSED — pulling stops, the idle verdict freezes at its last value 1)
+  ok    02:21:36  I2.2 CORE still held through the pause: lag 16.538s, idle=1 frozen, state=inactive, webhook 0 notices
+  ok    02:21:36  I2.3 pipeline resumed (engine verdict RUNNING — polls back on, still at EOF)
+  ok    02:21:37  I3.1 new data: W-2 appended → flushed to the sink (lag re-stamped to 0.949s < 6)
+  ok    02:21:40  I3.2 after the data landed: idle back to 1 (EOF again), state=inactive, webhook still 0 — the whole idle episode produced zero notices
+  ok    02:21:40  L0.1 outage rig: sink path wl is now a directory (the two landed rows parked in wl.keep) and 40000 backlog rows B-1..B-40000 appended behind the cursor
+  ok    02:21:40  L0.2 CORE the first backlog row's flush failed → PIPELINE_RESTART event #1 (backing off 20s) with the idle gauge frozen at 0 (backlog) — a real lag is now accumulating
+  ok    02:21:42  L1.1 CORE REAL lag fired the rule: state=firing (idle=0 + lag 6.235s > 6, strict >) — the same gauge values the idle sections held on, now with backlog behind them
+  ok    02:21:43  L2.1 CORE webhook notice #1: POST x-tailrace-event=firing, sample.value=6.049 > 6 (a NUMBER from the real gauge) and no sample.reason (an evaluated verdict, not a held one)
+  ok    02:21:43  L3.1 alert_event row landed in state firing (open episode id=1 — one row, transition-only)
+  ok    02:21:43  L4.0 sink repaired inside the 20s backoff (directory removed, the landed rows restored) — the restart will drain the backlog
+  ok    02:22:03  L4.1 CORE recovered: state back to inactive — the restart drained the backlog non-idle (idle=0, lag ≈ 0 → Clear)
+  ok    02:22:03  L4.2 CORE the SAME episode row flipped to resolved (id=1 unchanged, resolvedAt set, resolvedSample.value=0.008s < 6 — a real Clear from the drain, not series_absent) — no second row
+  ok    02:22:03  W1 CORE anti-flood: the webhook holds EXACTLY the episode's 2 notices (firing + resolved) — silent while firing persisted through the backoff, silent after it closed
+  ok    02:22:08  W2.1 sink drained: 40002 lines = W-1 + W-2 + 40000 backlog rows, B-1 (the row whose flush failed) present exactly once — the outage cost no row and duplicated none
+  ok    02:22:18  W3 CORE idle tail held: lag back over 6 (6.078s → 11.127s) with idle=1 after the drain, state=inactive, STILL exactly 2 notices across the whole episode (outage, backoff, drain, idle tail) — no re-fire, zero per-tick noise
+  ok    02:22:18  W4 SLO history (T-V4): console /metrics tailrace_slo_lag_p95_seconds{pipeline="1",statement="0"} 24.049 backed by tailrace_slo_lag_samples=14 — only the non-idle drain passes were sampled
+  ok    02:22:18  W5 lag pipeline stopped (series gone; the rule stays inactive — nothing was open to resolve)
+  ok    02:22:18  F0.1 poison seed: 2 rows; the projection below reads (extra, id) against the sink's (id, extra) — first batch bails
+  ok    02:22:19  F0.2 poison pipeline deployed → RUNNING (pipeline #2, recovery.autoRestart=false — the first statement error is terminal, no restart cycle)
+  ok    02:22:19  F1.1 CORE the engine REALLY failed: node /metrics tailrace_pipeline_state{pipeline="2"}=3 (ControlFlags FAILED — the exact series state_failed reads)
+  ok    02:22:19  F1.2 state_failed rule created (no threshold; webhook → mock) id=2
+  ok    02:22:21  F2.1 CORE the rule fired on the real FAILED pipeline within one evaluator tick (~2s)
+  ok    02:22:21  F2.2 webhook notice #3 received (state_failed firing)
+  ok    02:22:21  F3.0 poison pipeline stopped (registry entry gone → the state series disappears from /metrics)
+  ok    02:22:23  F3.1 CORE resolved the honest way: the series is ABSENT while its node still answers /metrics → reason=series_absent (R9 review fix: a node that is DOWN would HOLD the episode instead of faking a recovery)
+  ok    02:22:23  F3.2 webhook notice #4 received (state_failed resolved, sample.reason=series_absent) — 4 notices total across two episodes, every one a transition
+  ok    02:22:25  S3.1 rules deleted (204 ×2) → empty rule set; no extra notice (none was firing — a firing rule would have been closed with reason=deleted and its resolved delivered first)
+  ok    02:22:25  B1.1 badRowPolicy=skip pipeline deployed → RUNNING (pipeline #3; seed = good, MALFORMED, good)
+  ok    02:22:25  B1.2 CORE node.log start line for pipeline #3 says bad_row_policy=skip — the value crossed console → config_json → plan.options → engine parse_strict (the engine's own log, not the DTO)
+  ok    02:22:27  B1.3 CORE skip semantics: both good rows (S-1, S-2) flushed around the dropped row, tailrace_pipeline_state=0 (not FAILED)
+  ok    02:22:27  B1.4 CORE skip ≠ dlq: no bad_rows/p3-s0.jsonl was created and the DECODE_BAD event reads 'badRowPolicy=skip (rows dropped, counted only)'
+  ok    02:22:27  B1.5 skip pipeline stopped
+  ok    02:22:27  B2.1 badRowPolicy=fail pipeline deployed → RUNNING (pipeline #4; seed = good, MALFORMED — one poll, one batch)
+  ok    02:22:27  B2.2 node.log start line for pipeline #4 says bad_row_policy=fail
+  ok    02:22:27  B2.3 CORE fail semantics: the malformed row IS a statement error — tailrace_pipeline_state{pipeline="4"}=3 (terminal FAILED under autoRestart=false)
+  ok    02:22:27  B2.4 CORE STATEMENT_FAILED event carries the engine's own text 'decode bad row under badRowPolicy=fail' — the fail branch ran, not section F's projection fault
+  ok    02:22:27  B2.5 fail halts BEFORE the cursor crosses the batch: the good row that shared the poll with the poison was not written (bp_fail holds 0 × X-1)
+  ok    02:22:27  B2.6 fail pipeline stopped
+  ok    02:22:27  B3.1 negative: badRowPolicy="drop" passes create/publish and the ENGINE rejects the plan at deploy → 502 ENGINE_REJECTED naming options.badRowPolicy (strict parse, no silent fallback to dlq)
+  ok    02:22:27  D0.1 storm rig: sink path dlq_sink pre-created as a DIRECTORY, seed = good, 3 × MALFORMED, good (one poll, one batch); pipeline af-dlq-pipe deployed → RUNNING (#6, backoff [1,8])
+  ok    02:22:30  D1.1 CORE replay storm: tailrace_dlq_rows_total{pipeline="6"}=6 (3 bad rows × ≥2 isolation attempts) while bad_rows/p6-s0.jsonl holds 3 lines — the counter kept the storm, the table did not grow
+  ok    02:22:30  D1.2 the replays were real restarts: 1 PIPELINE_RESTART event(s) for pipeline#6 (flush into a directory fails every attempt)
+  ok    02:22:30  D2.0 sink repaired inside the second backoff (directory removed — FileSink creates the file on its next flush)
+  ok    02:22:32  D2.1 CORE after the repair the good rows landed exactly once (G-1, G-2 — the failed flushes wrote nothing) and the pipeline is not FAILED (tailrace_pipeline_state=0): the storm was survivable
+  ok    02:22:32  D3.1 CORE T-V2 contract: tailrace_dlq_rows_total=6 = 3 bad rows × 2 isolation attempts (every attempt counted), side file = 3 lines = the unique bad rows (dogfooding round 3 #3 read 9 lines for 3 rows here)
+  ok    02:22:32  D3.2 the side file's rawB64 set decodes to exactly the three seeded bad lines — each quarantined once, byte-exact, replayable
+  ok    02:22:32  D3.3 storm pipeline stopped
+  ok    02:22:32  D3.4 webhook untouched by sections B and D: still the 4 notices of the two rule episodes
+== alert_flow e2e summary: 69/69 steps passed ==
+EXIT=0

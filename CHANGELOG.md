@@ -107,6 +107,48 @@ _v1.3 development line (`feature/v1.3-dev`, R11 §二). Anchors are
   the store's batch/prune bounds. Semantics in
   `docs/protocol/console-api.md` 裁决 14.
 
+- **R11 wave-5 end-to-end recertification + dogfooding round 4** (W5). The
+  alerting e2e `scripts/e2e/alert_flow.sh` is rewritten around the T-V1/T-V2
+  semantics and goes 50 → 69 steps, all green (evidence
+  `scripts/e2e/evidence/alert-flow-e2e-2026-11-02-r11w5/`). The idle scenario
+  is asserted head-on: a file source at EOF publishes
+  `tailrace_pipeline_source_idle=1`, the lag gauge climbs past the threshold
+  over pure silence and the rule is HELD — through a pause too (the verdict
+  freezes at its last poll) — no firing, no notice; new data re-stamps the
+  lag and the episode stays quiet. A REAL lag is manufactured the way an
+  operator meets one: rows pile up behind a sink whose target path became a
+  directory, the first backlog row's flush fails and the restart backoff
+  freezes the counters at idle=0 → firing; repairing the sink inside the
+  backoff lets the restart drain the backlog non-idle (lag ≈ 0 → Clear) and
+  the SAME episode resolves; back at EOF the climbing lag is held again — no
+  re-fire (round-3 #6's oscillation gone) — and the drain's non-idle passes
+  leave `tailrace_slo_lag_p95_seconds` with sample support (T-V4
+  cross-check). The pre-revision script had actually been broken by T-V1 —
+  its lag was manufactured by pausing an EOF source, which now reads idle and
+  holds (baseline 40/50, `L1.1 state=inactive`; W1-W4 shipped without
+  re-running it) — and a pre-existing `wait_hook` bug (arguments read from
+  `$2`/`$3` since R9, so every call waited the full 60s before returning the
+  real count) went with it. New section D drives a replay storm through the
+  console (sink target a directory, backoff `[1,8]`):
+  `tailrace_dlq_rows_total` reaches 3 × attempts while `bad_rows/` holds
+  each bad row once (rawB64 round-trips the three seeded lines), and after
+  the repair the good rows land exactly once (T-V2's "表唯一化、计数不变").
+  `scripts/dogfood/round4.sh` (36/36, `scripts/dogfood/evidence/
+  round4-2026-11-02/`) drives a declaration file through the MCP face only —
+  dry-run diff → apply (confirm-gated, rejected without) → idempotent
+  re-apply (second summary all-zero, objects byte-untouched) → a v2 edit
+  showing the field-level diff (`checkpointMs 2000 → 5000`) → orphan and
+  omitted-config probes (reported, never deleted / `config → null` shown) →
+  the audit trail read back (exactly one `MCP_TOOL_CALL` row per call,
+  `APPLY` rows only for applies that wrote, `via:"apply"` domain rows under
+  `mcp:<client>`) — and reads SLO p95 back over `/api/slo` + `/metrics` with
+  its sample count. Findings in `docs/dev/dogfooding-round4-2026-10-31.md`:
+  the idle hold shadows a Clear when a backlog drains within one evaluator
+  tick (the episode lingers firing until the next data or stop — R12
+  candidate), pure-MCP GitOps stops at publish (no tool in the ≤16 budget;
+  `deploy_pipeline` on a DRAFT answers 400), the tables-list GET lives at a
+  different path shape than its POST (405), and a file-source pipeline only
+  feeds the SLO ring while draining (EOF = idle = not sampled).
 ### Changed
 
 - **DLQ side file is a set of bad rows, not a log of isolation attempts**

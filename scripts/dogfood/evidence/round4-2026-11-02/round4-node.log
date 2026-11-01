@@ -1,0 +1,10 @@
+[2m2026-11-01T18:22:34.467640Z[0m [32m INFO[0m [2mtailrace_node[0m[2m:[0m /v1 node token source (value not logged) [3morigin[0m[2m=[0mBootstrapFlag
+heartbeat enabled: control-plane=http://127.0.0.1:18094 advertise=127.0.0.1:18114 state_dir=/tmp/tailrace-df4-final/node-state secs=2
+tailrace-node serve mode: http://127.0.0.1:18114 (/healthz open; /v1 requires the node token)
+[2m2026-11-01T18:22:34.467902Z[0m [32m INFO[0m [2mtailrace_api::heartbeat[0m[2m:[0m identity ready [3mnode_key[0m[2m=[0msn-f7ccd314d12cb7c5 [3mname[0m[2m=[0mengine-node [3mcontrol_plane[0m[2m=[0m"http://127.0.0.1:18094"
+[2m2026-11-01T18:22:34.468589Z[0m [32m INFO[0m [2mtailrace_api::heartbeat[0m[2m:[0m adopted console-issued per-node token (persisted, m2m + /v1 rotated)
+[2m2026-11-01T18:22:34.468594Z[0m [32m INFO[0m [2mtailrace_api::heartbeat[0m[2m:[0m self-registration ok [3mnode_key[0m[2m=[0msn-f7ccd314d12cb7c5
+[2m2026-11-01T18:22:38.061365Z[0m [32m INFO[0m [2mtailrace_runtime::registry[0m[2m:[0m pipeline started (serve) [3mpipeline_id[0m[2m=[0m1 [3mstatements[0m[2m=[0m1 [3mdispatch_id[0m[2m=[0m1793557358060000 [3mbad_row_policy[0m[2m=[0mdlq
+[2m2026-11-01T18:23:03.912535Z[0m [32m INFO[0m [2mtailrace_runtime::registry[0m[2m:[0m pipeline stopped (final flush + cursor commit done in the statement threads) [3mpipeline_id[0m[2m=[0m1
+[2m2026-11-01T18:23:03.931440Z[0m [32m INFO[0m [2mtailrace_api::heartbeat[0m[2m:[0m heartbeat shut down
+serve shut down gracefully, exiting

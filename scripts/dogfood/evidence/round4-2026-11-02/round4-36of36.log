@@ -1,0 +1,39 @@
+== dogfooding round4: work=/tmp/tailrace-df4-final console=127.0.0.1:18094 node=127.0.0.1:18114 rows=120000 ==
+  ok    02:22:33  S0.1 console binary /Users/wagic/GLMProjects/tailrace/target/release/tailrace-console
+  ok    02:22:33  S0.2 node binary /Users/wagic/GLMProjects/tailrace/target/release/tailrace-node
+  ok    02:22:34  D1.1 console booted with --mcp-allow-write (alert evaluator at 2s)
+  ok    02:22:34  D1.2 console log: 'mcp: http://127.0.0.1:18094/mcp (write tools ENABLED)'
+  ok    02:22:34  D1.3 REST login (publish needs a session — see G3)
+  ok    02:22:34  D1.4 engine node up (serve; file tables resolve against /tmp/tailrace-df4-final/node)
+  ok    02:22:36  D1.5 node ONLINE (the deploy in G3 needs it)
+  ok    02:22:36  M0.1 initialize → serverInfo tailrace-console, session a823c170eeb46575e759e48dfbd00cf5 (client dogfood-r4)
+  ok    02:22:36  M0.2 tools/list: 16 tools incl. apply (W, confirm-gated) + apply_dry_run (R); descriptions route-prefixed by the OpenAPI same-source generation ('POST /api/apply…')
+  ok    02:22:36  G1.0 declaration file v1 written (1 file datasource, 2 tables, 1 pipeline — tuning pollRows=1/flushRows=1 declared in the file so the SLO drain below is observable at all)
+  ok    02:22:36  G1.1 CORE apply_dry_run (read tool, no confirm): dryRun=true, summary {"create":4,"orphan":0,"unchanged":0,"update":0}, every action=create — the diff before anything exists
+  ok    02:22:36  G1.2 dry-run wrote nothing: 0 pipelines, 0 datasources in the store
+  ok    02:22:36  G1.3 apply WITHOUT confirm → JSON-RPC -32602 CONFIRM_REQUIRED (write gate 2), nothing applied
+  ok    02:22:36  G1.4 CORE apply WITH confirm → http 200, summary {"create":4,"orphan":0,"unchanged":0,"update":0} == the dry-run summary (one plan() for both), pipeline id=1 assigned
+  ok    02:22:36  G1.5 the created pipeline reads back DRAFT, dsMapping name→id resolved (local=1), config.tuning.pollRows=1 carried verbatim — apply 不发布不部署
+  ok    02:22:36  G1.6 CORE dry-run after apply: summary {"create":0,"orphan":0,"unchanged":4,"update":0} — the file has converged with the store
+  ok    02:22:37  G1.7 CORE 幂等二连: second apply summary {"create":0,"orphan":0,"unchanged":4,"update":0}, pipeline updatedAt byte-unchanged (2026-11-01T18:22:36Z), datasource generation still 1 — unchanged objects are not touched
+  ok    02:22:38  G3.1 FRICTION (by design, recorded): MCP deploy_pipeline on the fresh DRAFT → isError http 400 '管道尚未发布（无 spec 快照），先执行发布' — there is no publish tool in the ≤16 budget, so the GitOps loop leaves MCP here
+  ok    02:22:38  G3.2 publish via ONE REST call (the only step off the MCP face)
+  ok    02:22:38  S1.0 SLO rig: 120000 backlog rows seeded into orders_in before the deploy (pollRows=1+flushRows=1 keep the source non-idle for tens of seconds)
+  ok    02:22:38  G3.3 CORE deploy back through MCP → engine ok=true (the pipeline is live; SQL/tables came from the applied declaration)
+  ok    02:22:38  G3.4 pipeline RUNNING (file→file, declared end to end by pipelines.v1.json)
+  ok    02:22:38  S2.1 lag rule df4-lag (threshold 30s, pipeline=1, no webhook) → the SLO target line
+  ok    02:22:44  S2.2 CORE GET /api/slo?pipeline=1: p50=0.01 p95=0.014 p99=0.014, samples=3 — the quantiles carry their support (non-idle drain passes only; T-V1 idle series are not sampled)
+  ok    02:22:44  S2.3 console /metrics: tailrace_slo_lag_p95_seconds{pipeline="1",statement="0"} 0.014 with tailrace_slo_lag_samples{pipeline="1",statement="0"} 3 beside the target tailrace_slo_lag_target_seconds{node="engine-node",pipeline="1",statement="0"} 30 — the Grafana SLO row's data plane
+  ok    02:22:59  S2.4 backlog drained: 120000 rows landed in orders_out in ≤21s (≈5714 rows/s at pollRows=1 — the per-row batch cost is the drain's speed)
+  ok    02:23:03  S2.5 after the drain: idle gauge 'tailrace_pipeline_source_idle{node="engine-node",pipeline="1",statement="0"} 1' (EOF), the ring keeps its 10 samples (1h retention) — no new samples accrue over silence
+  ok    02:23:03  G4.1 CORE v2 dry-run: summary {"create":0,"orphan":0,"unchanged":3,"update":1}, exactly one update — pipelines[0].changes=[{field: checkpointMs, from: 2000, to: 5000}] (field-level diff, not a whole-object swap)
+  ok    02:23:03  G4.2 CORE apply v2 → checkpointMs=5000 landed, status=PENDING_CHANGES (a non-DRAFT save flips PENDING_CHANGES; apply 不发布不部署 — the RUNNING pipeline itself is untouched)
+  ok    02:23:03  G4.3 v2 re-apply → summary {"create":0,"orphan":0,"unchanged":4,"update":0} (converged again — the GitOps loop's steady state)
+  ok    02:23:03  G5.1 orphan probe: a tables-section naming only orders_in → summary {"create":0,"orphan":1,"unchanged":1,"update":0}, orphans[0]=df4-files/local.orders_out — REPORTED, never deleted (v1 safety)
+  ok    02:23:03  G5.2 the orphaned table still registered (total=2) — a dry-run never deletes
+  ok    02:23:03  G5.3 omitted-config probe: dry-run shows pipelines[0] update with a config change '… -> null' — omitting config DECLARES 'no advanced config' (pipeline-file.md §五); an export that drops config would wipe tuning on apply
+  ok    02:23:03  A1 audit trail: exactly 12 MCP_TOOL_CALL rows — one per tools/call, actor mcp:dogfood-r4; exactly 2 APPLY summary rows (v1 create + v2 update — dry-runs AND the two no-op re-applies audited nothing); PIPELINE_CREATE carries via=apply under the MCP actor
+  ok    02:23:03  D9.1 pipeline stopped
+  ok    02:23:03  D9.2 lag rule deleted
+== dogfooding round4 summary: 36/36 steps passed ==
+EXIT=0
