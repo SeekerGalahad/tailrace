@@ -44,6 +44,29 @@ _v1.3 development line (`feature/v1.3-dev`, R11 §二). Anchors are
   kafka catch-up hold while real backlog still fires (alerting unit tests
   ×3 + driver-level `evaluator_holds_lag_episodes_while_source_idle`), file
   source EOF/backlog/missing verdicts, kafka streak logic, metrics mapping.
+- **MCP apply pair: the tool face goes 14 → 16, spending the ≤16 budget**
+  (T-V3, R11). Two new tools over `POST /mcp`
+  (`console/crates/tailrace-console/src/mcp.rs:104`, the `TOOLS` table):
+  `apply` (write) and `apply_dry_run` (read) are thin adapters on the
+  T-G6 endpoints `POST /api/apply` / `POST /api/apply/dry-run` — the same
+  handlers, the same `plan()`, so the diff an MCP client previews is the
+  diff apply lands (`mcp.rs:643`). The declaration file rides the call
+  arguments verbatim with `confirm` lifted out (the handler's own
+  top-level key check keeps refusing a typo'd section as a 400). The
+  write trio holds: `apply` needs BOTH `--mcp-allow-write` /
+  `MCP_ALLOW_WRITE=1` AND `"confirm": true`; `apply_dry_run` is always on
+  and, like its REST route, writes nothing and audits nothing beyond the
+  call's own `MCP_TOOL_CALL` envelope row. Tool descriptions stay
+  OpenAPI-generated (same-source; the apply routes were already
+  registered by T-G6, so no OpenAPI change). A passed `apply` produces
+  the handler's own domain rows (DATASOURCE/TABLE/PIPELINE_CREATE … with
+  `"via":"apply"`) plus the APPLY summary row under `mcp:<client>`. Pinned
+  by the surface unit test (16 tools, 9R+7W) and the contract tests:
+  switch-off rejection + audit row, dry-run zero side effects (store and
+  audit byte-identical but the envelope row), confirm gate, idempotent
+  re-apply auditing only the envelope (`tests/mcp_server.rs:595`).
+  `initialize` instructions and `docs/protocol/console-api.md` §五's
+  mirror table updated to the sixteen.
 
 ### Changed
 
@@ -68,6 +91,16 @@ _v1.3 development line (`feature/v1.3-dev`, R11 §二). Anchors are
   `docs/protocol/console-api.md` 裁决 13 is updated to "表唯一化、计数不变";
   the downstream `rawB64` idempotency habit stays valid but the engine no
   longer produces duplicate rows.
+
+### Fixed
+
+- **Public-face leftovers from the blueprint W0 public-surface sweep** (the
+  three items that slipped it, T-V3's rider). `tailrace-console --help`
+  still said "the four MCP write tools" when six (now seven) ship — now the
+  actual count (`console/crates/tailrace-console/src/main.rs:32`).
+  `SECURITY.md` still claimed "pre-1.0 (`0.1.x`)" — now post-1.0 (the `1.x`
+  line). `.github/ISSUE_TEMPLATE/config.yml` still pointed security reports
+  at a `TODO` URL — now the real repository's private advisory channel.
 
 ## [1.2.0] - 2026-10-31
 

@@ -2,7 +2,7 @@
 
 > 管理面 REST 协议正典（`tailrace-console` 二进制）。随 utoipa 注解同步维护；
 > 机器可读正典 = 运行时 `/api-docs/openapi.json`（65 路径，`tailrace-console/src/openapi.rs` `paths(…)` 登记数，2026-10-31 实测），Swagger UI 在 `/swagger-ui/`。
-> 首版 2026-10-11；鉴权协议安全修复改版 2026-10-13；MCP 面正典化 + 维表（T-D1）动线增补 2026-10-27；建表闭环（T-A1）三端点增补 2026-10-28；回填（T-A2）两端点增补 2026-10-28；部分列更新（T-A7）控制面开关 + evolve 双向互斥 + keyModel 登记增补 2026-10-28；R8 类型地基轮同步 2026-10-30（MCP 10→14 工具 + 工具描述 OpenAPI 同源；建表闭环词汇映射 4→13（A3）；infer-schema 收 `debezium-json` + 列型按十六词词汇收窄；draft body 增 `columnTypes`）；R8.5 评审修复轮 2026-10-30（三处 pre-A3 时态残留清偿：openapi 路径计数 49→58、evolve 比对词汇「4 类」→十六词、分区候选规则改为 A3 名称×类型双判——`int64`/`date`/`timestamp` 皆可取 RANGE 键）；告警/SLO（T-E2）五端点增补 2026-10-31（openapi 路径计数 58→63；规则引擎在 console、五类规则、事件只在状态迁移落行、webhook+SSE 投递、`/metrics` 增 `tailrace_slo_lag_target_seconds`——详见语义裁决 11）；管道即代码（T-G6）两端点增补 2026-10-31（openapi 路径计数 63→65；`POST /api/apply[/dry-run]` 声明文件结构化 diff + 幂等 upsert、CLI 薄壳 `tailrace-console apply`、JSON-only v1——详见语义裁决 12 与 `docs/ops/pipeline-file.md`）。
+> 首版 2026-10-11；鉴权协议安全修复改版 2026-10-13；MCP 面正典化 + 维表（T-D1）动线增补 2026-10-27；建表闭环（T-A1）三端点增补 2026-10-28；回填（T-A2）两端点增补 2026-10-28；部分列更新（T-A7）控制面开关 + evolve 双向互斥 + keyModel 登记增补 2026-10-28；R8 类型地基轮同步 2026-10-30（MCP 10→14 工具 + 工具描述 OpenAPI 同源；建表闭环词汇映射 4→13（A3）；infer-schema 收 `debezium-json` + 列型按十六词词汇收窄；draft body 增 `columnTypes`）；R8.5 评审修复轮 2026-10-30（三处 pre-A3 时态残留清偿：openapi 路径计数 49→58、evolve 比对词汇「4 类」→十六词、分区候选规则改为 A3 名称×类型双判——`int64`/`date`/`timestamp` 皆可取 RANGE 键）；告警/SLO（T-E2）五端点增补 2026-10-31（openapi 路径计数 58→63；规则引擎在 console、五类规则、事件只在状态迁移落行、webhook+SSE 投递、`/metrics` 增 `tailrace_slo_lag_target_seconds`——详见语义裁决 11）；管道即代码（T-G6）两端点增补 2026-10-31（openapi 路径计数 63→65；`POST /api/apply[/dry-run]` 声明文件结构化 diff + 幂等 upsert、CLI 薄壳 `tailrace-console apply`、JSON-only v1——详见语义裁决 12 与 `docs/ops/pipeline-file.md`）；R11 MCP apply 对（T-V3）增补 2026-11-01（MCP 14→16 工具=9R+7W，≤16 预算用满；`apply`(W)/`apply_dry_run`(R) 复用同一 G6 端点与 `plan()`，dry-run 零域审计；openapi 路径计数不变——两路径 T-G6 已登记）。
 
 ## 一、通用约定
 
@@ -254,7 +254,7 @@
     `scripts/e2e/evidence/alert-flow-e2e-2026-10-31-r10recert/e2e-38of38.log`）。
 
 12. **管道即代码（T-G6）的声明语义、幂等口径与安全边界**（2026-10-31 增补，R10 详案设计裁决照实施）：
-   - **服务端单一入口**：diff 只在服务端算一份（`api/apply.rs` 的 `plan()`），dry-run 与 apply 共用同一计划函数，CLI/CI（及后续 MCP 包装）全走这对端点——「人审的 diff」与「机器落的变更」不可能不一致。CLI 薄壳零 diff 逻辑，只渲染。
+   - **服务端单一入口**：diff 只在服务端算一份（`api/apply.rs` 的 `plan()`），dry-run 与 apply 共用同一计划函数，CLI/CI 及 MCP 工具（R11 T-V3 的 `apply`/`apply_dry_run`）全走这对端点——「人审的 diff」与「机器落的变更」不可能不一致。CLI 薄壳零 diff 逻辑，只渲染。
    - **JSON-only v1**：serde_yaml 已弃维护（RUSTSEC 风险）不引入；YAML 用户 `yq -o=json '.' x.yaml > x.json` 一行转换。schema 由 compile 期 serde 同源保证（条目=REST DTO），不设第二份 schema 文件；字段说明与示例落 `docs/ops/pipeline-file.md`。
    - **键缺省 vs 键存在**：`datasources`/`tables`/`pipelines` 三顶层键，缺省=本文件不对该类表态（不 diff 不动不报 orphan）；存在（含空数组）=声明该类**全集**，未点名者进 `orphans[]`（只报告，绝不删）。响应同构：未声明的节在响应里**整键省略**（skip_serializing），声明节哪怕空数组也在场。顶层未知键 400（`err.apply.unknown_key`，防 `"pipeline"` 手滑静默丢半份 diff）。
    - **幂等口径**：同文件二连 apply，第二次 summary 全零、零写零审计；unchanged 对象**字节不动**（数据源 generation 不 +1、已发布管道不翻 PENDING_CHANGES——不做无谓 UPDATE）。管道更新与 `PUT /api/pipelines/{id}` 同语义（apply 不发布不部署）；凭据解密比对（相同不重封，新 nonce 不产生伪漂移）。apply 的 `generation` CAS 字段一律忽略，服务端取当前代；apply 中途被并发修改 → 409 拒绝（不盲写）。
@@ -291,9 +291,9 @@
 ## 五、MCP 面（`POST /mcp`，T-E4 / 蓝图 §7.5）
 
 - **传输**：Streamable HTTP 请求/响应（无服务端 SSE 流）；单 body 单 JSON-RPC 消息，batch 拒绝（-32600）；`initialize` 发 `Mcp-Session-Id`（后续调用按 clientInfo.name 归因，未带回落 `X-MCP-Client`/`User-Agent`/anonymous）。协议版本 `2025-06-18`（echo 旧已知版本）。无 console 会话——全局固定窗口限速（默认 100 req/s，超限 429 + -32002）。
-- **写闸门**：六个写工具需**双重确认**——进程级开关 `--mcp-allow-write` / `MCP_ALLOW_WRITE=1` **且**调用参数 `"confirm": true`；缺一以 `WRITE_DISABLED`(-32001) / `INVALID_PARAMS`(code CONFIRM_REQUIRED) 拒绝。
-- **审计**：每次工具调用——成功、失败、被拒——都落 `audit_log` 为 `MCP_TOOL_CALL`（actor=`mcp:<client>`），含从未到达工具执行的尝试（未知工具名 / 缺名 / 非对象 arguments，以 UNKNOWN_TOOL / INVALID_PARAMS 登记）；过闸的写调用另产生对应 REST 域审计行（PIPELINE_CREATE 等，operator 归到 MCP 身份）。
-- **十四工具表**（`tools/list` 顺序；R=读恒开，W=写需闸门）——蓝图 §7.5 的十工具 + R8 四工具（建表闭环 `ddl_draft`/`ddl_execute`/`ddl_evolve` 与回填进度 `backfill_status`，≤16 预算内）；仓库内正典即 `tailrace-console/src/mcp.rs:90` 的 `TOOLS` 表与单测 `tool_table_matches_the_registered_surface`（`mcp.rs:1216`：14 工具、8R+6W、唯一名、写必 confirm）。**工具描述自 R8 起由 OpenAPI 文档同源生成**（`openapi_tool_description`，`mcp.rs:748`——`tools/list` 的 description 取自 utoipa 注解，无第二份手写文案可漂移）。此处镜像供评审对拍：
+- **写闸门**：七个写工具需**双重确认**——进程级开关 `--mcp-allow-write` / `MCP_ALLOW_WRITE=1` **且**调用参数 `"confirm": true`；缺一以 `WRITE_DISABLED`(-32001) / `INVALID_PARAMS`(code CONFIRM_REQUIRED) 拒绝。
+- **审计**：每次工具调用——成功、失败、被拒——都落 `audit_log` 为 `MCP_TOOL_CALL`（actor=`mcp:<client>`），含从未到达工具执行的尝试（未知工具名 / 缺名 / 非对象 arguments，以 UNKNOWN_TOOL / INVALID_PARAMS 登记）；过闸的写调用另产生对应 REST 域审计行（PIPELINE_CREATE、T-G6 逐写入行 + APPLY 汇总等，operator 归到 MCP 身份）。
+- **十六工具表**（`tools/list` 顺序；R=读恒开，W=写需闸门）——蓝图 §7.5 的十工具 + R8 四工具（建表闭环 `ddl_draft`/`ddl_execute`/`ddl_evolve` 与回填进度 `backfill_status`）+ R11 管道即代码对（`apply`/`apply_dry_run`，T-V3——≤16 预算用满，再加工具需先裁预算）；仓库内正典即 `tailrace-console/src/mcp.rs:104` 的 `TOOLS` 表与单测 `tool_table_matches_the_registered_surface`（`mcp.rs:1280`：16 工具、9R+7W、唯一名、写必 confirm）。**工具描述自 R8 起由 OpenAPI 文档同源生成**（`openapi_tool_description`，`mcp.rs:782`——`tools/list` 的 description 取自 utoipa 注解，无第二份手写文案可漂移）。此处镜像供评审对拍：
 
 | # | 工具 | 读写 | 映射 | 关键参数 |
 |---|---|---|---|---|
@@ -311,5 +311,7 @@
 | 12 | `ddl_execute` | W | POST …/ddl/execute | `datasourceId` `db` `table` `ddl` `keyModel` + `confirm` |
 | 13 | `ddl_evolve` | W | POST …/ddl/evolve | `datasourceId` `db` `table` + `confirm` |
 | 14 | `backfill_status` | R | GET /api/pipelines/{id}/backfill/jobs | `id` |
+| 15 | `apply` | W | POST /api/apply（T-G6 幂等 upsert；声明文件即参数原文，`confirm` 剥离后透传） | `datasources?` `tables?` `pipelines?`（声明文件三段，缺省段不管理——见 §四与 `docs/ops/pipeline-file.md`）+ `confirm` |
+| 16 | `apply_dry_run` | R | POST /api/apply/dry-run（同一 `plan()` 的结构化 diff；零写入零域审计——只落本调用信封行） | `datasources?` `tables?` `pipelines?`（与 `apply` 同一文件形态） |
 
 - **结果信封**：`content`（文本）+ `structuredContent`（`httpStatus` + 处理器 body 原文）+ `isError`（镜像 REST 状态）。

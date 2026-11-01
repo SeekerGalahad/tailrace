@@ -7,15 +7,16 @@
 //! client's declared `clientInfo.name`; clients that do not echo it fall
 //! back to `X-MCP-Client` / `User-Agent` labelling.
 //!
-//! Tools: fourteen entries (the §7.5 ten plus the R8 four — DDL
+//! Tools: sixteen entries (the §7.5 ten, the R8 four — DDL
 //! draft/execute/evolve and backfill status; `trigger_backfill` already
-//! covered create-with-dryRun), each a thin adapter over the REST handler
-//! it maps to — same DTOs, same error envelopes, invoked in-process (no
-//! HTTP hop, no session middleware; `/mcp` follows the MCP convention of no
-//! console auth, only a global fixed-window rate limit). Read tools are
-//! always on. The six write tools need BOTH the process-level switch
-//! (`--mcp-allow-write` / `MCP_ALLOW_WRITE=1`) AND `"confirm": true` in the
-//! call arguments.
+//! covered create-with-dryRun — and the R11 pipeline-as-code pair
+//! `apply` / `apply_dry_run`, which spends the ≤16 budget), each a thin
+//! adapter over the REST handler it maps to — same DTOs, same error
+//! envelopes, invoked in-process (no HTTP hop, no session middleware;
+//! `/mcp` follows the MCP convention of no console auth, only a global
+//! fixed-window rate limit). Read tools are always on. The seven write
+//! tools need BOTH the process-level switch (`--mcp-allow-write` /
+//! `MCP_ALLOW_WRITE=1`) AND `"confirm": true` in the call arguments.
 //!
 //! Tool descriptions are GENERATED from the OpenAPI document (R8): each
 //! tool names its `(method, path)` and the description text is the
@@ -29,12 +30,22 @@
 //! non-string name, non-object `arguments` — audited as rejected with
 //! `UNKNOWN_TOOL` / `INVALID_PARAMS`). Write tools that pass the gates
 //! additionally produce the REST handler's own domain
-//! audit row (PIPELINE_CREATE / PIPELINE_DEPLOY / PIPELINE_ACTION) under
-//! the same actor: the handler's operator resolves to the MCP identity.
+//! audit row (PIPELINE_CREATE / PIPELINE_DEPLOY / PIPELINE_ACTION, the T-G6
+//! per-write rows plus the APPLY summary) under the same actor: the
+//! handler's operator resolves to the MCP identity.
 //!
 //! `trigger_backfill` (T-A2, §7.3): maps to POST /api/pipelines/{id}/backfill
 //! with `dryRun` defaulting to TRUE (blueprint §7.5 — an MCP caller gets the
 //! zero-side-effect preview unless it explicitly asks for execution).
+//!
+//! `apply` / `apply_dry_run` (T-V3, R11): the T-G6 pipeline-as-code pair as
+//! tools — POST /api/apply and POST /api/apply/dry-run, the declaration file
+//! riding the call arguments verbatim (minus `confirm`). The diff is computed
+//! once, server-side, by the same `plan()` the CLI shell and CI hit, so an
+//! MCP client cannot see a different diff than the one apply lands. The dry
+//! run has zero side effects (nothing written, nothing audited beyond this
+//! module's MCP_TOOL_CALL envelope row); the apply is the idempotent upsert
+//! behind both write gates.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -86,7 +97,10 @@ pub const RATE_LIMITED: i64 = -32002;
 /// four: the DDL closed loop (`ddl_draft` read — it composes text only;
 /// `ddl_execute` / `ddl_evolve` write — they run DDL on Doris) and
 /// `backfill_status` (read — the job progress list; `trigger_backfill`
-/// already covers create, dryRun included). Fourteen of the ≤16 budget.
+/// already covers create, dryRun included). The R11 pair closes the
+/// sixteen: `apply` write (the T-G6 idempotent upsert), `apply_dry_run`
+/// read (the same diff, zero side effects). Sixteen of the ≤16 budget —
+/// the surface is full; a new tool needs a budget ruling first.
 pub const TOOLS: &[(&str, bool)] = &[
     ("list_datasources", false),
     ("list_pipelines", false),
@@ -102,6 +116,8 @@ pub const TOOLS: &[(&str, bool)] = &[
     ("ddl_execute", true),
     ("ddl_evolve", true),
     ("backfill_status", false),
+    ("apply", true),
+    ("apply_dry_run", false),
 ];
 
 // ---------------- state / router ----------------
@@ -358,10 +374,10 @@ fn instructions(allow_write: bool) -> String {
     };
     format!(
         "Tailrace console management plane. Read tools (list/get/compile, ddl_draft, \
-         backfill_status) are always available. Write tools (create_pipeline, \
-         deploy_pipeline, pause_resume_pipeline, trigger_backfill, ddl_execute, ddl_evolve) \
-         are {writes}; every write call must also pass \"confirm\": true. All calls are \
-         audited as actor mcp:<client>."
+         backfill_status, apply_dry_run) are always available. Write tools (create_pipeline, \
+         deploy_pipeline, pause_resume_pipeline, trigger_backfill, ddl_execute, ddl_evolve, \
+         apply) are {writes}; every write call must also pass \"confirm\": true. All calls \
+         are audited as actor mcp:<client>."
     )
 }
 
@@ -616,6 +632,22 @@ async fn execute(
             api::datasources::ddl_evolve(st, identity(), HeaderMap::new(), Path(target)).await
         }
         "backfill_status" => api::pipelines::backfill_jobs(st, Path(req_i64(args, "id")?)).await,
+        // R11 (T-V3): the T-G6 pipeline-as-code pair. The arguments ARE the
+        // declaration file (datasources / tables / pipelines sections) and
+        // pass through verbatim once `confirm` is lifted out — the handler's
+        // own top-level key check then refuses a typo'd section as a 400,
+        // exactly as it does for the CLI shell. Both run the same `plan()`:
+        // dry-run stops at the diff (handler-side zero side effects), apply
+        // executes it under the MCP identity so its per-write domain rows
+        // and the APPLY summary row carry `mcp:<client>`.
+        "apply" => {
+            let mut body = args.clone();
+            body.remove("confirm");
+            api::apply::apply(st, identity(), HeaderMap::new(), json_bytes(&body)).await
+        }
+        "apply_dry_run" => {
+            api::apply::dry_run(st, identity(), HeaderMap::new(), json_bytes(args)).await
+        }
         other => return Err(RpcErr::invalid_params(format!("unknown tool: {other}"))),
     };
     Ok(response)
@@ -730,6 +762,8 @@ fn tool_route(name: &str) -> (&'static str, &'static str) {
             "/api/datasources/{id}/tables/{db}/{table}/ddl/evolve",
         ),
         "backfill_status" => ("GET", "/api/pipelines/{id}/backfill/jobs"),
+        "apply" => ("POST", "/api/apply"),
+        "apply_dry_run" => ("POST", "/api/apply/dry-run"),
         other => unreachable!("tool_route called with unregistered tool {other:?}"),
     }
 }
@@ -777,6 +811,33 @@ fn tool_definition(name: &str, write: bool) -> Value {
         "datasourceId": { "type": "integer", "description": "Doris/StarRocks datasource id" },
         "db": { "type": "string" },
         "table": { "type": "string" }
+    });
+    // The T-G6 declaration file, shared by the apply pair: the section
+    // bodies are the REST CRUD DTOs (DatasourceUpsertBody / TableRegisterBody
+    // + datasource name / PipelineUpsertBody — see the OpenAPI components),
+    // kept as opaque objects here so this schema cannot drift from serde.
+    // Absent vs present section is meaningful (docs/ops/pipeline-file.md).
+    let apply_file = json!({
+        "type": "object",
+        "description": "Declaration file (docs/ops/pipeline-file.md). Every section is optional; a PRESENT section is the declared full set of that kind — console objects it does not name are reported as orphans, never deleted. Objects are identified by business key (datasource name / datasource+db+table / pipeline name), never by numeric id.",
+        "properties": {
+            "datasources": {
+                "type": "array",
+                "description": "DatasourceUpsertBody entries: name, type, connJson, optional username/password (blank password keeps the stored credential)",
+                "items": { "type": "object" }
+            },
+            "tables": {
+                "type": "array",
+                "description": "TableRegisterBody entries plus `datasource` — the owning datasource NAME (numeric ids are still accepted)",
+                "items": { "type": "object" }
+            },
+            "pipelines": {
+                "type": "array",
+                "description": "PipelineUpsertBody entries: name, sqlContent, dsMapping (alias -> datasource NAME or id), checkpointMs, preferredNodeId, config",
+                "items": { "type": "object" }
+            }
+        },
+        "additionalProperties": false
     });
     let description = openapi_tool_description(name);
     let mut schema = match name {
@@ -914,6 +975,8 @@ fn tool_definition(name: &str, write: bool) -> Value {
             "required": ["id"],
             "additionalProperties": false
         }),
+        "apply" => apply_file,
+        "apply_dry_run" => apply_file,
         other => unreachable!("tool_definition called with unregistered tool {other:?}"),
     };
     if write {
@@ -1205,20 +1268,21 @@ impl RateLimiter {
 mod tests {
     use super::*;
 
-    /// §7.5 + R8 surface guard: exactly fourteen tools (the blueprint ten
-    /// plus the DDL closed loop and backfill status — within the ≤16
-    /// budget), eight read + six write, unique names, every definition
-    /// well-formed, `confirm` required on writes, and every description
-    /// GENERATED from the OpenAPI document (route prefix + the operation's
-    /// text — the same-source rule; a handler losing its doc comment turns
-    /// this red, not a silently stale hand-written copy).
+    /// §7.5 + R8 + R11 surface guard: exactly sixteen tools (the blueprint
+    /// ten, the DDL closed loop and backfill status, the pipeline-as-code
+    /// apply pair — the ≤16 budget spent), nine read + seven write, unique
+    /// names, every definition well-formed, `confirm` required on writes,
+    /// and every description GENERATED from the OpenAPI document (route
+    /// prefix + the operation's text — the same-source rule; a handler
+    /// losing its doc comment turns this red, not a silently stale
+    /// hand-written copy).
     #[test]
     fn tool_table_matches_the_registered_surface() {
-        assert_eq!(TOOLS.len(), 14, "fourteen tools (≤16 budget)");
+        assert_eq!(TOOLS.len(), 16, "sixteen tools (the ≤16 budget, now full)");
         assert!(TOOLS.len() <= 16, "the R8 tool-face budget");
         let reads = TOOLS.iter().filter(|(_, w)| !w).count();
         let writes = TOOLS.iter().filter(|(_, w)| *w).count();
-        assert_eq!((reads, writes), (8, 6));
+        assert_eq!((reads, writes), (9, 7));
         let names: Vec<&str> = TOOLS.iter().map(|(n, _)| *n).collect();
         let mut unique = names.clone();
         unique.sort_unstable();

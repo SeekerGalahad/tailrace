@@ -29,7 +29,7 @@ fn usage() {
          Options:\n\
          \x20 -a, --addr <HOST:PORT>   listen address (default {DEFAULT_ADDR})\n\
          \x20 -d, --data-dir <DIR>     metadata dir, holds console.db (default {DEFAULT_DATA_DIR})\n\
-         \x20     --mcp-allow-write    enable the four MCP write tools on POST /mcp (default: read-only;\n\
+         \x20     --mcp-allow-write    enable the seven MCP write tools on POST /mcp (default: read-only;\n\
          \x20                             write calls additionally require \"confirm\": true)\n\
          \x20 -V, --version            print version and exit\n\
          \n\
