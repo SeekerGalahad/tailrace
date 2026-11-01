@@ -32,12 +32,15 @@
 //! - `tailrace_console_db_write_seconds` — console-side (tailrace-console
 //!   renders it from its own store stats; it does not appear here).
 //! - `tailrace_pipeline_source_idle` (gauge, pipeline/statement; T-V1
-//!   idle-aware alerting) — the source's **positional** idle verdict: 1 =
-//!   no backlog behind the cursor (file at EOF / kafka next offsets at the
-//!   end offsets for several checks), 0 = backlog exists. Omitted while the
-//!   source cannot tell (never polled, poll failing, connector without a
-//!   verdict) so the console's lag rules evaluate exactly as before; at 1
-//!   they hold instead of firing on a lag that merely measures silence.
+//!   idle-aware alerting) — the statement's **positional** idle verdict: 1 =
+//!   no backlog behind the source cursor (file at EOF / kafka next offsets
+//!   at the end offsets for several checks) AND no rows waiting in the sink
+//!   buffer (read-but-unflushed rows are backlog too — a failing or slow
+//!   sink never reads idle), 0 = backlog on either side. Omitted while there
+//!   is no verdict (never polled, poll failing, paused, statement loop
+//!   exited into restart backoff / FAILED, connector without a verdict) so
+//!   the console's lag rules evaluate exactly as before; at 1 they hold
+//!   instead of firing on a lag that merely measures silence.
 
 use std::collections::HashMap;
 use std::sync::Mutex;

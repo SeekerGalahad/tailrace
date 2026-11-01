@@ -67,8 +67,9 @@ pub fn build_exec_plan(
                             .iter()
                             .map(|(n, t)| {
                                 // G2: vocabulary goes through ColumnType::parse
-                                // (16 words, blueprint §7.1) — unknown words
-                                // warn + fold to Utf8 for one minor version.
+                                // (16 words, blueprint §7.1) — an unknown word
+                                // is a hard error since 1.3.0 (T-V5 closed the
+                                // 1.2.x warn-and-fold-to-Utf8 window).
                                 // A4: the field entry also stamps the variant
                                 // marker, identically to the runtime's ColBatch
                                 // schema (the injection compares them)

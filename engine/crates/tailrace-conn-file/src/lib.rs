@@ -320,7 +320,9 @@ impl Source for FileSource {
                     joined
                 };
                 self.byte_pos += full.len() as u64;
-                out.push(SourceChunk::plain(trim_tail_owned(full)));
+                // the line rides its own cursor advance (the byte position
+                // just past it) — the DLQ's per-row identity (T-V2 review)
+                out.push(SourceChunk::file(trim_tail_owned(full), self.byte_pos));
             } else {
                 // half line: buffered, not delivered, cursor not advanced —
                 // delivered only once the writer completes the newline; a
@@ -652,6 +654,14 @@ mod tests {
         let chunks = src.poll(2, Duration::from_millis(200))?;
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].raw, b"line1");
+        // each line carries the byte position just past it (its per-row
+        // DLQ identity, T-V2 review); no partition on a file carrier
+        assert_eq!(
+            (chunks[0].partition, chunks[0].next_offset),
+            (None, Some(6)),
+            "\"line1\\n\" ends at byte 6"
+        );
+        assert_eq!(chunks[1].next_offset, Some(12));
         let cur = src.cursor();
         let Cursor::File { byte_pos, .. } = &cur else {
             panic!("cursor kind")

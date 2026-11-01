@@ -395,9 +395,11 @@ pub struct StatementCountersSnapshot {
     /// wall-ms of the last data-carrying flush — A6 (additive stats field)
     #[serde(rename = "lastDataMs")]
     pub last_data_ms: u64,
-    /// source idle verdict — T-V1 (additive stats field): `true` = no
-    /// backlog behind the cursor, `false` = backlog, `null` = the source
-    /// cannot tell / not polled yet
+    /// statement idle verdict — T-V1 (additive stats field): `true` = no
+    /// backlog behind the source cursor AND no rows waiting in the sink
+    /// buffer, `false` = backlog on either side, `null` = no verdict (not
+    /// polled yet, poll failing, paused, or the statement loop exited —
+    /// restart backoff / FAILED)
     #[serde(rename = "sourceIdle")]
     pub source_idle: Option<bool>,
 }

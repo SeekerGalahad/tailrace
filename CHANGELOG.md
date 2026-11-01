@@ -25,9 +25,13 @@ _v1.3 development line (`feature/v1.3-dev`, R11 §二). Anchors are
   failed check holds the previous verdict, arriving rows or a positive gap
   reset the streak). The criterion
   is a **position** comparison, never a clock: a slow consumer with rows
-  still ahead of it is lagging, not idle. The serve loop publishes the
-  verdict after every successful poll and resets it to unknown on a poll
-  error (`tailrace-runtime/src/lib.rs` `obs_idle`); it reaches `/metrics` as
+  still ahead of it is lagging, not idle. The serve loop publishes a
+  **statement-level** verdict — the source's, AND nothing read-but-unflushed
+  in the sink buffer (`publish_idle`, see Fixed below for the R11 review
+  that moved it there) — before every poll and after every write, and
+  resets it to unknown on a poll error, on pause, and whenever the loop
+  exits (`tailrace-runtime/src/lib.rs` `obs_idle` / `IdleResetGuard`); it
+  reaches `/metrics` as
   `tailrace_pipeline_source_idle{pipeline,statement}` (gauge, 1 idle / 0
   backlog, **omitted** while the source cannot tell — the 10th series of the
   node surface, `tailrace-api/src/metrics.rs`) and the stats JSON as the
@@ -153,10 +157,15 @@ _v1.3 development line (`feature/v1.3-dev`, R11 §二). Anchors are
 
 - **DLQ side file is a set of bad rows, not a log of isolation attempts**
   (T-V2, dogfooding #3). `BadRowDlq::write` dedups on the row key
-  `(statement, cursor, rawB64)` (`engine/crates/tailrace-runtime/src/dlq.rs`):
-  the same bad bytes at the same poll-time cursor can only recur through an
-  at-least-once replay (flush failure → restart from the last committed
-  cursor re-polls the batch), so one bad row now lands exactly once per
+  `(statement, row position, rawB64)` (`engine/crates/tailrace-runtime/src/dlq.rs`)
+  where the row position is the chunk's own cursor advance — Kafka
+  `(partition, nextOffset)`, file `nextOffset` = the byte position past the
+  line, both written into the record; carriers without one (parquet, jdbc)
+  fall back to the poll-time cursor (the R11 review replaced the cursor key,
+  see Fixed below). A bad row can only recur through an at-least-once replay
+  (flush failure → restart from the last committed cursor re-polls the
+  batch), and its position does not move with the replay's poll boundary,
+  so one bad row now lands exactly once per
   replay window. The dedup index is in memory and seeded from the side file
   on first write, so a statement restart (fresh writer) or a process restart
   still dedups; corrupt lines are skipped during seeding and never block
@@ -170,8 +179,11 @@ _v1.3 development line (`feature/v1.3-dev`, R11 §二). Anchors are
   auto-restart: side file = 3 rows, counter = 3 × attempts). The R10
   disclosure in `docs/protocol/engine-v1.md` §二·五 and
   `docs/protocol/console-api.md` 裁决 13 is updated to "表唯一化、计数不变";
-  the downstream `rawB64` idempotency habit stays valid but the engine no
-  longer produces duplicate rows.
+  the downstream `rawB64` idempotency habit is still recommended: file and
+  Kafka carriers no longer produce duplicate rows, positionless carriers
+  keep the cursor key's limits, and lines written before 1.3 (no position
+  on record) seed cursor-keyed, so a positioned replay of one lands once
+  more across the upgrade — a one-time duplicate, never a loss.
 - **BREAKING: unknown column-type vocabulary is a hard error, not a Utf8
   fold** (T-V5, blueprint §7.6). `UNKNOWN_TYPE_UTF8_MIGRATION_WINDOW` is
   `false` (`engine/crates/tailrace-ir/src/column_type.rs:173`): the
@@ -197,6 +209,92 @@ _v1.3 development line (`feature/v1.3-dev`, R11 §二). Anchors are
 
 ### Fixed
 
+- **R11 review round** (independent review of the v1.3 wave; five findings
+  confirmed, all fixed, each pinned by a test that fails on the pre-review
+  tree).
+  - **T-V1: a sink failure's real lag was held as "idle" under the default
+    tuning** (high). The serve loop published the source's EOF verdict right
+    after the poll — before decode/write/flush — so rows read to EOF and
+    waiting in the sink buffer (default `flushRows` 10 000 / interval 10 s)
+    read as idle; a flush that then failed returned with that `1` frozen in
+    the counters the registry shares across restarts, and PAUSED / backoff /
+    FAILED never touched it. The console held the `lag_seconds` rule and the
+    SLO ring skipped the series — for minutes up to the FAILED verdict,
+    exactly when the lag was real (the e2e's `pollRows=1/flushRows=1`
+    tuning had stepped around this). The verdict is now statement-level:
+    source has no backlog AND `pending_rows == 0`, published before every
+    poll and right after every write (`publish_idle`,
+    `engine/crates/tailrace-runtime/src/lib.rs`), reset to unknown on pause
+    entry and — through an `IdleResetGuard` dropped on every exit path —
+    whenever the statement loop leaves (error, panic, stop), so backoff and
+    FAILED evaluate lag as 1.2.0 did. Pinned by
+    `tests/contract/tests/executor_loop.rs`
+    `idle_verdict_never_holds_a_broken_sink_under_default_tuning` (default
+    poll/flush row caps, sink target a directory: the verdict is never
+    `Some(true)` through the buffered wait, the failing flush and the
+    backoff, is withdrawn during the backoff, and reads idle only once the
+    repaired sink drained the rows). `tailrace_pipeline_source_idle` doc
+    updated (`tailrace-api/src/metrics.rs`, `pipeline_log.rs`).
+  - **MCP audit rows carried datasource credentials in plaintext** (high).
+    `abbreviate_args` truncated top-level strings only and cloned nested
+    values verbatim, so the apply pair's `datasources[].password` (and
+    `username`) landed in `audit_log.detail_json` on every outcome,
+    including rejected calls — against the datasources.rs invariant that
+    plaintext never reaches storage. The audit rendering now walks arrays
+    and objects, replaces non-null values under `password` / `username`
+    (any depth, any case) with `<redacted>`, bounds nested long strings
+    too, and the non-object fallback (`brief_value`) strips before it
+    serializes (`console/crates/tailrace-console/src/mcp.rs`). Unit test
+    `audit_args_redact_credentials_at_every_depth_and_bound_strings`;
+    contract `tests/mcp_server.rs`
+    `apply_pair_never_leaks_or_oracles_datasource_credentials` scans every
+    `audit_log` row after a credential-carrying apply.
+  - **MCP `apply_dry_run` was an unauthenticated credential oracle**
+    (high). `/mcp` carries no console session and the read tool rides
+    neither write gate, while `plan()` opens the stored credential and
+    compares it to a declared one — the `credential` diff line's presence
+    answered "is this the password?" at the global 100 req/s with none of
+    the REST login's lockout (`list_datasources` supplies the probe's
+    name/type/connJson). The tool now refuses any declaration whose
+    `datasources[]` carries a non-blank `username` or non-empty `password`
+    before `plan()` runs (`INVALID_PARAMS`, data
+    `code: CREDENTIALS_NOT_ALLOWED` naming the entry — the same presence
+    test as `credential_payload`, so blank halves still mean "keep the
+    stored credential"); credential-free files diff as before, and the
+    session-scoped REST `POST /api/apply/dry-run` keeps previewing
+    credential changes. The tool's `datasources` schema description says
+    so; `docs/protocol/console-api.md` row 16 records the ruling. Unit test
+    `declared_credential_matches_the_plan_presence_test`; the contract test
+    above drives refusal → credential-free unchanged → blank-halves pass.
+  - **T-V2: the DLQ row key was the poll-end cursor, so replays that cut
+    a different poll boundary duplicated rows and identical rows in one
+    poll collapsed** (medium ×2). The cursor is taken after the whole poll,
+    so a tail appended during the backoff, a multi-poll batch re-read as
+    one poll or interleaved partitions changed it and the "dedup" let the
+    same bad rows land again — in the very storm it was built for — while
+    two byte-identical bad rows in one poll shared the key and one was
+    silently dropped from quarantine (the counter still said 2). The key is
+    now `(statement, row position, rawB64)` with the row's own cursor
+    advance: `SourceChunk::file(raw, next_byte_pos)` is the new file-line
+    shape (`tailrace-ir`), the file source stamps every line with the byte
+    position past it, bad chunks keep their `partition` / `next_offset`
+    through serial and parallel decode (`PollDecode.bad_raws:
+    Vec<SourceChunk>`), and the record writes `nextOffset` (+ `partition`
+    for Kafka). Positionless carriers (parquet, jdbc) fall back to the
+    cursor key; pre-1.3 lines seed cursor-keyed (one-time duplicate across
+    the upgrade, documented in `docs/protocol/engine-v1.md` and
+    `console-api.md` 裁决 13, which also stop promising "no duplicates"
+    unconditionally). Unit tests
+    `row_position_keys_survive_replay_boundaries_and_keep_twins` /
+    `positionless_rows_fall_back_to_the_cursor_key`; contract
+    `dlq_dedup_survives_a_tail_appended_during_the_storm` (three bad rows
+    isolated, the tail grows by two good + one bad during the storm, the
+    replay reads all eight lines in one poll: four side-file rows, ≥ 7
+    attempts, four good rows land once). `docs/ops/grafana-dashboard.json`
+    panel 6 retitled to "DLQ isolation attempts" (the T-V2 semantics).
+  - Stale comment: `engine/crates/tailrace-ir/src/lib.rs` still described
+    the unknown-type word as "warn + fold to Utf8 for one minor version"
+    after T-V5 closed the window.
 - **Public-face leftovers from the blueprint W0 public-surface sweep** (the
   three items that slipped it, T-V3's rider). `tailrace-console --help`
   still said "the four MCP write tools" when six (now seven) ship — now the

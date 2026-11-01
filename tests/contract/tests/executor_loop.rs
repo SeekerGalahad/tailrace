@@ -368,6 +368,242 @@ fn dlq_replay_storm_dedups_rows_but_counts_attempts() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// T-V1 review: the idle verdict is statement-level — "no backlog behind
+/// the source cursor AND nothing pending in the sink buffer" — and it is
+/// withdrawn (unknown) whenever the loop is not running the poll/flush
+/// cycle. Under the DEFAULT tuning (poll 8000 / flush 10000 rows, interval
+/// ≥ 1 s) a small file is read to EOF in one poll and then sits in the sink
+/// buffer until the time boundary: the source alone says "idle", but those
+/// rows are backlog. With the sink broken (target path is a directory) the
+/// flush fails on the time boundary and the registry backs off: through
+/// the buffered wait, the failure and every backoff the published verdict
+/// must never read idle (`Some(true)`) — that is the value the console
+/// holds lag rules on, and this lag is real (the pre-review loop published
+/// the source's EOF verdict right after the poll and froze it on exit).
+/// Repairing the sink lets the replay land the rows; only then, drained at
+/// EOF, does the statement read idle.
+#[test]
+fn idle_verdict_never_holds_a_broken_sink_under_default_tuning() -> anyhow::Result<()> {
+    let work = tmp_workdir("idlesink");
+    let _cwd = CwdGuard::enter(&work);
+    let state_dir = work.join("state");
+    let reg = std::sync::Arc::new(tailrace_runtime::registry::PipelineRegistry::new(
+        &state_dir,
+    ));
+    append_jsonl("orders_in", &good_rows(1, 5));
+    // the sink target is a DIRECTORY → every jsonl append fails
+    std::fs::create_dir_all("orders_out")?;
+    let opts = tailrace_catalog::PlanOptions {
+        recovery: Some(tailrace_catalog::RecoveryOptions {
+            restart_backoff_secs: Some(vec![1, 8]),
+            auto_restart_max: Some(5),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    // checkpoint 1000 ms = the smallest flush interval; the poll / flush row
+    // caps stay at their defaults, so the 5 rows wait for the time boundary
+    reg.deploy(
+        5501,
+        1,
+        file_statements(),
+        file_tables(),
+        Some(1000),
+        Some(opts),
+        None,
+        false,
+    )?;
+    // sample the verdict continuously through the buffered wait, the failing
+    // flush, the backoff and the first replay (~4 s = two attempts)
+    let t0 = std::time::Instant::now();
+    let mut seen_consumed = false;
+    let mut seen_backlog = false;
+    let mut seen_withdrawn = false;
+    while t0.elapsed() < Duration::from_secs(4) {
+        let s = reg.stats(5501).expect("pipeline registered");
+        let idle = s.statements[0].source_idle;
+        seen_consumed |= s.totals.consumed > 0;
+        assert_ne!(
+            idle,
+            Some(true),
+            "rows stuck behind a broken sink must never read idle (consumed={}, flushed={})",
+            s.totals.consumed,
+            s.totals.flushed
+        );
+        if seen_consumed {
+            match idle {
+                Some(false) => seen_backlog = true,
+                None => seen_withdrawn = true,
+                Some(true) => unreachable!(),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(seen_consumed, "the file was polled");
+    assert!(
+        seen_backlog,
+        "rows buffered at EOF publish backlog (the source's EOF alone is not idle)"
+    );
+    assert!(
+        seen_withdrawn,
+        "the failing flush / restart backoff withdraws the verdict"
+    );
+    assert_eq!(
+        reg.stats(5501).expect("registered").totals.flushed,
+        0,
+        "nothing landed while the sink was broken"
+    );
+    // repair inside the second backoff → the replay lands the rows and the
+    // drained statement at EOF reads idle
+    std::fs::remove_dir_all("orders_out")?;
+    poll_until(Duration::from_secs(20), || {
+        let s = reg.stats(5501)?;
+        (s.totals.flushed >= 5 && s.statements[0].source_idle == Some(true)).then_some(())
+    })
+    .expect("after the repair the drained statement reads idle");
+    assert_eq!(line_count("orders_out"), 5, "the rows landed once");
+    reg.stop_pipeline(5501);
+    let _ = std::fs::remove_dir_all(&work);
+    Ok(())
+}
+
+/// R11 review of T-V2: the row key must survive a replay that cuts a
+/// different poll boundary. Here the tail GROWS during the storm — after
+/// the first isolation (three bad rows, poll-end cursor EOF₁) two good and
+/// one bad line are appended; the restart replays from the never-committed
+/// cursor and reads all eight lines in one poll, ending at EOF₂ ≠ EOF₁. The
+/// pre-review key `(statement, poll cursor, rawB64)` re-landed the original
+/// three under EOF₂ (seven lines); keyed on each row's own byte position the
+/// side file holds exactly the four distinct bad rows, while the attempt
+/// counter keeps counting every isolation and the repaired sink lands the
+/// four good rows once.
+#[test]
+fn dlq_dedup_survives_a_tail_appended_during_the_storm() -> anyhow::Result<()> {
+    let work = tmp_workdir("dlqtail");
+    let _cwd = CwdGuard::enter(&work);
+    let state_dir = work.join("state");
+    let reg = std::sync::Arc::new(tailrace_runtime::registry::PipelineRegistry::new(
+        &state_dir,
+    ));
+    let append_lines = |lines: &[&str]| -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open("orders_in")?;
+        for l in lines {
+            writeln!(f, "{l}")?;
+        }
+        Ok(())
+    };
+    append_jsonl("orders_in", &good_rows(1, 2));
+    append_lines(&["{broken-1", "not json at all", "{\"unterminated\": "])?;
+    // the sink target is a DIRECTORY → every flush fails → replay storm
+    std::fs::create_dir_all("orders_out")?;
+    let opts = tailrace_catalog::PlanOptions {
+        recovery: Some(tailrace_catalog::RecoveryOptions {
+            restart_backoff_secs: Some(vec![1, 8]),
+            auto_restart_max: Some(5),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    reg.deploy(
+        5601,
+        1,
+        file_statements(),
+        file_tables(),
+        Some(1000),
+        Some(opts),
+        None,
+        false,
+    )?;
+    let dlq_path = state_dir.join("bad_rows").join("p5601-s0.jsonl");
+    let dlq_lines = || -> usize {
+        std::fs::read_to_string(&dlq_path)
+            .map(|t| t.lines().filter(|l| !l.trim().is_empty()).count())
+            .unwrap_or(0)
+    };
+    // the first isolation is done (three attempts counted, three rows) —
+    // now grow the tail before the replay
+    poll_until(Duration::from_secs(15), || {
+        let bad = reg.stats(5601)?.totals.bad;
+        (bad >= 3).then_some(bad)
+    })
+    .expect("first isolation");
+    assert_eq!(dlq_lines(), 3);
+    append_jsonl("orders_in", &good_rows(3, 4));
+    append_lines(&["{broken-4"])?;
+    // the replay re-isolates the original three plus the new one (the new
+    // line may also be isolated by the first attempt's next poll, so 7 or 8
+    // attempts) …
+    let bad = poll_until(Duration::from_secs(15), || {
+        let bad = reg.stats(5601)?.totals.bad;
+        (bad >= 7).then_some(bad)
+    })
+    .expect("the replay re-isolates the bad rows past the grown tail");
+    assert!(bad >= 7, "attempts counted: {bad}");
+    // … while the side file holds the four distinct rows once each
+    assert_eq!(
+        dlq_lines(),
+        4,
+        "replayed rows are keyed on their own byte position, not the moved poll cursor"
+    );
+    // repair inside the second backoff → the good rows land once, the
+    // cursor commits at the grown EOF, the side file is unchanged
+    std::fs::remove_dir_all("orders_out")?;
+    let committed = poll_until(Duration::from_secs(20), || {
+        let v = reg.offsets(5601).ok()?;
+        let pos = v["statements"][0]["ledger"]["cursor"]["File"]["byte_pos"]
+            .as_u64()
+            .unwrap_or(0);
+        (pos > 0).then_some(pos)
+    })
+    .expect("after the repair the cursor commits");
+    assert_eq!(committed, std::fs::metadata("orders_in")?.len());
+    assert_eq!(
+        line_count("orders_out"),
+        4,
+        "the four good rows landed once"
+    );
+    assert_eq!(dlq_lines(), 4);
+    // the four records are the four distinct bad lines, each at its own
+    // byte position (the key), with the poll-time cursor still on record
+    let mut raws = std::collections::BTreeSet::new();
+    let mut positions = std::collections::BTreeSet::new();
+    for l in std::fs::read_to_string(&dlq_path)?.lines() {
+        use base64::Engine as _;
+        let v: serde_json::Value = serde_json::from_str(l)?;
+        raws.insert(
+            base64::engine::general_purpose::STANDARD
+                .decode(v["rawB64"].as_str().unwrap())
+                .unwrap(),
+        );
+        positions.insert(
+            v["nextOffset"]
+                .as_i64()
+                .expect("file rows carry nextOffset"),
+        );
+        assert!(
+            v.get("partition").is_none(),
+            "a file row has no partition: {v}"
+        );
+        assert!(v["cursor"]["File"]["byte_pos"].as_u64().unwrap() > 0);
+    }
+    assert_eq!(
+        raws,
+        [
+            b"{broken-1".to_vec(),
+            b"not json at all".to_vec(),
+            b"{\"unterminated\":".to_vec(),
+            b"{broken-4".to_vec(),
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert_eq!(positions.len(), 4, "four distinct row positions");
+    reg.stop_pipeline(5601);
+    let _ = std::fs::remove_dir_all(&work);
+    Ok(())
+}
+
 /// deploy idempotency: a repeated dispatch_id while the pipeline runs is
 /// rejected; a fresh dispatch replaces it.
 #[test]

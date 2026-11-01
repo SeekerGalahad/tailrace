@@ -646,11 +646,57 @@ async fn execute(
             api::apply::apply(st, identity(), HeaderMap::new(), json_bytes(&body)).await
         }
         "apply_dry_run" => {
+            // R11 review: `/mcp` carries no console session and this tool
+            // rides neither write gate, while `plan()` opens the stored
+            // credential and compares it with a declared one (so a re-applied
+            // file reads "unchanged"). Over an unauthenticated transport that
+            // comparison is a password oracle — declare a guess, read whether
+            // the `credential` diff line appears — with none of the lockout
+            // the REST login has. Refuse declarations that carry a credential
+            // at all: omitting it keeps the stored one (§4.2 blank-password
+            // semantics), and the session-scoped REST `POST /api/apply/dry-run`
+            // previews credential changes with the authority they need.
+            if let Some(name) = declared_credential(args) {
+                return Err(RpcErr::new(
+                    INVALID_PARAMS,
+                    format!(
+                        "apply_dry_run does not accept datasource credentials over MCP \
+                         (datasource {name:?} declares username/password): omit them — the \
+                         stored credential is kept — or preview with the session-scoped \
+                         POST /api/apply/dry-run"
+                    ),
+                    Some(json!({ "code": "CREDENTIALS_NOT_ALLOWED", "datasource": name })),
+                ));
+            }
             api::apply::dry_run(st, identity(), HeaderMap::new(), json_bytes(args)).await
         }
         other => return Err(RpcErr::invalid_params(format!("unknown tool: {other}"))),
     };
     Ok(response)
+}
+
+/// The first `datasources[]` entry of a declaration that carries a
+/// credential — the same presence test as `credential_payload`
+/// (`api/datasources.rs`: non-blank username OR non-empty password), so
+/// exactly the declarations `plan()` would compare against the store are
+/// the ones refused. Returns the entry's `name` (empty when missing).
+fn declared_credential(args: &Map<String, Value>) -> Option<String> {
+    args.get("datasources")?.as_array()?.iter().find_map(|ds| {
+        let has_user = ds
+            .get("username")
+            .and_then(Value::as_str)
+            .is_some_and(|u| !u.trim().is_empty());
+        let has_pass = ds
+            .get("password")
+            .and_then(Value::as_str)
+            .is_some_and(|p| !p.is_empty());
+        (has_user || has_pass).then(|| {
+            ds.get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        })
+    })
 }
 
 /// The DDL tools' path triple: `(datasourceId, db, table)` — required, typed.
@@ -976,7 +1022,15 @@ fn tool_definition(name: &str, write: bool) -> Value {
             "additionalProperties": false
         }),
         "apply" => apply_file,
-        "apply_dry_run" => apply_file,
+        "apply_dry_run" => {
+            // R11 review: the read tool refuses declared credentials (see
+            // `execute`) — say so where an agent reads the argument shape
+            let mut schema = apply_file;
+            schema["properties"]["datasources"]["description"] = json!(
+                "DatasourceUpsertBody entries: name, type, connJson. username/password are REFUSED by this tool (CREDENTIALS_NOT_ALLOWED): the MCP transport carries no console session, and a credential diff over it would be a password oracle — omit them (the stored credential is kept) or preview credential changes over the session-scoped POST /api/apply/dry-run"
+            );
+            schema
+        }
         other => unreachable!("tool_definition called with unregistered tool {other:?}"),
     };
     if write {
@@ -1196,11 +1250,11 @@ fn tool_label(params: &Value) -> String {
     }
 }
 
-/// One audit-bounded JSON rendering: serialized then head-truncated to
-/// [`MAX_AUDIT_STRING_CHARS`] chars (for values that cannot ride the
-/// args map, e.g. a non-object `arguments` payload).
+/// One audit-bounded JSON rendering: credentials stripped, then serialized
+/// and head-truncated to [`MAX_AUDIT_STRING_CHARS`] chars (for values that
+/// cannot ride the args map, e.g. a non-object `arguments` payload).
 fn brief_value(v: &Value) -> Value {
-    let s = serde_json::to_string(v).unwrap_or_default();
+    let s = serde_json::to_string(&abbreviate_value(v)).unwrap_or_default();
     if s.chars().count() > MAX_AUDIT_STRING_CHARS {
         let head: String = s.chars().take(MAX_AUDIT_STRING_CHARS).collect();
         Value::String(format!("{head}...({} chars)", s.chars().count()))
@@ -1209,23 +1263,50 @@ fn brief_value(v: &Value) -> Value {
     }
 }
 
-/// Bound audit noise: string values longer than [`MAX_AUDIT_STRING_CHARS`]
-/// are head-truncated with their original length noted (SQL bodies etc.).
+/// Keys whose values never ride an audit row, at any depth: the declaration
+/// file's datasource credentials (`DatasourceUpsertBody.username` /
+/// `.password`, nested under `datasources[]` on the apply pair). The
+/// datasources.rs invariant — plaintext never reaches storage — holds for
+/// `audit_log.detail_json` too (R11 review). Matched case-insensitively.
+const REDACTED_KEYS: &[&str] = &["password", "username"];
+const REDACTED: &str = "<redacted>";
+
+/// Bound audit noise and strip credentials, recursively: string values
+/// longer than [`MAX_AUDIT_STRING_CHARS`] are head-truncated with their
+/// original length noted (SQL bodies etc.), arrays and objects are walked,
+/// and a non-null value under a [`REDACTED_KEYS`] key becomes [`REDACTED`]
+/// (a null stays null — "no credential declared" is not a secret). The
+/// pre-review version truncated top-level strings only and cloned nested
+/// values verbatim, which landed `datasources[].password` in the audit log.
 fn abbreviate_args(args: &Map<String, Value>) -> Value {
     Value::Object(
         args.iter()
-            .map(|(k, v)| {
-                let v = match v {
-                    Value::String(s) if s.chars().count() > MAX_AUDIT_STRING_CHARS => {
-                        let head: String = s.chars().take(MAX_AUDIT_STRING_CHARS).collect();
-                        Value::String(format!("{head}...({} chars)", s.chars().count()))
-                    }
-                    other => other.clone(),
-                };
-                (k.clone(), v)
-            })
+            .map(|(k, v)| (k.clone(), abbreviate_field(k, v)))
             .collect(),
     )
+}
+
+fn abbreviate_field(key: &str, v: &Value) -> Value {
+    if !v.is_null() && REDACTED_KEYS.iter().any(|r| key.eq_ignore_ascii_case(r)) {
+        return Value::String(REDACTED.to_string());
+    }
+    abbreviate_value(v)
+}
+
+fn abbreviate_value(v: &Value) -> Value {
+    match v {
+        Value::String(s) if s.chars().count() > MAX_AUDIT_STRING_CHARS => {
+            let head: String = s.chars().take(MAX_AUDIT_STRING_CHARS).collect();
+            Value::String(format!("{head}...({} chars)", s.chars().count()))
+        }
+        Value::Array(items) => Value::Array(items.iter().map(abbreviate_value).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), abbreviate_field(k, v)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 // ---------------- rate limit ----------------
@@ -1371,5 +1452,97 @@ mod tests {
         assert!(!rl.allow_at(t0 + std::time::Duration::from_millis(900)));
         // new window
         assert!(rl.allow_at(t0 + std::time::Duration::from_secs(1)));
+    }
+
+    /// R11 review: the audit rendering strips credentials at every depth
+    /// (the apply pair's `datasources[].username/password`, any key case),
+    /// keeps a declared-null as null, leaves the rest of the object intact
+    /// and truncates long nested strings too — and the non-object fallback
+    /// (`brief_value`) goes through the same stripping before it is
+    /// serialized.
+    #[test]
+    fn audit_args_redact_credentials_at_every_depth_and_bound_strings() {
+        let long_sql = "SELECT ".repeat(60);
+        let args: Map<String, Value> = serde_json::from_value(json!({
+            "confirm": true,
+            "datasources": [
+                {"name": "lake", "type": "doris",
+                 "connJson": {"jdbcUrl": "jdbc:mysql://fe:9030", "streamLoadUrl": "http://fe:8030"},
+                 "username": "root", "password": "s3cr3t-pw"},
+                {"name": "edge", "type": "kafka", "connJson": {"bootstrap": "b:9092"},
+                 "password": null}
+            ],
+            "pipelines": [{"name": "p", "sqlContent": long_sql, "nested": {"PASSWORD": "Upper-Case-Key"}}]
+        }))
+        .unwrap();
+        let out = abbreviate_args(&args);
+        let text = out.to_string();
+        for secret in ["s3cr3t-pw", "\"root\"", "Upper-Case-Key"] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
+        assert_eq!(out["datasources"][0]["password"], REDACTED);
+        assert_eq!(out["datasources"][0]["username"], REDACTED);
+        assert_eq!(out["pipelines"][0]["nested"]["PASSWORD"], REDACTED);
+        assert_eq!(
+            out["datasources"][1]["password"],
+            Value::Null,
+            "a declared null is not a secret"
+        );
+        assert_eq!(out["datasources"][0]["name"], "lake");
+        assert_eq!(
+            out["datasources"][0]["connJson"]["jdbcUrl"],
+            "jdbc:mysql://fe:9030"
+        );
+        assert_eq!(out["confirm"], true);
+        let sql = out["pipelines"][0]["sqlContent"].as_str().unwrap();
+        assert!(
+            sql.ends_with(&format!("...({} chars)", long_sql.chars().count())),
+            "nested long strings are bounded too: {sql}"
+        );
+        // the non-object fallback strips before it serializes
+        let brief = brief_value(&json!([{"password": "pw-in-array"}]));
+        assert!(!brief.to_string().contains("pw-in-array"), "{brief}");
+        assert!(brief.to_string().contains(REDACTED));
+    }
+
+    /// R11 review: `apply_dry_run` refuses a declaration that carries a
+    /// credential — the presence test is `credential_payload`'s (a blank
+    /// username / empty password is "keep the stored credential", not a
+    /// declaration), and the first offending entry is named.
+    #[test]
+    fn declared_credential_matches_the_plan_presence_test() {
+        let file = |ds: Value| -> Map<String, Value> {
+            serde_json::from_value(json!({ "datasources": [ds] })).unwrap()
+        };
+        assert_eq!(declared_credential(&Map::new()), None, "no section");
+        assert_eq!(
+            declared_credential(&file(json!({"name": "a", "type": "kafka"}))),
+            None
+        );
+        assert_eq!(
+            declared_credential(&file(
+                json!({"name": "a", "username": "  ", "password": ""})
+            )),
+            None,
+            "blank halves keep the stored credential — not a declaration"
+        );
+        assert_eq!(
+            declared_credential(&file(json!({"name": "a", "password": "x"}))),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            declared_credential(&file(json!({"name": "b", "username": "root"}))),
+            Some("b".to_string())
+        );
+        assert_eq!(
+            declared_credential(&file(json!({"password": "x"}))),
+            Some(String::new()),
+            "a nameless entry is still refused"
+        );
+        let two: Map<String, Value> = serde_json::from_value(json!({
+            "datasources": [{"name": "clean"}, {"name": "second", "password": "x"}]
+        }))
+        .unwrap();
+        assert_eq!(declared_credential(&two), Some("second".to_string()));
     }
 }

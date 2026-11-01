@@ -182,8 +182,8 @@
     {
       "id": 6,
       "type": "timeseries",
-      "title": "DLQ rows — 10m increase (tailrace_dlq_rows_total)",
-      "description": "Same window arithmetic as the console dlq_window alert rule (increment over a sliding window, counter resets credited as the post-reset value).",
+      "title": "DLQ isolation attempts — 10m increase (tailrace_dlq_rows_total)",
+      "description": "Same window arithmetic as the console dlq_window alert rule (increment over a sliding window, counter resets credited as the post-reset value). Since v1.3 (T-V2) the counter counts every isolation ATTEMPT — a replay storm re-isolates the same bad rows — while the bad_rows/ side file holds each bad row once; a tall bar here with a flat side file is a replay storm, not new bad data.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 17 },
       "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "bars", "fillOpacity": 60 } }, "overrides": [] },

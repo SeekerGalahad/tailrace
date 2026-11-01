@@ -755,6 +755,120 @@ async fn apply_tools_share_the_g6_diff_and_dry_run_writes_nothing() {
     assert_eq!(body["error"]["message_key"], "err.apply.unknown_key");
 }
 
+/// R11 review, two findings on the apply pair's credential handling.
+/// (1) `apply_dry_run` is always-on over the unauthenticated `/mcp`, and
+/// `plan()` compares a declared credential against the stored one — a
+/// password oracle. The tool now refuses any declaration carrying
+/// username/password (`CREDENTIALS_NOT_ALLOWED`) before `plan()` runs;
+/// credential-free files keep working, and omitting the credential keeps
+/// the stored one. (2) Every MCP envelope row used to carry the call
+/// arguments with nested values verbatim, so `datasources[].password` landed
+/// in `audit_log.detail_json`; now no audit row — envelope, domain or
+/// summary, accepted or rejected — contains the plaintext.
+#[tokio::test]
+async fn apply_pair_never_leaks_or_oracles_datasource_credentials() {
+    let app = app_with_mcp(true).await;
+    let hdr = [("x-mcp-client", "gitops-agent")];
+    const USER: &str = "lake_admin_u";
+    const PASS: &str = "Sup3r-S3cr3t-pw!";
+    let with_credential = json!({
+        "datasources": [
+            {"name": "lake", "type": "doris",
+             "connJson": {"jdbcUrl": "jdbc:mysql://fe:9030/db", "streamLoadUrl": "http://fe:8030"},
+             "username": USER, "password": PASS}
+        ]
+    });
+    let no_secret_anywhere = |store: &Store| {
+        let rows: Vec<String> = store
+            .with_conn(|c| {
+                let mut stmt = c.prepare("SELECT detail_json FROM audit_log")?;
+                let rows = stmt.query_map([], |r| r.get::<_, Option<String>>(0))?;
+                Ok(rows.filter_map(|r| r.ok().flatten()).collect())
+            })
+            .unwrap();
+        assert!(!rows.is_empty(), "the audit log has rows");
+        for d in &rows {
+            assert!(!d.contains(PASS), "password leaked into audit_log: {d}");
+            assert!(!d.contains(USER), "username leaked into audit_log: {d}");
+        }
+    };
+
+    // --- dry-run with a credential: refused before the plan runs, nothing
+    //     created, the rejection audited without the plaintext
+    let b = tool(&app, &hdr, "apply_dry_run", with_credential.clone()).await;
+    assert_eq!(b["error"]["code"], -32602, "{b}");
+    assert_eq!(b["error"]["data"]["code"], "CREDENTIALS_NOT_ALLOWED", "{b}");
+    assert_eq!(b["error"]["data"]["datasource"], "lake", "{b}");
+    let msg = b["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("/api/apply/dry-run") && !msg.contains(PASS),
+        "the message points at the session-scoped route and echoes no secret: {msg}"
+    );
+    let (s, b) = req(&app, "GET", "/api/datasources", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(b["total"], 0, "refused before plan — nothing created");
+    let rows = audit_rows(&app.store, "MCP_TOOL_CALL");
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(rows[0].2["outcome"], "rejected");
+    assert_eq!(
+        rows[0].2["args"]["datasources"][0]["password"],
+        "<redacted>"
+    );
+    assert_eq!(
+        rows[0].2["args"]["datasources"][0]["username"],
+        "<redacted>"
+    );
+    assert_eq!(
+        rows[0].2["args"]["datasources"][0]["name"], "lake",
+        "non-secret fields stay readable"
+    );
+    no_secret_anywhere(&app.store);
+
+    // --- the write tool (both gates) still lands the credential, sealed:
+    //     the datasource exists with has_password, and no audit row —
+    //     envelope, DATASOURCE_CREATE domain row, APPLY summary — carries it
+    let mut args = with_credential.clone();
+    args["confirm"] = json!(true);
+    let (status, result) = tool_ok(&tool(&app, &hdr, "apply", args).await);
+    assert_eq!(status, 200, "{result}");
+    assert_eq!(result["datasources"][0]["action"], "create");
+    let (s, b) = req(&app, "GET", "/api/datasources", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(b["total"], 1);
+    assert_eq!(b["items"][0]["hasPassword"], true, "{b}");
+    assert_eq!(audit_rows(&app.store, "DATASOURCE_CREATE").len(), 1);
+    assert_eq!(audit_rows(&app.store, "APPLY").len(), 1);
+    no_secret_anywhere(&app.store);
+
+    // --- a credential-free dry-run of the same file is still the honest
+    //     diff (unchanged — the stored credential is kept by omission), so
+    //     the oracle surface is gone without taking the preview away
+    let mut without = with_credential.clone();
+    without["datasources"][0]
+        .as_object_mut()
+        .unwrap()
+        .retain(|k, _| k != "username" && k != "password");
+    let (status, diff) = tool_ok(&tool(&app, &hdr, "apply_dry_run", without).await);
+    assert_eq!(status, 200, "{diff}");
+    assert_eq!(diff["datasources"][0]["action"], "unchanged", "{diff}");
+    assert!(
+        diff["datasources"][0]["changes"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "no credential line for a declaration that carries none: {diff}"
+    );
+    // blank halves are "keep the stored credential", not a declaration —
+    // they pass the gate exactly like an omitted credential
+    let mut blank = with_credential.clone();
+    blank["datasources"][0]["username"] = json!("");
+    blank["datasources"][0]["password"] = json!("");
+    let (status, diff) = tool_ok(&tool(&app, &hdr, "apply_dry_run", blank).await);
+    assert_eq!(status, 200, "{diff}");
+    assert_eq!(diff["datasources"][0]["action"], "unchanged", "{diff}");
+    no_secret_anywhere(&app.store);
+}
+
 // ---------------- read tools + actions (mock engine) ----------------
 
 #[tokio::test]
