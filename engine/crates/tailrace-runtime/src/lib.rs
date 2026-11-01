@@ -1549,11 +1549,11 @@ fn run_statement_bounded(
 
 /// G2 (R8, blueprint §7.1): declared column → arrow Field through
 /// `tailrace_catalog::ColumnType::parse` (16 words: 4 legacy kept
-/// byte-compatible + 12 new). Unknown words warn (column name + known
-/// vocabulary) and fold to Utf8 for one minor version (migration window,
-/// blueprint §7.6) — behavior-identical to the pre-G2 `_ => Utf8` fallback
-/// arm, only the warn is new. When the window const in tailrace-ir flips,
-/// this returns the hard error callers already propagate via `?`. A4: the
+/// byte-compatible + 12 new). Unknown words warned and folded to Utf8
+/// through the 1.2.x migration window (blueprint §7.6) — behavior-identical
+/// to the pre-G2 `_ => Utf8` fallback arm, only the warn was new; the
+/// window const in tailrace-ir flipped for 1.3.0, so this now returns the
+/// hard error callers already propagate via `?`. A4: the
 /// field carries the `variant` marker metadata (tailrace-ir
 /// `VARIANT_FIELD_METADATA`) — the same entry tailrace-ir's plan builder
 /// uses, so the ColBatch schema built here and the plan's anchored `src`

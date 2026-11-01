@@ -12,11 +12,12 @@
 //! already depends on tailrace-ir, so ir cannot depend on catalog.
 //!
 //! Unknown vocabulary: strict `ColumnType::parse` errors; the two legacy
-//! `arrow_type` call sites fold through [`arrow_type_or_utf8`] instead — a
-//! one-minor-version migration window (blueprint §7.6) that warns (column
-//! name + the known vocabulary) and folds to Utf8 exactly like the pre-G2
-//! `_ => DataType::Utf8` arm did. The window const flips to `false` in the
-//! next minor, which turns the fold into a hard error propagated by `?` at
+//! `arrow_type` call sites go through [`arrow_type_or_utf8`] instead. G2
+//! shipped that entry with a one-minor-version migration window (blueprint
+//! §7.6): while open it warned (column name + the known vocabulary) and
+//! folded to Utf8 exactly like the pre-G2 `_ => DataType::Utf8` arm did.
+//! The window closed for 1.3.0 (`UNKNOWN_TYPE_UTF8_MIGRATION_WINDOW` is
+//! `false`): an unknown word is now a hard error propagated by `?` at
 //! pipeline assembly.
 
 use std::fmt;
@@ -84,8 +85,9 @@ pub enum ColumnType {
 
 impl ColumnType {
     /// Parse one vocabulary word. Strict: unknown or malformed input is an
-    /// error (the pre-G2 behavior folded silently to Utf8 — that fold now
-    /// lives only in [`arrow_type_or_utf8`], behind the migration window).
+    /// error (the pre-G2 behavior folded silently to Utf8 — that fold lived
+    /// in [`arrow_type_or_utf8`] through the 1.2.x migration window and is
+    /// gone since the window closed for 1.3.0).
     ///
     /// Vocabulary is lowercase-exact (a wire contract has one canonical
     /// spelling; accepting `UTF8` would make the round trip non-unique).
@@ -162,15 +164,21 @@ impl fmt::Display for ColumnType {
 }
 
 /// Migration window for unknown vocabulary (blueprint §7.6: one minor
-/// version of warn-then-fold, then a hard error). Flipping this to `false`
-/// turns [`arrow_type_or_utf8`]'s fold arm into the error pass-through —
-/// callers already `?` the Result, so the flip itself is the whole change.
-pub const UNKNOWN_TYPE_UTF8_MIGRATION_WINDOW: bool = true;
+/// version of warn-then-fold, then a hard error). `false` since 1.3.0 (the
+/// 1.2.x line was the window): [`arrow_type_or_utf8`]'s fold arm is dead
+/// and unknown words error — callers already `?` the Result, so the flip
+/// itself was the whole change. Kept as a const (not deleted) because
+/// `migration_window_folds_unknown_to_utf8` pins both phases against it
+/// and the warn arm stays as the 1.2.x behaviour record.
+pub const UNKNOWN_TYPE_UTF8_MIGRATION_WINDOW: bool = false;
 
 /// The schema-construction entry the two legacy `arrow_type` sites migrated
-/// to: strict parse, arrow mapping, and the migration-window fold for
-/// unknown words — warn (column name + known vocabulary, so the operator can
-/// fix the declaration) then Utf8, byte-identical to the pre-G2 fallback arm.
+/// to: strict parse, arrow mapping, and — while the G2 migration window was
+/// open (1.2.x, blueprint §7.6) — the fold of unknown words to Utf8 after a
+/// warn (column name + known vocabulary, so the operator could fix the
+/// declaration), byte-identical to the pre-G2 fallback arm. Since the
+/// window closed for 1.3.0 the entry is strict end to end: an unknown word
+/// is an error carrying the column name and the known vocabulary.
 pub fn arrow_type_or_utf8(column: &str, vocab: &str) -> anyhow::Result<DataType> {
     match ColumnType::parse(vocab) {
         Ok(ct) => Ok(ct.to_arrow()),
@@ -208,7 +216,7 @@ pub const KNOWN_VOCABULARY: &str = "utf8, string, int8, int16, int32, int64, flo
 pub const VARIANT_FIELD_METADATA: &str = "tailrace.variant";
 
 /// The schema-construction entry for one declared column: [`arrow_type_or_utf8`]
-/// for the data type (same migration-window fold for unknown words),
+/// for the data type (strict since the migration window closed for 1.3.0),
 /// nullable, plus the per-column annotation the arrow type cannot carry:
 /// the [`VARIANT_FIELD_METADATA`] marker when the word is `variant`, the
 /// declared dimension as [`VECTOR_DIM_FIELD_METADATA`] when the word is
@@ -620,8 +628,10 @@ mod tests {
     /// A4: the field-construction entry marks exactly the `variant` word.
     /// utf8 — the same arrow type — carries no metadata (byte-identical to
     /// the pre-A4 `Field::new(name, type, true)`), so schemas without a
-    /// variant column are unchanged; the unknown-word fold lands a plain
-    /// Utf8 field too (the marker is for the declared word, never a guess).
+    /// variant column are unchanged; through the 1.2.x window an unknown
+    /// word folded to a plain Utf8 field too — since the window closed for
+    /// 1.3.0 an unknown word errors before any field exists (there is no
+    /// field the marker could leak onto).
     #[test]
     fn variant_field_marker() {
         let v = arrow_field_or_utf8("attrs", "variant").unwrap();
@@ -633,11 +643,16 @@ mod tests {
             v.metadata().get(VARIANT_FIELD_METADATA).map(String::as_str),
             Some("true")
         );
-        for word in ["utf8", "string", "int64", "varchar(64)"] {
+        for word in ["utf8", "string", "int64"] {
             let f = arrow_field_or_utf8("c", word).unwrap();
             assert!(!is_variant_field(&f), "{word} must not carry the marker");
             assert!(f.metadata().is_empty(), "{word} field keeps empty metadata");
         }
+        // window closed (1.3.0): an unknown word never becomes a field
+        assert!(
+            arrow_field_or_utf8("c", "varchar(64)").is_err(),
+            "unknown words error — nothing a marker could ride on"
+        );
         assert_eq!(
             arrow_field_or_utf8("c", "utf8").unwrap(),
             Field::new("c", DataType::Utf8, true),
@@ -687,11 +702,16 @@ mod tests {
         );
         assert_eq!(bare, Field::new("emb", f32_list, true));
         // nothing else is a vector field, nothing else carries a dimension
-        for word in ["utf8", "float32", "variant", "binary", "varchar(64)"] {
+        for word in ["utf8", "float32", "variant", "binary"] {
             let f = arrow_field_or_utf8("c", word).unwrap();
             assert!(!is_vector_field(&f), "{word} is not a vector field");
             assert_eq!(vector_dim(&f), None, "{word} carries no dimension");
         }
+        // window closed (1.3.0): an unknown word never becomes a field
+        assert!(
+            arrow_field_or_utf8("c", "varchar(64)").is_err(),
+            "unknown words error — no field, so no dimension either"
+        );
     }
 
     /// R9 review fix: a dimension past `MAX_VECTOR_DIM` is rejected at
@@ -708,9 +728,9 @@ mod tests {
                 dim: Some(MAX_VECTOR_DIM)
             }
         );
-        // `parse` is the strict entry (the `*_or_utf8` entries fold any parse
-        // failure to Utf8 inside the G2 migration window — not what this
-        // test is about)
+        // `parse` is the strict entry (and since the G2 migration window
+        // closed for 1.3.0, the `*_or_utf8` entries share that strictness —
+        // the Utf8 fold is gone, not what this test is about)
         for bad in [
             format!("{}", MAX_VECTOR_DIM as u64 + 1),
             "4294967295".to_string(), // u32::MAX, over the cap
@@ -789,55 +809,27 @@ mod tests {
         }
     }
 
-    /// Review fix (R8 acceptance "迁移窗 warn 有日志样例"): the migration
-    /// window's warn actually REACHES a tracing subscriber — install a
-    /// thread-default fmt subscriber over a captured buffer, fold one
-    /// unknown word, and assert the WARN line carries the message, the
-    /// column name and the offending vocabulary. This is the runnable,
-    /// regression-proof form of the acceptance's "log sample" (no runtime
-    /// artifact is committed).
+    /// Window-closed successor of the R8 acceptance test "迁移窗 warn 有日志
+    /// 样例" (`migration_window_warn_actually_logs`, 1.2.x): that test
+    /// captured the window's WARN line through a tracing subscriber — a
+    /// subscriber is no longer in the picture once the fold arm is dead, so
+    /// the diagnostic-quality guard continues against the hard error
+    /// instead: the message an operator sees on an unknown word must carry
+    /// the column name, the offending vocabulary, and the known vocabulary,
+    /// because that message is now the ONLY signal (no Utf8-shaped row
+    /// surfaces downstream to hint at it).
     #[test]
-    fn migration_window_warn_actually_logs() {
-        use std::io::Write;
-        use std::sync::{Arc, Mutex};
-        use tracing_subscriber::util::SubscriberInitExt as _;
-
-        #[derive(Clone)]
-        struct Capture(Arc<Mutex<Vec<u8>>>);
-        impl Write for Capture {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().write(buf)
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
-            type Writer = Capture;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let buf = Capture(Arc::new(Mutex::new(Vec::new())));
-        let guard = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .with_target(false)
-            .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
-            .set_default();
-        let folded = arrow_type_or_utf8("amount", "varchar(64)").unwrap();
-        drop(guard);
-        assert_eq!(folded, DataType::Utf8);
-        let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        assert!(text.contains("WARN"), "expected a WARN event, got: {text}");
-        assert!(
-            text.contains("unknown column type vocabulary folds to utf8"),
-            "the migration-window message must reach the subscriber, got: {text}"
-        );
+    fn unknown_word_error_carries_diagnostic() {
+        let err = arrow_type_or_utf8("amount", "varchar(64)")
+            .expect_err("window closed (1.3.0) — unknown words must hard-error");
+        let text = format!("{err:#}");
         assert!(
             text.contains("amount") && text.contains("varchar(64)"),
-            "column name + offending vocabulary ride the event, got: {text}"
+            "column name + offending vocabulary ride the error, got: {text}"
+        );
+        assert!(
+            text.contains(KNOWN_VOCABULARY),
+            "the known-vocabulary hint rides the error, got: {text}"
         );
     }
 }

@@ -130,6 +130,28 @@ _v1.3 development line (`feature/v1.3-dev`, R11 §二). Anchors are
   `docs/protocol/console-api.md` 裁决 13 is updated to "表唯一化、计数不变";
   the downstream `rawB64` idempotency habit stays valid but the engine no
   longer produces duplicate rows.
+- **BREAKING: unknown column-type vocabulary is a hard error, not a Utf8
+  fold** (T-V5, blueprint §7.6). `UNKNOWN_TYPE_UTF8_MIGRATION_WINDOW` is
+  `false` (`engine/crates/tailrace-ir/src/column_type.rs:173`): the
+  one-minor-version warn-then-fold window G2 shipped in 1.2.x is closed, so
+  a `TableObject.columns` type word outside the 16-word vocabulary (e.g.
+  `varchar(64)`) now fails pipeline assembly via `?` at
+  `arrow_type_or_utf8` (`column_type.rs:182`) / `arrow_field_or_utf8`
+  (`column_type.rs:229`) — every schema-construction site goes through
+  them, no site is special-cased. **1.2.0 users upgrading to 1.3.0**: a
+  declaration that relied on the fold (unknown words silently landing
+  Utf8, with a WARN naming the column and the known vocabulary since
+  1.2.0) must be re-spelled to the vocabulary — `utf8, string, int8, int16,
+  int32, int64, float32, float64, decimal(p,s), timestamp(s|ms|us|ns),
+  date, bool, binary, list<float32[,dim]>, variant, null` — or assembly
+  errors with `column <name>: unknown type vocabulary "<word>" (known:
+  …)`. The R8 design kept both phases pinned against the const
+  (`migration_window_folds_unknown_to_utf8` — its else arm IS the
+  hard-error guard, so the flip turned the test with no edit), and the
+  1.2.x WARN-log acceptance test continues as the error-diagnostic guard
+  `unknown_word_error_carries_diagnostic` (column name + offending word +
+  known vocabulary ride the error); the `variant` / `vector-dim` marker
+  tests now assert the unknown word never becomes a field at all.
 
 ### Fixed
 
