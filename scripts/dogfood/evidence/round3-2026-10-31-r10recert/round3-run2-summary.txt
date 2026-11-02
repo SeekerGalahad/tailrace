@@ -1,0 +1,27 @@
+ok   0s  S0.1 console binary
+ok   0s  S0.2 node binary
+ok   0s  D0.1 standing stack doris-3.1.4-rc02-7f5ba43de6 (FE doris-2.1 → 127.0.0.1:9030, BE → 127.0.0.1:8040)
+ok   0s  D0.2 dedicated database tailrace_dogfood3 dropped+created (rest of the stack untouched)
+ok   1s  D1.1 mock webhook up (127.0.0.1:18195)
+ok   1s  D1.2 console booted (alert evaluator at 2s)
+ok   0s  D1.3 login
+ok   0s  D1.4 datasources (doris=1 file=2)
+ok   1s  D1.5 node up
+ok   1s  D1.6 node ONLINE
+ok   0s  D2.1 draft: VARIANT ×2 + emb ARRAY<FLOAT> dim=3 comment + bare scores (A4×A5 words through the wizard face)
+ok   0s  D2.2 executed on the live table (SHOW CREATE TABLE carries variant + the dim comment — zero hand DDL)
+ok   0s  D2.3 evolve on the dimmed table → 200 changed=false (dim invisible to DESC is not a retype — R9 review fix)
+ok   0s  D3.0a BE write path healthy (gate attempt 1)
+ok   0s  D3.1 pipeline df3-docs deployed → RUNNING (#1)
+ok   3s  D3.2 nested JSON answered from sub-columns (source/verified/4-level path) and vectors element-exact (incl. 1e-07) — through the real engine chain
+ok   0s  D3.3a BE write path healthy before the bad-row pipeline (gate attempt 1)
+ok   2s  D3.3 dim guard lived: the good row landed (1), the wrong-length row quarantined to bad_rows/p2-s0.jsonl (1 record(s))
+ok   0s  D4.1 lag rule (threshold 6s, pipeline=1) + webhook created (#1)
+ok   0s  D4.2 /metrics exposes the SLO target beside the lag series: tailrace_slo_lag_target_seconds{node="engine-node",pipeline="1",statement="0"} 6
+ok   0s  D4.3 pipeline paused (manufacturing the lag)
+ok   5s  D4.4 rule FIRING on the real pause (~8s in)
+ok   0s  D4.5 resumed (fresh row appended before)
+ok   2s  D4.6 rule RESOLVED 2s after the resume; DOC-4 landed (4 rows), pipeline stopped
+ok   3s  D4.7 webhook carries the episode's 2 notices (firing then resolved, SAME episode id 1, SAME series tailrace_pipeline_lag_seconds{node="engine-node",pipeline="1",statement="0"}) — sequence [firing,resolved], total 2
+ok   2s  D4.8 rule deleted (204), no phantom notice (hook total stays 2)
+ok   0s  D5.1 tailrace_dogfood3 dropped (standing stack untouched)

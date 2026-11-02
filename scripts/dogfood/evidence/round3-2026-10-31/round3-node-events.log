@@ -1,0 +1,1 @@
+1793400677656	WARN	DECODE_BAD	pipeline#2	decoded bad rows total 1 (this batch 1) — quarantined to DLQ: /tmp/tailrace-dogfood3/node-state/bad_rows/p2-s0.jsonl

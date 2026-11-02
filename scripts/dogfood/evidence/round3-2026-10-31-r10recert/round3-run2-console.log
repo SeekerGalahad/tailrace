@@ -1,0 +1,11 @@
+[2m2026-10-31T10:12:00.307665Z[0m [32m INFO[0m [2mrusqlite_migration[0m[2m:[0m Database migrated to version 6
+──────────────────────────────────────────────────────────────
+[Tailrace] 首次启动：初始管理员已创建
+[Tailrace]   用户名：admin
+[Tailrace]   初始密码：8912e0a33fff0f1aeab3780a
+[Tailrace]   （仅此一次显示，请妥善保存）
+──────────────────────────────────────────────────────────────
+[2m2026-10-31T10:12:00.322645Z[0m [32m INFO[0m [2mtailrace_console::alerting[0m[2m:[0m alert evaluator started [3minterval_secs[0m[2m=[0m2
+[2m2026-10-31T10:12:00.323956Z[0m [32m INFO[0m [2mtailrace_console[0m[2m:[0m tailrace-console 1.1.0 listening on http://127.0.0.1:18091
+[2m2026-10-31T10:12:00.323969Z[0m [32m INFO[0m [2mtailrace_console[0m[2m:[0m data dir: /tmp/tailrace-dogfood3/run | swagger: http://127.0.0.1:18091/swagger-ui | api doc: http://127.0.0.1:18091/api-docs/openapi.json
+[2m2026-10-31T10:12:00.323973Z[0m [32m INFO[0m [2mtailrace_console[0m[2m:[0m mcp: http://127.0.0.1:18091/mcp (write tools disabled)

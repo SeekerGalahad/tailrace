@@ -1,0 +1,74 @@
+== variant_vector e2e: work=/tmp/tailrace-vv-e2e fe=127.0.0.1:9030 be=127.0.0.1:8040 db=tailrace_vv_e2e console=127.0.0.1:18087 ==
+  ok    S0.1 console binary /Users/wagic/GLMProjects/tailrace/target/release/tailrace-console
+  ok    S0.2 engine node binary /Users/wagic/GLMProjects/tailrace/target/release/tailrace-node
+  ok    S0.4 compose override generated: BE swap check neutralized for the e2e stack only (/tmp/tailrace-vv-e2e/compose-be-swap-override.yml)
+  ok    S1.1 external standing doris via TAILRACE_E2E_DORIS_MYSQL (compose skipped; fe=127.0.0.1:9030 be=127.0.0.1:8040)
+  ok    S2.0 backend Alive=true (heartbeat-driven availability)
+  ok    S2.1 database tailrace_vv_e2e empty (DROP FORCE + CREATE)
+  ok    S2.2 server version under test: doris-3.1.4-rc02-7f5ba43de6 (SHOW FRONTENDS; SELECT VERSION() only reports the mysql protocol)
+  ok    P0.1 probe_mix created (VARIANT + ARRAY<FLOAT> side by side, hand-DDLed on purpose — this tier pins Doris, not the engine)
+  FAIL  P1.1 mixed shapes  b1= b2= e1= e2= r1={
+    "TxnId": 61196,
+    "Label": "vv_p_str_23806",
+    "Comment": "",
+    "TwoPhaseCommit": "false",
+    "Status": "Fail",
+    "Message": "[MEM_LIMIT_EXCEEDED]PreCatch error code:11, [E11] Allocator
+  ok    P2.1 f32 edges survive the string→FLOAT cast: 1e-7 → 1e-07, 0.33333334 kept, f32::MAX 3.4028235e38 → 3.4028235e+38 (vector probe README W4 note 1 — asserted, not assumed)
+  ok    S3.1 console booted (fresh data-dir)
+  ok    S3.2 login → 200 + token
+  ok    S3.3 datasources: doris direct (d=1) + doris via carrier proxy (d=2) + file (f=3)
+  ok    S3.4 engine node up (serve)
+  ok    S3.5 node ONLINE
+  ok    T1.1 draft maps the mixed vocabulary: meta/content→VARIANT, emb→ARRAY<FLOAT> COMMENT 'vector dim=3' (the dim annotation), scores→bare ARRAY<FLOAT> (no dim, no comment)
+  ok    T1.2 execute → live SHOW CREATE TABLE: meta/content variant, emb array<float> with the 'vector dim=3' comment, scores array<float> (real Doris types, zero hand DDL)
+  ok    T1.3 evolve on the BARE vector table reports changed=false (DESC array<float> folds back to list<float32> — round-trip stable)
+  ok    T1.4 observation: evolve on the DIMMED table → http=409 retyped=none (dim is declaration-only; vector probe README W4 note 2 — recorded, not asserted)
+  ok    T2.1 keyColumn=meta (variant) → 400 naming VARIANT (the generator refuses a draft the FE would refuse; variant probe A3)
+  ok    T2.2 keyColumn=emb (vector) → 400 naming ARRAY (FE: 'Array can only be used in the non-key column'; vector probe A3)
+  ok    T3.1 file table local.docs_in (jsonl, the mixed vocabulary)
+  ok    T3.2 seeds: 5 rows (nested docs incl. null/{}/array-root/string-scalar; vectors incl. ints/negatives/zero/1e-7; scores 3/1/null/[]/absent)
+  ok    T3.2a BE write path healthy before the deployment (gate attempt 1)
+  ok    T3.3 pipeline full-column file→docs_emb deployed → RUNNING
+  FAIL  T3.4 count  n=0 node.log=tailrace-node serve mode: http://127.0.0.1:18107 (/healthz open; /v1 requires the node token)
+[2m2026-10-30T19:59:52.492216Z[0m [32m INFO[0m [2mtailrace_api::heartbeat[0m[2m:[0m identity ready [3mnode_key[0m[2m=[0msn-740a5f8bd95ea0dc [3mname[0m[2m=[0mengine-node [3mcontrol_plane[0m[2m=[0m"http://127.0.0.1:18087"
+[2m2026-10-30T19:59:52.497445Z[0m [32m INFO[0m [2mtailrace_api::heartbeat[0m[2m:[0m adopted console-issued per-node token (persisted, m2m + /v1 rotated)
+[2m2026-10-30T19:59:52.497450Z[0m [32m INFO[0m [2mtailrace_api::heartbeat[0m[2m:[0m self-registration ok [3mnode_key[0m[2m=[0msn-740a5f8bd95ea0dc
+[2m2026-10-30T19:59:55.071278Z[0m [32m INFO[0m [2mtailrace_runtime::registry[0m[2m:[0m pipeline started (serve) [3mpipeline_id[0m[2m=[0m1 [3mstatements[0m[2m=[0m1 [3mdispatch_id[0m[2m=[0m1793390395026000 [3mbad_row_policy[0m[2m=[0mdlq events=3
+  FAIL  T3.5 nested sub-columns  meta=0 path=0 tags=0 (each expected 1)
+  FAIL  T3.6 variant shapes  doc2=0 doc3=0 doc4=0 doc5= (each expected 1) actual-doc5=[]
+  FAIL  T3.7 vector elements  got= want=DOC-1=0.1,0.2,0.3#3;DOC-2=1,2,3#3;DOC-3=-0.5,0,0.5#3;DOC-4=1e-07,1,0.33333334#3;DOC-5=0.25,0.5,0.75#3
+  FAIL  T3.8 dimless scores  sc= s2=
+  ok    T4.1 emb_bad created (emb declared dim=3)
+  ok    T4.2 seeds: GOOD-1, then wrong-length [1,2] / scalar 42 / non-numeric element "x" (the guard's kill shapes — Doris would degrade each silently), then GOOD-2
+  FAIL  T4.2a BE write health  MEM_LIMIT window outlasted 6×10s — the standing BE is too tight for this run
+  ok    T4.3 pipeline file→emb_bad deployed → RUNNING (default badRowPolicy=dlq, pipeline #2)
+  pipeline vv-bad create failed: http=409 body={"error":{"code":"CONFLICT","message":"管道名称已存在"}}
+  FAIL  T4.3a redeploy  deploy chain failed
+  FAIL  T4.4 guard filtered  n=0 goods=
+  ok    T4.5 CORE the killed rows are quarantined, not lost: /tmp/tailrace-vv-e2e/node-state/bad_rows/p2-s0.jsonl holds 9 record(s) (3 per decode of the batch — >3 means a failed flush replayed it, at-least-once)
+  ok    T4.6 CORE DLQ raw bytes round-trip: the distinct base64-decoded payloads are exactly the 3 seed lines, byte for byte, in source order (recoverable for replay, not just counted)
+  FAIL  T4.7 dlq metric  metric= dlq_rows=9
+  ok    C0.1 carrier proxy up: 127.0.0.1:18180 → BE 127.0.0.1:8040 (tees the engine's stream-load bytes)
+  ok    C0.1a BE write path healthy before the carrier deployment (gate attempt 2)
+  ok    C0.2 carrier pipeline deployed → RUNNING (sink table object on the proxy-fronted datasource)
+  ok    C0.3 the carrier row landed through the proxy (meta.nested.b=42 — the relay is transparent to correctness)
+  ok    C1.0 captured: PUT /api/tailrace_vv_e2e/docs_emb/_stream_load HTTP/1.1 with the CAR-1 body line
+  ok    C1.1 CARRIER (review focus): meta/content ride as JSON STRING literals holding the WHOLE sub-document (nested object + inner array, structurally equal to the source) — no leaf parsing, no flattening; Doris does the sub-column inference server-side. Wire form: meta="{\"source\":\"carrier\",\"nested\":{\"b\":42,\"arr\":[1,2]}}"
+  ok    C1.2 CARRIER vectors ride as the arrow display STRING (emb="[0.1, 0.2, 0.3]", scores="[1.0, 2.0]") — the ArrayFormatter catch-all arm, the exact shape P1.1 proved the server parses
+scripts/e2e/variant_vector.sh: line 169: 24425 Terminated: 15          TAILRACE_BOOTSTRAP_TOKEN="tr_b_vv_e2e_00112233445566778899aabbccddeeff" "$CONSOLE_BIN" --addr "$CONSOLE_ADDR" --data-dir "$WORK/run" > "$WORK/console.log" 2>&1
+scripts/e2e/variant_vector.sh: line 169: 27751 Terminated: 15          python3 "$WORK/proxy.py" "$PROXY_PORT" "127.0.0.1:$BE_PORT" "$WORK/carrier.txt" > "$WORK/proxy.log" 2>&1
+  ok    S4.1 external doris cleanup: DROP DATABASE tailrace_vv_e2e FORCE (standing stack untouched)
+== variant_vector e2e summary: 37/47 steps passed ==
+failed steps:
+  - P1.1 mixed shapes
+  - T3.4 count
+  - T3.5 nested sub-columns
+  - T3.6 variant shapes
+  - T3.7 vector elements
+  - T3.8 dimless scores
+  - T4.2a BE write health
+  - T4.3a redeploy
+  - T4.4 guard filtered
+  - T4.7 dlq metric
+work dir kept for post-mortem: /tmp/tailrace-vv-e2e

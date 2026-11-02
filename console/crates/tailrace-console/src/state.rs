@@ -28,6 +28,11 @@ struct Inner {
     /// §5.3 credential cipher (AES-256-GCM; the key is loaded by main and
     /// never persisted anywhere the cipher could leak it).
     cipher: CredentialCipher,
+    /// T-E2 alert event hub: every firing/resolved transition is broadcast
+    /// here; `GET /api/alerts/stream` subscribers fan out over SSE. Bounded
+    /// (64): a slow subscriber lags and is told so, the evaluator never
+    /// blocks on it.
+    alerts_tx: tokio::sync::broadcast::Sender<crate::alerting::AlertNotice>,
 }
 
 impl AppState {
@@ -73,6 +78,7 @@ impl AppState {
                 .map(|data| data.join("backfill"))
                 .unwrap_or_else(|| PathBuf::from("./data/backfill")),
             cipher,
+            alerts_tx: tokio::sync::broadcast::channel(64).0,
         }))
     }
 
@@ -104,6 +110,18 @@ impl AppState {
 
     pub fn cipher(&self) -> &CredentialCipher {
         &self.0.cipher
+    }
+
+    /// T-E2: the alert event hub (evaluator publishes transitions here).
+    pub fn alerts_tx(&self) -> &tokio::sync::broadcast::Sender<crate::alerting::AlertNotice> {
+        &self.0.alerts_tx
+    }
+
+    /// T-E2: subscribe to alert transitions (SSE stream / tests).
+    pub fn subscribe_alerts(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::alerting::AlertNotice> {
+        self.0.alerts_tx.subscribe()
     }
 }
 

@@ -4,6 +4,8 @@
 // Err site for no runtime gain (cold-path parse/load helpers).
 #![allow(clippy::result_large_err)]
 
+pub mod alerts;
+pub mod apply;
 pub mod artifacts;
 pub mod auth;
 pub mod datasources;

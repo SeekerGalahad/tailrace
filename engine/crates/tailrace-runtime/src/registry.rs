@@ -75,6 +75,15 @@ fn cursor_progress(state_dir: &std::path::Path, pipeline_id: u64, n_statements: 
                     .bytes()
                     .chain(value.bytes())
                     .fold(13u64, |a, b| a.wrapping_mul(31).wrapping_add(b as u64)),
+                // G3: the payload is opaque to the engine, so fold kind + the
+                // compact JSON of the payload — any payload advance must read
+                // as progress (the JdbcKey lesson above). serde_json's Map is
+                // key-sorted, so the same ledger entry re-serializes to the
+                // same bytes across restarts (deterministic fold).
+                Cursor::Custom { kind, payload } => kind
+                    .bytes()
+                    .chain(payload.to_string().bytes())
+                    .fold(17u64, |a, b| a.wrapping_mul(31).wrapping_add(b as u64)),
                 Cursor::None => 5,
             };
             acc = acc.wrapping_mul(1_000_003).wrapping_add(h);
@@ -880,6 +889,68 @@ mod tests {
             fp2,
             cursor_progress(&dir, 9902, 1),
             "key change moves the fingerprint"
+        );
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// G3 (Cursor::Custom): the poison-data fingerprint must see an opaque
+    /// payload advance as progress (a constant arm would repeat the JdbcKey
+    /// regression above — 3 transient failures judged poison data), stay
+    /// bit-stable while the payload is frozen (re-parsed from the ledger
+    /// across restarts), and treat a `kind` change as a visible change.
+    #[test]
+    fn custom_payload_advance_moves_the_cursor_fingerprint() -> anyhow::Result<()> {
+        let ccursor = |kind: &str, lsn: &str| Cursor::Custom {
+            kind: kind.into(),
+            payload: serde_json::json!({ "lsn": lsn, "ts": 1730000000_i64 }),
+        };
+        let dir = std::env::temp_dir().join(format!("tailrace-custom-fp-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        {
+            let mut store = FileOffsetStore::new(&dir)?;
+            store.save(9903, 0, &ccursor("pg-lsn", "0/16B3748"), Some("run1"), None)?;
+        }
+        let fp1 = cursor_progress(&dir, 9903, 1);
+        assert_eq!(
+            fp1,
+            cursor_progress(&dir, 9903, 1),
+            "same ledger → identical fingerprint (deterministic fold)"
+        );
+        {
+            let mut store = FileOffsetStore::new(&dir)?;
+            store.save(9903, 0, &ccursor("pg-lsn", "0/16B3800"), Some("run2"), None)?;
+        }
+        let fp2 = cursor_progress(&dir, 9903, 1);
+        assert_ne!(
+            fp1, fp2,
+            "payload advance must move the fingerprint (no false NO_PROGRESS)"
+        );
+        // frozen payload re-committed → identical fingerprint
+        {
+            let mut store = FileOffsetStore::new(&dir)?;
+            store.save(9903, 0, &ccursor("pg-lsn", "0/16B3800"), Some("run3"), None)?;
+        }
+        assert_eq!(
+            fp2,
+            cursor_progress(&dir, 9903, 1),
+            "frozen cursor → identical fingerprint across restarts"
+        );
+        // same payload under another kind is a different position
+        {
+            let mut store = FileOffsetStore::new(&dir)?;
+            store.save(
+                9903,
+                0,
+                &ccursor("mysql-gtid", "0/16B3800"),
+                Some("run4"),
+                None,
+            )?;
+        }
+        assert_ne!(
+            fp2,
+            cursor_progress(&dir, 9903, 1),
+            "kind change moves the fingerprint"
         );
         std::fs::remove_dir_all(&dir)?;
         Ok(())

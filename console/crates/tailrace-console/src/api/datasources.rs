@@ -168,7 +168,7 @@ fn registry() -> Vec<DatasourceType> {
 }
 
 /// Registry order gate for write paths (§4.2: 400 when the type is unknown).
-fn registry_type(ty: &str) -> Option<&'static str> {
+pub(crate) fn registry_type(ty: &str) -> Option<&'static str> {
     match ty {
         "kafka" => Some("kafka"),
         "doris" => Some("doris"),
@@ -181,7 +181,7 @@ fn registry_type(ty: &str) -> Option<&'static str> {
 }
 
 /// Required connJson keys per type (form-completeness precheck).
-fn required_conn_keys(ty: &str) -> &'static [&'static str] {
+pub(crate) fn required_conn_keys(ty: &str) -> &'static [&'static str] {
     match ty {
         "kafka" => &["bootstrap"],
         "doris" | "starrocks" => &["jdbcUrl", "streamLoadUrl"],
@@ -201,7 +201,7 @@ fn required_conn_keys(ty: &str) -> &'static [&'static str] {
 /// `kind == "starrocks"`, so folding starrocks into "doris" here would make
 /// the engine send Doris-only headers to a StarRocks FE. Both kinds derive
 /// cursor NONE (sink-side).
-fn table_kind_for(ds_type: &str) -> &str {
+pub(crate) fn table_kind_for(ds_type: &str) -> &str {
     match ds_type {
         "mysql" | "postgresql" => "jdbc",
         other => other,
@@ -525,14 +525,12 @@ fn validate_upsert(body: &DatasourceUpsertBody) -> Result<String, Response> {
     serde_json::to_string(&conn).map_err(|e| ApiError::internal(&e.into()).into_response())
 }
 
-/// Credential halves (§5.3): JSON {"username","password"} sealed with
-/// AES-256-GCM → (nonce_b64, ciphertext_b64) for the two
-/// `datasource_credential` columns. Plaintext never reaches storage or any
-/// response, and credentials are never returned by any endpoint.
-fn credential_halves(
-    body: &DatasourceUpsertBody,
-    cipher: &console_store::CredentialCipher,
-) -> Option<anyhow::Result<(String, String)>> {
+/// The credential plaintext a body declares — JSON `{"username","password"}`
+/// — or None when the body carries neither (blank password keeps the stored
+/// credential, §4.2 A.1 #7). Shared by [`credential_halves`] and the T-G6
+/// apply diff, which opens the stored halves and compares against exactly
+/// this text so a re-declared identical credential is "unchanged".
+pub(crate) fn credential_payload(body: &DatasourceUpsertBody) -> Option<String> {
     let has_user = body
         .username
         .as_deref()
@@ -546,11 +544,24 @@ fn credential_halves(
     if !has_user && !has_pass {
         return None;
     }
-    let payload = json!({
-        "username": body.username.as_deref().unwrap_or(""),
-        "password": body.password.as_deref().unwrap_or(""),
-    });
-    Some(cipher.seal(&payload.to_string()))
+    Some(
+        json!({
+            "username": body.username.as_deref().unwrap_or(""),
+            "password": body.password.as_deref().unwrap_or(""),
+        })
+        .to_string(),
+    )
+}
+
+/// Credential halves (§5.3): JSON {"username","password"} sealed with
+/// AES-256-GCM → (nonce_b64, ciphertext_b64) for the two
+/// `datasource_credential` columns. Plaintext never reaches storage or any
+/// response, and credentials are never returned by any endpoint.
+fn credential_halves(
+    body: &DatasourceUpsertBody,
+    cipher: &console_store::CredentialCipher,
+) -> Option<anyhow::Result<(String, String)>> {
+    credential_payload(body).map(|payload| cipher.seal(&payload))
 }
 
 /// `GET /api/datasources?type=&layer=` (§4.2; `layer` accepted for form
@@ -1679,7 +1690,7 @@ fn ddl_ident(name: &str) -> anyhow::Result<String> {
 }
 
 /// `unique` / `duplicate` (case-insensitive) → key model.
-fn parse_key_model(s: &str) -> Option<tailrace_ddl::KeyModel> {
+pub(crate) fn parse_key_model(s: &str) -> Option<tailrace_ddl::KeyModel> {
     match s.trim().to_ascii_lowercase().as_str() {
         "unique" => Some(tailrace_ddl::KeyModel::Unique),
         "duplicate" => Some(tailrace_ddl::KeyModel::Duplicate),
@@ -1706,7 +1717,13 @@ fn ddl_key_clause(ddl: &str) -> Option<tailrace_ddl::KeyModel> {
 /// folded through the type vocabulary (A3-narrowed — widths/decimals/time
 /// types survive the fold, so the diff sees real type differences),
 /// `target` = registered columns_json. Names compare case-insensitively
-/// (Doris column names are), types exactly.
+/// (Doris column names are), types exactly — except the vector dim: a
+/// registered `list<float32,N>` arrives from `DESC` as `array<float>`,
+/// which folds back to a bare `list<float32>` (the dim lives in the column
+/// COMMENT, not the type), so the dim is invisible to the diff and must
+/// not read as a retype (R9 review fix — otherwise every dimmed vector
+/// table could never evolve: one phantom MODIFY would 409 the whole plan
+/// and block even pure ADD COLUMNs).
 #[derive(Debug, Default, PartialEq, Eq)]
 struct EvolvePlan {
     /// In target, not in current — the only change evolve executes.
@@ -1716,6 +1733,21 @@ struct EvolvePlan {
     /// Same name, different vocabulary — `(name, registered, current)`;
     /// `MODIFY COLUMN` suggestion, never executed.
     retyped: Vec<(String, String, String)>,
+}
+
+/// Registered vs DESC-folded type equality. Exact, except
+/// `list<float32,N> == list<float32>`: the dim annotation is a
+/// registration-side guard the live table cannot contradict (Doris itself
+/// does not carry it in the type), so it is not a retype. Everything else
+/// — including a real dim change or any other type change — still reads as
+/// retyped once the DESC side could show it.
+fn type_matches(registered: &str, current: &str) -> bool {
+    if registered == current {
+        return true;
+    }
+    registered.starts_with("list<float32,")
+        && registered.ends_with('>')
+        && current == "list<float32>"
 }
 
 fn diff_columns(current: &[(String, String)], target: &[(String, String)]) -> EvolvePlan {
@@ -1728,7 +1760,9 @@ fn diff_columns(current: &[(String, String)], target: &[(String, String)]) -> Ev
     for (name, ty) in target {
         match find(current, name) {
             None => plan.added.push((name.clone(), ty.clone())),
-            Some((_, have)) if &have != ty => plan.retyped.push((name.clone(), ty.clone(), have)),
+            Some((_, have)) if !type_matches(ty, &have) => {
+                plan.retyped.push((name.clone(), ty.clone(), have))
+            }
             Some(_) => {}
         }
     }
@@ -2450,6 +2484,39 @@ mod tests {
         let current = cols(&[("id", "int64"), ("Name", "utf8")]);
         let target = cols(&[("ID", "int64"), ("name", "utf8")]);
         assert_eq!(diff_columns(&current, &target), EvolvePlan::default());
+    }
+
+    /// R9 review fix: a registered `list<float32,N>` (the A5 recommended
+    /// vector shape) reads back from `DESC` as bare `list<float32>` — the
+    /// dim lives in the column COMMENT, not the type — so it must not be
+    /// flagged retyped: evolve on a dimmed table stays add-only (no phantom
+    /// MODIFY, no 409), and a bare registered list is NOT treated as a
+    /// dimmed one in either direction.
+    #[test]
+    fn evolve_dimmed_vector_column_is_not_a_retype() {
+        // registered dimmed, DESC folded bare → match, and a new column is
+        // still addable (the case T1.4/D2.3 hit as a 409)
+        let current = cols(&[("id", "int64"), ("vec", "list<float32>")]);
+        let target = cols(&[("id", "int64"), ("vec", "list<float32,3>"), ("tag", "utf8")]);
+        let plan = diff_columns(&current, &target);
+        assert_eq!(plan.added, cols(&[("tag", "utf8")]));
+        assert!(
+            plan.retyped.is_empty(),
+            "dim invisible to DESC is not a retype: {plan:?}"
+        );
+        assert!(plan.removed.is_empty());
+        // a REAL type change on the same column still reads as retyped
+        let target = cols(&[("id", "int64"), ("vec", "list<float32,3>"), ("n", "int32")]);
+        let current = cols(&[("id", "int64"), ("vec", "int64")]);
+        let plan = diff_columns(&current, &target);
+        assert_eq!(
+            plan.retyped,
+            vec![(
+                "vec".to_string(),
+                "list<float32,3>".to_string(),
+                "int64".to_string()
+            )]
+        );
     }
 
     /// ALTER text hygiene: a type outside the four-type vocabulary is an

@@ -14,19 +14,22 @@
 
 ## 状态
 
-**已发布：v1.1.0（2026-10-25）。** 21 个 workspace crate 在 crates.io 发至 1.1.0
-（`cargo install tailrace-node --version 1.1.0 --locked`），v1.1.0 git tag 与
-9 资产 GitHub Release 在档。随版交付：引擎数据面（kafka / file / jdbc 为源，Doris +
-StarRocks Stream Load 与 file 为汇）、数据源发现与模式推断（`discover` /
-`infer-schema`）、SSH 部署链、性能账本（docs/BENCHMARKS.md）与 8 job CI 矩阵。
+**已发布：v1.2.0（2026-10-31）。** 全树已锁版 1.2.0（22 个可发布 crate 同步
+lockstep）并随发布门禁发往 crates.io（`cargo install tailrace-node --version 1.2.0
+--locked`），v1.2.0 git tag / GitHub Release 为余下步骤（R5 先例：先定版、后发布）。
+随版交付：引擎数据面（kafka / file / jdbc 为源，Doris + StarRocks Stream Load 与 file
+为汇）、数据源发现与模式推断（`discover` / `infer-schema`）、SSH 部署链、性能账本
+（docs/BENCHMARKS.md）、8 job CI 矩阵与下方全部能力——叠在 v1.1.0（2026-10-25，首批
+21 个 crate 上 crates.io、tag 与 9 资产 Release 在档）之上。
 
-**在本树中、尚未发布。** v1.1.0 之后四轮开发落地了下方[能力矩阵](#能力矩阵v110-之后未发布)
-所列十二项能力：`/metrics`、Debezium CDC 解码、MCP 服务、维表广播 join、建表闭环、
-确定性回填、部分列更新、十六词列类型词汇、`TableObject` options 化、Sink 事务钩子、
-`sequence_col` DDL 属性与全 workspace `forbid(unsafe_code)`。**crates.io 与二进制
-Release 现值仍为 1.1.0——开发线能力超前于已发布版。** 下一个版本号在发布时
-定、不在这里定；逐轮账见 [docs/design/architecture.zh.md](docs/design/architecture.zh.md)
-§十二，[CHANGELOG.md](CHANGELOG.md) 为发布日志。
+**v1.1.0 之后**六轮开发落地了下方[能力矩阵](#能力矩阵v120)所列能力：`/metrics`、
+Debezium CDC 解码、MCP 服务、维表广播 join、建表闭环、确定性回填、部分列更新、
+十六词列类型词汇、`TableObject` options 化、Sink 事务钩子、`sequence_col` DDL 属性与
+全 workspace `forbid(unsafe_code)`——以及发布线上的 VARIANT 直写、向量列
+（`ARRAY<FLOAT>`）、管理台告警与 SLO 暴露、开放的 `Cursor::Custom` 变体、管道即代码
+（`POST /api/apply` + CLI）。逐轮账见 [docs/design/architecture.zh.md](docs/design/architecture.zh.md)
+§十二，[CHANGELOG.md](CHANGELOG.md) 为发布日志——其 [1.2.0] 条目同时载有 **1.3.0
+预告**：未知列类型词的迁移窗关闭（warn + 折叠改为硬报错）。
 
 汇端交付档位如实表述：**label 幂等档已交付**，分两种模式。常驻管道用*进程作用域*
 label——同进程内重试复用同一 label，Doris 去重；跨重启的不重复来自已提交游标加表的
@@ -81,31 +84,34 @@ trait 现已带 `prepare / commit / abort` 钩子（默认 no-op）与 `SinkCapa
 `debezium-json`——消费 Kafka 上已有的 Debezium CDC 事件；tailrace 只消费事件，不读
 binlog。
 
-## 能力矩阵（v1.1.0 之后，未发布）
+## 能力矩阵（v1.2.0）
 
-下表全部已在本源码树中，有单测/契约测试与所列 e2e 脚本覆盖，但**尚未发布**到
-crates.io（见「状态」）。锚点为本仓库内的 `路径:行号`。
+下表全部为 v1.1.0 之后落在本源码树、随 v1.2.0 发布的能力，有单测/契约测试与所列
+e2e 脚本覆盖。发布线新增的五项——VARIANT 直写、向量列、管理台告警/SLO、
+`Cursor::Custom`、管道即代码——见 [CHANGELOG.md](CHANGELOG.md) [1.2.0]，尚未入表。
+锚点为本仓库内的 `路径:行号`。
 
 | 能力 | 做什么 | 代码位置（锚点） |
 |---|---|---|
-| **Prometheus `/metrics`** | 9 指标面、手写 text format、零 exporter 依赖；node 端在抓取时从活管道计数器现算渲染，console 端另加 `tailrace_console_db_write_seconds` | `engine/crates/tailrace-api/src/metrics.rs:9`（指标面）`:235`（`node_metrics_text`）；`console/crates/tailrace-console/src/metrics.rs:40`（`scrape`），路由 `console/crates/tailrace-console/src/lib.rs:189` |
-| **Debezium CDC 解码** | `format = "debezium-json"` 解码器：`c`/`r`/`u` 事件转行、`d` 与墓碑跳过、schemas-enabled 外壳解包、畸形事件进 DLQ。窄口 CDC：只消费事件，不抓 binlog | `engine/crates/tailrace-decode/src/lib.rs:950`（`DebeziumJsonDecoder`）；派发 `engine/crates/tailrace-runtime/src/lib.rs:1532` |
+| **Prometheus `/metrics`** | 9 指标面、手写 text format、零 exporter 依赖；node 端在抓取时从活管道计数器现算渲染，console 端另加 `tailrace_console_db_write_seconds`（R9 起每条启用的 lag 规则另暴露 `tailrace_slo_lag_target_seconds`） | `engine/crates/tailrace-api/src/metrics.rs:9`（指标面）`:235`（`node_metrics_text`）；`console/crates/tailrace-console/src/metrics.rs:155`（`scrape`），路由 `console/crates/tailrace-console/src/lib.rs:204` |
+| **Debezium CDC 解码** | `format = "debezium-json"` 解码器：`c`/`r`/`u` 事件转行、`d` 与墓碑跳过、schemas-enabled 外壳解包、畸形事件进 DLQ。窄口 CDC：只消费事件，不抓 binlog | `engine/crates/tailrace-decode/src/lib.rs:1204`（`DebeziumJsonDecoder`）；派发 `engine/crates/tailrace-runtime/src/lib.rs:1550` |
 | **MCP 服务** | `POST /mcp`（JSON-RPC 2.0，Streamable HTTP）：14 工具——8 读、6 写。写工具须**同时**满足 `--mcp-allow-write` / `MCP_ALLOW_WRITE=1` 与 `"confirm": true`；每次调用审计为 `MCP_TOOL_CALL`、`actor = mcp:<client>`。工具描述由 OpenAPI 文档生成——无第二份手写文案可漂移 | `console/crates/tailrace-console/src/mcp.rs:90`（`TOOLS`），路由 `:177`；开关 `console/crates/tailrace-console/src/main.rs:26` |
 | **维表广播 join** | `… JOIN ${ds:dim.<别名>} d ON …` 在装配期经 JDBC 全表装载维表为静态 MemTable；500 000 行 / 64 MiB 上限 fail-fast，必须有唯一键，仅 INNER / LEFT（RIGHT / FULL / CROSS 编译期拒绝） | `engine/crates/tailrace-runtime/src/dim.rs:36` `:39`（上限）；join 类型门 `engine/crates/tailrace-parser/src/lib.rs:351-359` |
-| **建表闭环** | draft → 人工确认键模型（必选；缺省 422）→ execute 全文审计 → evolve 仅 `ADD COLUMN`（Light Schema Change；改类型/删列只报告不执行）。纯函数生成器：schema + hints 进，DDL + 「这是猜测」标注出；映射 13 个标量词汇，未映射类型报错而非折叠 | `engine/crates/tailrace-ddl/src/lib.rs:169`（`generate_draft`）`:385`（`doris_type`）；执行 `engine/crates/tailrace-metadata/src/lib.rs:233`（`mysql_exec`）；端点 `console/crates/tailrace-console/src/api/datasources.rs:1887` `:2002` `:2162`；web 向导 `web/src/api/datasources.ts` |
-| **确定性回填** | `POST /api/pipelines/{id}/backfill` 带 `dryRun`（零副作用）→ 在 `bf-<job>` 台账命名空间与独立消费组内有界运行；label 为 `前缀-语句号-<sha256(from,to)[..8]>_<批序号>`，重放同区间即去重；console 启动期把孤儿 job 标 failed。源门现状：仅 `file`（Kafka 分区级种子为后续项） | `engine/crates/tailrace-conn-doris/src/lib.rs:153`（`range_fingerprint`）`:187`（`LabelMode`）；`engine/crates/tailrace-runtime/src/lib.rs:773`（`run_bounded`）`:1566`（`backfill_state_dir`）；`console/crates/tailrace-console/src/api/pipelines.rs:2319`（POST）`:2420`（jobs）`:2277-2289`（源门） |
-| **部分列更新** | 开关即 SQL：`INSERT INTO sink (k, a) SELECT …`——INSERT 列清单声明子集，裸 INSERT 整行写。四道门：登记 `key_model = unique` → 活表 `SHOW CREATE TABLE` 须为 UNIQUE merge-on-write（FE 不可达 = 502，不猜）→ 无进行中 Schema Change（409）→ sink 能力 + `sequence_column ∈ 子集`。Stream Load 同时发 `partial_columns:true` **与** `columns` 头（缺头时 Doris 静默把未列出的列置 NULL——活探针实证） | parser `engine/crates/tailrace-parser/src/lib.rs:93-98` `:281`（`insert_column_list`）；`engine/crates/tailrace-conn-doris/src/lib.rs:574`（`with_partial_columns`）；门 `console/crates/tailrace-console/src/api/pipelines.rs:359` `:452` `:622` |
-| **十六词列类型** | `utf8 string int8 int16 int32 int64 float32 float64 decimal(p,s) timestamp(unit) date bool binary list<float32[,dim]> variant null`；参数化解析、规范 Display。未知词：一个 minor 版本迁移窗内 warn + 折叠为 `utf8`，之后硬报错（`UNKNOWN_TYPE_UTF8_MIGRATION_WINDOW`） | `engine/crates/tailrace-ir/src/column_type.rs:30`（`ColumnType`）`:84`（`parse`）`:158`（迁移窗）；经 `tailrace_catalog::ColumnType` re-export |
-| **`TableObject` options 化** | 5 个通用字段（`datasource / name / kind / format / columns`）+ `options` 映射；连接器字段经 typed accessor 读取（`KafkaTableExt` / `DorisTableExt` / `JdbcTableExt` / `FileTableExt`）；键名正典在 `option_keys`；旧扁平字段仍可读可写（serde 双写） | `engine/crates/tailrace-catalog/src/lib.rs:35`（`option_keys`）`:80`（`TableObject`）`:107`（`options`）；accessor `tailrace-conn-kafka:31` `tailrace-conn-doris:256` `tailrace-conn-jdbc:80` `tailrace-conn-file:49` |
+| **建表闭环** | draft → 人工确认键模型（必选；缺省 422）→ execute 全文审计 → evolve 仅 `ADD COLUMN`（Light Schema Change；改类型/删列只报告不执行）。纯函数生成器：schema + hints 进，DDL + 「这是猜测」标注出；R6 映射 13 个标量词，R9 起 `variant` → `VARIANT`、`list<float32[,dim]>` → `ARRAY<FLOAT>`，未映射类型（`null`）报错而非折叠 | `engine/crates/tailrace-ddl/src/lib.rs:180`（`generate_draft`）`:438`（`doris_type`）；执行 `engine/crates/tailrace-metadata/src/lib.rs:233`（`mysql_exec`）；端点 `console/crates/tailrace-console/src/api/datasources.rs:1930` `:2047` `:2206`；web 向导 `web/src/api/datasources.ts` |
+| **确定性回填** | `POST /api/pipelines/{id}/backfill` 带 `dryRun`（零副作用）→ 在 `bf-<job>` 台账命名空间与独立消费组内有界运行；label 为 `前缀-语句号-<sha256(from,to)[..8]>_<批序号>`，重放同区间即去重；console 启动期把孤儿 job 标 failed。源门现状：仅 `file`（Kafka 分区级种子为后续项） | `engine/crates/tailrace-conn-doris/src/lib.rs:153`（`range_fingerprint`）`:187`（`LabelMode`）；`engine/crates/tailrace-runtime/src/lib.rs:773`（`run_bounded`）`:1584`（`backfill_state_dir`）；`console/crates/tailrace-console/src/api/pipelines.rs:2341`（POST）`:2437`（jobs）`:2287-2299`（源门） |
+| **部分列更新** | 开关即 SQL：`INSERT INTO sink (k, a) SELECT …`——INSERT 列清单声明子集，裸 INSERT 整行写。四道门：登记 `key_model = unique` → 活表 `SHOW CREATE TABLE` 须为 UNIQUE merge-on-write（FE 不可达 = 502，不猜）→ 无进行中 Schema Change（409）→ sink 能力 + `sequence_column ∈ 子集`。Stream Load 同时发 `partial_columns:true` **与** `columns` 头（缺头时 Doris 静默把未列出的列置 NULL——活探针实证） | parser `engine/crates/tailrace-parser/src/lib.rs:93-98` `:281`（`insert_column_list`）；`engine/crates/tailrace-conn-doris/src/lib.rs:589`（`with_partial_columns`）；门 `console/crates/tailrace-console/src/api/pipelines.rs:369` `:462` `:632` |
+| **十六词列类型** | `utf8 string int8 int16 int32 int64 float32 float64 decimal(p,s) timestamp(unit) date bool binary list<float32[,dim]> variant null`；参数化解析、规范 Display。未知词：一个 minor 版本迁移窗内 warn + 折叠为 `utf8`，**1.3.0 起硬报错**（`UNKNOWN_TYPE_UTF8_MIGRATION_WINDOW`） | `engine/crates/tailrace-ir/src/column_type.rs:30`（`ColumnType`）`:94`（`parse`）`:168`（迁移窗）；经 `tailrace_catalog::ColumnType` re-export |
+| **`TableObject` options 化** | 5 个通用字段（`datasource / name / kind / format / columns`）+ `options` 映射；连接器字段经 typed accessor 读取（`KafkaTableExt` / `DorisTableExt` / `JdbcTableExt` / `FileTableExt`）；键名正典在 `option_keys`；旧扁平字段仍可读可写（serde 双写） | `engine/crates/tailrace-catalog/src/lib.rs:36`（`option_keys`）`:81`（`TableObject`）`:108`（`options`）；accessor `tailrace-conn-kafka:31` `tailrace-conn-doris:256` `tailrace-conn-jdbc:80` `tailrace-conn-file:49` |
 | **Sink 事务钩子 + 能力声明** | `Sink` trait 上的 `prepare / commit / abort` 默认 no-op（现有 sink 零改动）与 `SinkCapabilities { idempotent_label, transactional, overwrite, partial_update, partition_aware }`；runtime 拒绝「无 `partial_update` 能力的 sink 带 `partial_columns`」——旗标真承重，不是装饰 | `engine/crates/tailrace-connector/src/sink.rs:18`（`SinkCapabilities`）`:107` `:113` `:119`（钩子）`:126`（`capabilities`） |
-| **`sequence_col` DDL 属性** | UNIQUE KEY 下声明的 `sequence_column` 以表级属性 `"function_column.sequence_col"` 输出——没有它 Doris 会静默忽略引擎的 `sequence_column` Stream Load 头（2.1.7 与 3.1.4 实探） | `engine/crates/tailrace-ddl/src/lib.rs:327-329` |
+| **`sequence_col` DDL 属性** | UNIQUE KEY 下声明的 `sequence_column` 以表级属性 `"function_column.sequence_col"` 输出——没有它 Doris 会静默忽略引擎的 `sequence_column` Stream Load 头（2.1.7 与 3.1.4 实探） | `engine/crates/tailrace-ddl/src/lib.rs:367-374` |
 | **工程治理** | 全 workspace `unsafe_code = "forbid"`；依赖与测试构建 `debug = "line-tables-only"`（一次磁盘写满事故后单套产物收敛到 16 GiB 量级）；`cargo deny` 新 advisory 随到随清 | `Cargo.toml:55-56`（lints）`:71-72` `:84-85`（profile）；`deny.toml` |
 
 上述各轮的 e2e 覆盖，对真 Doris（compose 2.1.7 与外部 3.1.4）：`scripts/e2e/ddl_create.sh`
 （48/48）、`backfill_replay.sh`（31/31）、`partial_update.sh`（compose 38/38 +
-外部 37/37）、`type_precision.sh`（decimal(18,2) 精度守恒、sequence_col 定序），另有两轮
-dogfooding（`scripts/dogfood/`，报告在 `docs/dev/`）。这些数字是各轮落地当时登记的
-结果——未为本 README 重跑。
+外部 37/37）、`type_precision.sh`（decimal(18,2) 精度守恒、sequence_col 定序），另有三轮
+dogfooding（`scripts/dogfood/`，报告在 `docs/dev/`）。发布线新增 `variant_vector.sh`
+（46/46）与 `alert_flow.sh`（50/50），两者已于 2026-10-31 在本树复跑（证据在
+`scripts/e2e/evidence/`）；更早的数字是各轮落地当时登记的结果——未为本 README 重跑。
 
 ## 基准
 
@@ -178,9 +184,11 @@ AI 客户端可经 `POST /mcp`（JSON-RPC 2.0）操作管理台：14 工具—�
 **表对象能声明哪些列类型？**
 十六个词：`utf8 string int8 int16 int32 int64 float32 float64 decimal(p,s)
 timestamp(unit) date bool binary list<float32[,dim]> variant null`。四个旧词语义
-逐字节不变。未知词当前记 warning 并折叠为 `utf8`（一个 minor 版本的迁移窗）；下个
-minor 改为管道装配期硬报错。DDL 生成器映射 13 个标量词到 Doris 类型；`variant` 与
-`list<float32>` 已在词汇表中，但其 Doris DDL 映射与端到端直写是后续工作。
+逐字节不变。未知词当前记 warning 并折叠为 `utf8`（一个 minor 版本的迁移窗）；
+**1.3.0 起改为管道装配期硬报错**——升级前先核查手工登记的类型字符串。DDL 生成器
+映射 13 个标量词到 Doris 类型，`variant` → `VARIANT`（嵌套 JSON 原文透传、不展平）、
+`list<float32[,dim]>` → `ARRAY<FLOAT>`（维度以列注释附带，每行写前按维度校验）；
+`null` 是唯一仍未映射的词。
 
 **StarRocks 与 Doris 通道是什么关系？**
 一条 Stream Load 实现：StarRocks 复用 `tailrace-conn-doris` 内的 Doris 汇，

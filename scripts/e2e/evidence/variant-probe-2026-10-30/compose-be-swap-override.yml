@@ -1,0 +1,8 @@
+services:
+  doris-be:
+    entrypoint:
+      - bash
+      - -c
+      - |
+        sed -i 's/-gt 1 ]]; then/-gt 999999 ]]; then/' /opt/apache-doris/be/bin/start_be.sh
+        exec bash entry_point.sh

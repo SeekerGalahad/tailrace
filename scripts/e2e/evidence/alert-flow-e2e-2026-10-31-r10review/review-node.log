@@ -1,0 +1,14 @@
+[2m2026-10-31T11:09:36.218443Z[0m [32m INFO[0m [2mtailrace_node[0m[2m:[0m /v1 node token source (value not logged) [3morigin[0m[2m=[0mBootstrapFlag
+heartbeat enabled: control-plane=http://127.0.0.1:18088 advertise=127.0.0.1:18108 state_dir=/tmp/tailrace-af-e2e/node-state secs=2
+tailrace-node serve mode: http://127.0.0.1:18108 (/healthz open; /v1 requires the node token)
+[2m2026-10-31T11:09:36.222690Z[0m [32m INFO[0m [2mtailrace_api::heartbeat[0m[2m:[0m identity ready [3mnode_key[0m[2m=[0msn-78a101daefbbf8be [3mname[0m[2m=[0mengine-node [3mcontrol_plane[0m[2m=[0m"http://127.0.0.1:18088"
+[2m2026-10-31T11:09:36.225917Z[0m [32m INFO[0m [2mtailrace_api::heartbeat[0m[2m:[0m adopted console-issued per-node token (persisted, m2m + /v1 rotated)
+[2m2026-10-31T11:09:36.225922Z[0m [32m INFO[0m [2mtailrace_api::heartbeat[0m[2m:[0m self-registration ok [3mnode_key[0m[2m=[0msn-78a101daefbbf8be
+[2m2026-10-31T11:09:38.466756Z[0m [32m INFO[0m [2mtailrace_runtime::registry[0m[2m:[0m pipeline started (serve) [3mpipeline_id[0m[2m=[0m1 [3mstatements[0m[2m=[0m1 [3mdispatch_id[0m[2m=[0m1793444978410000 [3mbad_row_policy[0m[2m=[0mdlq
+[2m2026-10-31T11:10:51.552287Z[0m [32m INFO[0m [2mtailrace_runtime::registry[0m[2m:[0m pipeline stopped (final flush + cursor commit done in the statement threads) [3mpipeline_id[0m[2m=[0m1
+[2m2026-10-31T11:12:52.840767Z[0m [32m INFO[0m [2mtailrace_runtime::registry[0m[2m:[0m pipeline started (serve) [3mpipeline_id[0m[2m=[0m2 [3mstatements[0m[2m=[0m1 [3mdispatch_id[0m[2m=[0m1793445172840001 [3mbad_row_policy[0m[2m=[0mdlq
+[2m2026-10-31T11:15:00.439899Z[0m [32m INFO[0m [2mtailrace_runtime::registry[0m[2m:[0m pipeline started (serve) [3mpipeline_id[0m[2m=[0m3 [3mstatements[0m[2m=[0m1 [3mdispatch_id[0m[2m=[0m1793445300439002 [3mbad_row_policy[0m[2m=[0mskip
+[2m2026-10-31T11:15:02.601269Z[0m [32m INFO[0m [2mtailrace_runtime::registry[0m[2m:[0m pipeline stopped (final flush + cursor commit done in the statement threads) [3mpipeline_id[0m[2m=[0m3
+[2m2026-10-31T11:15:02.640543Z[0m [32m INFO[0m [2mtailrace_runtime::registry[0m[2m:[0m pipeline started (serve) [3mpipeline_id[0m[2m=[0m4 [3mstatements[0m[2m=[0m1 [3mdispatch_id[0m[2m=[0m1793445302640003 [3mbad_row_policy[0m[2m=[0mfail
+[2m2026-10-31T11:15:02.710841Z[0m [32m INFO[0m [2mtailrace_api::heartbeat[0m[2m:[0m heartbeat shut down
+serve shut down gracefully, exiting

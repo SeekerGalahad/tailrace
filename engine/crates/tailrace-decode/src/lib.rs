@@ -11,11 +11,25 @@
 //! declared schema columns; inference belongs to the console discover step).
 //! parquet brings its own schema: the whole file is one batch, column-cast
 //! into the target via `ColBatch::append_batch`.
+//!
+//! Nested JSON values (objects / arrays) in a field: a scalar column cannot
+//! hold them and the typed chain NULLs them — except a `variant` column (A4,
+//! marked on its arrow Field by tailrace-ir's `VARIANT_FIELD_METADATA`),
+//! which takes the value's serialized JSON text verbatim, leaves unparsed:
+//! the sink escapes it as an ordinary string and Doris parses the string
+//! literal into the VARIANT structure server-side (probed on 2.1.7 and
+//! 3.1.4, scripts/e2e/evidence/variant-probe-2026-10-30/ B2). See
+//! [`append_variant_json`]. And except a vector column (A5,
+//! `list<float32[,dim]>` → arrow List(Float32)), which takes a JSON array
+//! of numbers as the list — guarded: a declared dimension the array misses,
+//! a non-numeric element, or a non-array cell makes the row Bad instead of a
+//! silent NULL, because Doris itself degrades those shapes silently (vector
+//! probe B7/B8/B10). See [`check_vector_cell`].
 
 use datafusion::arrow::array::{
-    ArrayBuilder, BooleanBuilder, Date32Builder, Date64Builder, Decimal128Builder, Float64Builder,
-    Int64Builder, StringBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
-    TimestampNanosecondBuilder, TimestampSecondBuilder,
+    ArrayBuilder, BooleanBuilder, Date32Builder, Date64Builder, Decimal128Builder, Float32Builder,
+    Float64Builder, Int64Builder, ListBuilder, StringBuilder, TimestampMicrosecondBuilder,
+    TimestampMillisecondBuilder, TimestampNanosecondBuilder, TimestampSecondBuilder,
 };
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::error::Result as ArrowResult;
@@ -72,6 +86,29 @@ impl ColBatch {
                 }
                 // G2 date — arrow Date32 (days since epoch)
                 DataType::Date32 => Box::new(Date32Builder::with_capacity(rows)),
+                // A5 list<float32[,dim]> — arrow List(Float32), the vector
+                // column. The item field is the schema's own so finish()
+                // reproduces the declared List type by construction (the
+                // builder's default item field happens to match, but
+                // RecordBatch::try_new compares fields exactly). Values
+                // capacity = rows × the declared dim when there is one — a
+                // vector column's natural size, clamped so the HINT can
+                // never demand absurd memory on its own (the declared dim
+                // is capped at tailrace_ir::MAX_VECTOR_DIM by the parser,
+                // and the builder grows past a wrong guess either way).
+                DataType::List(item) if item.data_type() == &DataType::Float32 => {
+                    let dim = tailrace_ir::vector_dim(f).map_or(16, |d| d as usize);
+                    let rows_hint = rows.min(2000);
+                    Box::new(
+                        ListBuilder::with_capacity(
+                            Float32Builder::with_capacity(
+                                rows_hint.saturating_mul(dim).min(1 << 20),
+                            ),
+                            rows_hint,
+                        )
+                        .with_field(item.clone()),
+                    )
+                }
                 other => unimplemented!("decode column type {other:?}"),
             };
             builders.push(b);
@@ -238,6 +275,32 @@ fn append_array(b: &mut dyn ArrayBuilder, arr: &dyn datafusion::arrow::array::Ar
             for i in 0..a.len() {
                 b2.append_option(if a.is_null(i) { None } else { Some(a.value(i)) });
             }
+            return;
+        }
+    }
+    // A5: List(Float32) (parquet/batch path — the cast in append_batch has
+    // already landed Float32 items, this is a plain copy list by list). No
+    // dim guard here: the guard is per-row and a parquet file is one Bad
+    // or one Append as a whole; the JSON walks are the guarded path.
+    if let Some(a) = arr.as_any().downcast_ref::<ListArray>() {
+        if let Some(lb) = b.as_any_mut().downcast_mut::<ListBuilder<Float32Builder>>() {
+            for i in 0..a.len() {
+                if a.is_null(i) {
+                    lb.append_null();
+                    continue;
+                }
+                let items = a.value(i);
+                if let Some(items) = items.as_any().downcast_ref::<Float32Array>() {
+                    for j in 0..items.len() {
+                        lb.values().append_option(if items.is_null(j) {
+                            None
+                        } else {
+                            Some(items.value(j))
+                        });
+                    }
+                }
+                lb.append(true);
+            }
         }
     }
 }
@@ -295,6 +358,11 @@ fn append_nulls(b: &mut dyn ArrayBuilder, rows: usize) {
             if let Some(db) = b.as_any_mut().downcast_mut::<Date32Builder>() {
                 db.append_null();
             }
+        }
+    } else if let Some(lb) = b.as_any_mut().downcast_mut::<ListBuilder<Float32Builder>>() {
+        // A5 vector column absent from a parquet batch → NULL arrays
+        for _ in 0..rows {
+            lb.append_null();
         }
     }
 }
@@ -706,6 +774,162 @@ fn append_g2_json(
     }
 }
 
+// ==================== variant columns (A4) ====================
+//
+// A `variant` column is arrow Utf8 like `utf8`; what sets it apart is the
+// `VARIANT_FIELD_METADATA` marker tailrace-ir stamps on its Field (the same
+// construction on the plan side and the ColBatch side — the micro-batch
+// injection compares the two schemas, metadata included). The decoder's
+// contract for such a column is "do not parse the leaves": a nested object
+// or array is written back as its serialized JSON text, so the whole
+// sub-document reaches Doris and the server-side VARIANT does the
+// sub-column inference. Every other cell shape is unchanged — strings ride
+// as-is, numbers/bools as their JSON text, null/absent as NULL.
+//
+// Wire shape, probed (scripts/e2e/evidence/variant-probe-2026-10-30/ B2 /
+// C1 / C3, 2.1.7 and 3.1.4 alike): the sink escapes the text like any Utf8
+// cell (`"{\"a\":{\"b\":1}}"`), and Doris parses that JSON *string literal*
+// into the variant structure — `v['a']['b']` answers 1 exactly as for a
+// bare object. So no variant-aware raw-emission arm is needed downstream.
+//
+// Key order inside the serialized object is simd-json's (halfbrown keeps
+// insertion order for small objects, not guaranteed beyond): consumers must
+// compare structurally, never byte-for-byte against the input.
+
+/// One JSON cell into a variant column: nested shapes serialize to JSON
+/// text, strings pass through, scalars stringify, null/absent → NULL.
+fn append_variant_json(b: &mut dyn ArrayBuilder, v: Option<&simd_json::BorrowedValue<'_>>) {
+    match v {
+        None => append_str(b, None),
+        Some(v) if v.is_null() => append_str(b, None),
+        Some(v) => match v.as_str() {
+            Some(s) => append_str(b, Some(s)),
+            // object / array / number / bool — `encode` is simd-json's
+            // compact serializer (Writable), no pretty-printing
+            None => append_str(b, Some(&v.encode())),
+        },
+    }
+}
+
+// ==================== vector columns: list<float32[,dim]> (A5) ====================
+//
+// A vector column is arrow List(Float32) (tailrace-ir `is_vector_field`);
+// its declared dimension, when there is one, rides the Field as
+// `VECTOR_DIM_FIELD_METADATA` (`tailrace_ir::vector_dim`) — arrow List has
+// no length of its own. The decoder's contract for such a cell:
+//
+//   * JSON null / absent key → NULL. A missing vector is a legal row (Doris
+//     loads a NULL array, vector probe B5); the guard must not kill it.
+//   * a JSON array whose every element is a JSON number → the list, each
+//     element cast f64→f32 (integers widen, probe B4).
+//   * with a declared dim, an array of any other length → the ROW is Bad;
+//     without one, any length is legal, `[]` included (probe B6).
+//   * anything else — a non-array cell, or an element that is not a number
+//     (string / bool / null / nested array / object) → the row is Bad.
+//
+// Bad rather than NULL, on purpose: Doris itself degrades every one of those
+// shapes silently (probe B7/B8/B10 on 3.1.4: `["a",2,3]` → `[null, 2, 3]`,
+// `[[1,2],[3]]` → `[null, null]`, `42` → `NULL`, all with
+// NumberFilteredRows 0), and a vector with a hole or a vector that vanished
+// is invisible downstream. The engine is the only place the error can be
+// raised, so it raises it: the row goes through the bad-row policy (DLQ /
+// fail) with its raw bytes, exactly like malformed JSON.
+//
+// Order of operations: `check_vector_cells` runs over the whole row BEFORE
+// the append loop, because a Bad row must leave every builder untouched
+// (the equal-column-lengths invariant — arrow builders cannot un-append)
+// and the vector column is rarely the first column. The array is read twice
+// (validate, then append) instead of buffering a Vec<f32> per cell: no
+// per-row allocation on the hot path, and `append_vector_json` stays
+// infallible.
+
+/// Why a vector cell failed the guard. Test-facing: the walks fold every
+/// variant into `WalkFail::Bad` (`Decoded::Bad` carries the raw row, not a
+/// reason — same as malformed JSON).
+#[derive(Debug, PartialEq, Eq)]
+enum VectorCellError {
+    /// The cell is neither null nor a JSON array.
+    NotAnArray,
+    /// Declared `list<float32,want>`, the array has `got` elements.
+    Dimension { want: u32, got: usize },
+    /// Element `index` is not a JSON number.
+    Element { index: usize },
+}
+
+/// Validate one vector cell against the column's declared dimension (`None`
+/// = any length). Null and absent pass — see the section doc.
+fn check_vector_cell(
+    v: Option<&simd_json::BorrowedValue<'_>>,
+    dim: Option<u32>,
+) -> Result<(), VectorCellError> {
+    let Some(v) = v else { return Ok(()) };
+    if v.is_null() {
+        return Ok(());
+    }
+    let Some(items) = v.as_array() else {
+        return Err(VectorCellError::NotAnArray);
+    };
+    if let Some(want) = dim {
+        if items.len() != want as usize {
+            return Err(VectorCellError::Dimension {
+                want,
+                got: items.len(),
+            });
+        }
+    }
+    // cast_f64 is Some for every JSON number shape (i64 / u64 / f64) and
+    // None for everything else — the one-call "is a number" test. A number
+    // that cannot land in an f32 without degrading — non-finite as f64
+    // (|v| past f64::MAX parses to inf), or |v| past f32::MAX (e.g. 1e39,
+    // which would silently become inf) — fails the same way: a bad row to
+    // quarantine, not a silent [inf,…] cell into the sink (R9 review fix).
+    if let Some(index) = items.iter().position(|e| {
+        e.cast_f64()
+            .is_none_or(|f| !f.is_finite() || f.abs() > f32::MAX as f64)
+    }) {
+        return Err(VectorCellError::Element { index });
+    }
+    Ok(())
+}
+
+/// Run [`check_vector_cell`] over every vector column of a row object
+/// (the JSON root, or the CDC `after` object) before any append — the first
+/// failure makes the row Bad. A row without vector columns pays one
+/// type-match per field and nothing more.
+fn check_vector_cells(
+    fields: &[datafusion::arrow::datatypes::FieldRef],
+    row: &simd_json::BorrowedValue<'_>,
+) -> Result<(), WalkFail> {
+    for f in fields {
+        if tailrace_ir::is_vector_field(f)
+            && check_vector_cell(row.get(f.name().as_str()), tailrace_ir::vector_dim(f)).is_err()
+        {
+            return Err(WalkFail::Bad);
+        }
+    }
+    Ok(())
+}
+
+/// Append one (pre-validated) vector cell: null/absent → NULL, array → the
+/// elements as f32 then one list entry. A cell the guard would have refused
+/// lands NULL here — unreachable from the walks, which run
+/// [`check_vector_cells`] first; kept total so the column-length invariant
+/// cannot break through this path either.
+fn append_vector_json(b: &mut dyn ArrayBuilder, v: Option<&simd_json::BorrowedValue<'_>>) {
+    let Some(lb) = b.as_any_mut().downcast_mut::<ListBuilder<Float32Builder>>() else {
+        return;
+    };
+    match v.and_then(|v| v.as_array()) {
+        Some(items) => {
+            for e in items {
+                lb.values().append_option(e.cast_f64().map(|f| f as f32));
+            }
+            lb.append(true);
+        }
+        None => lb.append_null(),
+    }
+}
+
 /// Decode outcome: Append=column-filled / Skip=not-a-row, dropped silently /
 /// Bad=parse-or-shape failure (carrying the raw bytes back).
 ///
@@ -788,11 +1012,24 @@ impl JsonDecoder {
         // (Floats and bools used to fall through to NULL when as_str/as_i64
         // both failed — whole float64/bool columns silently lost their values.)
         let (fields, builders) = batch.parts();
+        // A5: vector cells are guarded before any append (a Bad row leaves
+        // every builder untouched) — see check_vector_cells
+        check_vector_cells(fields, &dom)?;
         for (i, f) in fields.iter().enumerate() {
             let name = f.name();
             // G2 typed columns (decimal/timestamp/date) carry their type
             // parameters — see append_g2_json
             if append_g2_json(builders[i].as_mut(), f.data_type(), dom.get(name.as_str())) {
+                continue;
+            }
+            // A4 variant columns: nested values ride as JSON text, not NULL
+            if tailrace_ir::is_variant_field(f) {
+                append_variant_json(builders[i].as_mut(), dom.get(name.as_str()));
+                continue;
+            }
+            // A5 vector columns: the (validated) array as a List(Float32) cell
+            if tailrace_ir::is_vector_field(f) {
+                append_vector_json(builders[i].as_mut(), dom.get(name.as_str()));
                 continue;
             }
             match dom.get(name.as_str()).and_then(|v| v.as_str()) {
@@ -855,6 +1092,10 @@ impl OggDecoder {
                 }
             }
         }
+        // A5: after.* vector cells are guarded before any append (a Bad row
+        // leaves every builder untouched); a pushdown-skipped row never gets
+        // here — Skip outranks Bad for a row that was not going to load
+        check_vector_cells(fields, after)?;
         for (i, f) in fields.iter().enumerate() {
             // G2 typed columns (decimal/timestamp/date) carry their type
             // parameters — see append_g2_json
@@ -863,6 +1104,13 @@ impl OggDecoder {
                 f.data_type(),
                 after.get(f.name().as_str()),
             ) {
+                continue;
+            }
+            // A5 vector columns: the (validated) after.* array as a
+            // List(Float32) cell — placed before the envelope match like the
+            // G2 arm, so the column's type decides regardless of its name
+            if tailrace_ir::is_vector_field(f) {
+                append_vector_json(builders[i].as_mut(), after.get(f.name().as_str()));
                 continue;
             }
             match f.name().as_str() {
@@ -878,6 +1126,10 @@ impl OggDecoder {
                     builders[i].as_mut(),
                     dom.get("ts").and_then(|v| v.as_i64()).unwrap_or(0),
                 ),
+                // A4 variant columns: nested after.* values ride as JSON text
+                name if tailrace_ir::is_variant_field(f) => {
+                    append_variant_json(builders[i].as_mut(), after.get(name))
+                }
                 name => match after.get(name).and_then(|v| v.as_str()) {
                     Some(s) => append_str(builders[i].as_mut(), Some(s)),
                     None => {
@@ -926,7 +1178,9 @@ impl Decoder for OggDecoder {
 /// v1 row semantics:
 /// - `after.*` keys write into same-named schema columns (typed chain
 ///   identical to JsonDecoder/OggDecoder; nested objects/arrays in a field
-///   value decode as null, matching that family). `before`/`op`/`ts_ms`/
+///   value decode as null, matching that family — unless the column is a
+///   `variant` column, which takes the nested value as JSON text, A4).
+///   `before`/`op`/`ts_ms`/
 ///   `source` are envelope metadata and are NOT decoded into columns (an
 ///   OGG-style op/ts envelope-column pair is a v1.x follow-up, as is console
 ///   discover inference for this format).
@@ -998,6 +1252,9 @@ impl DebeziumJsonDecoder {
             Some(_) => return Err(WalkFail::Bad), // envelope violation: after must be an object
         };
         let (fields, builders) = batch.parts();
+        // A5: after.* vector cells are guarded before any append (a Bad row
+        // leaves every builder untouched) — see check_vector_cells
+        check_vector_cells(fields, after)?;
         for (i, f) in fields.iter().enumerate() {
             let name = f.name();
             // G2 typed columns (decimal/timestamp/date) carry their type
@@ -1007,6 +1264,17 @@ impl DebeziumJsonDecoder {
                 f.data_type(),
                 after.get(name.as_str()),
             ) {
+                continue;
+            }
+            // A4 variant columns: nested after.* values ride as JSON text
+            if tailrace_ir::is_variant_field(f) {
+                append_variant_json(builders[i].as_mut(), after.get(name.as_str()));
+                continue;
+            }
+            // A5 vector columns: the (validated) after.* array as a
+            // List(Float32) cell
+            if tailrace_ir::is_vector_field(f) {
+                append_vector_json(builders[i].as_mut(), after.get(name.as_str()));
                 continue;
             }
             match after.get(name.as_str()).and_then(|v| v.as_str()) {
@@ -1115,6 +1383,17 @@ impl Decoder for CsvDecoder {
                 DataType::Boolean => {
                     if let Some(bb) = b.as_any_mut().downcast_mut::<BooleanBuilder>() {
                         bb.append_option(v.parse::<bool>().ok());
+                    }
+                }
+                // A5: CSV carries no array literal for a vector column in
+                // v1 — the cell lands NULL under the CSV decoder's own
+                // degrade-to-null rule (the row is kept); the JSON-family
+                // decoders are the vector path. Explicit arm so the list
+                // builder is appended exactly once (the `_` arm's append_str
+                // has no list case and would leave the column short).
+                DataType::List(_) => {
+                    if let Some(lb) = b.as_any_mut().downcast_mut::<ListBuilder<Float32Builder>>() {
+                        lb.append_null();
                     }
                 }
                 _ => {
@@ -1698,6 +1977,600 @@ mod tests {
         assert!(tags.is_null(0), "array field → null");
         let name = rb.column(3).as_any().downcast_ref::<StringArray>().unwrap();
         assert!(name.is_null(0), "JSON null field value → null");
+    }
+
+    // ==================== variant passthrough (A4) ====================
+
+    /// The declared-schema construction the runtime uses (tailrace-ir
+    /// `arrow_field_or_utf8`): `attrs` is a marked variant column, `plain`
+    /// an unmarked utf8 column of the same arrow type — the control that
+    /// pins "only the marker changes behaviour".
+    fn variant_schema(extra_front: Vec<Field>) -> SchemaRef {
+        let mut fields = extra_front;
+        fields.push(tailrace_ir::arrow_field_or_utf8("id", "int64").unwrap());
+        fields.push(tailrace_ir::arrow_field_or_utf8("attrs", "variant").unwrap());
+        fields.push(tailrace_ir::arrow_field_or_utf8("plain", "utf8").unwrap());
+        Arc::new(Schema::new(fields))
+    }
+
+    /// The canonical nested row every variant test feeds, and its `attrs`
+    /// sub-document as the structural expectation.
+    const NESTED_ATTRS: &str =
+        r#"{"a":{"b":1,"c":"x"},"arr":[1,2,3],"s":"hello","f":1.5,"t":true,"n":null}"#;
+
+    /// Carrier assertion shared by the three decoders: the cell text parses
+    /// back to the ORIGINAL nested document (structural equality — simd-json
+    /// may reorder keys), the leaves are all still inside it (nothing was
+    /// flattened out or dropped), and the sink's escaping round-trips it:
+    /// `serde_json::to_string(text)` is exactly what tailrace-conn-doris
+    /// emits for a Utf8 cell, and unescaping that string literal yields the
+    /// same document — the two-step unwrap Doris performs on a VARIANT
+    /// column (probe B2).
+    fn assert_variant_carrier(cell: &str, original: &str) {
+        let got: serde_json::Value = serde_json::from_str(cell).expect("cell is JSON text");
+        let want: serde_json::Value = serde_json::from_str(original).unwrap();
+        assert_eq!(got, want, "variant cell must be the original sub-document");
+        for leaf in [
+            "\"a\"", "\"b\"", "\"c\"", "\"arr\"", "\"s\"", "\"f\"", "\"t\"",
+        ] {
+            assert!(
+                cell.contains(leaf),
+                "leaf {leaf} must stay inside the cell: {cell}"
+            );
+        }
+        // sink wire shape → Doris unwrap
+        let wire = serde_json::to_string(cell).unwrap();
+        assert!(
+            wire.starts_with("\"{") && wire.contains("\\\""),
+            "escaped literal: {wire}"
+        );
+        let unescaped: String = serde_json::from_str(&wire).unwrap();
+        let reparsed: serde_json::Value = serde_json::from_str(&unescaped).unwrap();
+        assert_eq!(reparsed, want, "original JSON survives the sink's escaping");
+    }
+
+    /// JsonDecoder: a marked variant column takes nested objects/arrays as
+    /// JSON text (leaves unparsed), strings as-is, scalars stringified,
+    /// null/absent as NULL; the unmarked utf8 sibling keeps NULLing nested
+    /// values (pre-A4 behaviour, byte-identical).
+    #[test]
+    fn variant_passthrough_json_decoder() {
+        use datafusion::arrow::array::StringArray;
+        let mut batch = ColBatch::new(variant_schema(vec![]), 8);
+        let rows: Vec<String> = vec![
+            format!(r#"{{"id":1,"attrs":{NESTED_ATTRS},"plain":{{"nested":true}}}}"#),
+            r#"{"id":2,"attrs":[10,20,30],"plain":[1]}"#.to_string(),
+            r#"{"id":3,"attrs":"plain string","plain":"p"}"#.to_string(),
+            r#"{"id":4,"attrs":42}"#.to_string(),
+            r#"{"id":5,"attrs":true}"#.to_string(),
+            r#"{"id":6,"attrs":null}"#.to_string(),
+            r#"{"id":7}"#.to_string(),
+        ];
+        for r in &rows {
+            assert_eq!(
+                JsonDecoder.decode(r.as_bytes().to_vec(), &mut batch, &Pushdown::default()),
+                Decoded::Append,
+                "{r}"
+            );
+        }
+        let rb = batch.finish().unwrap();
+        assert_eq!(rb.num_rows(), 7);
+        let attrs = rb.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let plain = rb.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_variant_carrier(attrs.value(0), NESTED_ATTRS);
+        assert!(
+            plain.is_null(0),
+            "unmarked utf8 sibling still NULLs a nested object"
+        );
+        assert_eq!(
+            attrs.value(1),
+            "[10,20,30]",
+            "array root serializes compact"
+        );
+        assert!(
+            plain.is_null(1),
+            "unmarked utf8 sibling still NULLs an array"
+        );
+        assert_eq!(
+            attrs.value(2),
+            "plain string",
+            "string cells pass through unquoted"
+        );
+        assert_eq!(plain.value(2), "p");
+        assert_eq!(attrs.value(3), "42", "integer stringifies");
+        assert_eq!(attrs.value(4), "true", "bool stringifies");
+        assert!(attrs.is_null(5), "JSON null → NULL");
+        assert!(attrs.is_null(6), "absent key → NULL");
+        for i in 3..7 {
+            assert!(plain.is_null(i), "absent plain stays NULL");
+        }
+    }
+
+    /// DebeziumJsonDecoder: the same contract on `after.*` — a nested
+    /// after-field in a variant column rides as JSON text; the unmarked
+    /// sibling keeps the family rule (`debezium_nested_objects_and_null_fields`).
+    #[test]
+    fn variant_passthrough_debezium_decoder() {
+        use datafusion::arrow::array::{Int64Array, StringArray};
+        let mut batch = ColBatch::new(variant_schema(vec![]), 4);
+        let event = format!(
+            r#"{{"before":null,"after":{{"id":9,"attrs":{NESTED_ATTRS},"plain":{{"k":"v"}}}},"op":"c","ts_ms":1}}"#
+        );
+        assert_eq!(
+            DebeziumJsonDecoder.decode(event.into_bytes(), &mut batch, &Pushdown::default()),
+            Decoded::Append
+        );
+        // schemas.enable=true wrapper takes the same path
+        let wrapped = format!(
+            r#"{{"schema":{{"type":"struct"}},"payload":{{"after":{{"id":10,"attrs":{NESTED_ATTRS}}},"op":"r","ts_ms":2}}}}"#
+        );
+        assert_eq!(
+            DebeziumJsonDecoder.decode(wrapped.into_bytes(), &mut batch, &Pushdown::default()),
+            Decoded::Append
+        );
+        let rb = batch.finish().unwrap();
+        assert_eq!(rb.num_rows(), 2);
+        let id = rb.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!((id.value(0), id.value(1)), (9, 10));
+        let attrs = rb.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_variant_carrier(attrs.value(0), NESTED_ATTRS);
+        assert_variant_carrier(attrs.value(1), NESTED_ATTRS);
+        let plain = rb.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(
+            plain.is_null(0),
+            "unmarked after.* nested object still NULLs"
+        );
+    }
+
+    /// OggDecoder: `after.*` variant columns ride as JSON text next to the
+    /// envelope columns (the decoder family is one contract).
+    #[test]
+    fn variant_passthrough_ogg_decoder() {
+        use datafusion::arrow::array::StringArray;
+        let schema = variant_schema(vec![
+            Field::new("op_type", DataType::Utf8, false),
+            Field::new("ogg_table", DataType::Utf8, true),
+            Field::new("ogg_ts", DataType::Int64, true),
+        ]);
+        let mut batch = ColBatch::new(schema, 4);
+        let msg = format!(
+            r#"{{"table":"SHOP.EVENTS","op_type":"I","ts":1726000000001,"after":{{"id":1,"attrs":{NESTED_ATTRS},"plain":{{"k":1}}}}}}"#
+        );
+        assert_eq!(
+            OggDecoder.decode(msg.into_bytes(), &mut batch, &Pushdown::default()),
+            Decoded::Append
+        );
+        let rb = batch.finish().unwrap();
+        let op = rb.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(op.value(0), "I");
+        let attrs = rb.column(4).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_variant_carrier(attrs.value(0), NESTED_ATTRS);
+        let plain = rb.column(5).as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(plain.is_null(0));
+    }
+
+    // ==================== vector columns (A5) ====================
+
+    /// The declared-schema construction the runtime uses (tailrace-ir
+    /// `arrow_field_or_utf8`): `emb` is a dimensioned vector column
+    /// (dim=3, the metadata the guard reads), `free` an undimensioned one
+    /// (any length legal) — both arrow List(Float32). `id` leads so a Bad
+    /// row would have had something to append before reaching the vector
+    /// column: that is what the untouched-builders assertions lean on.
+    fn vector_schema(extra_front: Vec<Field>) -> SchemaRef {
+        let mut fields = extra_front;
+        fields.push(tailrace_ir::arrow_field_or_utf8("id", "int64").unwrap());
+        fields.push(tailrace_ir::arrow_field_or_utf8("emb", "list<float32,3>").unwrap());
+        fields.push(tailrace_ir::arrow_field_or_utf8("free", "list<float32>").unwrap());
+        Arc::new(Schema::new(fields))
+    }
+
+    /// Parse one JSON text and run the guard on its `v` key — the cell
+    /// shapes under test are the values, the object is just the carrier.
+    fn guard(json: &str, dim: Option<u32>) -> Result<(), VectorCellError> {
+        let mut buf = json.as_bytes().to_vec();
+        let dom = simd_json::to_borrowed_value(&mut buf).unwrap();
+        check_vector_cell(dom.get("v"), dim)
+    }
+
+    /// Read the vector column `col` of a finished batch as `Vec<Option<Vec<f32>>>`.
+    fn vectors(rb: &RecordBatch, col: usize) -> Vec<Option<Vec<f32>>> {
+        use datafusion::arrow::array::{Float32Array, ListArray};
+        let list = rb.column(col).as_any().downcast_ref::<ListArray>().unwrap();
+        (0..list.len())
+            .map(|i| {
+                if list.is_null(i) {
+                    return None;
+                }
+                let items = list.value(i);
+                let items = items.as_any().downcast_ref::<Float32Array>().unwrap();
+                Some((0..items.len()).map(|j| items.value(j)).collect())
+            })
+            .collect()
+    }
+
+    /// The dim guard's boundary matrix (A5 acceptance: 恰好 / 超出 / null /
+    /// 嵌套非数值 报错). Exact length passes; one over, one under and the
+    /// empty array are dimension errors naming both numbers; null and an
+    /// absent key pass with and without a declared dim (a missing vector
+    /// is a legal row — vector probe B5); an undeclared dim accepts any
+    /// length including empty (probe B6); every JSON number shape is an
+    /// element; every non-number element — string, bool, null, nested
+    /// array, object — is an element error at its index; a non-array cell
+    /// of any shape is NotAnArray. Dimension is checked before elements
+    /// (the cheaper test, and the more useful reason when both fail).
+    #[test]
+    fn vector_guard_boundaries() {
+        use VectorCellError as E;
+        let d3 = Some(3);
+        // 恰好
+        assert_eq!(guard(r#"{"v":[0.1,0.2,0.3]}"#, d3), Ok(()));
+        // 超出 / 不足 / 空
+        assert_eq!(
+            guard(r#"{"v":[0.1,0.2,0.3,0.4]}"#, d3),
+            Err(E::Dimension { want: 3, got: 4 })
+        );
+        assert_eq!(
+            guard(r#"{"v":[0.1,0.2]}"#, d3),
+            Err(E::Dimension { want: 3, got: 2 })
+        );
+        assert_eq!(
+            guard(r#"{"v":[]}"#, d3),
+            Err(E::Dimension { want: 3, got: 0 })
+        );
+        // null / absent — never killed, dim or not
+        assert_eq!(guard(r#"{"v":null}"#, d3), Ok(()));
+        assert_eq!(guard(r#"{"other":1}"#, d3), Ok(()));
+        assert_eq!(guard(r#"{"v":null}"#, None), Ok(()));
+        assert_eq!(guard(r#"{"other":1}"#, None), Ok(()));
+        // undeclared dim: any length
+        for json in [
+            r#"{"v":[]}"#,
+            r#"{"v":[1.5]}"#,
+            r#"{"v":[1,2,3,4,5,6,7,8]}"#,
+        ] {
+            assert_eq!(guard(json, None), Ok(()), "{json}");
+        }
+        // every JSON number shape is an element: int, negative, float,
+        // exponent, u64 above i64::MAX
+        assert_eq!(
+            guard(r#"{"v":[1,-2,0.5,1e-7,18446744073709551615]}"#, Some(5)),
+            Ok(())
+        );
+        // 嵌套非数值: each non-number element shape, reported at its index
+        assert_eq!(
+            guard(r#"{"v":[0.1,"x",0.3]}"#, d3),
+            Err(E::Element { index: 1 })
+        );
+        assert_eq!(
+            guard(r#"{"v":[true,0.2,0.3]}"#, d3),
+            Err(E::Element { index: 0 })
+        );
+        assert_eq!(
+            guard(r#"{"v":[0.1,0.2,null]}"#, d3),
+            Err(E::Element { index: 2 })
+        );
+        assert_eq!(
+            guard(r#"{"v":[[0.1],[0.2],[0.3]]}"#, d3),
+            Err(E::Element { index: 0 })
+        );
+        assert_eq!(
+            guard(r#"{"v":[0.1,{"a":1},0.3]}"#, d3),
+            Err(E::Element { index: 1 })
+        );
+        // the element guard applies without a dim too (undeclared ≠ unguarded)
+        assert_eq!(
+            guard(r#"{"v":[1,2,"3"]}"#, None),
+            Err(E::Element { index: 2 })
+        );
+        // a number that cannot land in an f32 without degrading — past
+        // f32::MAX (1e39 → inf after the cast) or non-finite as f64 — is a
+        // bad row, not a silent [inf,…] cell (R9 review fix)
+        assert_eq!(
+            guard(r#"{"v":[0.1,1e39,0.3]}"#, d3),
+            Err(E::Element { index: 1 })
+        );
+        assert_eq!(
+            guard(r#"{"v":[-1e300,0.2]}"#, None),
+            Err(E::Element { index: 0 })
+        );
+        // f32::MAX itself still passes (the boundary is exclusive only
+        // past what f32 can hold)
+        let f32_max = format!("{:e}", f32::MAX as f64);
+        assert_eq!(
+            guard(&format!(r#"{{"v":[{f32_max},0.2,0.3]}}"#), d3),
+            Ok(())
+        );
+        // the first offender is the one named
+        assert_eq!(
+            guard(r#"{"v":[1,"x",null]}"#, None),
+            Err(E::Element { index: 1 })
+        );
+        // dimension outranks a bad element
+        assert_eq!(
+            guard(r#"{"v":[1,"x"]}"#, d3),
+            Err(E::Dimension { want: 3, got: 2 })
+        );
+        // not an array at all: string (even one that looks like an array),
+        // number, bool, object
+        for json in [
+            r#"{"v":"[0.1,0.2,0.3]"}"#,
+            r#"{"v":"abc"}"#,
+            r#"{"v":42}"#,
+            r#"{"v":true}"#,
+            r#"{"v":{"a":1}}"#,
+        ] {
+            assert_eq!(guard(json, d3), Err(E::NotAnArray), "{json}");
+            assert_eq!(guard(json, None), Err(E::NotAnArray), "{json}");
+        }
+    }
+
+    /// JsonDecoder end to end: well-formed rows land List(Float32) cells
+    /// (exact dim, integers widened, null and absent as NULL, the
+    /// undimensioned column at any length), while every guarded shape makes
+    /// the row Bad with its buffer handed back AND leaves the batch exactly
+    /// as it was — including the `id` column that sits BEFORE the vector
+    /// column and would have been appended by an in-loop check (the
+    /// equal-column-lengths invariant, `finish()` must still succeed).
+    #[test]
+    fn vector_decode_json_decoder() {
+        use datafusion::arrow::array::Int64Array;
+        let mut batch = ColBatch::new(vector_schema(vec![]), 8);
+        let good: Vec<&str> = vec![
+            r#"{"id":1,"emb":[0.1,0.2,0.3],"free":[9.5]}"#,
+            r#"{"id":2,"emb":[1,2,3],"free":[]}"#,
+            r#"{"id":3,"emb":null,"free":null}"#,
+            r#"{"id":4}"#,
+            r#"{"id":5,"emb":[-1.5,0,2.5e-1],"free":[1,2,3,4,5]}"#,
+        ];
+        for r in &good {
+            assert_eq!(
+                JsonDecoder.decode(r.as_bytes().to_vec(), &mut batch, &Pushdown::default()),
+                Decoded::Append,
+                "{r}"
+            );
+        }
+        assert_eq!(batch.len(), 5);
+        let bad: Vec<&str> = vec![
+            r#"{"id":90,"emb":[0.1,0.2,0.3,0.4],"free":[1]}"#, // 超出
+            r#"{"id":91,"emb":[0.1,0.2],"free":[1]}"#,         // 不足
+            r#"{"id":92,"emb":[],"free":[1]}"#,                // 空 ≠ dim
+            r#"{"id":93,"emb":[0.1,"x",0.3]}"#,                // 非数值元素
+            r#"{"id":94,"emb":[[0.1],[0.2],[0.3]]}"#,          // 嵌套
+            r#"{"id":95,"emb":[0.1,0.2,null]}"#,               // null 元素
+            r#"{"id":96,"emb":"[0.1,0.2,0.3]"}"#,              // 字串非数组
+            r#"{"id":97,"emb":42}"#,                           // 标量
+            r#"{"id":98,"emb":{"a":1}}"#,                      // 对象
+            r#"{"id":99,"emb":[0.1,0.2,0.3],"free":[1,"x"]}"#, // 无 dim 列也守元素
+        ];
+        for r in &bad {
+            match JsonDecoder.decode(r.as_bytes().to_vec(), &mut batch, &Pushdown::default()) {
+                Decoded::Bad(buf) => assert_eq!(buf, r.as_bytes(), "buffer handed back: {r}"),
+                other => panic!("{r} must be Bad, got {other:?}"),
+            }
+            assert_eq!(batch.len(), 5, "a Bad row leaves the batch untouched: {r}");
+        }
+        // one more good row after the Bad ones — the builders are still in
+        // lockstep, nothing half-appended
+        assert_eq!(
+            JsonDecoder.decode(
+                br#"{"id":6,"emb":[7,8,9]}"#.to_vec(),
+                &mut batch,
+                &Pushdown::default()
+            ),
+            Decoded::Append
+        );
+        let rb = batch.finish().expect("equal column lengths after Bad rows");
+        assert_eq!(rb.num_rows(), 6);
+        let id = rb.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(
+            (0..6).map(|i| id.value(i)).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6],
+            "no id from a Bad row leaked in"
+        );
+        assert_eq!(
+            vectors(&rb, 1),
+            vec![
+                Some(vec![0.1, 0.2, 0.3]),
+                Some(vec![1.0, 2.0, 3.0]),   // integers widen to f32
+                None,                        // JSON null → NULL
+                None,                        // absent → NULL
+                Some(vec![-1.5, 0.0, 0.25]), // exponent literal, exact in f32
+                Some(vec![7.0, 8.0, 9.0]),
+            ]
+        );
+        assert_eq!(
+            vectors(&rb, 2),
+            vec![
+                Some(vec![9.5]),
+                Some(vec![]), // undimensioned: empty is a value, not NULL
+                None,
+                None,
+                Some(vec![1.0, 2.0, 3.0, 4.0, 5.0]),
+                None,
+            ]
+        );
+    }
+
+    /// DebeziumJsonDecoder: the same contract on `after.*`, through both
+    /// converter shapes; a dim miss in `after` is Bad and leaves the batch
+    /// untouched; the CDC skips (delete / tombstone) still outrank the guard
+    /// — a row that was never going to load is not a bad row.
+    #[test]
+    fn vector_decode_debezium_decoder() {
+        use datafusion::arrow::array::Int64Array;
+        let mut batch = ColBatch::new(vector_schema(vec![]), 4);
+        assert_eq!(
+            DebeziumJsonDecoder.decode(
+                br#"{"before":null,"after":{"id":9,"emb":[0.1,0.2,0.3],"free":[1,2]},"op":"c","ts_ms":1}"#.to_vec(),
+                &mut batch,
+                &Pushdown::default()
+            ),
+            Decoded::Append
+        );
+        // schemas.enable=true wrapper takes the same path
+        assert_eq!(
+            DebeziumJsonDecoder.decode(
+                br#"{"schema":{"type":"struct"},"payload":{"after":{"id":10,"emb":null},"op":"r","ts_ms":2}}"#.to_vec(),
+                &mut batch,
+                &Pushdown::default()
+            ),
+            Decoded::Append
+        );
+        // guarded shapes in after.* → Bad, batch untouched
+        for bad in [
+            &br#"{"before":null,"after":{"id":11,"emb":[0.1,0.2]},"op":"u","ts_ms":3}"#[..],
+            &br#"{"before":null,"after":{"id":12,"emb":[0.1,"x",0.3]},"op":"c","ts_ms":4}"#[..],
+            &br#"{"schema":{},"payload":{"after":{"id":13,"emb":[1,2,3,4]},"op":"c","ts_ms":5}}"#[..],
+        ] {
+            match DebeziumJsonDecoder.decode(bad.to_vec(), &mut batch, &Pushdown::default()) {
+                Decoded::Bad(buf) => assert_eq!(buf, bad),
+                other => panic!("expected Bad, got {other:?}"),
+            }
+            assert_eq!(batch.len(), 2);
+        }
+        // delete with a (would-be) bad vector in before → Skip, not Bad
+        assert_eq!(
+            DebeziumJsonDecoder.decode(
+                br#"{"before":{"id":9,"emb":[1]},"after":null,"op":"d","ts_ms":6}"#.to_vec(),
+                &mut batch,
+                &Pushdown::default()
+            ),
+            Decoded::Skip
+        );
+        let rb = batch.finish().unwrap();
+        assert_eq!(rb.num_rows(), 2);
+        let id = rb.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!((id.value(0), id.value(1)), (9, 10));
+        assert_eq!(vectors(&rb, 1), vec![Some(vec![0.1, 0.2, 0.3]), None]);
+        assert_eq!(vectors(&rb, 2), vec![Some(vec![1.0, 2.0]), None]);
+    }
+
+    /// OggDecoder: `after.*` vector columns ride next to the envelope
+    /// columns; a pushdown-filtered row with a bad vector is a Skip (the
+    /// early filter runs first — zero column copies, zero guard work), a
+    /// passing row with a bad vector is Bad and leaves the batch untouched.
+    #[test]
+    fn vector_decode_ogg_decoder() {
+        use datafusion::arrow::array::StringArray;
+        let schema = vector_schema(vec![
+            Field::new("op_type", DataType::Utf8, false),
+            Field::new("ogg_table", DataType::Utf8, true),
+            Field::new("ogg_ts", DataType::Int64, true),
+        ]);
+        let mut batch = ColBatch::new(schema, 4);
+        let mut pushdown = Pushdown::default();
+        pushdown
+            .eq_whitelist
+            .insert("op_type".into(), vec!["I".into(), "U".into()]);
+        assert_eq!(
+            OggDecoder.decode(
+                br#"{"table":"KB.CHUNKS","op_type":"I","ts":1726000000001,"after":{"id":1,"emb":[0.5,0.6,0.7]}}"#.to_vec(),
+                &mut batch,
+                &pushdown
+            ),
+            Decoded::Append
+        );
+        // filtered op_type → Skip even though emb is off-dimension
+        assert_eq!(
+            OggDecoder.decode(
+                br#"{"table":"KB.CHUNKS","op_type":"D","ts":1726000000002,"after":{"id":2,"emb":[1]}}"#.to_vec(),
+                &mut batch,
+                &pushdown
+            ),
+            Decoded::Skip
+        );
+        // passing op_type with an off-dimension emb → Bad, batch untouched
+        let bad = br#"{"table":"KB.CHUNKS","op_type":"U","ts":1726000000003,"after":{"id":3,"emb":[1,2,3,4,5]}}"#;
+        match OggDecoder.decode(bad.to_vec(), &mut batch, &pushdown) {
+            Decoded::Bad(buf) => assert_eq!(buf, bad.to_vec()),
+            other => panic!("expected Bad, got {other:?}"),
+        }
+        assert_eq!(batch.len(), 1);
+        let rb = batch.finish().unwrap();
+        assert_eq!(rb.num_rows(), 1);
+        let op = rb.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(op.value(0), "I");
+        assert_eq!(vectors(&rb, 4), vec![Some(vec![0.5, 0.6, 0.7])]);
+        assert_eq!(vectors(&rb, 5), vec![None]);
+    }
+
+    /// CSV v1 has no array literal for a vector column: the cell lands NULL
+    /// under the CSV decoder's degrade-to-null rule, the row is kept, and
+    /// the list builder is appended exactly once (column lengths equal) —
+    /// whether the cell is empty or carries array-looking text.
+    #[test]
+    fn csv_vector_column_lands_null_v1() {
+        use datafusion::arrow::array::Int64Array;
+        let mut batch = ColBatch::new(vector_schema(vec![]), 4);
+        for row in [&b"1,,"[..], &b"2,\"[0.1,0.2,0.3]\",\"[1]\""[..]] {
+            assert_eq!(
+                CsvDecoder.decode(row.to_vec(), &mut batch, &Pushdown::default()),
+                Decoded::Append
+            );
+        }
+        let rb = batch.finish().expect("equal column lengths");
+        assert_eq!(rb.num_rows(), 2);
+        let id = rb.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!((id.value(0), id.value(1)), (1, 2));
+        assert_eq!(vectors(&rb, 1), vec![None, None]);
+        assert_eq!(vectors(&rb, 2), vec![None, None]);
+    }
+
+    /// Parquet/batch path: a source List(Float64) column casts into the
+    /// target List(Float32) and copies list by list (nulls and empty lists
+    /// kept); a vector column absent from the file lands NULL arrays. No dim
+    /// guard on this path (a parquet file is one Append or one Bad as a
+    /// whole) — the JSON walks are the guarded path.
+    #[test]
+    fn parquet_list_column_cast_copy_and_missing() -> anyhow::Result<()> {
+        use datafusion::arrow::array::{Int64Array, ListArray};
+        use datafusion::arrow::datatypes::Float64Type;
+        use datafusion::parquet::arrow::ArrowWriter;
+
+        let src_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "emb",
+                DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+                true,
+            ),
+        ]));
+        let emb = ListArray::from_iter_primitive::<Float64Type, _, _>(vec![
+            Some(vec![Some(0.5), Some(1.5), Some(2.5)]),
+            None,
+            Some(vec![]),
+        ]);
+        let rb = RecordBatch::try_new(
+            src_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3])), Arc::new(emb)],
+        )?;
+        let dir =
+            std::env::temp_dir().join(format!("tailrace-decode-pq-list-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let pq = dir.join("fixture.parquet");
+        {
+            let mut w = ArrowWriter::try_new(std::fs::File::create(&pq)?, src_schema, None)?;
+            w.write(&rb)?;
+            w.close()?;
+        }
+        let raw = std::fs::read(&pq)?;
+
+        // target: emb present (cast f64→f32), free absent (→ NULL arrays)
+        let mut batch = ColBatch::new(vector_schema(vec![]), 8);
+        assert_eq!(
+            ParquetDecoder.decode(raw, &mut batch, &Pushdown::default()),
+            Decoded::Append
+        );
+        let out = batch.finish().expect("equal column lengths");
+        assert_eq!(out.num_rows(), 3);
+        assert_eq!(
+            vectors(&out, 1),
+            vec![Some(vec![0.5, 1.5, 2.5]), None, Some(vec![])]
+        );
+        assert_eq!(vectors(&out, 2), vec![None, None, None]);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     /// Mixed batch — the pipeline shape: c/u append, d and a real tombstone

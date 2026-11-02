@@ -5,20 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.2.0] - 2026-10-31
 
-_Scope: changes since v1.1.0 — four development rounds on the main line:
+_Scope: changes since v1.1.0 — six development rounds on the main line:
 the extension round (`feature/mcp-dim-join`, merge `a558231`: T-A6 /
 Debezium decoder / T-E4 / T-D1), R6 (`feature/ddl-backfill`, merge
 `a364b8e`: T-A1 / T-A2), R7 (`feature/sink-capabilities`, merge `aead2b5`:
-T-G4 / T-A7 / T-A8) and R8 (`feature/type-foundation`, HEAD `3690090`:
-T-G2 / T-G1 / T-A3 plus three carried items). **None of it is published**:
-crates.io and the binary releases are still 1.1.0, the development line is
-ahead of the released version, and the next version number is set at
-release time — not here. e2e counts quoted below are the figures recorded
-when each round landed (`scripts/e2e/`, against Doris 2.1.7 in compose and
-an external 3.1.4), not re-run for this entry. Anchors are `path:line` in
-this tree._
+T-G4 / T-A7 / T-A8), R8 (`feature/type-foundation`, merge `86c5289`:
+T-G2 / T-G1 / T-A3 plus three carried items), R8.5 (`feature/docs-v1.2`,
+merge `003f27e`: documentation alignment, zero code changes) and the
+release line itself (`feature/v1.2-release`: R9 T-A4 / T-A5 / T-E2, R10
+T-G3 / T-G6 plus the dogfooding tail-debt bundle). This entry cuts the
+tree at 1.2.0 in lockstep — one workspace version inherited by all 23
+members, 22 of them publishable; the v1.2.0 tag, the binary release and
+the crates.io publish follow it (R5 precedent — version first, publish
+second). e2e counts quoted below are the figures
+recorded when each round landed (`scripts/e2e/`, against Doris 2.1.7 in
+compose and an external 3.1.4); the R9 suites were re-run on the release
+line on 2026-10-31 after the review-round semantics change
+(`variant_vector.sh` 46/46, `alert_flow.sh` 38/38 → 50/50 with the
+badRowPolicy section, dogfooding round 3 27/27 — artifacts under
+`scripts/e2e/evidence/*-r10recert/`). Anchors are `path:line` in this
+tree. **Heads-up for 1.3.0**: the unknown-column-type migration window
+closes — see Deprecated below._
 
 ### Added
 
@@ -31,7 +40,7 @@ this tree._
   `tailrace_console_db_write_seconds{op}` (SQLite write latency) and proxies
   every registered node's `/metrics` behind it, relabelled `node="<name>"`
   with a 3 s timeout and an unreachable node degraded to a comment line
-  (`console/crates/tailrace-console/src/metrics.rs:40` `scrape`).
+  (`console/crates/tailrace-console/src/metrics.rs:155` `scrape`).
   `tailrace_pipeline_bytes_total` is declared but not yet fed (sinks report
   in-flight `buffered_bytes` only — ack-side byte accounting is a follow-up).
 - Debezium CDC decoding (extension round, the narrow path of the old
@@ -40,9 +49,9 @@ this tree._
   `after` payload, `d` events and tombstones are skipped, the
   `schemas.enable` `{schema,payload}` wrapper is unwrapped, and an event
   without an `after` object goes to the DLQ as a Bad row rather than
-  vanishing (`engine/crates/tailrace-decode/src/lib.rs:950`
+  vanishing (`engine/crates/tailrace-decode/src/lib.rs:1204`
   `DebeziumJsonDecoder`; runtime dispatch
-  `engine/crates/tailrace-runtime/src/lib.rs:1532`; the metadata format
+  `engine/crates/tailrace-runtime/src/lib.rs:1550`; the metadata format
   whitelist and kafka `infer-schema` accept the format). tailrace consumes
   CDC, it does not capture it — reading binlogs / WAL stays out of scope.
 - MCP server (T-E4, extension round; widened in R8): `POST /mcp` on the
@@ -81,7 +90,7 @@ this tree._
 - DDL closed loop (T-A1, R6): the new `tailrace-ddl` crate is a pure
   CREATE TABLE draft generator — schema + hints in, DDL text + "this is a
   guess" annotations out, no I/O, snapshot-tested
-  (`engine/crates/tailrace-ddl/src/lib.rs:169` `generate_draft`). Three
+  (`engine/crates/tailrace-ddl/src/lib.rs:180` `generate_draft`). Three
   console endpoints under
   `/api/datasources/{id}/tables/{db}/{table}/ddl/`: `draft` (key model
   recommended from CDC evidence, key column guessed from `id` / `*_id`,
@@ -94,8 +103,10 @@ this tree._
   through `tailrace-metadata::mysql_exec` and is audited in full as
   `TABLE_DDL_EXECUTE`, pass or fail) and `evolve` (registered-vs-live
   `DESC` diff, **`ADD COLUMN` only** — a retype or drop is reported, never
-  run). 13 scalar vocabulary words map to Doris types; an unmapped word is
-  an error, not a fold (`:385` `doris_type`). A three-step web wizard
+  run). 13 scalar vocabulary words map to Doris types (15 once T-A4 /
+  T-A5 below land `variant` and `list<float32>`; `null` is the one word
+  left unmapped); an unmapped word is an error, not a fold (`:438`
+  `doris_type`). A three-step web wizard
   (`web/src/pages/datasources/parts/TableDdlWizard.vue`) fronts it. e2e
   `ddl_create.sh` 48/48 including the partition path and "ADD COLUMN, then
   restart, pipeline keeps running".
@@ -105,7 +116,7 @@ this tree._
   otherwise a `backfill_job` row (new console migration) is created and the
   console runs `PipelineRunner::run_bounded(from, to)` in-process
   (`engine/crates/tailrace-runtime/src/lib.rs:773`) against a `bf-<job>`
-  ledger namespace (`:1566` `backfill_state_dir`) and `bf-` consumer
+  ledger namespace (`:1584` `backfill_state_dir`) and `bf-` consumer
   groups — a backfill never reads or advances the resident pipeline's
   cursor. The Doris sink gains `LabelMode::Deterministic`
   (`engine/crates/tailrace-conn-doris/src/lib.rs:187`): labels are
@@ -136,7 +147,7 @@ this tree._
   `SCHEMA_CHANGE_IN_PROGRESS`, and the DDL `evolve` endpoint refuses in the
   other direction with 409 `PARTIAL_UPDATE_ACTIVE`; at assembly the sink
   must declare `partial_update` and the `sequence_column` must be inside
-  the subset (`engine/crates/tailrace-conn-doris/src/lib.rs:574`
+  the subset (`engine/crates/tailrace-conn-doris/src/lib.rs:589`
   `with_partial_columns`). Stream Load sends `partial_columns:true` **and**
   a `columns` header naming the subset — live-probed on 2.1.7: without the
   header Doris resolves the write to every table column and silently NULLs
@@ -153,7 +164,7 @@ this tree._
   / `:307`, row DTO `:350` / `:353`). A new `PUT
   /api/datasources/tables/{id}` records the key model of a table created
   outside the console (`:319` `TableKeyModelBody`, audited as
-  `TABLE_KEY_MODEL` `:1536`; route
+  `TABLE_KEY_MODEL` `:1547`; route
   `console/crates/tailrace-console/src/lib.rs:57-60` — in v1.1.0 that path
   was DELETE-only), while the DDL `execute` step records it automatically.
   The plan push now fills `sequence_column` from the registration (extension
@@ -170,19 +181,19 @@ this tree._
   `decimal(p,s)` / `timestamp(s|ms|us|ns)` / `date` / `binary` /
   `list<float32[,dim]>` / `variant` / `null`. Parametric words are parsed
   structurally and `Display` prints the canonical spelling; `parse` is
-  strict (`:84`). The type surface is wired through (T-A3): the DDL
+  strict (`:94`). The type surface is wired through (T-A3): the DDL
   generator maps the 13 scalar words, `infer-schema` narrows DDL column
   types to the same vocabulary instead of folding `decimal(18,2)` to
   `int64` / `utf8` (Doris `DESC` reports a `STRING` column as `text`, so
   `text` → `string` — live-probed), and the web wizard's type dropdown
   reads from it. `variant` and `list<float32>` are in the vocabulary; their
-  Doris DDL mapping and end-to-end write are later work. e2e
-  `type_precision.sh`: a `decimal(18,2)` column survives file → Doris with
-  its scale intact.
+  Doris DDL mapping and end-to-end write landed in R9 (T-A4 / T-A5 below).
+  e2e `type_precision.sh`: a `decimal(18,2)` column survives file → Doris
+  with its scale intact.
 - `sequence_col` DDL property (R8 carried item, from dogfooding round 1):
   under UNIQUE KEY a declared `sequence_column` is emitted as the
   table-level property `"function_column.sequence_col" = "<col>"`
-  (`engine/crates/tailrace-ddl/src/lib.rs:316-331`). Without it Doris
+  (`engine/crates/tailrace-ddl/src/lib.rs:367-374`). Without it Doris
   accepts the engine's `sequence_column` Stream Load header and silently
   ignores it — a low-sequence write overwrites a high-sequence row with
   `Status: Success` (probed on 2.1.7 and 3.1.4); `type_precision.sh` keeps
@@ -202,6 +213,134 @@ this tree._
   the exactly-once and group-commit tiers remain undelivered, this is the
   extension point they will land on. Pinned by `tests/contract`
   `sink_capabilities` (5 tests).
+- VARIANT column passthrough (T-A4, R9): the `variant` vocabulary word now
+  reaches Doris end to end. The DDL generator maps it to `VARIANT`
+  (`engine/crates/tailrace-ddl/src/lib.rs:451`; a variant column never
+  takes the key — the heuristic steps over it and an explicit pick is an
+  error), the decoders pass a nested JSON value in a variant column
+  through as its serialised text instead of parsing leaves (json / ogg /
+  debezium-json walks; the column is marked per field with
+  `VARIANT_FIELD_METADATA`, `engine/crates/tailrace-ir/src/column_type.rs:208`,
+  because variant and utf8 share arrow `Utf8` — both schema-construction
+  sites go through `arrow_field_or_utf8` `:221` so the micro-batch schema
+  equality holds), `infer-schema` reports nested JSON samples as `variant`
+  and folds Doris `DESC variant` back to the word so `evolve` stays quiet.
+  The probe that made the sink a zero-change path
+  (`scripts/e2e/evidence/variant-probe-2026-10-30/`, 2.1.7 and 3.1.4):
+  Doris parses a JSON *string literal* into the variant structure
+  server-side exactly like a bare object, so the sink's existing Utf8
+  escaping is already the right wire shape — the R9 e2e round captured the
+  Stream Load body through a TCP proxy to show the raw JSON on the wire.
+  Version difference recorded: 3.1.4 merges a dotted key `"a.b"` into the
+  `a.b` sub-column path, 2.1.7 keeps them apart — the e2e asserts via
+  sub-columns only. e2e `variant.sh` 41/41 (3.1.4) + 42/42 (2.1.7);
+  `variant_vector.sh` 46/46.
+- Vector column (T-A5, R9): `list<float32[,dim]>` lands as `ARRAY<FLOAT>`
+  (`engine/crates/tailrace-ddl/src/lib.rs:482`), a declared dimension
+  riding as `COMMENT 'vector dim=N'` (`:495`) — Doris has no array
+  dimension of its own, and `DESC` spells the column back as the bare
+  `list<float32>` (the dim is not recoverable from DESC, so the DDL
+  `evolve` diff treats the dimmed and bare spellings as one column — R9
+  review fix, `console/crates/tailrace-console/src/api/datasources.rs:1753`
+  `diff_columns`). The decoders build a `List(Float32)` column and
+  pre-validate every row before any append (`check_vector_cells`,
+  `engine/crates/tailrace-decode/src/lib.rs:899`): a length that misses
+  the declared dim, a non-numeric / null / nested element or a non-array
+  cell makes the whole row Bad with every builder untouched — the probe
+  (`scripts/e2e/evidence/vector-probe-2026-10-30/`) found Doris silently
+  degrades such vectors (`["a",2,3]` → `[null,2,3]`, `42` → `NULL`,
+  `NumberFilteredRows 0`), so the engine refuses instead of NULLing. The
+  dim is capped at 65 536 (`MAX_VECTOR_DIM`,
+  `engine/crates/tailrace-ir/src/column_type.rs:259`), elements must be
+  finite, integers widen to f32, null / absent land NULL; a list column
+  never takes the key or a partition (the FE refuses both); CSV degrades a
+  vector cell to NULL (v1). HNSW / IVF indexing is the user's table DDL,
+  not tailrace's. e2e `variant_vector.sh` 46/46 on 3.1.4 (vector write +
+  read-back, dimmed-vector evolve 200 `changed=false`).
+- Console alerting, SLO exposure and ops bundles (T-E2, R9; reworked in
+  the R9 review round): the rules engine lives in the console — the node
+  has none. A periodic task (15 s default, `TAILRACE_ALERT_INTERVAL_SECS`)
+  evaluates the same aggregated node `/metrics` snapshot the scrape serves
+  against five rule kinds, `lag_seconds` / `state_failed` /
+  `heartbeat_age` / `dlq_window` / `flush_errors_window`
+  (`console/crates/tailrace-console/src/alerting.rs:261` `RuleKind`).
+  Episodes are kept **per (rule, series)** — two pipelines under one rule
+  are two independent episodes (`alert_event.series_key`, migration `05`)
+  — and every series gets a three-state verdict, Firing / Clear /
+  **Unknown**, where Unknown HOLDS the current state instead of resolving
+  it: a window rule with no usable base sample (a restart, or a gap wider
+  than `BASE_SLACK_SECS` = 60 s, `:88`) and every series of an
+  unreachable node are Unknown, so a node going dark can never turn a
+  firing alert into a false "resolved"; `heartbeat_age` is synthesised
+  from the console's own receive clock, so a dead node does fire it.
+  Thresholds are strict `>` and accept 0 (a single DLQ row can fire);
+  window increments credit a counter reset as the post-reset value. An
+  episode row lands **only on a transition** — inactive→firing inserts,
+  firing→inactive resolves the same row — and resolved is always
+  reachable: condition clears, series disappears
+  (`reason=series_absent`), rule disabled (`reason=disabled`), rule
+  deleted (`reason=deleted` is delivered before the row goes). Surface:
+  `GET /api/alerts` (rules + current state + open episode + the 50 most
+  recent), audited `POST` / `PUT` / `DELETE /api/alerts/rules`, SSE
+  `GET /api/alerts/stream`; delivery is a webhook POST (JSON; a failure
+  is logged, not retried, and runs off the evaluation loop) plus the SSE
+  hub. SLO v1 stays deliberately small: every enabled lag rule's threshold
+  is exposed on `/metrics` as `tailrace_slo_lag_target_seconds` under the
+  same label set as the lag series it watches
+  (`console/crates/tailrace-console/src/metrics.rs:190`) — no history, no
+  p95 (there is no sample store; a v1.3 candidate). Companion files for
+  users who do run a Prometheus stack: `docs/ops/grafana-dashboard.json`
+  (nine panels over the `/metrics` surface plus the SLO overlay) and
+  `docs/ops/prometheus-alerts.yaml` (seven equivalent rules). Contract
+  suite `console/crates/tailrace-console/tests/alerts_flow.rs`; e2e
+  `alert_flow.sh` 38/38 (real lag, real FAILED, the webhook receives
+  exactly the transition events) and 50/50 with the R10 badRowPolicy
+  section.
+- Cursor openness (T-G3, R10): `Cursor` gains a `Custom { kind, payload }`
+  variant (`engine/crates/tailrace-ir/src/cursor_sourcechunk_impl.rs:64`)
+  — `kind` names the semantics (`pg-lsn`, `iceberg-snapshot`, …) so a
+  connector can refuse a cursor it did not write, `payload` is opaque JSON
+  the connector needs to resume. The four existing variants keep their
+  externally-tagged encoding byte for byte, so pre-G3 ledgers load without
+  migration — read old, write new
+  (`engine/crates/tailrace-state/src/lib.rs:41`; both accepted legacy
+  ledger shapes are pinned as fixtures under
+  `engine/crates/tailrace-state/tests/fixtures/`) — and an unknown tag
+  still fails loudly: openness goes through `Custom`, never through silent
+  acceptance. No shipped connector writes a `Custom` cursor yet; this is
+  the door for a WAL / LSN source or an Iceberg snapshot cursor, not
+  either of them.
+- Pipeline as code (T-G6, R10): one declarative JSON file — `datasources`
+  / `tables` / `pipelines`, any subset — goes through one server-side
+  pair. `POST /api/apply/dry-run` computes a structured, field-level diff
+  against the store (read-only, unaudited); `POST /api/apply` performs the
+  idempotent upsert; both share `plan`
+  (`console/crates/tailrace-console/src/api/apply.rs:347`), so the diff a
+  human reviews is the diff the machine applies, and GitOps / CI / the CLI
+  hit the same entry (routes `console/crates/tailrace-console/src/lib.rs:136-137`).
+  Identity is the business key (datasource name / `(datasource, db,
+  table)` / pipeline name), never a numeric id, so a file written against
+  one console applies unchanged to another; entry bodies **are** the REST
+  create / update DTOs (serde same-source), so the file schema cannot
+  drift from the endpoints. Semantics, stated plainly: an absent top-level
+  key makes no statement about that kind; a present key — even an empty
+  array — declares the full set, and console objects the file does not
+  name are reported as **orphans, never deleted** (v1 has no prune,
+  `:832`). Apply touches nothing that already matches (no generation bump,
+  no `PENDING_CHANGES` flip, no audit row; a second apply of the same file
+  is a zero-change no-op); whole-file validation precedes any write;
+  execution order is datasources → tables → pipelines, non-transactional
+  across objects, re-run converges. Credentials are compared by presence
+  only and never echoed (`<redacted>` both sides). JSON only in v1 —
+  `serde_yaml` is unmaintained and was not introduced; a YAML file
+  converts with one `yq` line, shown in `docs/ops/pipeline-file.md` with
+  the field table and an example. CLI thin shell: `tailrace-console apply
+  -f <file> [--dry-run] [--server URL] [--token | --user --password]`
+  (`console/crates/tailrace-console/src/apply_cli.rs`; exit 0 / 1 / 2,
+  zero diff logic client-side). Contract suite
+  `console/crates/tailrace-console/tests/apply_flow.rs`, 6 cases,
+  including the real CLI against a served router agreeing with the API
+  byte for byte.
 
 ### Changed
 
@@ -214,23 +353,23 @@ this tree._
   (`deploy` / `recover`, 400 with the diagnostic) and at backfill accept
   (422 `PARTIAL_DECLARATION_INVALID`) — a DUPLICATE / merge-on-read sink
   with a stale column list fails loudly instead of slipping into partial
-  mode (`console/crates/tailrace-console/src/api/pipelines.rs:359`
-  `partial_declarations_gate` for publish and plan push — call sites `:1086`
-  / `:1291`; the backfill accept path calls the same diagnostics generator
-  `partial_declaration_diags` (`:289`) directly at `:2265`). A repository
+  mode (`console/crates/tailrace-console/src/api/pipelines.rs:369`
+  `partial_declarations_gate` for publish and plan push — call sites `:1096`
+  / `:1301`; the backfill accept path calls the same diagnostics generator
+  `partial_declaration_diags` (`:299`) directly at `:2276`). A repository
   grep found no in-tree usage of the old form; the impact is user-side
   only.
 - `TableObject` is now five generic fields plus an options map (T-G1, R8):
   `datasource` / `name` / `kind` / `format` / `columns` stay typed, every
   connector-specific setting moves into `options`
-  (`engine/crates/tailrace-catalog/src/lib.rs:80`, `:107`), with the
-  canonical key spellings in one place (`:35` `option_keys`: `bootstrap` /
+  (`engine/crates/tailrace-catalog/src/lib.rs:81`, `:108`), with the
+  canonical key spellings in one place (`:36` `option_keys`: `bootstrap` /
   `stream_load_url` / `auth_env` / `label_prefix` / `sequence_column` /
   `partial_columns`) and typed accessors per connector (`KafkaTableExt` /
   `DorisTableExt` / `JdbcTableExt` / `FileTableExt`). Wire compatibility:
   the six legacy flat keys are **double-written** on serialise and folded
-  into `options` on read for one minor-version window (`:54-61` `LEGACY`,
-  `:257-262` `fold_legacy`; explicit `options` keys win), so stored
+  into `options` on read for one minor-version window (`:55-62` `LEGACY`,
+  `:258-263` `fold_legacy`; explicit `options` keys win), so stored
   `table_object` rows and plan bodies keep working; a cross-window test
   (legacy field names + new vocabulary words in one object) pins the two
   windows against each other. Construction sites collapsed from 17 struct
@@ -238,13 +377,13 @@ this tree._
 - Unknown column-type words no longer fold to `utf8` silently (T-G2, R8).
   During a one-minor migration window
   (`UNKNOWN_TYPE_UTF8_MIGRATION_WINDOW = true`,
-  `engine/crates/tailrace-ir/src/column_type.rs:158`) the two legacy
+  `engine/crates/tailrace-ir/src/column_type.rs:168`) the two legacy
   `arrow_type` call sites — pipeline assembly and dim loading — log a
   `warn` naming the column and the known vocabulary, then fold exactly as
-  before; the next minor flips the constant and turns the fold into a hard
-  error at pipeline assembly. Review that any `columns` type string you
-  rely on is one of the sixteen words before then. The DDL generator and
-  `ColumnType::parse` are already strict.
+  before; **1.3.0 flips the constant and turns the fold into a hard error
+  at pipeline assembly** (see Deprecated below). Review that any `columns`
+  type string you rely on is one of the sixteen words before then. The
+  DDL generator and `ColumnType::parse` are already strict.
 - Engineering governance (R6–R8): `unsafe_code = "forbid"` for the whole
   workspace via `[workspace.lints]` (`Cargo.toml:55-56`; a grep found zero
   `unsafe` tokens, the fence is for the future); `debug =
@@ -254,24 +393,90 @@ this tree._
   backtraces keep file:line, set `CARGO_PROFILE_TEST_DEBUG=2` when you
   need full variable info; new `cargo deny` advisories are paid down as
   they land (see Security).
-- Console `api/messages.rs` zh dictionary grows to 77 keys / 109 call
-  sites (36 / 50 at T34): the DDL endpoints' 400 / 404 / 422 / 409 / 502
-  envelopes, the backfill request gates, the partial-update publish /
-  deploy / evolve gates and the live key-model probe all carry
-  `message_key`. Dictionary completeness is still enforced by the source
-  scan test.
-- Console SQLite schema: three new migrations, auto-applied on start —
+- Console `api/messages.rs` zh dictionary grows to 93 keys / 137 call
+  sites (36 / 50 at T34; the key count is pinned by the dictionary's own
+  scale test): the DDL endpoints' 400 / 404 / 422 / 409 / 502 envelopes,
+  the backfill request gates, the partial-update publish / deploy / evolve
+  gates, the live key-model probe, the alert-rule CRUD gates (T-E2) and
+  the declarative apply's `err.apply.*` whole-file refusals (T-G6) all
+  carry `message_key`. Dictionary completeness is still enforced by the
+  source scan test.
+- Console SQLite schema: five new migrations, auto-applied on start —
   `01` adds `table_object.sequence_column`, `02` adds the `backfill_job`
   table, `03` adds `table_object.key_model` (the T-A7 registry gate's
-  ledger). Downgrading a data directory across them is not supported.
+  ledger), `04` adds `alert_rule` / `alert_event` (T-E2) and `05` adds
+  `alert_event.series_key` for per-series episodes (R9 review round; an
+  open episode written under `04` is adopted by the first series the
+  evaluator sees firing for its rule, `adopt_alert_episode`
+  `console/crates/console-store/src/alerts.rs:237`). Downgrading
+  a data directory across them is not supported.
+- DLQ accounting is at-least-once — disclosed, not changed (R10 tail-debt
+  bundle, from dogfooding round 3): a bad row inside the replay window is
+  quarantined again on every replay (round 3 recorded 3 bad rows → 9 DLQ
+  records), the side file and `tailrace_dlq_rows_total` count quarantines
+  rather than distinct rows, and a consumer must dedupe on `rawB64`
+  (`docs/protocol/engine-v1.md:207`; console-api ruling 13). The round-3
+  open item — a `file` run ending with the cursor at EOF and
+  `totals.flushed` one short — is closed on the source-evidence chain in
+  `docs/dev/open-item-cursor-flush.md`: every ledger save sits after a
+  successful flush except stop finalisation's `pending_rows == 0` branch,
+  which can only cross a row that was decoded Bad or projected away; three
+  targeted DorisSink reproductions did not recreate the shape, and the
+  document says so (with a capture checklist) rather than claiming a fix.
 - Repository docs: the internal process records (roadmap, review minutes,
   incident reports, lineage decision) moved out of the public tree into a
   private workflow (`1bed48d`); `docs/dev/` now holds technical decision
   records and dogfooding reports only, and `docs/dev/README.md` states the
   boundary. Links into the removed files were rewritten.
 
+### Deprecated
+
+- **The unknown-column-type migration window closes in 1.3.0 (T-G2).** A
+  type word in `TableObject.columns` outside the sixteen-word vocabulary
+  currently logs a `warn` and folds to `utf8` at pipeline assembly and dim
+  loading (`UNKNOWN_TYPE_UTF8_MIGRATION_WINDOW = true`,
+  `engine/crates/tailrace-ir/src/column_type.rs:168`, fold arm
+  `arrow_type_or_utf8` `:174`). 1.3.0 flips the constant to `false` and
+  the fold becomes a hard error: a pipeline whose table objects carry an
+  unknown word will refuse to assemble — the `warn` text already says
+  "hard error next minor". The DDL generator and `ColumnType::parse`
+  already refuse such words and `infer-schema` only emits vocabulary
+  words, so the exposure is a hand-registered table object — REST, apply
+  file or MCP — carrying a word outside the list. Audit them now: compare
+  every type string in `GET /api/datasources/tables` → `columnsJson`
+  against the list in `ColumnType` (`:30`), and fix the registration while
+  the fold still carries the row.
+
 ### Fixed
 
+- `badRowPolicy` was silently dropped by the console (R10 tail-debt
+  bundle, from dogfooding round 3): `PipelineConfig` had no field for it,
+  so the key vanished between the request body and `plan["options"]` and
+  the engine kept running `dlq` while the request said `fail`. The DTO now
+  carries `bad_row_policy`
+  (`console/crates/tailrace-console/src/api/pipelines.rs:56`) and a
+  contract test pins the console's key set equal to the engine's
+  `PlanOptions` key set, so the next engine-side option cannot go missing
+  the same way. e2e `alert_flow.sh` section B exercises `skip` / `fail` /
+  an invalid value end to end (50/50), asserting on the engine's own
+  `bad_row_policy=<v>` start line rather than on the DTO.
+- Doris BE memory-pressure refusals were classified as fatal (R10
+  tail-debt bundle, from dogfooding round 3): a `MEM_LIMIT_EXCEEDED` /
+  "Cannot alloc" / low-water-mark Stream Load answer fell through the
+  generic patterns to statement error → restart loop → a poison-data
+  verdict on a healthy pipeline during a 20–40 minute BE memory window.
+  `is_memory_pressure` (`engine/crates/tailrace-conn-doris/src/lib.rs:401`)
+  now recognises the live 3.1.4 and 2.x spellings before the generic
+  patterns and returns `FlushError::retry` with the buffer kept (status
+  matrix rows ⑧ / ⑧b: same buffer resent, window passes → success;
+  budget exhausted → "retries exhausted", never "not retryable");
+  strict-mode / quality / schema refusals stay fatal and the poison-data
+  criterion itself is unchanged.
+- A vector table declared with a dimension (`list<float32,N>`) answered
+  409 on every DDL `evolve` (R9 review round): Doris `DESC` cannot report
+  the dim, so the registered-vs-live diff saw a retype each time;
+  `diff_columns` now treats the dimmed and bare spellings as the same
+  column (`console/crates/tailrace-console/src/api/datasources.rs:1753`).
 - Doris sink label reuse after a same-process `stop → deploy` rebuild (R6
   review round, unplanned): a rebuilt `ProcessScoped` sink restarted its
   label ordinal at `_0` and reused a label the previous instance had
@@ -286,9 +491,16 @@ this tree._
   wrote `rowsWritten = 0` and reported success. References are now
   absolutised against the registered directory; the e2e asserts the old
   shape cannot recur.
-- `scripts/release-crates.sh` read a hard-coded `VERSION` (`b19661b`): at
-  the 1.0.0 → 1.1.0 release it still looked for 1.0.0 and skipped every
-  crate. It now reads the workspace version from `Cargo.toml`.
+- `scripts/release-crates.sh` read a hard-coded `VERSION`: at the
+  1.0.0 → 1.1.0 release it still looked for 1.0.0 and skipped every
+  crate. `b19661b`'s message promised a dynamic read but its diff only
+  re-pinned the literal to `1.1.0` — the same skip would have recurred at
+  this release. The 1.2.0 prep commit makes the promise true: the script
+  now reads `[workspace.package] version` from `Cargo.toml` and refuses
+  to run if it cannot, and its publish topology gains `tailrace-ddl` (L0,
+  depended on by `tailrace-console`; added in R6 but never listed), with
+  the integrity check raised from 21 to 22 packages — `--list` matches the
+  `cargo metadata` publishable set exactly.
 
 ### Security
 
@@ -543,7 +755,8 @@ web UI.
   `checksums.txt`, and community health files (CONTRIBUTING, SECURITY,
   CODE_OF_CONDUCT, issue/PR templates).
 
-[Unreleased]: https://github.com/SeekerGalahad/tailrace/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/SeekerGalahad/tailrace/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/SeekerGalahad/tailrace/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/SeekerGalahad/tailrace/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/SeekerGalahad/tailrace/compare/v0.1.0...v1.0.0
 [0.1.0]: https://github.com/SeekerGalahad/tailrace/releases/tag/v0.1.0

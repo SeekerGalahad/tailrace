@@ -1,0 +1,3 @@
+1793445172851	ERROR	STATEMENT_FAILED	pipeline#2	transform output column order != sink: output ["extra", "id"] vs sink ["id", "extra"] — check the SELECT projection order（auto-restart disabled (recovery.autoRestart=false)，auto-restart stopped）
+1793445300440	WARN	DECODE_BAD	pipeline#3	decoded bad rows total 1 (this batch 1) — badRowPolicy=skip (rows dropped, counted only)
+1793445302640	ERROR	STATEMENT_FAILED	pipeline#4	decode bad row under badRowPolicy=fail (statement halted before the cursor crossed the batch) — first bad row sample: not json {（auto-restart disabled (recovery.autoRestart=false)，auto-restart stopped）

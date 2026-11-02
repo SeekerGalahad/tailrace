@@ -1,0 +1,72 @@
+### probe target: standing-3.1.4 (fe in-container 9030 be host 127.0.0.1:8040)
+           Version: doris-3.1.4-rc02-7f5ba43de6
+=== A: DDL shapes ===
+--- A1 DUPLICATE KEY + ARRAY<FLOAT> value column with COMMENT ---
+A1: created
+--- A2 UNIQUE KEY MoW + ARRAY<FLOAT> value column ---
+A2: created
+--- A3 ARRAY<FLOAT> as KEY column (expect refusal) ---
+ERROR 1105 (HY000) at line 1: errCode = 2, detailMessage = Array can only be used in the non-key column of the duplicate table at present.
+--- A4 ARRAY<FLOAT> as RANGE partition column (expect refusal) ---
+ERROR 1105 (HY000) at line 1: errCode = 2, detailMessage = Complex type column can't be partition column: ARRAY<FLOAT>
+--- A5 SHOW CREATE TABLE d (column lines) / DESC d ---
+  `id` int NOT NULL,
+  `emb` array<float> NULL COMMENT "vector dim=3"
+Field	Type	Null	Key	Default	Extra
+id	int	No	true	NULL	
+emb	array<float>	Yes	false	NULL	NONE
+=== B: load shapes → SELECT (DUPLICATE table d) ===
+--- B load (well-formed shapes): B1 bare array / B2 json-string compact / B3 json-string spaced / B4 ints / B5 null,absent / B6 empty / B9 longer ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 8,
+    "NumberFilteredRows": 0,
+--- B raw: SELECT id, emb, array_size(emb), element_at(emb, 2) ---
+1	[0.1, 0.2, 0.3]	3	0.2
+2	[0.1, 0.2, 0.3]	3	0.2
+3	[0.1, 0.2, 0.3]	3	0.2
+4	[1, 2, 3]	3	2
+5	NULL	NULL	NULL
+6	NULL	NULL	NULL
+7	[]	0	NULL
+9	[0.1, 0.2, 0.3, 0.4, 0.5]	5	0.2
+--- B7 non-numeric element (own load, max_filter_ratio 1) ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 1,
+    "NumberFilteredRows": 0,
+10	[null, 2, 3]
+--- B8 nested array (own load, max_filter_ratio 1) ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 1,
+    "NumberFilteredRows": 0,
+11	[null, null]
+--- B10 scalar where the array goes (own load, max_filter_ratio 1) ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 1,
+    "NumberFilteredRows": 0,
+12	NULL
+=== C: UNIQUE MoW × partial_columns (table u) ===
+--- C1 full write ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 1,
+    "NumberFilteredRows": 0,
+1	first	[0.5, 0.6, 0.7]
+--- C1 partial: columns id,name only → emb preserved? ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 1,
+    "NumberFilteredRows": 0,
+1	renamed	[0.5, 0.6, 0.7]
+--- C2 partial: columns id,emb → whole replacement? name preserved? ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 1,
+    "NumberFilteredRows": 0,
+1	renamed	[9, 9, 9]
+=== cleanup ===
+standing-3.1.4: dropped vec_probe
+### probe done: standing-3.1.4

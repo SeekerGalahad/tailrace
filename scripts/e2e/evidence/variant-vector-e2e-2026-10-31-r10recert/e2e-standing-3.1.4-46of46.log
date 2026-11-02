@@ -1,0 +1,50 @@
+== variant_vector e2e: work=/tmp/tailrace-vv-e2e fe=127.0.0.1:9030 be=127.0.0.1:8040 db=tailrace_vv_e2e console=127.0.0.1:18087 ==
+  ok    S0.1 console binary /Users/wagic/GLMProjects/tailrace/target/release/tailrace-console
+  ok    S0.2 engine node binary /Users/wagic/GLMProjects/tailrace/target/release/tailrace-node
+  ok    S0.4 compose override generated: BE swap check neutralized for the e2e stack only (/tmp/tailrace-vv-e2e/compose-be-swap-override.yml)
+  ok    S1.1 external standing doris via TAILRACE_E2E_DORIS_MYSQL (compose skipped; fe=127.0.0.1:9030 be=127.0.0.1:8040)
+  ok    S2.0 backend Alive=true (heartbeat-driven availability)
+  ok    S2.1 database tailrace_vv_e2e empty (DROP FORCE + CREATE)
+  ok    S2.2 server version under test: doris-3.1.4-rc02-7f5ba43de6 (SHOW FRONTENDS; SELECT VERSION() only reports the mysql protocol)
+  ok    P0.1 probe_mix created (VARIANT + ARRAY<FLOAT> side by side, hand-DDLed on purpose — this tier pins Doris, not the engine)
+  ok    P1.1 both engine emission shapes land on the MIXED table, equal to the bare forms: variant JSON-string literal → v['a']['b']=42, vector display string '[0.1, 0.2, 0.3]' → elements 0.1/0.3, size 3 (variant probe B2 + vector probe B3 re-pinned side by side)
+  ok    P2.1 f32 edges survive the string→FLOAT cast: 1e-7 → 1e-07, 0.33333334 kept, f32::MAX 3.4028235e38 → 3.4028235e+38 (vector probe README W4 note 1 — asserted, not assumed)
+  ok    S3.1 console booted (fresh data-dir)
+  ok    S3.2 login → 200 + token
+  ok    S3.3 datasources: doris direct (d=1) + doris via carrier proxy (d=2) + file (f=3)
+  ok    S3.4 engine node up (serve)
+  ok    S3.5 node ONLINE
+  ok    T1.1 draft maps the mixed vocabulary: meta/content→VARIANT, emb→ARRAY<FLOAT> COMMENT 'vector dim=3' (the dim annotation), scores→bare ARRAY<FLOAT> (no dim, no comment)
+  ok    T1.2 execute → live SHOW CREATE TABLE: meta/content variant, emb array<float> with the 'vector dim=3' comment, scores array<float> (real Doris types, zero hand DDL)
+  ok    T1.3 evolve on the BARE vector table reports changed=false (DESC array<float> folds back to list<float32> — round-trip stable)
+  ok    T1.4 evolve on the DIMMED table → 200 changed=false (dim invisible to DESC is not a retype — R9 review fix)
+  ok    T2.1 keyColumn=meta (variant) → 400 naming VARIANT (the generator refuses a draft the FE would refuse; variant probe A3)
+  ok    T2.2 keyColumn=emb (vector) → 400 naming ARRAY (FE: 'Array can only be used in the non-key column'; vector probe A3)
+  ok    T3.1 file table local.docs_in (jsonl, the mixed vocabulary)
+  ok    T3.2 seeds: 5 rows (nested docs incl. null/{}/array-root/string-scalar; vectors incl. ints/negatives/zero/1e-7; scores 3/1/null/[]/absent)
+  ok    T3.2a BE write path healthy before the deployment (gate attempt 1)
+  ok    T3.3 pipeline full-column file→docs_emb deployed → RUNNING
+  ok    T3.4 COUNT=5/5 through the engine chain
+  ok    T3.5 CORE DOC-1 variant leaves: meta.source='api' + meta.verified→1 (bool stored as int, variant probe B1), content.l1.l2.l3='leaf' (4-level path), content.tags leaf array (3.1.4 spells it ['x', 'y'] under a sub-path CAST)
+  ok    T3.6 CORE DOC-2..5 variant shapes: shallow path beside DOC-1's deeper one (l1.l2 string vs object), mixed leaf kinds (1.5 / true→1), json null meta → NULL, string-scalar meta kept as a JSON string, array-root content answers via CAST
+  ok    T3.7 CORE vectors element-exact on all 5 rows: floats, integers widened (1,2,3), negatives+zero, the f32 edges (1e-07 / 0.33333334) — dimension 3 everywhere
+  ok    T3.8 dim-less scores take ANY length: 3 / 1 / json null→NULL / []→0 / absent→NULL, element_at(scores,2)=8 — none killed (vector probe B5/B6)
+  ok    T4.1 emb_bad created (emb declared dim=3)
+  ok    T4.2 seeds: GOOD-1, then wrong-length [1,2] / scalar 42 / non-numeric element "x" (the guard's kill shapes — Doris would degrade each silently), then GOOD-2
+  ok    T4.2a BE write path healthy before the deployment (gate attempt 1)
+  ok    T4.3 pipeline file→emb_bad deployed → RUNNING (default badRowPolicy=dlq, pipeline #2)
+  ok    T4.4 CORE dim guard: exactly the 2 legal rows landed, each with ITS OWN vector (no misalignment around the killed rows), all 3 kill shapes nowhere in the table
+  ok    T4.5 CORE the killed rows are quarantined, not lost: /tmp/tailrace-vv-e2e/node-state/bad_rows/p2-s0.jsonl holds 3 record(s) (3 per decode of the batch — >3 means a failed flush replayed it, at-least-once)
+  ok    T4.6 CORE DLQ raw bytes round-trip: the distinct base64-decoded payloads are exactly the 3 seed lines, byte for byte, in source order (recoverable for replay, not just counted)
+  ok    T4.7 node /metrics tailrace_dlq_rows_total{pipeline="2",statement="0"} 3 = the side file's 3 records (the series the E2 dlq_window rule counts agrees with what was quarantined)
+  ok    C0.1 carrier proxy up: 127.0.0.1:18180 → BE 127.0.0.1:8040 (tees the engine's stream-load bytes)
+  ok    C0.1a BE write path healthy before the carrier deployment (gate attempt 1)
+  ok    C0.2 carrier pipeline deployed → RUNNING (sink table object on the proxy-fronted datasource)
+  ok    C0.3 the carrier row landed through the proxy (meta.nested.b=42 — the relay is transparent to correctness)
+  ok    C1.0 captured: PUT /api/tailrace_vv_e2e/docs_emb/_stream_load HTTP/1.1 with the CAR-1 body line
+  ok    C1.1 CARRIER (review focus): meta/content ride as JSON STRING literals holding the WHOLE sub-document (nested object + inner array, structurally equal to the source) — no leaf parsing, no flattening; Doris does the sub-column inference server-side. Wire form: meta="{\"source\":\"carrier\",\"nested\":{\"b\":42,\"arr\":[1,2]}}"
+  ok    C1.2 CARRIER vectors ride as the arrow display STRING (emb="[0.1, 0.2, 0.3]", scores="[1.0, 2.0]") — the ArrayFormatter catch-all arm, the exact shape P1.1 proved the server parses
+scripts/e2e/variant_vector.sh: line 169:  2867 Terminated: 15          TAILRACE_BOOTSTRAP_TOKEN="tr_b_vv_e2e_00112233445566778899aabbccddeeff" "$CONSOLE_BIN" --addr "$CONSOLE_ADDR" --data-dir "$WORK/run" > "$WORK/console.log" 2>&1
+scripts/e2e/variant_vector.sh: line 169:  3215 Terminated: 15          python3 "$WORK/proxy.py" "$PROXY_PORT" "127.0.0.1:$BE_PORT" "$WORK/carrier.txt" > "$WORK/proxy.log" 2>&1
+  ok    S4.1 external doris cleanup: DROP DATABASE tailrace_vv_e2e FORCE (standing stack untouched)
+== variant_vector e2e summary: 46/46 steps passed ==

@@ -1,0 +1,16 @@
+{
+  "0": {
+    "cursor": {
+      "File": {
+        "path": "/tmp/tailrace-af-e2e/node/bp_skip_in",
+        "byte_pos": 37
+      }
+    },
+    "lastAck": "/tmp/tailrace-af-e2e/node/bp_skip/append.0",
+    "totals": {
+      "consumed": 3,
+      "flushed": 2,
+      "flushes": 1
+    }
+  }
+}

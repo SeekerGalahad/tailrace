@@ -12,12 +12,14 @@
 //! 规模口径（T39 ③ 勘正，2026-10-23 实测；T35 增补；T-D1 dim join +6 key；
 //! T-A1 建表闭环 +10 key；T-A2 回填 +9 key；T-A7 部分列更新 +9 key，
 //! 2026-10-28 实测；R7 评审修复轮 +1 key——回填 accept 重跑部分列发布门；
-//! LOW-5 R8 +2 key——publish 活表核实 2）：字典
-//! **76 key**（[`tests::KEY_LIST`] 与 `template` 同步，长度由
+//! LOW-5 R8 +2 key——publish 活表核实 2；T-E2 告警 +6 key——规则 CRUD 门禁，
+//! 2026-10-31 实测；T-G6 管道即代码 +11 key——apply 声明文件门禁，2026-10-31
+//! 落地）：字典
+//! **93 key**（[`tests::KEY_LIST`] 与 `template` 同步，长度由
 //! [`tests::templates_use_only_positional_placeholders`]
-//! 钉住）/ **109 调用点**（`grep -rn 'messages::' src/ --include='*.rs'`
-//! 排除本模块，2026-10-30 LOW-5 改前实测 107——原记 106 为旧值——+2：
-//! publish 活表核实 2）；
+//! 钉住）；调用点规模见上一轮登记（T-E2 实测 120 站点），T-G6 的
+//! apply.rs 全部走本字典（含 bad_body 复用），新增 17 个调用站点
+//! （120→137，`grep -rn 'messages::' src/` 排除本模块实测）；
 //! T35 部署链 +3 key/+7 站点；T-D1 +6 站点——发布门禁 3 + 维表登记 3；
 //! T-A1 +14 站点——draft/execute/evolve 三端点的 400/404/422/409/502 信封全部走字典，
 //! 改前实测 66，此前登记的 63 为 T-D1 后未同步的旧值；T-A2 回填 +11 站点，
@@ -244,6 +246,43 @@ fn template(key: &str) -> Option<&'static str> {
         "err.backfill.partial_declaration" => {
             "部分列声明未通过发布门禁，拒绝回填：{0}"
         }
+        // ---- T-E2 告警规则（rules CRUD 门禁）----
+        "err.alert.name_missing" => "缺少告警规则名称",
+        "err.alert.name_taken" => "告警规则名称已存在：{0}",
+        "err.alert.type_unknown" => {
+            "未知告警规则类型 {0}（lag_seconds / state_failed / heartbeat_age / dlq_window / flush_errors_window）"
+        }
+        "err.alert.params_invalid" => "告警规则参数非法：{0}",
+        "err.alert.webhook_url_invalid" => "webhookUrl 须为 http(s) URL：{0}",
+        "err.alert.not_found" => "告警规则 #{0} 不存在",
+        // ---- T-G6 管道即代码（apply 声明文件门禁）----
+        "err.apply.unknown_key" => {
+            "声明文件含未知顶层键 {0}（仅 datasources / tables / pipelines）"
+        }
+        "err.apply.duplicate" => "声明文件 {0} 重复声明：{1}",
+        "err.apply.field_missing" => "声明文件 {0}[{1}] 缺少 {2}",
+        "err.apply.datasource_type_unknown" => {
+            "数据源 {0} 的类型 {1} 未知（注册表：kafka/doris/starrocks/file/mysql/postgresql）"
+        }
+        "err.apply.conn_json_not_object" => "数据源 {0} 的 connJson 必须是对象",
+        "err.apply.table_datasource_unknown" => {
+            "表对象 {0} 引用的数据源 {1} 不存在（声明文件与库中均无）"
+        }
+        "err.apply.table_kind_invalid" => {
+            "表对象 {0} 的 kind 覆盖 {1} 不支持（仅 dim，且仅 mysql/postgresql 数据源；当前类型 {2}）"
+        }
+        "err.apply.table_dim_sequence_required" => {
+            "维表 {0}（kind=dim）必须声明 sequenceColumn（主键/单列唯一键，全表加载分页键）"
+        }
+        "err.apply.table_key_model_invalid" => {
+            "表对象 {0} 的 keyModel {1} 非法（仅 unique/duplicate，且仅 doris/starrocks 数据源；当前类型 {2}）"
+        }
+        "err.apply.mapping_datasource_unknown" => {
+            "管道 {0} 的 dsMapping 别名 {1} 引用的数据源 {2} 不存在（声明文件与库中均无）"
+        }
+        "err.apply.concurrent_modification" => {
+            "数据源 {0} 在 apply 过程中被并发修改（generation 冲突或名称被占用），请重试"
+        }
         _ => return None,
     })
 }
@@ -336,7 +375,7 @@ mod tests {
     }
 
     /// 字典自洽：模板只含 {数字} 占位，且插值后无残留花括号。
-    /// 另钉字典规模 = 76 key（模块文档「规模口径」的机器锚点，T39 ③；T35 +3；
+    /// 另钉字典规模 = 93 key（模块文档「规模口径」的机器锚点，T39 ③；T35 +3；
     /// T-D1 dim join +6：发布门禁 3 + 维表登记 3；T-A1 建表闭环 +10；
     /// T-A2 回填 +9：not_published/statement_index/dim_unsupported/
     /// bounds_type/bounds_value/bounds_order/sink_unsupported/
@@ -346,12 +385,19 @@ mod tests {
     /// evolve 侧互斥 1（partial_update_active）+ keyModel 登记 1
     /// （key_model_datasource）；R7 评审修复轮 +1：backfill 部分列重门
     /// （partial_declaration）；LOW-5 +2：publish 活表核实 2
-    /// （live_key_model/live_precheck_failed））：加 key 时同步改此数与 KEY_LIST。
+    /// （live_key_model/live_precheck_failed）；T-E2 告警 +6：规则 CRUD 门禁
+    /// （name_missing/name_taken/type_unknown/params_invalid/
+    /// webhook_url_invalid/not_found）；T-G6 管道即代码 +13：apply 声明文件
+    /// 门禁（unknown_key/duplicate/field_missing/datasource_type_unknown/
+    /// conn_json_not_object/table_datasource_unknown/table_kind_invalid/
+    /// table_dim_sequence_required/table_key_model_invalid/
+    /// mapping_datasource_unknown/concurrent_modification））：加 key 时
+    /// 同步改此数与 KEY_LIST。
     #[test]
     fn templates_use_only_positional_placeholders() {
         let keys: Vec<&str> = KEY_LIST.to_vec();
         assert!(!keys.is_empty());
-        assert_eq!(keys.len(), 76, "字典规模漂移：同步模块文档「规模口径」");
+        assert_eq!(keys.len(), 93, "字典规模漂移：同步模块文档「规模口径」");
         for key in keys {
             let tpl = template(key).expect("listed key resolves");
             let mut rest = tpl;
@@ -768,5 +814,24 @@ mod tests {
         "err.backfill.source_unsupported",
         "err.backfill.no_credential",
         "err.backfill.partial_declaration",
+        // T-E2 alert rules
+        "err.alert.name_missing",
+        "err.alert.name_taken",
+        "err.alert.type_unknown",
+        "err.alert.params_invalid",
+        "err.alert.webhook_url_invalid",
+        "err.alert.not_found",
+        // T-G6 apply declaration-file gates
+        "err.apply.unknown_key",
+        "err.apply.duplicate",
+        "err.apply.field_missing",
+        "err.apply.datasource_type_unknown",
+        "err.apply.conn_json_not_object",
+        "err.apply.table_datasource_unknown",
+        "err.apply.table_kind_invalid",
+        "err.apply.table_dim_sequence_required",
+        "err.apply.table_key_model_invalid",
+        "err.apply.mapping_datasource_unknown",
+        "err.apply.concurrent_modification",
     ];
 }

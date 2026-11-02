@@ -21,6 +21,11 @@ csv = { workspace = true }
 datafusion = { workspace = true }
 simd-json = { workspace = true }
 serde_json = { workspace = true }
+# A4 (R9): the variant field marker (`VARIANT_FIELD_METADATA` /
+# `is_variant_field`) is part of the column-type wire contract and lives in
+# tailrace-ir; the decoders read it to pass nested JSON through as text.
+# No cycle: ir does not depend on decode.
+tailrace-ir = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

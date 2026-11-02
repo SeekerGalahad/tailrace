@@ -24,6 +24,7 @@ struct Args {
 fn usage() {
     eprintln!(
         "Usage: tailrace-console [--addr <HOST:PORT>] [--data-dir <DIR>] [--mcp-allow-write] [--version]\n\
+         \x20              tailrace-console apply -f <file.json> [--dry-run] [--server <URL>] …\n\
          \n\
          Options:\n\
          \x20 -a, --addr <HOST:PORT>   listen address (default {DEFAULT_ADDR})\n\
@@ -31,6 +32,10 @@ fn usage() {
          \x20     --mcp-allow-write    enable the four MCP write tools on POST /mcp (default: read-only;\n\
          \x20                             write calls additionally require \"confirm\": true)\n\
          \x20 -V, --version            print version and exit\n\
+         \n\
+         Subcommand (T-G6 pipeline-as-code — `tailrace-console apply --help` for flags):\n\
+         \x20 apply -f <file.json> [--dry-run] [--server <URL>] [--token <T> | --user <U> --password <P>]\n\
+         \x20                             send a declaration file to /api/apply[/dry-run], print the diff\n\
          \n\
          Env:\n\
          \x20 MCP_ALLOW_WRITE           same as --mcp-allow-write (1/true/yes/on)\n\
@@ -44,6 +49,9 @@ fn usage() {
          \x20 TAILRACE_CONSOLE_ADVERTISE_URL  base URL engines use for --control-plane\n\
          \x20                             (default http://127.0.0.1:8080)\n\
          \x20 TAILRACE_DEPLOY_HEALTH_TIMEOUT_SECS  deploy health/register window (default 90)\n\
+         \x20 TAILRACE_ALERT_INTERVAL_SECS  alert evaluator period in seconds (default 15, min 1;\n\
+         \x20                             T-E2 rules engine over the aggregated node /metrics)\n\
+         \x20 TAILRACE_CONSOLE_TOKEN / _USER / _PASSWORD  the apply subcommand's credentials\n\
          \x20 RUST_LOG                   tracing filter (default info)"
     );
 }
@@ -98,7 +106,14 @@ fn parse_args(argv: &[String]) -> Result<Args> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = parse_args(std::env::args().skip(1).collect::<Vec<_>>().as_slice())?;
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // T-G6: `apply` is a client subcommand — it talks to a console over
+    // HTTP and never opens the local store, so it short-circuits before
+    // any server-side startup side effect (data dir, migrations, seeds).
+    if argv.first().map(String::as_str) == Some("apply") {
+        std::process::exit(tailrace_console::apply_cli::run(&argv[1..]).await);
+    }
+    let args = parse_args(&argv)?;
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -170,6 +185,13 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&artifact_dir)
         .with_context(|| format!("create {}", artifact_dir.display()))?;
     let state = AppState::new_full(store, bootstrap, artifact_dir, cipher);
+    // T-E2: the alert evaluator is a console-side periodic task (the node
+    // has no rules engine) — one pass per interval over the same aggregated
+    // /metrics snapshot the scrape serves; transitions land in
+    // alert_event and fan out to webhooks + the SSE hub. Started here,
+    // next to the other startup side effects, before the listener binds.
+    let alert_interval = tailrace_console::alerting::interval_from_env();
+    tailrace_console::alerting::spawn_evaluator(state.clone(), alert_interval);
     // T-E4 §7.5: write tools on only by explicit flag or env — never by default.
     let mcp_allow_write =
         args.mcp_allow_write || env_truthy(std::env::var(ALLOW_WRITE_ENV).ok().as_deref());

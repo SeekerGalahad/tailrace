@@ -233,12 +233,7 @@ impl Store {
         sequence_column: Option<&str>,
         key_model: Option<&str>,
     ) -> Result<i64> {
-        let cursor = match kind {
-            "kafka" => "KAFKA_OFFSET",
-            "file" => "FILE_POINTER",
-            "jdbc" => "JDBC_KEY",
-            _ => "NONE",
-        };
+        let cursor = cursor_semantics_for(kind);
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO table_object (datasource_id, db_name, table_name, kind, format, columns_json, cursor_semantics, source, sequence_column, key_model) \
@@ -246,6 +241,39 @@ impl Store {
                 rusqlite::params![datasource_id, db_name, table_name, kind, format, columns_json, cursor, sequence_column, key_model],
             )?;
             Ok(conn.last_insert_rowid())
+        })
+    }
+
+    /// Rewrite the declared fields of a registered table object (T-G6
+    /// pipeline-as-code upsert): everything the registration form carries
+    /// except its identity `(datasource, db, table)`. `cursor_semantics`
+    /// follows `kind` exactly as [`Self::insert_table_object`] derives it,
+    /// so a re-declared kind never leaves a stale cursor behind. `false` =
+    /// no such row.
+    pub fn update_table_object(
+        &self,
+        id: i64,
+        kind: &str,
+        format: Option<&str>,
+        columns_json: Option<&str>,
+        sequence_column: Option<&str>,
+        key_model: Option<&str>,
+    ) -> Result<bool> {
+        let cursor = cursor_semantics_for(kind);
+        self.with_conn(|conn| {
+            Ok(conn.execute(
+                "UPDATE table_object SET kind = ?2, format = ?3, columns_json = ?4, \
+                 cursor_semantics = ?5, sequence_column = ?6, key_model = ?7 WHERE id = ?1",
+                rusqlite::params![
+                    id,
+                    kind,
+                    format,
+                    columns_json,
+                    cursor,
+                    sequence_column,
+                    key_model
+                ],
+            )? > 0)
         })
     }
 
@@ -413,6 +441,19 @@ impl Store {
 
     pub fn delete_table_object(&self, id: i64) -> Result<bool> {
         self.with_conn(|conn| Ok(conn.execute("DELETE FROM table_object WHERE id = ?1", [id])? > 0))
+    }
+}
+
+/// `cursor_semantics` a table object of `kind` carries (§4.2 registration
+/// derivation): kafka → KAFKA_OFFSET, file → FILE_POINTER, jdbc → JDBC_KEY,
+/// else NONE (doris/starrocks sinks and dim broadcast tables carry no
+/// cursor). One definition for insert and the T-G6 declarative update.
+fn cursor_semantics_for(kind: &str) -> &'static str {
+    match kind {
+        "kafka" => "KAFKA_OFFSET",
+        "file" => "FILE_POINTER",
+        "jdbc" => "JDBC_KEY",
+        _ => "NONE",
     }
 }
 
@@ -607,6 +648,77 @@ mod tests {
                 .unwrap(),
             DatasourceUpdate::NotFound
         );
+    }
+
+    /// T-G6 declarative update: every declared field is rewritten, the
+    /// cursor follows the (possibly re-declared) kind by the same derivation
+    /// insert uses, identity columns stay put, and a missing row is `false`.
+    #[test]
+    fn table_object_update_rewrites_declared_fields_and_cursor() {
+        let store = Store::open_in_memory().unwrap();
+        let ds = store
+            .insert_datasource(
+                "shop-mysql",
+                "mysql",
+                r#"{"jdbcUrl":"jdbc:mysql://h:3306/shop"}"#,
+            )
+            .unwrap();
+        let t = store
+            .insert_table_object(
+                ds,
+                "shop",
+                "users",
+                "jdbc",
+                Some("json"),
+                None,
+                Some("id"),
+                None,
+            )
+            .unwrap();
+        assert!(store
+            .update_table_object(
+                t,
+                "dim",
+                None,
+                Some(r#"[["id","int64"],["name","utf8"]]"#),
+                Some("id"),
+                None,
+            )
+            .unwrap());
+        let row = store.table_object(t).unwrap().unwrap();
+        assert_eq!(
+            (row.kind.as_str(), row.cursor_semantics.as_str()),
+            ("dim", "NONE")
+        );
+        assert_eq!(row.format, None);
+        assert_eq!(row.sequence_column.as_deref(), Some("id"));
+        assert_eq!(
+            (
+                row.datasource_id,
+                row.db_name.as_str(),
+                row.table_name.as_str()
+            ),
+            (ds, "shop", "users")
+        );
+        assert_eq!(
+            store
+                .table_object_columns_json(t)
+                .unwrap()
+                .flatten()
+                .as_deref(),
+            Some(r#"[["id","int64"],["name","utf8"]]"#)
+        );
+        // back to jdbc restores the cursor derivation
+        assert!(store
+            .update_table_object(t, "jdbc", Some("json"), None, Some("id"), None)
+            .unwrap());
+        assert_eq!(
+            store.table_object(t).unwrap().unwrap().cursor_semantics,
+            "JDBC_KEY"
+        );
+        assert!(!store
+            .update_table_object(999_999, "jdbc", None, None, None, None)
+            .unwrap());
     }
 
     /// T-D1 dim reference resolution ("dsId.table", the form the parser

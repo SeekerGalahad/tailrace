@@ -24,13 +24,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use datafusion::arrow::datatypes::{Field, Schema};
+use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
 use tailrace_catalog::{option_keys, StatementSpec, TableObject};
 use tailrace_connector::{ConnectorRegistry, Cursor};
 use tailrace_decode::{ColBatch, Decoded, Decoder, JsonDecoder, Pushdown};
 
-use crate::arrow_type;
+use crate::arrow_field;
 
 /// Default dim row cap (blueprint D1: 500_000 rows).
 pub const DEFAULT_DIM_MAX_ROWS: usize = 500_000;
@@ -97,7 +97,7 @@ pub fn load_dim(
     let schema = Arc::new(Schema::new(
         obj.columns
             .iter()
-            .map(|(n, t)| Ok(Field::new(n.clone(), arrow_type(n, t)?, true)))
+            .map(|(n, t)| arrow_field(n, t))
             .collect::<anyhow::Result<Vec<_>>>()?,
     ));
     // bridge to the JDBC source factory through the registry (kind rewrite —

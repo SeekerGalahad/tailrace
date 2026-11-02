@@ -1,0 +1,40 @@
+== alert_flow e2e: work=/tmp/tailrace-af-e2e console=127.0.0.1:18088 node=127.0.0.1:18108 webhook=127.0.0.1:18190 ==
+  ok    S0.1 console binary /Users/wagic/GLMProjects/tailrace/target/release/tailrace-console
+  ok    S0.2 engine node binary /Users/wagic/GLMProjects/tailrace/target/release/tailrace-node
+  ok    S1.1 mock webhook listening on 127.0.0.1:18190 (records every POST to hook.jsonl)
+  ok    S2.1 console booted (fresh data-dir, TAILRACE_ALERT_INTERVAL_SECS=2)
+  ok    S2.2 login → 200 + token
+  ok    S2.3 file datasource (f=1) — the whole e2e is file→file, no third-party server in the path
+  ok    S2.4 engine node up (serve)
+  ok    S2.5 node ONLINE
+  ok    S2.6 console log carries 'alert evaluator started' (the periodic task is live)
+  ok    R0.1 GET /api/alerts: ruleTypes=5 kinds, intervalSecs=2, empty rule set
+  ok    R0.2 lag rule created (threshold=6s, webhook → mock) id=1
+  ok    R0.3 negative: threshold=0 → 400 (strictly positive required)
+  ok    R0.4 negative: unknown ruleType → 400
+  ok    P1.1 file→file pipeline af-lag-pipe deployed → RUNNING (pipeline #1)
+  ok    P1.2 first row flushed to the sink file (last_data_ms stamped — the lag gauge's basis)
+  ok    P1.3 console /metrics: lag series tailrace_pipeline_lag_seconds{pipeline="1",statement="0"} 0.049 with the SLO target beside it tailrace_slo_lag_target_seconds{node="engine-node",pipeline="1",statement="0"} 6 (same labels — T-E2 SLO v1)
+  ok    P1.4 rule state inactive while the data flows (lag ≈ 0 < 6)
+  ok    L0.1 pipeline paused via the console proxy (engine verdict PAUSED — pulling stops, last_data_ms freezes)
+  ok    L1.1 CORE REAL lag fired the rule: state=firing ~7-10s after the pause (engine gauge climbs with wall time; strict > 6)
+  ok    L2.1 CORE webhook notice #1: POST x-tailrace-event=firing, sample.value=6.654 > 6 (a NUMBER, from the real gauge)
+  ok    L3.1 alert_event row landed in state firing (open episode id=1 — one row, transition-only)
+  ok    R2.0 pipeline resumed (fresh row appended before the resume — the next flush re-stamps last_data_ms)
+  ok    R2.1 CORE recovered: state back to inactive once data flows again (lag ≈ 0)
+  ok    R2.2 CORE the SAME episode row flipped to resolved (id=1 unchanged, resolvedAt set, resolvedSample.value=1.735) — no second row
+  ok    R2.3 laggy pipeline stopped right after the resolve (before the idle lag could re-cross 6s)
+  ok    W1 CORE anti-flood: the webhook holds EXACTLY the episode's 2 notices (firing + resolved) — silent while firing persisted, silent after it closed, silent through the stop
+  ok    W2.1 sink drained: both rows (W-1, W-2) flushed to the sink file after the stop
+  ok    W3 CORE anti-flood totals: still exactly 2 notices after the drain — one firing + one resolved across the WHOLE episode (pause 40s+, firing 60s+, stop), zero per-tick noise
+  ok    F0.1 poison seed: 2 rows; the projection below reads (extra, id) against the sink's (id, extra) — first batch bails
+  ok    F0.2 poison pipeline deployed → RUNNING (pipeline #2, recovery.autoRestart=false — the first statement error is terminal, no restart cycle)
+  ok    F1.1 CORE the engine REALLY failed: node /metrics tailrace_pipeline_state{pipeline="2"}=3 (ControlFlags FAILED — the exact series state_failed reads)
+  ok    F1.2 state_failed rule created (no threshold; webhook → mock) id=2
+  ok    F2.1 CORE the rule fired on the real FAILED pipeline within one evaluator tick (~2s)
+  ok    F2.2 webhook notice #3 received (state_failed firing)
+  ok    F3.0 poison pipeline stopped (registry entry gone → the state series disappears from /metrics)
+  ok    F3.1 CORE resolved the honest way: an ABSENT series never fires (the engine is down to the alert exactly as long as it is down)
+  ok    F3.2 webhook notice #4 received (state_failed resolved) — 4 notices total across two episodes, every one a transition
+  ok    S3.1 rules deleted (204 ×2) → empty rule set (episodes cascade; a firing rule resolves via reason=disabled first — none was firing here)
+== alert_flow e2e summary: 38/38 steps passed ==

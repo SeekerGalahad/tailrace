@@ -1,0 +1,70 @@
+== variant e2e: work=/tmp/tailrace-va-e2e fe=127.0.0.1:9030 be=127.0.0.1:8040 db=tailrace_va_e2e console=127.0.0.1:18086 ==
+  ok    S0.1 console binary target/debug/tailrace-console
+  ok    S0.2 engine node binary target/debug/tailrace-node
+  ok    S0.4 compose override generated: BE swap check neutralized for the e2e stack only (/tmp/tailrace-va-e2e/compose-be-swap-override.yml)
+  ok    S1.1 external standing doris via TAILRACE_E2E_DORIS_MYSQL (compose skipped; fe=127.0.0.1:9030 be=127.0.0.1:8040)
+  ok    S2.0 backend Alive=true (heartbeat-driven availability)
+  ok    S2.1 database tailrace_va_e2e empty (DROP FORCE + CREATE)
+  ok    P0.1 probe_var created (VARIANT, hand-DDLed on purpose — this tier pins Doris, not the engine)
+  ok    P1.1 json STRING shape (the engine's sink emission) parses into the variant structure — v['a']['b']=42 on BOTH shapes, identical to the bare object (probe B2 re-pinned; the contract decoder+sink ride without any sink change)
+  ok    P1.2 deeper leaves ride too: v['a']['c']='x', v['arr']=[7,8,9] (sub-column, not raw-text, assertion)
+  FAIL  P2.1 mow partial  keeped=orig new=replaced oldk=NULL name=renamed
+  ok    S3.1 console booted (fresh data-dir)
+  ok    S3.2 login → 200 + token
+  ok    S3.3 doris+file datasources (d=1 f=2)
+  FAIL  S3.4 node boot  env: target/debug/tailrace-node: No such file or directory
+  FAIL  S3.5 node ONLINE  node.log=env: target/debug/tailrace-node: No such file or directory
+  ok    T1.1 sink table object variant_events registered (payload variant — the A4 word through the console)
+  ok    T1.2 draft maps variant→VARIANT (A4 mapping in the draft text)
+scripts/e2e/variant.sh: line 387: payload: command not found
+  ok    T1.3 execute → live SHOW CREATE TABLE carries  variant (real Doris type, zero hand DDL)
+  FAIL  T1.4 evolve quiet  http=200 changed= body={"changed":false,"statements":[],"added":[],"elapsedMs":0,"partialUpdateNotice":"Doris 限制：Schema Change 进行中的表不支持部分列更新（partial update）。双向互斥：本次 ADD CO
+  ok    T1.5 keyColumn=payload → 400 naming variant (the generator refuses a draft the FE would refuse; probe A3)
+  ok    T2.1 file table local.var_in (jsonl, payload variant)
+  ok    T2.2 seeds: 8 rows (nested all-leaf-kinds / array root / string / 4-level deep / null / absent / conflicting k types)
+  pipeline va-full deploy failed: http=409 body={"error":{"code":"NO_ELIGIBLE_NODE","message":"没有可指派的在线节点（需心跳 90s 内在线且已上报 api_url）"}}
+  FAIL  T2.3 pipeline variant_events  deploy chain failed (see lines above)
+  FAIL  T2.4 count  n=0 node.log=env: target/debug/tailrace-node: No such file or directory
+  FAIL  T2.5 CORE nested leaves  leaves=0
+  FAIL  T2.6 deep path  deep=
+  FAIL  T2.7 nulls/scalars  nulls=0 strp=
+  FAIL  T2.8 type conflict  kint= kstr=
+  ok    T3.1 table object variant_mow registered (UNIQUE, payload variant — probe A2 shape)
+  ok    T3.2 variant_mow created (draft → execute)
+  pipeline va-mow-full deploy failed: http=409 body={"error":{"code":"NO_ELIGIBLE_NODE","message":"没有可指派的在线节点（需心跳 90s 内在线且已上报 api_url）"}}
+  FAIL  T3.3 mow full pipeline  deploy chain failed
+  FAIL  T3.4 mow first round  keep=
+  pipeline va-mow-name deploy failed: http=409 body={"error":{"code":"NO_ELIGIBLE_NODE","message":"没有可指派的在线节点（需心跳 90s 内在线且已上报 api_url）"}}
+  FAIL  T3.5 mow name partial  deploy chain failed
+  FAIL  T3.6 partial preserves variant  kept=
+  pipeline va-mow-payload deploy failed: http=409 body={"error":{"code":"NO_ELIGIBLE_NODE","message":"没有可指派的在线节点（需心跳 90s 内在线且已上报 api_url）"}}
+  FAIL  T3.7 mow payload partial  deploy chain failed
+  FAIL  T3.8 variant whole replace  new= old= note=
+  ok    T4.1 sink variant_dbz created (draft → execute)
+  ok    T4.2 seeds: debezium c/u events with nested after.payload + one delete (skipped)
+  pipeline va-dbz deploy failed: http=409 body={"error":{"code":"NO_ELIGIBLE_NODE","message":"没有可指派的在线节点（需心跳 90s 内在线且已上报 api_url）"}}
+  FAIL  T4.3 dbz pipeline  deploy chain failed
+  FAIL  T4.4 dbz sub-columns  n=0 b1= b2= src= node.log=env: target/debug/tailrace-node: No such file or directory
+scripts/e2e/variant.sh: line 130: 57015 Terminated: 15          TAILRACE_BOOTSTRAP_TOKEN="tr_b_va_e2e_00112233445566778899aabbccddeeff" "$CONSOLE_BIN" --addr "$CONSOLE_ADDR" --data-dir "$WORK/run" > "$WORK/console.log" 2>&1
+  ok    S4.1 external doris cleanup: DROP DATABASE tailrace_va_e2e FORCE (standing stack untouched)
+== variant e2e summary: 23/41 steps passed ==
+failed steps:
+  - P2.1 mow partial
+  - S3.4 node boot
+  - S3.5 node ONLINE
+  - T1.4 evolve quiet
+  - T2.3 pipeline variant_events
+  - T2.4 count
+  - T2.5 CORE nested leaves
+  - T2.6 deep path
+  - T2.7 nulls/scalars
+  - T2.8 type conflict
+  - T3.3 mow full pipeline
+  - T3.4 mow first round
+  - T3.5 mow name partial
+  - T3.6 partial preserves variant
+  - T3.7 mow payload partial
+  - T3.8 variant whole replace
+  - T4.3 dbz pipeline
+  - T4.4 dbz sub-columns
+work dir kept for post-mortem: /tmp/tailrace-va-e2e

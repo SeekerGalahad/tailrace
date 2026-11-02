@@ -1,0 +1,33 @@
+== dogfooding round3: work=/tmp/tailrace-dogfood3 db=tailrace_dogfood3 console=127.0.0.1:18091 node=127.0.0.1:18111 webhook=127.0.0.1:18195 ==
+  ok    1   s  S0.1 console binary
+  ok    0   s  S0.2 node binary
+  ok    0   s  D0.1 standing stack doris-3.1.4-rc02-7f5ba43de6 (FE doris-2.1 → 127.0.0.1:9030, BE → 127.0.0.1:8040)
+  ok    0   s  D0.2 dedicated database tailrace_dogfood3 dropped+created (rest of the stack untouched)
+  ok    0   s  D1.1 mock webhook up (127.0.0.1:18195)
+  ok    1   s  D1.2 console booted (alert evaluator at 2s)
+  ok    0   s  D1.3 login
+  ok    1   s  D1.4 datasources (doris=1 file=2)
+  ok    1   s  D1.5 node up
+  ok    1   s  D1.6 node ONLINE
+  ok    0   s  D2.1 draft: VARIANT ×2 + emb ARRAY<FLOAT> dim=3 comment + bare scores (A4×A5 words through the wizard face)
+  ok    0   s  D2.2 executed on the live table (SHOW CREATE TABLE carries variant + the dim comment — zero hand DDL)
+  FAIL  0   s  D2.3 evolve on dimmed table  http=200 body={"changed":false,"statements":[],"added":[],"elapsedMs":0,"partialUpdateNotice":"Doris 限制：Schema Change 进行中的表不支持部分列更新（partial update）。双向互斥：本次 ADD COLUMN 完成前（SHOW ALTER TABLE COLUMN 状态为 FINISHED）对该表的部分列更新管道（IN
+  ok    0   s  D3.0a BE write path healthy (gate attempt 1)
+  ok    0   s  D3.1 pipeline df3-docs deployed → RUNNING (#1)
+  ok    3   s  D3.2 nested JSON answered from sub-columns (source/verified/4-level path) and vectors element-exact (incl. 1e-07) — through the real engine chain
+  ok    0   s  D3.3a BE write path healthy before the bad-row pipeline (gate attempt 1)
+  ok    2   s  D3.3 dim guard lived: the good row landed (1), the wrong-length row quarantined to bad_rows/p2-s0.jsonl (1 record(s))
+  ok    0   s  D4.1 lag rule (threshold 6s, pipeline=1) + webhook created (#1)
+  ok    1   s  D4.2 /metrics exposes the SLO target beside the lag series: tailrace_slo_lag_target_seconds{node="engine-node",pipeline="1",statement="0"} 6
+  ok    0   s  D4.3 pipeline paused (manufacturing the lag)
+  ok    4   s  D4.4 rule FIRING on the real pause (~8s in)
+  ok    0   s  D4.5 resumed (fresh row appended before)
+  ok    2   s  D4.6 rule RESOLVED 2s after the resume; DOC-4 landed (4 rows), pipeline stopped
+  ok    3   s  D4.7 webhook carries the episode's 2 notices (firing then resolved, SAME episode id 1, SAME series tailrace_pipeline_lag_seconds{node="engine-node",pipeline="1",statement="0"}) — sequence [firing,resolved], total 2
+  ok    2   s  D4.8 rule deleted (204), no phantom notice (hook total stays 2)
+scripts/dogfood/round3.sh: line 79:  6638 Terminated: 15          python3 "$WORK/hook.py" "$WEBHOOK_PORT" "$WORK/hook.jsonl" > "$WORK/hook.log" 2>&1
+scripts/dogfood/round3.sh: line 79:  6657 Terminated: 15          TAILRACE_BOOTSTRAP_TOKEN="tr_b_df3_00112233445566778899aabbccddeeff" TAILRACE_ALERT_INTERVAL_SECS=2 "$CONSOLE_BIN" --addr "$CONSOLE_ADDR" --data-dir "$WORK/run" > "$WORK/console.log" 2>&1
+  ok    0   s  D5.1 tailrace_dogfood3 dropped (standing stack untouched)
+== dogfooding round3 summary: 26/27 steps passed ==
+failed steps:
+  - D2.3 evolve on dimmed table

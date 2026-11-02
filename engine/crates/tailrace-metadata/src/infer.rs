@@ -2,9 +2,16 @@
 //! extraction) and DDL type names → the engine's 16-word type vocabulary.
 //!
 //! JSON-family inference (ogg / json / jsonl / debezium-json) stays on the
-//! four evidence-bearing words — a JSON sample carries no width or
+//! four evidence-bearing scalar words — a JSON sample carries no width or
 //! precision, so `int64`/`float64` are the honest integer/float picks and
-//! anything wider would be invented. DDL type names (MySQL / Doris `DESC`,
+//! anything wider would be invented — plus `variant` for a field whose
+//! non-null samples are all nested (object / array): since A4 the decoder
+//! passes such a value through as JSON text and Doris VARIANT infers the
+//! sub-columns, so the whole sub-document is carried instead of NULLed
+//! (the pre-A4 `utf8` pick kept the column visible but every nested value
+//! decoded NULL). A field that mixes nested and scalar samples still lands
+//! `utf8` — the lossy-but-honest carrier for a column of mixed shapes.
+//! DDL type names (MySQL / Doris `DESC`,
 //! PG `information_schema`) DO carry width/precision, and A3 narrowed the
 //! fold: `tinyint` keeps its width as `int8`, `decimal(18,2)` keeps its
 //! parameters, `datetime`/`date` land `timestamp(us)`/`date` — before A3
@@ -12,7 +19,13 @@
 //! live diff deaf to real type differences on them (console-api 裁决 8:
 //! 「G2 扩词汇后收窄」). Doris DESC prints a `STRING` column back as `text`
 //! (live-probed 2.1.7, 2026-10-30), so `text` maps to `string` — that keeps
-//! the draft→DESC round trip stable for evolve.
+//! the draft→DESC round trip stable for evolve; likewise a VARIANT column
+//! prints back as `variant` (probed 2.1.7 and 3.1.4) and maps to `variant`,
+//! and an ARRAY<FLOAT> column prints back as `array<float>` (A5, probed
+//! 3.1.4) and maps to the bare `list<float32>`. JSON-sample inference does
+//! NOT pick `list<float32>` on its own — a numeric array in a sample is
+//! `variant` like any array: whether it is a vector (and of what dimension)
+//! is the operator's declaration, not a guess from samples.
 
 use std::collections::HashMap;
 
@@ -21,9 +34,10 @@ use serde_json::Value;
 use crate::InferredSchema;
 
 /// Value-level type lattice. Merge widens: Null absorbs into anything,
-/// Int+Float → Float, any other mix → Str (a column of mixed shapes is only
-/// safely carried as text — the JsonDecoder's `as_str` arm then takes
-/// string values and NULLs the rest, which is the lossy-but-honest option).
+/// Int+Float → Float, Nested+Nested stays Nested, any other mix → Str (a
+/// column of mixed shapes is only safely carried as text — the
+/// JsonDecoder's `as_str` arm then takes string values and NULLs the rest,
+/// which is the lossy-but-honest option).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ty {
     Null,
@@ -31,6 +45,9 @@ enum Ty {
     Int,
     Float,
     Str,
+    /// Object or array (A4): the decoder carries it whole as JSON text into
+    /// a `variant` column; Doris VARIANT infers the sub-columns.
+    Nested,
 }
 
 impl Ty {
@@ -41,9 +58,7 @@ impl Ty {
             Value::Number(n) if n.is_i64() || n.is_u64() => Ty::Int,
             Value::Number(_) => Ty::Float,
             Value::String(_) => Ty::Str,
-            // nested shapes: the JsonDecoder cannot place them in a scalar
-            // column (NULLs them); utf8 keeps the column visible
-            Value::Array(_) | Value::Object(_) => Ty::Str,
+            Value::Array(_) | Value::Object(_) => Ty::Nested,
         }
     }
 
@@ -61,6 +76,7 @@ impl Ty {
             Ty::Bool => "bool",
             Ty::Int => "int64",
             Ty::Float => "float64",
+            Ty::Nested => "variant",
             // a never-non-null column has no evidence → the runtime default
             Ty::Null | Ty::Str => "utf8",
         }
@@ -253,7 +269,17 @@ fn detect(parsed: &[Value]) -> Fmt {
 /// `datev2` → `date`, and the `text` family → `string` (Doris prints its
 /// STRING columns back as `text` — live-probed 2.1.7 — so string is what
 /// keeps draft→DESC→diff stable; MySQL TEXT lands the same, a strictly
-/// wider carrier than VARCHAR(65533)).
+/// wider carrier than VARCHAR(65533)). A4: Doris prints a VARIANT column
+/// back as `variant` (probed 2.1.7 and 3.1.4,
+/// scripts/e2e/evidence/variant-probe-2026-10-30/ A4) → `variant`, the
+/// same round-trip reasoning. A5: Doris prints an ARRAY<FLOAT> column back
+/// as `array<float>` (probed 3.1.4,
+/// scripts/e2e/evidence/vector-probe-2026-10-30/ A5) → `list<float32>`; the
+/// declared dimension is a column COMMENT, not part of the type, so DESC
+/// cannot give it back — a dimensioned registration reads back as the bare
+/// word. Every other array element type stays utf8 (the engine has no other
+/// list word). MySQL `json` / Doris `json`/`jsonb` stay utf8:
+/// they are not VARIANT and the engine has no JSON-column word.
 pub(crate) fn ddl_arrow_type(ddl: &str) -> String {
     let lower = ddl.trim().to_ascii_lowercase();
     let head: String = lower
@@ -269,6 +295,13 @@ pub(crate) fn ddl_arrow_type(ddl: &str) -> String {
         let (p, s): (u32, u32) = (p.trim().parse().ok()?, s.trim().parse().ok()?);
         ((1..=38).contains(&p) && s <= p).then(|| format!("decimal({p},{s})"))
     };
+    // `array_elem()` = the element type between `array<` and `>`
+    let array_elem = || -> Option<&str> {
+        lower
+            .strip_prefix("array<")
+            .and_then(|rest| rest.strip_suffix('>'))
+            .map(str::trim)
+    };
     match head.as_str() {
         "tinyint" => "int8".to_string(),
         "smallint" => "int16".to_string(),
@@ -281,6 +314,8 @@ pub(crate) fn ddl_arrow_type(ddl: &str) -> String {
         "datetime" | "datetimev2" | "timestamp" => "timestamp(us)".to_string(),
         "date" | "datev2" => "date".to_string(),
         "text" | "tinytext" | "mediumtext" | "longtext" | "string" => "string".to_string(),
+        "variant" => "variant".to_string(),
+        "array" if array_elem() == Some("float") => "list<float32>".to_string(),
         _ => "utf8".to_string(),
     }
 }
@@ -339,6 +374,43 @@ mod tests {
         );
     }
 
+    /// A4: a field whose non-null samples are all nested (object / array)
+    /// infers `variant` — the whole sub-document is carried through (the
+    /// decoder's variant passthrough) and Doris VARIANT does the sub-column
+    /// inference. Null samples absorb; a nested/scalar mix stays `utf8`
+    /// (mixed shapes have no honest typed carrier). Both json and
+    /// debezium-json `after.*` walks pick it the same way.
+    #[test]
+    fn json_nested_infers_variant() {
+        let s = raws(&[
+            r#"{"id":1,"attrs":{"a":{"b":1}},"tags":[1,2],"maybe":null,"mixed":{"k":1}}"#,
+            r#"{"id":2,"attrs":{"a":{"b":2},"c":"x"},"tags":[],"maybe":{"late":true},"mixed":"text"}"#,
+            r#"{"id":3,"attrs":null,"tags":[3]}"#,
+        ]);
+        let out = infer_from_json_samples(&s, Some("json")).unwrap();
+        assert_eq!(
+            out.columns,
+            vec![
+                ("attrs".into(), "variant".into()), // object + object + null
+                ("id".into(), "int64".into()),
+                ("maybe".into(), "variant".into()), // null + object
+                ("mixed".into(), "utf8".into()),    // object + string → mixed → utf8
+                ("tags".into(), "variant".into()),  // arrays (incl. empty)
+            ]
+        );
+        let dbz =
+            raws(&[r#"{"before":null,"after":{"id":1,"payload":{"x":[1]}},"op":"c","ts_ms":1}"#]);
+        let out = infer_from_json_samples(&dbz, None).unwrap();
+        assert_eq!(out.format.as_deref(), Some("debezium-json"));
+        assert_eq!(
+            out.columns,
+            vec![
+                ("id".into(), "int64".into()),
+                ("payload".into(), "variant".into()),
+            ]
+        );
+    }
+
     #[test]
     fn ogg_detected_envelope_first() {
         let s = raws(&[
@@ -363,13 +435,15 @@ mod tests {
 
     #[test]
     fn explicit_format_and_failures() {
-        // explicit json on an OGG-shaped sample: root keys, after as utf8 (nested)
+        // explicit json on an OGG-shaped sample: root keys; `after` is a
+        // nested object → variant (A4; pre-A4 it folded to utf8 and every
+        // value decoded NULL)
         let s = raws(&[r#"{"op_type":"I","after":{"x":1}}"#]);
         let out = infer_from_json_samples(&s, Some("json")).unwrap();
         assert_eq!(
             out.columns,
             vec![
-                ("after".into(), "utf8".into()),
+                ("after".into(), "variant".into()),
                 ("op_type".into(), "utf8".into())
             ]
         );
@@ -459,10 +533,21 @@ mod tests {
             ("timestamp", "timestamp(us)"),     // MySQL TIMESTAMP (no tz payload read)
             ("datev2", "date"),                 // Doris
             ("date", "date"),
-            ("json", "utf8"),
-            ("array<int>", "utf8"), // Doris
-            ("hll", "utf8"),        // Doris
-            ("bitmap", "utf8"),     // Doris
+            ("variant", "variant"), // Doris VARIANT prints back as variant (probed 2.1.7 + 3.1.4)
+            ("json", "utf8"),       // MySQL JSON / Doris JSON(B): not VARIANT, no vocabulary word
+            ("jsonb", "utf8"),      // Doris
+            // A5: Doris ARRAY<FLOAT> prints back as array<float> (probed
+            // 3.1.4) → the bare vector word (the dim is a COMMENT, not the
+            // type); any other element type has no vocabulary word
+            ("array<float>", "list<float32>"),
+            ("ARRAY<FLOAT>", "list<float32>"), // SHOW CREATE TABLE casing
+            ("array< float >", "list<float32>"),
+            ("array<int>", "utf8"),    // Doris
+            ("array<double>", "utf8"), // no list<float64> word
+            ("array<array<float>>", "utf8"),
+            ("array", "utf8"),  // bare / malformed
+            ("hll", "utf8"),    // Doris
+            ("bitmap", "utf8"), // Doris
         ] {
             assert_eq!(ddl_arrow_type(ddl), want, "ddl {ddl:?}");
         }

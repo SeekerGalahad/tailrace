@@ -1,0 +1,16 @@
+{
+  "0": {
+    "cursor": {
+      "File": {
+        "path": "/tmp/tailrace-vv-e2e/node/bad_in",
+        "byte_pos": 181
+      }
+    },
+    "lastAck": "p2-r17784_0",
+    "totals": {
+      "consumed": 15,
+      "flushed": 2,
+      "flushes": 1
+    }
+  }
+}

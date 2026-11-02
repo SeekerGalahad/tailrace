@@ -1,0 +1,101 @@
+### probe target: compose-2.1.7 (fe in-container 9030 be host 127.0.0.1:38040)
+           Version: doris-2.1.7-rc03-443e87e203
+=== A: DDL shapes ===
+--- A1 DUPLICATE KEY + VARIANT value column ---
+A1: created
+--- A2 UNIQUE KEY MoW + VARIANT value column ---
+A2: created
+--- A3 VARIANT as KEY column (expect refusal) ---
+ERROR 1105 (HY000) at line 1: errCode = 2, detailMessage = JSONB or VARIANT type should not be used in key column[v].
+--- A4 SHOW CREATE TABLE d (column lines) / DESC d ---
+  `id` int NOT NULL,
+  `v` variant NULL
+Field	Type	Null	Key	Default	Extra
+id	int	No	true	NULL	
+v	variant	Yes	false	NULL	NONE
+=== B: load shapes → raw + sub-column (DUPLICATE table d) ===
+--- B load: 18 rows (B1 object / B2 json-string object / B3 json-string array / B4 json-string scalars / B5 text,malformed,empty / B6 array,int,bool roots / B7 null,absent / B8 empty objects / B9 deep) ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 18,
+    "NumberFilteredRows": 0,
+--- B raw: SELECT id, v ---
+1	{"a":{"b":1,"c":"x"},"arr":[1,2,3],"f":1.5,"s":"hello","t":1}
+2	{"a":{"b":2,"c":"y"},"arr":[4,5],"s":"str-form"}
+3	[7,8,9]
+4	42
+5	1.5
+6	1
+7	{}
+8	"plain string"
+9	"{broken"
+10	{}
+11	[10,20,30]
+12	42
+13	1
+14	NULL
+15	NULL
+16	{}
+17	{}
+18	{"l1":{"l2":{"l3":{"l4":"deep"}}}}
+--- B sub-columns: v['a']['b'], v['a']['c'], v['arr'], v['s'], v['f'], v['t'] ---
+1	1	x	[1, 2, 3]	hello	1.5	1
+2	2	y	[4, 5]	str-form	NULL	NULL
+--- B2 vs B1 equivalence: CAST sub-columns to typed scalars ---
+1	1	x	1.5
+2	2	y	NULL
+--- B9 deep path v['l1']['l2']['l3']['l4'] ---
+18	deep
+--- B4/B5 json-string scalars & text: how were they stored? (CAST AS STRING) ---
+3	[7,8,9]
+4	42
+5	1.5
+6	1
+7	{}
+8	"plain string"
+9	"{broken"
+10	{}
+--- B10 (own table dk) dotted single key "a.b" next to nested a→b ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 2,
+    "NumberFilteredRows": 0,
+1	{"a":{"b":"nested-b"},"a.b":"dotted-key"}	dotted-key	"nested-b"
+2	{"a":{"b":7}}	NULL	7
+=== C: UNIQUE MoW × partial_columns (table u) ===
+--- C1 full write (v in json STRING form) ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 1,
+    "NumberFilteredRows": 0,
+1	first	{"a":{"b":1},"keep":"orig"}	1	orig
+--- C1 partial: columns id,name only → v preserved? ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 1,
+    "NumberFilteredRows": 0,
+1	renamed	{"a":{"b":1},"keep":"orig"}	1	orig
+--- C2 partial: columns id,v with v OBJECT → whole replacement? name preserved? ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 1,
+    "NumberFilteredRows": 0,
+1	renamed	{"a":{"b":2},"new":"replaced"}	2	NULL	replaced
+--- C3 partial: columns id,v with v json STRING form → parsed? ---
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 1,
+    "NumberFilteredRows": 0,
+1	renamed	{"a":{"b":3},"via":"string-form"}	3	string-form
+=== D: sub-column type conflict across rows ===
+    "Status": "Success",
+    "Message": "OK",
+    "NumberLoadedRows": 4,
+    "NumberFilteredRows": 0,
+1	100	100
+2	"one hundred"	"one hundred"
+3	1.5	1.5
+4	{"nested":1}	{"nested":1}
+=== cleanup ===
+compose-2.1.7: dropped va_probe
+### probe done: compose-2.1.7

@@ -15,25 +15,30 @@ server) from the same two binaries.
 
 ## Status
 
-**Released: v1.1.0 (2026-10-25).** All 21 workspace crates are on crates.io at
-1.1.0 (`cargo install tailrace-node --version 1.1.0 --locked`), with the
-v1.1.0 git tag and a 9-asset GitHub release. It ships the engine data plane
-(kafka / file / jdbc sources; Doris + StarRocks Stream Load and file sinks),
-datasource discovery & schema inference (`discover` / `infer-schema`), the SSH
-deploy chain, the performance ledger (docs/BENCHMARKS.md) and the 8-job CI
-matrix.
+**Released: v1.2.0 (2026-10-31).** The workspace is versioned 1.2.0 in
+lockstep (22 publishable crates) and ships to crates.io (`cargo install
+tailrace-node --version 1.2.0 --locked`); the v1.2.0 git tag / GitHub
+release follow (R5 precedent — the tree is cut first, published second).
+It ships the engine data plane (kafka / file / jdbc sources; Doris +
+StarRocks Stream Load and file sinks), datasource discovery & schema
+inference (`discover` / `infer-schema`), the SSH deploy chain, the
+performance ledger (docs/BENCHMARKS.md), the 8-job CI matrix and the
+capabilities below — on top of v1.1.0 (2026-10-25), which put the first 21
+crates on crates.io with its tag and a 9-asset release.
 
-**Unreleased, in this tree.** Four development rounds since v1.1.0 landed
-the twelve capabilities listed in the [capability matrix](#capability-matrix-post-v110-unreleased)
-below: `/metrics`, Debezium CDC decoding, an MCP server, broadcast dimension
-joins, the DDL closed loop, deterministic backfill, partial-column update, a
-16-word column type vocabulary, `TableObject` options, sink transaction hooks,
-`sequence_col` DDL and workspace-wide `forbid(unsafe_code)`. **crates.io and
-the binary releases are still 1.1.0 — the development line is ahead of the
-published version.** The next version number is set at release time, not
-here; the round-by-round account is
+**Since v1.1.0** six development rounds landed the capabilities listed in
+the [capability matrix](#capability-matrix-v120) below: `/metrics`,
+Debezium CDC decoding, an MCP server, broadcast dimension joins, the DDL
+closed loop, deterministic backfill, partial-column update, a 16-word
+column type vocabulary, `TableObject` options, sink transaction hooks,
+`sequence_col` DDL and workspace-wide `forbid(unsafe_code)` — then, in
+the release line, VARIANT passthrough, vector (`ARRAY<FLOAT>`) columns,
+console alerting with SLO exposure, the open `Cursor::Custom` variant and
+pipeline-as-code (`POST /api/apply` + CLI). The round-by-round account is
 [docs/design/architecture.zh.md](docs/design/architecture.zh.md) §12, and
-[CHANGELOG.md](CHANGELOG.md) is the release log.
+[CHANGELOG.md](CHANGELOG.md) is the release log — its [1.2.0] entry also
+carries the **1.3.0 heads-up**: the unknown-column-type migration window
+closes (warn-and-fold becomes a hard error).
 
 Sink delivery tiers, stated plainly: **label idempotency is delivered**, in
 two modes. Resident pipelines use *process-scoped* labels — an in-process
@@ -93,34 +98,39 @@ Source decoders (the table object's `format`): `ogg` (default), `json` /
 `jsonl`, `csv`, `parquet`, `debezium-json` — Debezium CDC events already on
 Kafka; tailrace consumes them, it does not read binlogs.
 
-## Capability matrix (post-v1.1.0, unreleased)
+## Capability matrix (v1.2.0)
 
-Everything below is in this source tree and covered by unit / contract tests
-plus the listed e2e scripts, but **not yet published** to crates.io (see
-Status). Anchors are `path:line` in this repository.
+Everything below landed in this source tree after v1.1.0 and ships in
+v1.2.0, covered by unit / contract tests plus the listed e2e scripts. The
+five release-line additions — VARIANT passthrough, vector columns, console
+alerting / SLO, `Cursor::Custom`, pipeline-as-code — are described in
+[CHANGELOG.md](CHANGELOG.md) [1.2.0] and not yet rowed here. Anchors are
+`path:line` in this repository.
 
 | Capability | What it does | Where (anchor) |
 |---|---|---|
-| **Prometheus `/metrics`** | 9-metric surface in hand-written text format, zero exporter crates; node renders it from live pipeline counters at scrape time, console adds `tailrace_console_db_write_seconds` | `engine/crates/tailrace-api/src/metrics.rs:9` (surface) `:235` (`node_metrics_text`); `console/crates/tailrace-console/src/metrics.rs:40` (`scrape`), route `console/crates/tailrace-console/src/lib.rs:189` |
-| **Debezium CDC decoding** | `format = "debezium-json"` decoder: `c`/`r`/`u` events to rows, `d` and tombstones skipped, schemas-enabled wrapper unwrapped, malformed events to the DLQ. Narrow-path CDC: consume events, never capture binlogs | `engine/crates/tailrace-decode/src/lib.rs:950` (`DebeziumJsonDecoder`); dispatch `engine/crates/tailrace-runtime/src/lib.rs:1532` |
+| **Prometheus `/metrics`** | 9-metric surface in hand-written text format, zero exporter crates; node renders it from live pipeline counters at scrape time, console adds `tailrace_console_db_write_seconds` (and, since R9, `tailrace_slo_lag_target_seconds` per enabled lag rule) | `engine/crates/tailrace-api/src/metrics.rs:9` (surface) `:235` (`node_metrics_text`); `console/crates/tailrace-console/src/metrics.rs:155` (`scrape`), route `console/crates/tailrace-console/src/lib.rs:204` |
+| **Debezium CDC decoding** | `format = "debezium-json"` decoder: `c`/`r`/`u` events to rows, `d` and tombstones skipped, schemas-enabled wrapper unwrapped, malformed events to the DLQ. Narrow-path CDC: consume events, never capture binlogs | `engine/crates/tailrace-decode/src/lib.rs:1204` (`DebeziumJsonDecoder`); dispatch `engine/crates/tailrace-runtime/src/lib.rs:1550` |
 | **MCP server** | `POST /mcp` (JSON-RPC 2.0, Streamable HTTP): 14 tools — 8 read, 6 write. Write tools need **both** `--mcp-allow-write` / `MCP_ALLOW_WRITE=1` and `"confirm": true`; every call is audited as `MCP_TOOL_CALL`, `actor = mcp:<client>`. Tool descriptions are generated from the OpenAPI document — nothing to drift | `console/crates/tailrace-console/src/mcp.rs:90` (`TOOLS`), route `:177`; flag `console/crates/tailrace-console/src/main.rs:26` |
 | **Broadcast dimension join** | `… JOIN ${ds:dim.<alias>} d ON …` loads the dim table full-table over JDBC at assembly into a static MemTable; 500 000-row / 64 MiB caps fail fast, unique key required, INNER / LEFT only (RIGHT / FULL / CROSS rejected at compile) | `engine/crates/tailrace-runtime/src/dim.rs:36` `:39` (caps); join-type gate `engine/crates/tailrace-parser/src/lib.rs:351-359` |
-| **DDL closed loop** | draft → human-confirmed key model (required; 422 otherwise) → execute with full-text audit → evolve = `ADD COLUMN` only (Light Schema Change; retype / drop reported, never run). Pure generator: schema + hints in, DDL + "this is a guess" annotations out; 13 scalar vocabulary words mapped, unmapped types are an error, not a fold | `engine/crates/tailrace-ddl/src/lib.rs:169` (`generate_draft`) `:385` (`doris_type`); exec `engine/crates/tailrace-metadata/src/lib.rs:233` (`mysql_exec`); endpoints `console/crates/tailrace-console/src/api/datasources.rs:1887` `:2002` `:2162`; web wizard `web/src/api/datasources.ts` |
-| **Deterministic backfill** | `POST /api/pipelines/{id}/backfill` with `dryRun` (zero side effects) → bounded run in a `bf-<job>` ledger namespace and its own consumer group; labels `prefix-stmt-<sha256(from,to)[..8]>_<seq>` so a replayed range dedups; orphaned jobs are failed at console start. Source gate today: `file` only (Kafka per-partition seeding is a follow-up) | `engine/crates/tailrace-conn-doris/src/lib.rs:153` (`range_fingerprint`) `:187` (`LabelMode`); `engine/crates/tailrace-runtime/src/lib.rs:773` (`run_bounded`) `:1566` (`backfill_state_dir`); `console/crates/tailrace-console/src/api/pipelines.rs:2319` (POST) `:2420` (jobs) `:2277-2289` (source gate) |
-| **Partial-column update** | The switch is SQL: `INSERT INTO sink (k, a) SELECT …` — the INSERT column list declares the subset, a bare INSERT writes whole rows. Four gates: registered `key_model = unique` → live `SHOW CREATE TABLE` must be UNIQUE merge-on-write (FE unreachable = 502, not a guess) → no in-flight schema change (409) → sink capability + `sequence_column ∈ subset`. Stream Load sends `partial_columns:true` **and** a `columns` header (without it Doris silently NULLs the unlisted columns — live-probed) | parser `engine/crates/tailrace-parser/src/lib.rs:93-98` `:281` (`insert_column_list`); `engine/crates/tailrace-conn-doris/src/lib.rs:574` (`with_partial_columns`); gates `console/crates/tailrace-console/src/api/pipelines.rs:359` `:452` `:622` |
-| **16-word column types** | `utf8 string int8 int16 int32 int64 float32 float64 decimal(p,s) timestamp(unit) date bool binary list<float32[,dim]> variant null`; parametric parse, canonical Display. Unknown words: warn + fold to `utf8` during a one-minor migration window, hard error after (`UNKNOWN_TYPE_UTF8_MIGRATION_WINDOW`) | `engine/crates/tailrace-ir/src/column_type.rs:30` (`ColumnType`) `:84` (`parse`) `:158` (window); re-exported as `tailrace_catalog::ColumnType` |
-| **`TableObject` options** | 5 generic fields (`datasource / name / kind / format / columns`) + `options` map; connector fields read through typed accessors (`KafkaTableExt` / `DorisTableExt` / `JdbcTableExt` / `FileTableExt`); key names canonical in `option_keys`; legacy flat fields still read and written (serde double-write) | `engine/crates/tailrace-catalog/src/lib.rs:35` (`option_keys`) `:80` (`TableObject`) `:107` (`options`); accessors `tailrace-conn-kafka:31` `tailrace-conn-doris:256` `tailrace-conn-jdbc:80` `tailrace-conn-file:49` |
+| **DDL closed loop** | draft → human-confirmed key model (required; 422 otherwise) → execute with full-text audit → evolve = `ADD COLUMN` only (Light Schema Change; retype / drop reported, never run). Pure generator: schema + hints in, DDL + "this is a guess" annotations out; 13 scalar vocabulary words mapped at R6, `variant` → `VARIANT` and `list<float32[,dim]>` → `ARRAY<FLOAT>` since R9, unmapped types (`null`) are an error, not a fold | `engine/crates/tailrace-ddl/src/lib.rs:180` (`generate_draft`) `:438` (`doris_type`); exec `engine/crates/tailrace-metadata/src/lib.rs:233` (`mysql_exec`); endpoints `console/crates/tailrace-console/src/api/datasources.rs:1930` `:2047` `:2206`; web wizard `web/src/api/datasources.ts` |
+| **Deterministic backfill** | `POST /api/pipelines/{id}/backfill` with `dryRun` (zero side effects) → bounded run in a `bf-<job>` ledger namespace and its own consumer group; labels `prefix-stmt-<sha256(from,to)[..8]>_<seq>` so a replayed range dedups; orphaned jobs are failed at console start. Source gate today: `file` only (Kafka per-partition seeding is a follow-up) | `engine/crates/tailrace-conn-doris/src/lib.rs:153` (`range_fingerprint`) `:187` (`LabelMode`); `engine/crates/tailrace-runtime/src/lib.rs:773` (`run_bounded`) `:1584` (`backfill_state_dir`); `console/crates/tailrace-console/src/api/pipelines.rs:2341` (POST) `:2437` (jobs) `:2287-2299` (source gate) |
+| **Partial-column update** | The switch is SQL: `INSERT INTO sink (k, a) SELECT …` — the INSERT column list declares the subset, a bare INSERT writes whole rows. Four gates: registered `key_model = unique` → live `SHOW CREATE TABLE` must be UNIQUE merge-on-write (FE unreachable = 502, not a guess) → no in-flight schema change (409) → sink capability + `sequence_column ∈ subset`. Stream Load sends `partial_columns:true` **and** a `columns` header (without it Doris silently NULLs the unlisted columns — live-probed) | parser `engine/crates/tailrace-parser/src/lib.rs:93-98` `:281` (`insert_column_list`); `engine/crates/tailrace-conn-doris/src/lib.rs:589` (`with_partial_columns`); gates `console/crates/tailrace-console/src/api/pipelines.rs:369` `:462` `:632` |
+| **16-word column types** | `utf8 string int8 int16 int32 int64 float32 float64 decimal(p,s) timestamp(unit) date bool binary list<float32[,dim]> variant null`; parametric parse, canonical Display. Unknown words: warn + fold to `utf8` during a one-minor migration window, **hard error from 1.3.0** (`UNKNOWN_TYPE_UTF8_MIGRATION_WINDOW`) | `engine/crates/tailrace-ir/src/column_type.rs:30` (`ColumnType`) `:94` (`parse`) `:168` (window); re-exported as `tailrace_catalog::ColumnType` |
+| **`TableObject` options** | 5 generic fields (`datasource / name / kind / format / columns`) + `options` map; connector fields read through typed accessors (`KafkaTableExt` / `DorisTableExt` / `JdbcTableExt` / `FileTableExt`); key names canonical in `option_keys`; legacy flat fields still read and written (serde double-write) | `engine/crates/tailrace-catalog/src/lib.rs:36` (`option_keys`) `:81` (`TableObject`) `:108` (`options`); accessors `tailrace-conn-kafka:31` `tailrace-conn-doris:256` `tailrace-conn-jdbc:80` `tailrace-conn-file:49` |
 | **Sink transaction hooks + capabilities** | `prepare / commit / abort` on the `Sink` trait with no-op defaults (every existing sink unchanged) and `SinkCapabilities { idempotent_label, transactional, overwrite, partial_update, partition_aware }`; the runtime refuses `partial_columns` on a sink without `partial_update` — the flag is load-bearing, not decorative | `engine/crates/tailrace-connector/src/sink.rs:18` (`SinkCapabilities`) `:107` `:113` `:119` (hooks) `:126` (`capabilities`) |
-| **`sequence_col` DDL property** | Under UNIQUE KEY a declared `sequence_column` is emitted as `"function_column.sequence_col"` — without it Doris silently ignores the engine's `sequence_column` Stream Load header (probed on 2.1.7 and 3.1.4) | `engine/crates/tailrace-ddl/src/lib.rs:327-329` |
+| **`sequence_col` DDL property** | Under UNIQUE KEY a declared `sequence_column` is emitted as `"function_column.sequence_col"` — without it Doris silently ignores the engine's `sequence_column` Stream Load header (probed on 2.1.7 and 3.1.4) | `engine/crates/tailrace-ddl/src/lib.rs:367-374` |
 | **Engineering governance** | `unsafe_code = "forbid"` for the whole workspace; `debug = "line-tables-only"` for dependencies and test builds (one build tree shrank to the 16 GiB range after a disk-full incident); `cargo deny` advisories paid down as they land | `Cargo.toml:55-56` (lints) `:71-72` `:84-85` (profiles); `deny.toml` |
 
 e2e coverage for the rounds above, against real Doris (compose 2.1.7 and an
 external 3.1.4): `scripts/e2e/ddl_create.sh` (48/48), `backfill_replay.sh`
 (31/31), `partial_update.sh` (38/38 compose + 37/37 external),
-`type_precision.sh` (decimal(18,2) precision, sequence_col ordering), plus two
-dogfooding rounds (`scripts/dogfood/`, reports in `docs/dev/`). These counts
-are the figures recorded at the time each round landed — not re-run for this
-README.
+`type_precision.sh` (decimal(18,2) precision, sequence_col ordering), plus
+three dogfooding rounds (`scripts/dogfood/`, reports in `docs/dev/`). The
+release line adds `variant_vector.sh` (46/46) and `alert_flow.sh` (50/50),
+both re-run on this tree on 2026-10-31 (evidence under
+`scripts/e2e/evidence/`); the earlier counts are the figures recorded at
+the time each round landed — not re-run for this README.
 
 ## Benchmarks
 
@@ -216,10 +226,13 @@ Sixteen words: `utf8 string int8 int16 int32 int64 float32 float64
 decimal(p,s) timestamp(unit) date bool binary list<float32[,dim]> variant
 null`. The four legacy words keep their meaning byte for byte. An unknown
 word currently logs a warning and folds to `utf8` (one-minor migration
-window); the next minor turns that into a hard error at pipeline assembly.
-The DDL generator maps the 13 scalar words to Doris types; `variant` and
-`list<float32>` are in the vocabulary but their Doris DDL mapping and
-end-to-end write are later work.
+window); **1.3.0 turns that into a hard error at pipeline assembly** —
+audit hand-registered type strings before upgrading. The DDL generator
+maps the 13 scalar words to Doris types, `variant` to `VARIANT` (nested
+JSON is passed through unparsed, not flattened) and `list<float32[,dim]>`
+to `ARRAY<FLOAT>` (the dimension rides as a column comment and every row
+is validated against it before the write); `null` is the one word left
+unmapped.
 
 **What is the StarRocks story vs Doris?**
 One Stream Load implementation: StarRocks reuses the Doris sink inside

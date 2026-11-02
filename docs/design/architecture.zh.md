@@ -193,8 +193,8 @@ sequenceDiagram
 
 - **正典落点在 tailrace-ir**（wire 契约 crate），tailrace-catalog re-export 为稳定公共路径 `tailrace_catalog::ColumnType`（catalog/src/lib.rs:27）——反向放置会成环（catalog 已依赖 ir），这是 R8 实施时记录在案的必要偏差。
 - **arrow 映射**：`ColumnType::to_arrow()`（column_type.rs:89）；两个 legacy `arrow_type` 调用点（runtime 装配、dim 装载）走 `arrow_type_or_utf8`（:164）——**迁移窗**（`UNKNOWN_TYPE_UTF8_MIGRATION_WINDOW=true`，:158）：未知词 warn（列名+已知词汇表）后折叠 Utf8，与 pre-G2 行为逐字节同；下个 minor 版本翻 false 变硬错（一个 minor 版本的迁移窗语义，warn 日志捕获测试在树）。
-- **DDL 侧映射**：`tailrace-ddl::doris_type`（ddl/src/lib.rs:385-420）映射 13 个标量词；`list<float32>`/`variant`/`null` 留待 live 探针后开放（R7 实证教训：写断言前先探真库）。
-- **infer-schema 收窄**：A3 起 Doris DESC 回读的 `text` 映射 `string`（2.1.7 实测 DESC 把 STRING 列打回 `text`，metadata/src/infer.rs:13-14）、`datetime`/`date` 带/不带参数落 `timestamp(us)`/`date`（infer.rs:8-13）；kafka 采样推断接受 debezium-json 格式（infer.rs:142）。
+- **DDL 侧映射**：`tailrace-ddl::doris_type`（ddl/src/lib.rs:385 起）映射 15 个词形态——12 个标量词 + `decimal(p,s)`/`timestamp(unit)` + **A4 `variant`→`VARIANT`、A5 `list<float32[,dim]>`→`ARRAY<FLOAT>`（dim 以列 COMMENT `'vector dim=N'` 附注，上限 65536）**（R9，2.1.7/3.1.4 探针先行再开放——R7 实证教训：写断言前先探真库）；`null` 仍是唯一未映射词、显式报错不折叠。
+- **infer-schema 收窄**：A3 起 Doris DESC 回读的 `text` 映射 `string`（2.1.7 实测 DESC 把 STRING 列打回 `text`，metadata/src/infer.rs:13-14）、`datetime`/`date` 带/不带参数落 `timestamp(us)`/`date`（infer.rs:8-13）；R9 起 `variant` 回读 `variant`、`array<float>` 折回**裸** `list<float32>`（dim 对 DESC 不可见，故 console evolve 对登记 `list<float32,N>` 不判改型——R9 评审修复）；kafka 采样推断接受 debezium-json 格式（infer.rs:142）。
 
 ### 3.4 解码格式族：五 Decoder 与 Debezium CDC 窄口
 
@@ -607,7 +607,7 @@ gantt
 5. **SSH 部署 e2e 未入 CI**：host.docker.internal 回连 + 制品版本 fixture 两处适配未在 Linux docker 主机验证。
 6. **`tailrace_pipeline_bytes_total` 未喂数**（§9）：待 sink ack 携带字节计数。
 7. **G2 迁移窗**：未知类型词 warn+折叠 Utf8 的窗口在下个 minor 版本翻硬错（column_type.rs:158 常量翻转即全链生效）。
-8. **variant 与 `list<float32>` 的 DDL 与直写**：词汇已落（§3.3），Doris 侧映射与 e2e 留待后续轮（A4/A5 方向）；`estimatedRows` 诚实降级为 null（回填 dryRun）。
+8. **variant 与 `list<float32>` 的 DDL 与直写**：R9 A4/A5 已落（§3.3：`VARIANT` / `ARRAY<FLOAT>` 映射、decoder 整段透传与 dim 守卫、e2e `scripts/e2e/variant_vector.sh`）；仍开放：向量列只在在役 3.1.4 实测、compose 2.1.7 栈上的向量复跑未做（`scripts/e2e/evidence/vector-probe-2026-10-30/README.md`）；variant 根级字符串值不保真属显式取舍（`docs/book/src/connectors-matrix.md` §3.1）；`estimatedRows` 诚实降级为 null（回填 dryRun）。
 9. 开放问题沿旧：OTLP 默认开未决；proto plan 解码 gated 维持（CustomScan qualifier 边界）；`migrate` 留 501（nodes_admin.rs:1193）；`ticket` 端点尚未开路由（凭据加密静态半边已落地，票据链为 v1.x 结构性修复，console-api.md「已知差异」）。
 
 ## 十三、附录

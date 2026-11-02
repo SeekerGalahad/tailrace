@@ -437,12 +437,14 @@ async fn ddl_draft_column_type_overrides() {
     assert_eq!(b["error"]["message_key"], "err.ddl.override_column_unknown");
 
     // a type the generator cannot map is refused by the generator itself
-    // (same refusal shape as an unmappable registered type)
+    // (same refusal shape as an unmappable registered type). A4 opened
+    // `variant` and A5 opened `list<float32>`, so the sample is `null` — the
+    // one 16-vocabulary word the DDL surface still does not map.
     let (s, b) = req(
         &app,
         "POST",
         &path,
-        Some(json!({"columnTypes": [["amount", "list<float32>"]]})),
+        Some(json!({"columnTypes": [["amount", "null"]]})),
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
@@ -608,16 +610,16 @@ async fn ddl_evolve_guards() {
     assert_eq!(b["error"]["message_key"], "err.ddl.columns_missing");
 
     // a registered column outside the generator's vocabulary is refused,
-    // not folded — `binary` became a mapped word in A3, so the refusal
-    // sample is a word the 16-vocabulary knows but the DDL surface does
-    // not open yet (list<float32>, the W5 probe pass)
+    // not folded — `binary` became a mapped word in A3 and `list<float32>`
+    // in A5, so the refusal sample is `null`: the one 16-vocabulary word
+    // the DDL surface still does not open
     let (s, b) = req(
         &app,
         "POST",
         &format!("/api/datasources/{ds}/tables"),
         Some(json!({
             "dbName": "shop", "tableName": "odd",
-            "columnsJson": [["id", "int64"], ["emb", "list<float32>"]]
+            "columnsJson": [["id", "int64"], ["emb", "null"]]
         })),
     )
     .await;
