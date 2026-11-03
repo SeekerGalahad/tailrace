@@ -322,7 +322,7 @@
 - **传输**：Streamable HTTP 请求/响应（无服务端 SSE 流）；单 body 单 JSON-RPC 消息，batch 拒绝（-32600）；`initialize` 发 `Mcp-Session-Id`（后续调用按 clientInfo.name 归因，未带回落 `X-MCP-Client`/`User-Agent`/anonymous）。协议版本 `2025-06-18`（echo 旧已知版本）。无 console 会话——全局固定窗口限速（默认 100 req/s，超限 429 + -32002）。
 - **写闸门**：七个写工具需**双重确认**——进程级开关 `--mcp-allow-write` / `MCP_ALLOW_WRITE=1` **且**调用参数 `"confirm": true`；缺一以 `WRITE_DISABLED`(-32001) / `INVALID_PARAMS`(code CONFIRM_REQUIRED) 拒绝。
 - **审计**：每次工具调用——成功、失败、被拒——都落 `audit_log` 为 `MCP_TOOL_CALL`（actor=`mcp:<client>`），含从未到达工具执行的尝试（未知工具名 / 缺名 / 非对象 arguments，以 UNKNOWN_TOOL / INVALID_PARAMS 登记）；过闸的写调用另产生对应 REST 域审计行（PIPELINE_CREATE、T-G6 逐写入行 + APPLY 汇总等，operator 归到 MCP 身份）。
-- **十六工具表**（`tools/list` 顺序；R=读恒开，W=写需闸门）——蓝图 §7.5 的十工具 + R8 四工具（建表闭环 `ddl_draft`/`ddl_execute`/`ddl_evolve` 与回填进度 `backfill_status`）+ R11 管道即代码对（`apply`/`apply_dry_run`，T-V3——≤16 预算用满，再加工具需先裁预算）；仓库内正典即 `tailrace-console/src/mcp.rs:104` 的 `TOOLS` 表与单测 `tool_table_matches_the_registered_surface`（`mcp.rs:1280`：16 工具、9R+7W、唯一名、写必 confirm）。**工具描述自 R8 起由 OpenAPI 文档同源生成**（`openapi_tool_description`，`mcp.rs:782`——`tools/list` 的 description 取自 utoipa 注解，无第二份手写文案可漂移）。此处镜像供评审对拍：
+- **十六工具表**（`tools/list` 顺序；R=读恒开，W=写需闸门）——蓝图 §7.5 的十工具 + R8 四工具（建表闭环 `ddl_draft`/`ddl_execute`/`ddl_evolve` 与回填进度 `backfill_status`）+ R11 管道即代码对（`apply`/`apply_dry_run`，T-V3——≤16 预算用满，再加工具需先裁预算）；仓库内正典即 `tailrace-console/src/mcp.rs:104` 的 `TOOLS` 表与单测 `tool_table_matches_the_registered_surface`（`mcp.rs:1361`：16 工具、9R+7W、唯一名、写必 confirm）。**工具描述自 R8 起由 OpenAPI 文档同源生成**（`openapi_tool_description`，`mcp.rs:828`——`tools/list` 的 description 取自 utoipa 注解，无第二份手写文案可漂移）。此处镜像供评审对拍：
 
 | # | 工具 | 读写 | 映射 | 关键参数 |
 |---|---|---|---|---|

@@ -142,7 +142,7 @@ DataFusion 依赖面：根 Cargo.toml `datafusion = "55.2.0"` / `datafusion-prot
 | console-auth | 认证平面：argon2id、暴力锁定、会话 token（cookie/bearer）、m2m bootstrap/per-node token（console-auth/src/lib.rs:1-28；R8.5 后未改） |
 | console-store | SQLite 元数据库（4274 行）：WAL + busy_timeout + foreign_keys + synchronous=NORMAL（T8）；rusqlite_migration **7 迁移**自动前滚（00_init 14 表 → 01 `table_object.sequence_column` → 02 `backfill_job` 表 → 03 `table_object.key_model` → **04 `alert_rule` + `alert_event`** → **05 `alert_event.series_key`**（逐序列 episode）→ **06 `slo_lag_sample`**（1h 样本环），lib.rs:48-66）；启动 purge 过期会话与指标 + **孤儿回填 job 清扫**（main.rs:135）+ **SLO 样本环启动修剪**（main.rs:149，§9.3）；T35 起节点行携 SSH 托管与部署状态列 |
 | console-proxy | console→engine HTTP 层：`NodeEndpoint` 类型化 /v1 封装 + `probe_datasource` TCP 探测（3s 超时 / ≤8 端点）（console-proxy/src/lib.rs:1-11、probe.rs:25-40；R8.5 后未改） |
-| tailrace-console | lib+bin 装配（src 17925 行；含 tests/ 目录 27804 行）：build_router、**9 个 api 域**（auth/datasources/nodes/nodes_admin/artifacts/pipelines/**alerts**/**apply**/**slo**，api/mod.rs）、compile.rs（内嵌 parser 本地编译）、openapi.rs、spa.rs、state.rs + **mcp.rs（1548 行）/ backfill.rs（383 行）/ metrics.rs（612 行）/ deploy.rs（1104 行）/ alerting.rs（1668 行）/ slo.rs（398 行）/ apply_cli.rs（419 行）**（tailrace-console/src/lib.rs:7-18） |
+| tailrace-console | lib+bin 装配（src 17925 行；含 tests/ 目录 27738 行）：build_router、**9 个 api 域**（auth/datasources/nodes/nodes_admin/artifacts/pipelines/**alerts**/**apply**/**slo**，api/mod.rs）、compile.rs（内嵌 parser 本地编译）、openapi.rs、spa.rs、state.rs + **mcp.rs（1548 行）/ backfill.rs（383 行）/ metrics.rs（612 行）/ deploy.rs（1104 行）/ alerting.rs（1668 行）/ slo.rs（398 行）/ apply_cli.rs（419 行）**（tailrace-console/src/lib.rs:7-18） |
 
 ## 三、数据面：SQL 管道与执行
 
