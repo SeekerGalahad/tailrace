@@ -21,10 +21,12 @@ pub use plan_options::{PlanOptions, RecoveryOptions, ReliabilityOptions, TuningO
 /// public path is `tailrace_catalog::ColumnType::parse` (blueprint G2:
 /// "arrow_type 迁至 tailrace-catalog::ColumnType::parse"). The two legacy
 /// `arrow_type` sites (runtime + ir) map through
-/// [`arrow_type_or_utf8`], which folds unknown words to Utf8 behind a
-/// one-minor-version warn window (const in tailrace-ir) instead of erroring
-/// on the spot. A4: schema construction goes through [`arrow_field_or_utf8`]
-/// (same fold, plus the `variant` field marker the decoder reads).
+/// [`arrow_type_or_utf8`], which folded unknown words to Utf8 behind the
+/// 1.2.x migration window (const in tailrace-ir); the window closed for
+/// 1.3.0, so unknown words now error on the spot. A4: schema construction
+/// goes through [`arrow_field_or_utf8`]
+/// (strict the same way, plus the `variant` field marker the decoder
+/// reads).
 pub use tailrace_ir::column_type::{arrow_field_or_utf8, arrow_type_or_utf8, ColumnType};
 
 /// Option key canon (R8 G1): the names of the legacy top-level fields that
@@ -919,8 +921,9 @@ mod tests {
     /// G2: the stable public path `tailrace_catalog::ColumnType::parse` is
     /// live (canonical home tailrace-ir, re-exported here — blueprint G2
     /// wording). Representative words across the 16-word vocabulary plus the
-    /// unknown-word fold through [`arrow_type_or_utf8`] (migration window:
-    /// warn + Utf8, never a silent hard error mid-window). The full 16-word
+    /// window-closed hard error through [`arrow_type_or_utf8`] (unknown
+    /// words folded to Utf8 through the 1.2.x migration window; the const
+    /// flipped for 1.3.0, so they hard-error now). The full 16-word
     /// round-trip / illegal-input matrices live next to the parser in
     /// tailrace-ir's column_type tests.
     #[test]
@@ -956,11 +959,12 @@ mod tests {
         );
         // strict parse: unknown words error
         assert!(ColumnType::parse("varchar(64)").is_err());
-        // migration window fold (blueprint §7.6): same unknown word through
-        // the schema-construction entry lands Utf8, not an error
-        assert_eq!(
-            arrow_type_or_utf8("note", "varchar(64)").unwrap(),
-            DataType::Utf8
+        // window closed (blueprint §7.6, flipped for 1.3.0): the same
+        // unknown word through the schema-construction entry is a hard
+        // error, not a Utf8 fold
+        assert!(
+            arrow_type_or_utf8("note", "varchar(64)").is_err(),
+            "unknown words hard-error through arrow_type_or_utf8 once the migration window closed"
         );
     }
 

@@ -75,11 +75,19 @@ pub enum Cursor {
 /// // Kafka chunks carry their cursor advance …
 /// let k = SourceChunk::kafka(b"{\"k\":1}".to_vec(), 0, 100);
 /// assert_eq!((k.partition, k.next_offset), (Some(0), Some(100)));
-/// // … non-partitioned carriers (file tailing, jdbc polling) are plain bytes.
+/// // … file lines carry theirs as the byte position just past the line …
+/// let f = SourceChunk::file(b"line".to_vec(), 5);
+/// assert_eq!((f.partition, f.next_offset), (None, Some(5)));
+/// // … and carriers without a per-row position (parquet, jdbc) are plain bytes.
 /// let p = SourceChunk::plain(b"line\n".to_vec());
 /// assert_eq!((p.partition, p.next_offset), (None, None));
 /// assert_eq!(p.raw, b"line\n".to_vec());
 /// ```
+///
+/// The per-chunk position is the row's identity for the bad-row DLQ (T-V2,
+/// R11 review): unlike the poll-time cursor it does not move with the poll
+/// boundary a replay happens to cut, so the same bad row replayed lands
+/// once while two identical bad rows at two positions land twice.
 #[derive(Debug, Clone)]
 pub struct SourceChunk {
     pub raw: Vec<u8>,
@@ -94,6 +102,17 @@ impl SourceChunk {
             raw,
             partition: Some(partition),
             next_offset: Some(next_offset),
+        }
+    }
+
+    /// A line from a byte-addressed carrier (file tailing): `next_byte_pos`
+    /// is the cursor just past this line — its per-row position — with no
+    /// partition.
+    pub fn file(raw: Vec<u8>, next_byte_pos: u64) -> Self {
+        Self {
+            raw,
+            partition: None,
+            next_offset: Some(i64::try_from(next_byte_pos).unwrap_or(i64::MAX)),
         }
     }
 

@@ -24,6 +24,11 @@
 //!   threshold of every enabled `lag_seconds` alert rule, emitted with the
 //!   same labels as the lag series it watches ([`slo_target_lines`]) so
 //!   target and current value sit side by side under one label set.
+//! - `tailrace_slo_lag_p50_seconds` / `_p95_` / `_p99_` +
+//!   `tailrace_slo_lag_samples` (gauges, R11 T-V4) — the achieved side of
+//!   the SLO: nearest-rank lag quantiles and their sample count per
+//!   `{pipeline,statement}` over the whole 1h sample ring
+//!   ([`slo_quantile_lines`], [`crate::slo`]).
 //!
 //! [`gather`] is the shared snapshot step: the alert evaluator
 //! ([`crate::alerting`]) runs on exactly what the scrape would serve.
@@ -163,6 +168,17 @@ pub async fn scrape(State(state): State<AppState>) -> Response {
     );
     let mut console_text = gathered.console_text.clone();
     console_text.push_str(&slo);
+    // R11 T-V4: the achieved side — quantiles over the whole sample ring,
+    // computed from the stored samples at scrape time
+    let quantiles = crate::slo::window_summaries(
+        state.store(),
+        crate::slo::now_ms(),
+        crate::slo::RETENTION_SECS,
+        None,
+        None,
+    )
+    .unwrap_or_default();
+    console_text.push_str(&slo_quantile_lines(&quantiles));
     (
         StatusCode::OK,
         [(
@@ -241,6 +257,38 @@ pub fn slo_target_lines(gathered: &Gathered, rules: &[console_store::AlertRule])
         out.push_str(&format!(
             "tailrace_slo_lag_target_seconds{labels} {target}\n"
         ));
+    }
+    out
+}
+
+/// R11 T-V4: the achieved side of the SLO — per `{pipeline,statement}` (the
+/// SLO identity; no `node` label, a migrated pipeline keeps one series):
+/// `tailrace_slo_lag_p50_seconds` / `_p95_` / `_p99_` (nearest-rank, each
+/// value one of the stored samples) and `tailrace_slo_lag_samples` (their
+/// support). Four gauge families, one TYPE line each; empty string when no
+/// summary exists (absent ≠ 0 — same convention as the target lines).
+pub fn slo_quantile_lines(summaries: &[crate::slo::SeriesSummary]) -> String {
+    if summaries.is_empty() {
+        return String::new();
+    }
+    type Pick = fn(&crate::slo::SeriesSummary) -> f64;
+    let families: [(&str, Pick); 4] = [
+        ("tailrace_slo_lag_p50_seconds", |s| s.p50),
+        ("tailrace_slo_lag_p95_seconds", |s| s.p95),
+        ("tailrace_slo_lag_p99_seconds", |s| s.p99),
+        ("tailrace_slo_lag_samples", |s| s.samples as f64),
+    ];
+    let mut out = String::new();
+    for (name, pick) in families {
+        out.push_str(&format!("# TYPE {name} gauge\n"));
+        for s in summaries {
+            out.push_str(&format!(
+                "{name}{{pipeline=\"{}\",statement=\"{}\"}} {}\n",
+                escape_label_value(&s.pipeline),
+                escape_label_value(&s.statement),
+                pick(s)
+            ));
+        }
     }
     out
 }
@@ -500,6 +548,65 @@ mod tests {
         assert_eq!(
             samples[0].labels.get("node").map(String::as_str),
             Some("edge-1")
+        );
+    }
+
+    /// R11 T-V4: four gauge families (p50/p95/p99 + samples), one TYPE line
+    /// each, labelled `{pipeline,statement}` only (no node), values verbatim
+    /// from the summaries, label values escaped; nothing at all — not even
+    /// a TYPE line — without summaries. Assembled next to node blocks, the
+    /// families stay single-declared.
+    #[test]
+    fn slo_quantile_lines_shape() {
+        assert_eq!(slo_quantile_lines(&[]), "");
+        let s = |pipeline: &str, p50: f64, p95: f64, p99: f64, samples: usize| {
+            crate::slo::SeriesSummary {
+                pipeline: pipeline.into(),
+                statement: "0".into(),
+                node: "edge-1".into(),
+                samples,
+                p50,
+                p95,
+                p99,
+                oldest_ms: 0,
+                newest_ms: 0,
+            }
+        };
+        let out = slo_quantile_lines(&[s("3", 1.5, 12.0, 30.25, 240), s("q\"x", 2.0, 2.0, 2.0, 1)]);
+        assert_eq!(
+            out,
+            "# TYPE tailrace_slo_lag_p50_seconds gauge\n\
+             tailrace_slo_lag_p50_seconds{pipeline=\"3\",statement=\"0\"} 1.5\n\
+             tailrace_slo_lag_p50_seconds{pipeline=\"q\\\"x\",statement=\"0\"} 2\n\
+             # TYPE tailrace_slo_lag_p95_seconds gauge\n\
+             tailrace_slo_lag_p95_seconds{pipeline=\"3\",statement=\"0\"} 12\n\
+             tailrace_slo_lag_p95_seconds{pipeline=\"q\\\"x\",statement=\"0\"} 2\n\
+             # TYPE tailrace_slo_lag_p99_seconds gauge\n\
+             tailrace_slo_lag_p99_seconds{pipeline=\"3\",statement=\"0\"} 30.25\n\
+             tailrace_slo_lag_p99_seconds{pipeline=\"q\\\"x\",statement=\"0\"} 2\n\
+             # TYPE tailrace_slo_lag_samples gauge\n\
+             tailrace_slo_lag_samples{pipeline=\"3\",statement=\"0\"} 240\n\
+             tailrace_slo_lag_samples{pipeline=\"q\\\"x\",statement=\"0\"} 1\n"
+        );
+        // the evaluator-side parser reads the lines back (escapes round-trip)
+        let parsed = crate::alerting::parse_samples(&out, None);
+        assert_eq!(parsed.len(), 8);
+        assert_eq!(
+            parsed[3].labels.get("pipeline").map(String::as_str),
+            Some("q\"x")
+        );
+        let assembled = assemble(
+            out,
+            &[(
+                "edge-1".to_string(),
+                Ok("tailrace_pipeline_lag_seconds{pipeline=\"3\",statement=\"0\"} 4\n".to_string()),
+            )],
+        );
+        assert_eq!(
+            assembled
+                .matches("# TYPE tailrace_slo_lag_p95_seconds gauge")
+                .count(),
+            1
         );
     }
 }

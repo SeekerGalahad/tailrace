@@ -149,9 +149,11 @@ SQL 编译诊断（编辑器内联报错数据源）。
 ```json
 { "ok": true, "stats": {
     "pipelineId": 42, "status": "RUNNING",
-    "totals":  { "consumed": 0, "flushed": 0, "skipped": 0, "bad": 0, "flushes": 0, "lastFlushMs": 0 },
-    "statements": [ { "consumed": 0, "flushed": 0, "skipped": 0, "bad": 0, "flushes": 0, "lastFlushMs": 0 } ] } }
+    "totals":  { "consumed": 0, "flushed": 0, "skipped": 0, "bad": 0, "flushes": 0, "lastFlushMs": 0, "sourceIdle": null },
+    "statements": [ { "consumed": 0, "flushed": 0, "skipped": 0, "bad": 0, "flushes": 0, "lastFlushMs": 0, "sourceIdle": null } ] } }
 ```
+
+`sourceIdle`（v1.3 T-V1，R11 新增）：语句级 idle 判决——`true` = 源游标后无积压**且** sink 缓冲无待写行，`false` = 任一侧有积压，`null` = 无判决（尚未轮询、轮询失败、已暂停或语句循环退出）。`totals.sourceIdle` 为保守折叠：任一语句 `false` 即 `false`，全部 `true` 才 `true`，否则 `null`。
 
 不在册（未部署/已停止）→ `{"ok": false, "error": "pipeline #42 not registered ..."}`（日志仍可查）。
 
@@ -197,20 +199,36 @@ SQL 编译诊断（编辑器内联报错数据源）。
 | `skip` | 仅计数（旧行为，行丢失） |
 
 - **side 文件**：`state_dir/bad_rows/p{pipeline}-s{statement}.jsonl`，追加式，每行
-  一条记录：`{"tsMs":169...,"pipeline":42,"statement":0,"cursor":{...},"rawB64":"..."}`。
+  一条记录：`{"tsMs":169...,"pipeline":42,"statement":0,"cursor":{...},"nextOffset":48,"rawB64":"..."}`
+  （Kafka 行另带 `"partition"`；无行位置的载体——parquet 整文件块、jdbc——两键皆缺）。
   raw 为 base64 原始字节（坏行常为非法 UTF-8）；cursor 为 poll 时点游标（人工恢复
-  的重放锚点）。
+  的重放锚点）；`partition`/`nextOffset` 为**该行自身的游标推进**（Kafka 分区+下一
+  offset，文件为行尾字节位）。**行键唯一（v1.3 T-V2，R11 评审修正）**：以
+  `(statement, 行位置, rawB64)` 去重，行位置缺失时回退 `(statement, cursor, rawB64)`。
+  不以 poll 时点游标为键的原因：重放切到的 poll 边界会变（退避期尾部追加、跨 poll 的
+  批次重放时合并成一个 poll、多分区交错），以它为键会让重放的坏行再落一次，而同一
+  poll 内字节相同的两条坏行又会共键折叠成一条（隔离丢行）；行位置跨重放稳定、逐行
+  互异，故同一坏行无论重放怎么切都只落一行，字节相同的两行各落一行。去重索引在内存、
+  首次写入时从 side 文件播种（语句重启/进程重启后重建写入器仍去重）；文件中损坏的行
+  跳过播种、不阻断隔离。**升级注意**：1.3 前写下的行无 `nextOffset`，播种为游标键——
+  升级后同一行带位置的重放会多落一行（跨升级一次性重复，非丢失）。
 - **事件带 DLQ 路径**：`DECODE_BAD` 事件消息携带 side 文件路径（替代旧的 120 字符
   样本）；首个坏批即发一次，其后每 1000 行节流一次。stats 的 `bad` 计数全策略累加。
 - DLQ 写失败 = 语句错误（宁可不过游标也不丢原始字节——越过未持久化的坏行等于
   数据销毁）。
-- **at-least-once 记账（如实披露，2026-10-31 / R10）**：同一坏行在重放窗口内可能被
-  隔离**多次**。坏行落 DLQ 时游标越过，但重启后的重放从「上一次成功 flush 的游标」
-  起算——窗口内已隔离过的坏行随重放再次隔离，side 文件追加式不去重。dogfooding
+- **at-least-once 记账：表唯一化、计数不变（2026-10-31 R10 披露，v1.3 T-V2 修正）**：
+  同一坏行在重放窗口内可能被**隔离多次**——坏行落 DLQ 时游标越过，但重启后的重放从
+  「上一次成功 flush 的游标」起算，窗口内已隔离过的坏行随重放再次隔离。dogfooding
   round3 实测（#3）：2 好 3 坏的首批在 flush 撞 BE MEM_LIMIT 窗口后重启重放两次，
-  side 文件与 `tailrace_dlq_rows_total` 记到 9（3 坏行 × 3 次隔离；三组时间戳、
-  游标相同）。**下游消费方须以 `rawB64` 为幂等键去重**（同一坏行的重放记录
-  `cursor` 亦相同，可作辅助校验）——侧文件与指标计的是隔离次数，不是坏行数。
+  side 文件与 `tailrace_dlq_rows_total` 均记到 9（3 坏行 × 3 次隔离）。**T-V2 起两者
+  分道**：`tailrace_dlq_rows_total` / stats `bad` 仍计**每次隔离尝试**（审计面保留风暴
+  全貌，`dlq_window` 规则按次数放大属预期），side 文件按上述行键**唯一化**（同例下
+  文件 3 行、指标 9）。下游以 `rawB64` 为幂等键的消费习惯**建议保留**：带行位置的载体
+  （文件/Kafka）引擎侧已不再产生重复行；无行位置的载体回退游标键，重放边界变化时仍
+  可能重复，跨升级也有一次性重复。契约钉住：`tests/contract/tests/executor_loop.rs`
+  `dlq_replay_storm_dedups_rows_but_counts_attempts`（重放风暴下 DLQ 行数 = 唯一坏行数，
+  指标 = 尝试次数）与 `dlq_dedup_survives_a_tail_appended_during_the_storm`（风暴期尾部
+  追加、重放切到不同 poll 边界，DLQ 行数仍 = 唯一坏行数）。
 
 ## 三、心跳协议（console → node 反向：node → console）
 

@@ -183,6 +183,55 @@ impl StatementRuntime {
             }
         }
     }
+
+    /// T-V1 idle signal → `source_idle` (feeds `tailrace_pipeline_source_idle`).
+    /// `None` = no verdict (a source that cannot be read, a paused
+    /// statement, a loop that exited): the console's lag rules evaluate
+    /// exactly as before T-V1. The serve loop publishes through
+    /// [`Self::publish_idle`]; only the no-verdict resets call this directly.
+    fn obs_idle(&self, idle: Option<bool>) {
+        if let Some(c) = self.counters.as_ref() {
+            c.source_idle.store(
+                pipeline_log::source_idle_code(idle),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// T-V1 statement-level idle verdict (R11 review): idle only when the
+    /// source reports no backlog behind its cursor AND nothing it already
+    /// handed over is still waiting in the sink buffer. Rows read but not
+    /// yet acknowledged by a flush are backlog too — the lag gauge measures
+    /// the time since the last data-carrying flush, so a failing or slow
+    /// sink sitting on pending rows must keep the lag rules evaluating,
+    /// never hold them. Published before every poll (the state the previous
+    /// iteration left behind) and right after a write (the rows just
+    /// buffered), so the value is honest at the two points the thread may
+    /// block for long: the poll and the flush.
+    fn publish_idle(&self) {
+        self.obs_idle(
+            self.source
+                .idle()
+                .map(|idle| idle && self.pending_rows == 0),
+        );
+    }
+}
+
+/// Resets a statement's published idle verdict to unknown when its serve
+/// loop exits by any path — error via `?`, panic, stop. The counters outlive
+/// the statement thread (the registry shares one set across auto-restarts),
+/// so without this a verdict frozen at "idle" would hold the console's lag
+/// rules through the restart backoff and the FAILED terminal state — exactly
+/// when a sink failure's lag is real (R11 review of T-V1).
+struct IdleResetGuard(Option<Arc<pipeline_log::StatementCounters>>);
+
+impl Drop for IdleResetGuard {
+    fn drop(&mut self) {
+        if let Some(c) = self.0.as_ref() {
+            c.source_idle
+                .store(pipeline_log::SOURCE_IDLE_UNKNOWN, Ordering::Relaxed);
+        }
+    }
 }
 
 fn now_ms() -> u64 {
@@ -210,16 +259,21 @@ fn sink_flush_span(pipeline_id: u64, st: &StatementRuntime) -> tracing::Span {
 
 /// Bad-row post-processing shared by both statement loops (upgrade plan §二
 /// engine H2): policy handling (fail → bail before the cursor can cross the
-/// batch; dlq → quarantine raw bytes + poll-time cursor + timestamp to the
-/// side file — a quarantine write failure is fatal for the same reason),
-/// counters, and the throttled DECODE_BAD event carrying the DLQ path (not a
-/// raw sample).
+/// batch; dlq → quarantine raw bytes + the row's own source position +
+/// poll-time cursor + timestamp to the side file — a quarantine write
+/// failure is fatal for the same reason), counters, and the throttled
+/// DECODE_BAD event carrying the DLQ path (not a raw sample). The attempt
+/// counter (`bad` → `tailrace_dlq_rows_total`) is bumped **before** the
+/// write and counts every isolation attempt; the side file dedups on the
+/// row key (T-V2) — a replay storm stays visible on the metric while the
+/// table holds each bad row once. `bad_raws` are the bad chunks with their
+/// `partition` / `next_offset` intact (the key's position component).
 #[allow(clippy::too_many_arguments)]
 fn handle_bad_rows(
     st: &StatementRuntime,
     pipeline_id: u64,
     bad_now: u64,
-    bad_raws: Vec<Vec<u8>>,
+    bad_raws: Vec<SourceChunk>,
     fail_sample: Option<String>,
     bad_since_event: &mut u64,
     bad_event_emitted: &mut bool,
@@ -239,7 +293,7 @@ fn handle_bad_rows(
         let cursor = st.source.cursor();
         let records: Vec<BadRowRecord> = bad_raws
             .iter()
-            .map(|raw| dlq::record(pipeline_id, st.statement_index, &cursor, raw))
+            .map(|chunk| dlq::record(pipeline_id, st.statement_index, &cursor, chunk))
             .collect();
         let writer = st
             .dlq
@@ -315,7 +369,9 @@ struct GroupDecode {
     appended: u64,
     skipped: u64,
     bad_rows: u64,
-    bad_raws: Vec<Vec<u8>>,
+    /// bad chunks under Dlq: the returned raw bytes re-paired with the
+    /// chunk's own position (T-V2 row key)
+    bad_raws: Vec<SourceChunk>,
     fail_sample: Option<String>,
 }
 
@@ -333,7 +389,9 @@ struct PollDecode {
     /// every bad row this poll, **all policies** (the fail-policy bail fires
     /// on this count; `bad_raws` only carries payloads under Dlq)
     bad_now: u64,
-    bad_raws: Vec<Vec<u8>>,
+    /// bad chunks (raw bytes + their own `partition` / `next_offset`), in
+    /// chunk order
+    bad_raws: Vec<SourceChunk>,
     /// first bad-row sample under the Fail policy, in chunk order
     fail_sample: Option<String>,
 }
@@ -364,7 +422,12 @@ fn decode_poll(
         // serial: today's path verbatim — decode into the reused batch
         // (builders keep capacity across polls)
         for chunk in chunks {
-            match decoder.decode(chunk.raw, reuse, pushdown) {
+            let SourceChunk {
+                raw,
+                partition,
+                next_offset,
+            } = chunk;
+            match decoder.decode(raw, reuse, pushdown) {
                 Decoded::Append => stats.appended += 1,
                 Decoded::Skip => {
                     stats.skipped += 1;
@@ -380,7 +443,11 @@ fn decode_poll(
                                     Some(String::from_utf8_lossy(&raw).chars().take(120).collect());
                             }
                         }
-                        BadRowPolicy::Dlq => pd.bad_raws.push(raw),
+                        BadRowPolicy::Dlq => pd.bad_raws.push(SourceChunk {
+                            raw,
+                            partition,
+                            next_offset,
+                        }),
                         BadRowPolicy::Skip => {}
                     }
                 }
@@ -417,7 +484,12 @@ fn decode_poll(
                     let mut r = GroupDecode::default();
                     let mut batch = ColBatch::new(schema.clone(), chunks.len());
                     for chunk in chunks {
-                        match decoder.decode(chunk.raw, &mut batch, pushdown) {
+                        let SourceChunk {
+                            raw,
+                            partition,
+                            next_offset,
+                        } = chunk;
+                        match decoder.decode(raw, &mut batch, pushdown) {
                             Decoded::Append => r.appended += 1,
                             Decoded::Skip => r.skipped += 1,
                             Decoded::Bad(raw) => {
@@ -433,7 +505,11 @@ fn decode_poll(
                                             );
                                         }
                                     }
-                                    BadRowPolicy::Dlq => r.bad_raws.push(raw),
+                                    BadRowPolicy::Dlq => r.bad_raws.push(SourceChunk {
+                                        raw,
+                                        partition,
+                                        next_offset,
+                                    }),
                                     BadRowPolicy::Skip => {}
                                 }
                             }
@@ -829,6 +905,9 @@ fn run_statement_serve(
     let mut bad_event_emitted = false; // first-bad visibility (engine H2)
     let mut was_paused = false; // PAUSED edge — enter the suspended zone / leave to recover
     let mut pause_ok = false; // only a successful pause allows keepalive polls (otherwise poll = real consumption, dropped)
+                              // T-V1: whatever path this thread leaves by, the published idle verdict
+                              // goes back to unknown (the shared counters outlive the thread)
+    let _idle_reset = IdleResetGuard(st.counters.clone());
     let resume = state
         .lock()
         .unwrap_or_else(|e| e.into_inner()) // poisoned ≠ corrupt — recover, don't cascade a sibling thread's panic (T39 ④; rationale at run_statement)
@@ -854,6 +933,10 @@ fn run_statement_serve(
             if !was_paused {
                 pause_ok = st.source.pause();
                 was_paused = true;
+                // no polls while paused: the verdict is unknown, not the last
+                // poll's — a frozen "idle" would hold the lag rules for the
+                // whole pause (T-V1 review)
+                st.obs_idle(None);
             }
             if pause_ok {
                 st.source.keepalive(std::time::Duration::from_millis(200));
@@ -868,9 +951,15 @@ fn run_statement_serve(
             }
             was_paused = false;
         }
+        // T-V1: publish the statement's idle verdict (source position AND
+        // sink buffer, see `publish_idle`) before the poll — the console
+        // holds lag rules only while nothing is pending anywhere
+        st.publish_idle();
         let chunks = match st.source.poll(options.poll_rows, options.poll_slice) {
             Ok(c) => c,
             Err(e) => {
+                // a source that cannot be read has no idle verdict (T-V1)
+                st.obs_idle(None);
                 // Flink exponential-delay pattern: back off and retry on
                 // transient errors instead of killing the pipeline
                 backoff_secs += 1;
@@ -994,6 +1083,9 @@ fn run_statement_serve(
             st.sink.write(out)?;
         }
         st.pending_rows += rows;
+        // T-V1: the rows just buffered are backlog until a flush acks them —
+        // republish so a slow flush below blocks behind an honest verdict
+        st.publish_idle();
         // three-threshold boundary (Doris Flink connector
         // `sink.buffer-flush.max-rows / max-bytes / interval`: any satisfied →
         // flush) — byte boundary wired through the sink's real
@@ -1528,11 +1620,11 @@ fn run_statement_bounded(
 
 /// G2 (R8, blueprint §7.1): declared column → arrow Field through
 /// `tailrace_catalog::ColumnType::parse` (16 words: 4 legacy kept
-/// byte-compatible + 12 new). Unknown words warn (column name + known
-/// vocabulary) and fold to Utf8 for one minor version (migration window,
-/// blueprint §7.6) — behavior-identical to the pre-G2 `_ => Utf8` fallback
-/// arm, only the warn is new. When the window const in tailrace-ir flips,
-/// this returns the hard error callers already propagate via `?`. A4: the
+/// byte-compatible + 12 new). Unknown words warned and folded to Utf8
+/// through the 1.2.x migration window (blueprint §7.6) — behavior-identical
+/// to the pre-G2 `_ => Utf8` fallback arm, only the warn was new; the
+/// window const in tailrace-ir flipped for 1.3.0, so this now returns the
+/// hard error callers already propagate via `?`. A4: the
 /// field carries the `variant` marker metadata (tailrace-ir
 /// `VARIANT_FIELD_METADATA`) — the same entry tailrace-ir's plan builder
 /// uses, so the ColBatch schema built here and the plan's anchored `src`
@@ -1705,14 +1797,15 @@ mod tests {
         // —— serial reference (the pre-T5 inline loop, verbatim) ——
         let mut ref_batch = ColBatch::new(schema.clone(), n);
         let mut ref_stats = StatementStats::default();
-        let mut ref_bad_raws: Vec<Vec<u8>> = Vec::new();
+        let mut ref_bad_raws: Vec<(Vec<u8>, Option<i32>, Option<i64>)> = Vec::new();
         for c in chunks {
+            let (partition, next_offset) = (c.partition, c.next_offset);
             match OggDecoder.decode(c.raw, &mut ref_batch, &pushdown) {
                 Decoded::Append => ref_stats.appended += 1,
                 Decoded::Skip => ref_stats.skipped += 1,
                 Decoded::Bad(raw) => {
                     ref_stats.bad_rows += 1;
-                    ref_bad_raws.push(raw);
+                    ref_bad_raws.push((raw, partition, next_offset));
                 }
             }
         }
@@ -1722,8 +1815,13 @@ mod tests {
             "per-outcome stats identical"
         );
         assert_eq!(pd.bad_raws.len(), ref_bad_raws.len());
-        for (a, b) in pd.bad_raws.iter().zip(ref_bad_raws.iter()) {
-            assert_eq!(a, b, "bad-row payloads identical and in chunk order");
+        for (a, (raw, partition, next_offset)) in pd.bad_raws.iter().zip(ref_bad_raws.iter()) {
+            assert_eq!(&a.raw, raw, "bad-row payloads identical and in chunk order");
+            assert_eq!(
+                (a.partition, a.next_offset),
+                (*partition, *next_offset),
+                "bad rows keep their own position (the T-V2 row key)"
+            );
         }
         let rb_ref = ref_batch.finish()?;
         let rb_par = pd.merged.expect("appended rows present");

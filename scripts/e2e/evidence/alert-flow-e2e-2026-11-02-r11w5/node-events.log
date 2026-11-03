@@ -1,0 +1,7 @@
+1793557300775	WARN	PIPELINE_RESTART	pipeline#1	auto-restart #1 (backing off 20s): Is a directory (os error 21)
+1793557339004	ERROR	STATEMENT_FAILED	pipeline#2	transform output column order != sink: output ["extra", "id"] vs sink ["id", "extra"] — check the SELECT projection order（auto-restart disabled (recovery.autoRestart=false)，auto-restart stopped）
+1793557345299	WARN	DECODE_BAD	pipeline#3	decoded bad rows total 1 (this batch 1) — badRowPolicy=skip (rows dropped, counted only)
+1793557347478	ERROR	STATEMENT_FAILED	pipeline#4	decode bad row under badRowPolicy=fail (statement halted before the cursor crossed the batch) — first bad row sample: not json {（auto-restart disabled (recovery.autoRestart=false)，auto-restart stopped）
+1793557347605	WARN	DECODE_BAD	pipeline#6	decoded bad rows total 3 (this batch 3) — quarantined to DLQ: /tmp/tailrace-af-final/node-state/bad_rows/p6-s0.jsonl
+1793557349609	WARN	PIPELINE_RESTART	pipeline#6	auto-restart #1 (backing off 1s): Is a directory (os error 21)
+1793557350621	WARN	DECODE_BAD	pipeline#6	decoded bad rows total 3 (this batch 3) — quarantined to DLQ: /tmp/tailrace-af-final/node-state/bad_rows/p6-s0.jsonl

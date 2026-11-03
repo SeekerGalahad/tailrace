@@ -13,6 +13,7 @@ pub mod deploy;
 pub mod mcp;
 pub mod metrics;
 pub mod openapi;
+pub mod slo;
 pub mod spa;
 pub mod state;
 
@@ -172,6 +173,9 @@ pub fn build_router_with_mcp(state: AppState, mcp_state: mcp::McpState) -> Route
             put(api::alerts::update).delete(api::alerts::remove),
         )
         .route("/api/alerts/stream", get(api::alerts::stream))
+        // R11 T-V4 SLO history: lag p50/p95/p99 + sample count per
+        // pipeline/statement over a window of the 1h sample ring
+        .route("/api/slo", get(api::slo::summary))
         .layer(from_fn_with_state(
             state.clone(),
             require_session::<AppState>,

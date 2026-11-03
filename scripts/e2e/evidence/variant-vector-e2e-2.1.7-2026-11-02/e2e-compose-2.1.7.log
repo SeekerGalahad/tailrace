@@ -1,0 +1,27 @@
+== variant_vector e2e: work=/tmp/tailrace-vv-e2e fe=127.0.0.1:39030 be=127.0.0.1:38040 db=tailrace_vv_e2e console=127.0.0.1:18087 ==
+  ok    S0.1 console binary /Users/wagic/GLMProjects/tailrace/target/release/tailrace-console
+  ok    S0.2 engine node binary /Users/wagic/GLMProjects/tailrace/target/release/tailrace-node
+  ok    S0.4 compose override generated: BE swap check neutralized for the e2e stack only (/tmp/tailrace-vv-e2e/compose-be-swap-override.yml)
+  ok    S0.5 VM sysctl vm.max_map_count already 2000000 (BE requirement met)
+  starting compose doris-fe+doris-be (--wait-timeout 300s)
+ Container tailrace-doris-fe Running 
+ Container tailrace-doris-be Recreate 
+ Container tailrace-doris-be Recreated 
+ Container tailrace-doris-fe Waiting 
+ Container tailrace-doris-fe Healthy 
+ Container tailrace-doris-be Starting 
+ Container tailrace-doris-be Started 
+ Container tailrace-doris-be Waiting 
+ Container tailrace-doris-fe Waiting 
+ Container tailrace-doris-fe Healthy 
+ Container tailrace-doris-be Healthy 
+  ok    S1.1 docker compose doris-fe+doris-be up --wait healthy (kafka not started)
+  ok    S2.0 backend Alive=true (heartbeat-driven availability)
+  ok    S2.1 database tailrace_vv_e2e empty (DROP FORCE + CREATE)
+  ok    S2.2 server version under test: doris-2.1.7-rc03-443e87e203 (SHOW FRONTENDS; SELECT VERSION() only reports the mysql protocol)
+ERROR 1105 (HY000) at line 1: errCode = 2, detailMessage = Failed to find enough backend, please check the replication num,replication tag and storage medium and avail capacity of backends or maybe all be on same host. Backends details: backends with tag {"location" : "default"} is [], 
+Create failed replications:
+replication tag: {"location" : "default"}, replication num: 1, storage medium: HDD
+ERROR 1105 (HY000) at line 1: errCode = 2, detailMessage = replication num should be less than the number of available backends. replication num is 1, available backend num is 0
+ERROR 1105 (HY000) at line 1: errCode = 2, detailMessage = replication num should be less than the number of available backends. replication num is 1, available backend num is 0
+  FAIL  P0.1 probe_mix  create failed

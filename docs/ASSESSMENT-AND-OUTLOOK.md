@@ -1,6 +1,16 @@
 # tailrace 现状评估与未来展望
 
-> 本文按日期分两段、自上而下以新覆旧。**§〇 post-R8 基线（2026-10-30）**描述 v1.1.0 之后四轮开发（扩展轮 / R6 / R7 / R8）落地后的实况，是当前有效结论。其后的 **v1.1.0 基线（2026-10-26）**为时点评估原文，逐字保留不改——其中引用的 `roadmap.md`、`R3-升格评审`、`R5-lineage-judge` 等过程档已于 2026-10-26（提交 `1bed48d`，公私仓文档分离）移入私有工作流，作为当时的证据链原样保留、公开仓内不再可点开。两段结论不一致处，以 §〇 为准。
+> 本文按日期分段、自上而下以新覆旧。**§0.0 post-R11 状态短段（2026-11-03）**是当前有效结论；其后的 **§〇 post-R8 基线（2026-10-30）**描述 v1.1.0 之后四轮开发（扩展轮 / R6 / R7 / R8）落地后的实况，与最底的 **v1.1.0 基线（2026-10-26）**时点评估原文（逐字保留——其中引用的 `roadmap.md`、`R3-升格评审`、`R5-lineage-judge` 等过程档已于 2026-10-26（提交 `1bed48d`，公私仓文档分离）移入私有工作流，作为当时的证据链原样保留、公开仓内不再可点开）均为历史快照。段间结论不一致处，以最上段为准。
+
+## 〇·〇、post-R11 状态短段（2026-11-03）
+
+> **基线**：工作树分支 `feature/v1.3-dev`（HEAD `9799a61`，R11 评审修复轮）；`origin/main` 现值 `84a1393`（v1.2.0 合并点，tag 所指）。代码锚点为 2026-11-03 实读；发布事实为本段 `gh release view` / crates.io API 实查。
+
+- **v1.2.0 已发布（部分）**：CHANGELOG 版本切点 2026-10-31；tag `v1.2.0` 与 GitHub Release（**9 资产** = 8 tarball + checksums.txt）于 **2026-11-02** 上线（`gh release view v1.2.0`：publishedAt 2026-11-02T12:00:16Z）。**crates.io 现值仍 1.1.0**（`tailrace-ir` / `tailrace-console` / `tailrace-runtime` max_version 1.1.0，`tailrace-ddl` 404 从未上架）——22 包 1.2.0 lockstep publish 未执行，这是 v1.2.0 收尾的未清项。
+- **§0.2 十二项能力面全部随 v1.2.0 出门**；其后 R9（A4 VARIANT / A5 向量 / E2 告警+SLO 目标线）与 R10（G3 `Cursor::Custom` / G6 管道即代码 / badRowPolicy·MEM_LIMIT·DLQ 语义尾债束）**也已随 v1.2.0 发布**——§0.4 蓝图对账的三个「未清项」（G3、G6、E2）与 W1 的 A4/A5 已全部兑现：W0 6/6、W1 8/8、W2 2/2。
+- **R11（v1.3 开发线，Unreleased）五项**：T-V1 idle 感知告警（`tailrace_pipeline_source_idle`，源位置判据∧pending==0，lag 规则三态 hold——dogfooding round3 #5 根修）、T-V2 DLQ 行键去重（表唯一化、计数不变）、T-V3 MCP apply 对（**14→16 工具**，≤16 预算用满）、T-V4 SLO p50/p95/p99（1h 样本环迁移 06 + `/api/slo` + grafana SLO row）、T-V5 **迁移窗硬错（1.3.0 BREAKING）**——§0.6 预告的「下一发布窗必动行为」开关已翻。评审修复五项全钉测试（idle 判决计 sink 积压并在退出/暂停复位、MCP 审计任意深度脱敏、`apply_dry_run` 拒凭据 oracle、DLQ 行键改行位点）。
+- **公开面**：§0.3 登记的三处残债（SECURITY.md「pre-1.0」、issue 模板 `TODO` URL、`--help` 工具数）已由 R11 清偿；mdBook gh-pages 部署仍未立。e2e 现值：`alert_flow.sh` 69/69（R11 W5 重写）、`variant_vector.sh` compose 2.1.7 上 47/47（补做）、dogfooding 四轮（round4 36/36 纯 MCP 驱动管道即代码）。新开放项见架构正典 §12.2（10-13 条：crates.io publish、idle hold 遮蔽窗、纯 MCP GitOps 止于 publish、告警/SLO/apply 无 web 页）。
+- **第一性问题未变：0 用户**（本段未复跑 `gh api` 社区数字；§0.3 的 2026-10-30 实查值 0/0/0/0 仍为最近读数）。三轮把 Day-2 运维闭环补齐到「告警+SLO+管道即代码」，下一步仍是被看见，不是再加功能。
 
 ## 〇、post-R8 基线（2026-10-30）
 

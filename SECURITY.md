@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-tailrace is pre-1.0 (`0.1.x`). Security fixes are applied to the default branch
+tailrace is post-1.0 (the `1.x` line). Security fixes are applied to the default branch
 only; there are no backport branches yet.
 
 ## Reporting a vulnerability

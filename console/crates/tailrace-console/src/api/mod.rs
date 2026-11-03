@@ -14,6 +14,7 @@ pub mod messages;
 pub mod nodes;
 pub mod nodes_admin;
 pub mod pipelines;
+pub mod slo;
 
 use axum::http::HeaderMap;
 use console_auth::AuthContext;

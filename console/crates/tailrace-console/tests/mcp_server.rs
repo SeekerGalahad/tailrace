@@ -14,10 +14,11 @@ use serde_json::{json, Value};
 use tailrace_console::mcp::McpState;
 use tower::ServiceExt;
 
-/// §7.5 table order + the R8 four — `tools/list` must expose exactly these
-/// fourteen (the pause and resume routes share the `pause_resume_pipeline`
-/// slot; the DDL closed loop and backfill status ride at the end).
-const ALL_TOOLS: [&str; 14] = [
+/// §7.5 table order + the R8 four + the R11 apply pair — `tools/list` must
+/// expose exactly these sixteen (the pause and resume routes share the
+/// `pause_resume_pipeline` slot; the DDL closed loop, backfill status and
+/// the pipeline-as-code pair ride at the end).
+const ALL_TOOLS: [&str; 16] = [
     "list_datasources",
     "list_pipelines",
     "get_pipeline",
@@ -32,14 +33,17 @@ const ALL_TOOLS: [&str; 14] = [
     "ddl_execute",
     "ddl_evolve",
     "backfill_status",
+    "apply",
+    "apply_dry_run",
 ];
-const WRITE_TOOLS: [&str; 6] = [
+const WRITE_TOOLS: [&str; 7] = [
     "create_pipeline",
     "deploy_pipeline",
     "pause_resume_pipeline",
     "trigger_backfill",
     "ddl_execute",
     "ddl_evolve",
+    "apply",
 ];
 
 // ---------------- helpers ----------------
@@ -141,7 +145,7 @@ fn audit_rows(store: &Store, action: &str) -> Vec<(String, Option<String>, Value
 // ---------------- initialize / tools/list ----------------
 
 #[tokio::test]
-async fn initialize_and_tools_list_expose_the_fourteen_tools() {
+async fn initialize_and_tools_list_expose_the_sixteen_tools() {
     let app = app_with_mcp(false).await;
 
     // initialize: negotiation, server info, session id, instructions
@@ -197,17 +201,17 @@ async fn initialize_and_tools_list_expose_the_fourteen_tools() {
     let b = rpc(&app, &[], "ping", json!({})).await;
     assert_eq!(b["result"], json!({}));
 
-    // tools/list: exactly the fourteen (§7.5 ten + R8 four), in table
-    // order, well-formed; descriptions are route-prefixed (the OpenAPI
-    // same-source generation)
+    // tools/list: exactly the sixteen (§7.5 ten + R8 four + R11 apply
+    // pair), in table order, well-formed; descriptions are route-prefixed
+    // (the OpenAPI same-source generation)
     let b = rpc(&app, &[], "tools/list", json!({})).await;
     let tools = b["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 14, "{tools:#?}");
+    assert_eq!(tools.len(), 16, "{tools:#?}");
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(names, ALL_TOOLS);
     assert!(
         b["result"].get("nextCursor").is_none(),
-        "all fourteen in one page"
+        "all sixteen in one page"
     );
     for t in tools {
         let name = t["name"].as_str().unwrap();
@@ -220,6 +224,8 @@ async fn initialize_and_tools_list_expose_the_fourteen_tools() {
             "ddl_execute" => "POST /api/datasources/{id}/tables/{db}/{table}/ddl/execute",
             "ddl_evolve" => "POST /api/datasources/{id}/tables/{db}/{table}/ddl/evolve",
             "backfill_status" => "GET /api/pipelines/{id}/backfill/jobs",
+            "apply" => "POST /api/apply",
+            "apply_dry_run" => "POST /api/apply/dry-run",
             _ => continue,
         };
         assert!(
@@ -287,6 +293,12 @@ async fn write_tools_are_rejected_while_the_switch_is_off() {
             "ddl_evolve",
             json!({"confirm": true, "datasourceId": 1, "db": "ods", "table": "orders"}),
         ),
+        (
+            "apply",
+            json!({"confirm": true, "pipelines": [
+                {"name": "p", "sqlContent": "SELECT 1"}
+            ]}),
+        ),
     ];
     for (name, args) in &calls {
         let b = tool(&app, &hdr, name, args.clone()).await;
@@ -311,7 +323,7 @@ async fn write_tools_are_rejected_while_the_switch_is_off() {
         .iter()
         .filter(|(_, _, d)| d["code"] == "WRITE_DISABLED")
         .collect();
-    assert_eq!(rejected.len(), 6, "{rows:#?}");
+    assert_eq!(rejected.len(), 7, "{rows:#?}");
     for (actor, entity, detail) in &rejected {
         assert_eq!(actor, "mcp:gate-test");
         assert!(
@@ -321,12 +333,16 @@ async fn write_tools_are_rejected_while_the_switch_is_off() {
         assert_eq!(detail["outcome"], "rejected");
         assert_eq!(detail["tool"], entity.as_deref().unwrap());
     }
-    // 6 rejected + 1 ok read = the complete MCP audit trail
-    assert_eq!(rows.len(), 7, "{rows:#?}");
+    // 7 rejected + 1 ok read = the complete MCP audit trail
+    assert_eq!(rows.len(), 8, "{rows:#?}");
     assert!(audit_rows(&app.store, "PIPELINE_CREATE").is_empty());
     assert!(
         audit_rows(&app.store, "TABLE_DDL_EXECUTE").is_empty(),
         "the DDL write never reached its handler"
+    );
+    assert!(
+        audit_rows(&app.store, "APPLY").is_empty(),
+        "the declaration file never reached the apply handler"
     );
 }
 
@@ -562,6 +578,295 @@ async fn ddl_and_backfill_tools_round_trip_the_r8_surface() {
     assert_eq!(by("ddl_execute"), 2, "confirm rejection + 502: {rows:#?}");
     assert_eq!(by("ddl_evolve"), 1, "{rows:#?}");
     assert_eq!(by("backfill_status"), 1, "{rows:#?}");
+}
+
+// ---------------- R11: the pipeline-as-code apply pair ----------------
+
+/// The T-G6 pair as tools. `apply_dry_run` is a read tool (no switch, no
+/// confirm) with ZERO side effects: the structured diff comes back, and
+/// the store and the audit trail are byte-untouched except for this call's
+/// own MCP_TOOL_CALL envelope row. `apply` rides both write gates and, once
+/// through, lands exactly the plan the dry run showed — its per-write
+/// domain rows and the APPLY summary row carry the MCP actor. Same
+/// handler, same `plan()`: the diff an MCP client previews is the diff
+/// apply lands; `confirm` is lifted out before the handler sees the file
+/// (the handler's own top-level key check would otherwise 400 it).
+#[tokio::test]
+async fn apply_tools_share_the_g6_diff_and_dry_run_writes_nothing() {
+    let app = app_with_mcp(true).await;
+    let hdr = [("x-mcp-client", "gitops-agent")];
+    // the world the file diffs against: one kafka datasource registered
+    // over REST (so `edge-kafka` reads `unchanged`), nothing else
+    let (s, b) = req(
+        &app,
+        "POST",
+        "/api/datasources",
+        Some(json!({
+            "name": "edge-kafka", "type": "kafka",
+            "connJson": {"bootstrap": "127.0.0.1:19092"}
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let kafka = b["id"].as_i64().unwrap();
+    let file = json!({
+        "datasources": [
+            {"name": "edge-kafka", "type": "kafka", "connJson": {"bootstrap": "127.0.0.1:19092"}}
+        ],
+        "tables": [
+            {"datasource": "edge-kafka", "dbName": "shop", "tableName": "orders", "format": "ogg",
+             "columnsJson": [["id", "int64"], ["payload", "utf8"]]}
+        ],
+        "pipelines": [
+            {"name": "orders→ods",
+             "sqlContent": "INSERT INTO ods.orders SELECT id FROM shop.orders",
+             "dsMapping": {"shop": "edge-kafka"}}
+        ]
+    });
+    let total_audit = || -> i64 {
+        app.store
+            .with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM audit_log", [], |r| r.get(0))?))
+            .unwrap()
+    };
+
+    // --- apply_dry_run: read tool, no confirm — the structured diff
+    let before = total_audit();
+    let (status, diff) = tool_ok(&tool(&app, &hdr, "apply_dry_run", file.clone()).await);
+    assert_eq!(status, 200, "{diff}");
+    assert_eq!(diff["dryRun"], true);
+    assert_eq!(
+        diff["summary"],
+        json!({"create": 2, "update": 0, "unchanged": 1, "orphan": 0})
+    );
+    assert_eq!(diff["datasources"][0]["action"], "unchanged");
+    assert_eq!(diff["datasources"][0]["id"], kafka);
+    assert_eq!(diff["tables"][0]["action"], "create");
+    assert_eq!(
+        diff["tables"][0]["id"],
+        Value::Null,
+        "dry-run create has no id yet"
+    );
+    assert_eq!(diff["pipelines"][0]["action"], "create");
+    // zero side effects: nothing created, nothing audited beyond the one
+    // MCP envelope row of this call
+    assert_eq!(
+        total_audit(),
+        before + 1,
+        "exactly the MCP_TOOL_CALL row, no domain / APPLY rows"
+    );
+    let (_, body) = tool_ok(&tool(&app, &hdr, "list_pipelines", json!({})).await);
+    assert_eq!(body["total"], 0, "dry run created nothing");
+    let (s, b) = req(&app, "GET", "/api/datasources/tables", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(b["total"], 0, "dry run registered nothing");
+    assert!(audit_rows(&app.store, "APPLY").is_empty());
+    assert!(audit_rows(&app.store, "TABLE_CREATE").is_empty());
+    assert!(audit_rows(&app.store, "PIPELINE_CREATE").is_empty());
+
+    // --- apply without confirm → CONFIRM_REQUIRED, audited, nothing written
+    let b = tool(&app, &hdr, "apply", file.clone()).await;
+    assert_eq!(b["error"]["code"], -32602, "{b}");
+    assert_eq!(b["error"]["data"]["code"], "CONFIRM_REQUIRED", "{b}");
+    assert!(audit_rows(&app.store, "APPLY").is_empty());
+
+    // --- apply with confirm: the same plan lands
+    let mut args = file.clone();
+    args["confirm"] = json!(true);
+    let (status, result) = tool_ok(&tool(&app, &hdr, "apply", args).await);
+    assert_eq!(status, 200, "{result}");
+    assert_eq!(result["dryRun"], false);
+    assert_eq!(
+        result["summary"], diff["summary"],
+        "apply lands the diff the dry run showed"
+    );
+    let pid = result["pipelines"][0]["id"]
+        .as_i64()
+        .expect("created pipeline id");
+    let tid = result["tables"][0]["id"]
+        .as_i64()
+        .expect("created table id");
+    let (_, body) = tool_ok(&tool(&app, &hdr, "get_pipeline", json!({"id": pid})).await);
+    assert_eq!(body["name"], "orders→ods");
+    assert_eq!(
+        body["dsMapping"],
+        json!({"shop": kafka}),
+        "the dsMapping NAME resolved to the store id"
+    );
+
+    // audit: the MCP envelope rows, the handler's per-write domain rows and
+    // the APPLY summary row — all under the MCP actor
+    let rows = audit_rows(&app.store, "MCP_TOOL_CALL");
+    let by = |tool: &str, outcome: &str| {
+        rows.iter()
+            .filter(|(_, e, d)| e.as_deref() == Some(tool) && d["outcome"] == outcome)
+            .count()
+    };
+    assert_eq!(by("apply_dry_run", "ok"), 1, "{rows:#?}");
+    assert_eq!(
+        by("apply", "rejected"),
+        1,
+        "the confirm rejection: {rows:#?}"
+    );
+    assert_eq!(by("apply", "ok"), 1, "{rows:#?}");
+    assert!(rows.iter().all(|(a, _, _)| a == "mcp:gitops-agent"));
+    let summary = audit_rows(&app.store, "APPLY");
+    assert_eq!(summary.len(), 1, "one APPLY summary row: {summary:#?}");
+    assert_eq!(summary[0].0, "mcp:gitops-agent");
+    assert_eq!(summary[0].2["summary"]["create"], 2);
+    for (action, id) in [("TABLE_CREATE", tid), ("PIPELINE_CREATE", pid)] {
+        let domain = audit_rows(&app.store, action);
+        assert_eq!(domain.len(), 1, "{action}: {domain:#?}");
+        assert_eq!(
+            domain[0].0, "mcp:gitops-agent",
+            "{action} carries the MCP actor"
+        );
+        assert_eq!(domain[0].1.as_deref(), Some(id.to_string().as_str()));
+        assert_eq!(domain[0].2["via"], "apply");
+    }
+
+    // --- re-applying the converged file: zero changes, no domain or
+    //     summary rows (the CI-loop ruling), only this call's envelope row
+    let before = total_audit();
+    let mut again = file.clone();
+    again["confirm"] = json!(true);
+    let (_, result) = tool_ok(&tool(&app, &hdr, "apply", again).await);
+    assert_eq!(
+        result["summary"],
+        json!({"create": 0, "update": 0, "unchanged": 3, "orphan": 0})
+    );
+    assert_eq!(
+        total_audit(),
+        before + 1,
+        "a no-op apply audits only the envelope"
+    );
+
+    // --- a typo'd section is the handler's own 400 (`confirm` was lifted
+    //     out, so it is NOT the unknown key), surfacing as a tool error
+    let (status, body) = tool_err(
+        &tool(
+            &app,
+            &hdr,
+            "apply",
+            json!({"confirm": true, "pipeline": []}),
+        )
+        .await,
+    );
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"]["message_key"], "err.apply.unknown_key");
+}
+
+/// R11 review, two findings on the apply pair's credential handling.
+/// (1) `apply_dry_run` is always-on over the unauthenticated `/mcp`, and
+/// `plan()` compares a declared credential against the stored one — a
+/// password oracle. The tool now refuses any declaration carrying
+/// username/password (`CREDENTIALS_NOT_ALLOWED`) before `plan()` runs;
+/// credential-free files keep working, and omitting the credential keeps
+/// the stored one. (2) Every MCP envelope row used to carry the call
+/// arguments with nested values verbatim, so `datasources[].password` landed
+/// in `audit_log.detail_json`; now no audit row — envelope, domain or
+/// summary, accepted or rejected — contains the plaintext.
+#[tokio::test]
+async fn apply_pair_never_leaks_or_oracles_datasource_credentials() {
+    let app = app_with_mcp(true).await;
+    let hdr = [("x-mcp-client", "gitops-agent")];
+    const USER: &str = "lake_admin_u";
+    const PASS: &str = "Sup3r-S3cr3t-pw!";
+    let with_credential = json!({
+        "datasources": [
+            {"name": "lake", "type": "doris",
+             "connJson": {"jdbcUrl": "jdbc:mysql://fe:9030/db", "streamLoadUrl": "http://fe:8030"},
+             "username": USER, "password": PASS}
+        ]
+    });
+    let no_secret_anywhere = |store: &Store| {
+        let rows: Vec<String> = store
+            .with_conn(|c| {
+                let mut stmt = c.prepare("SELECT detail_json FROM audit_log")?;
+                let rows = stmt.query_map([], |r| r.get::<_, Option<String>>(0))?;
+                Ok(rows.filter_map(|r| r.ok().flatten()).collect())
+            })
+            .unwrap();
+        assert!(!rows.is_empty(), "the audit log has rows");
+        for d in &rows {
+            assert!(!d.contains(PASS), "password leaked into audit_log: {d}");
+            assert!(!d.contains(USER), "username leaked into audit_log: {d}");
+        }
+    };
+
+    // --- dry-run with a credential: refused before the plan runs, nothing
+    //     created, the rejection audited without the plaintext
+    let b = tool(&app, &hdr, "apply_dry_run", with_credential.clone()).await;
+    assert_eq!(b["error"]["code"], -32602, "{b}");
+    assert_eq!(b["error"]["data"]["code"], "CREDENTIALS_NOT_ALLOWED", "{b}");
+    assert_eq!(b["error"]["data"]["datasource"], "lake", "{b}");
+    let msg = b["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("/api/apply/dry-run") && !msg.contains(PASS),
+        "the message points at the session-scoped route and echoes no secret: {msg}"
+    );
+    let (s, b) = req(&app, "GET", "/api/datasources", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(b["total"], 0, "refused before plan — nothing created");
+    let rows = audit_rows(&app.store, "MCP_TOOL_CALL");
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(rows[0].2["outcome"], "rejected");
+    assert_eq!(
+        rows[0].2["args"]["datasources"][0]["password"],
+        "<redacted>"
+    );
+    assert_eq!(
+        rows[0].2["args"]["datasources"][0]["username"],
+        "<redacted>"
+    );
+    assert_eq!(
+        rows[0].2["args"]["datasources"][0]["name"], "lake",
+        "non-secret fields stay readable"
+    );
+    no_secret_anywhere(&app.store);
+
+    // --- the write tool (both gates) still lands the credential, sealed:
+    //     the datasource exists with has_password, and no audit row —
+    //     envelope, DATASOURCE_CREATE domain row, APPLY summary — carries it
+    let mut args = with_credential.clone();
+    args["confirm"] = json!(true);
+    let (status, result) = tool_ok(&tool(&app, &hdr, "apply", args).await);
+    assert_eq!(status, 200, "{result}");
+    assert_eq!(result["datasources"][0]["action"], "create");
+    let (s, b) = req(&app, "GET", "/api/datasources", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(b["total"], 1);
+    assert_eq!(b["items"][0]["hasPassword"], true, "{b}");
+    assert_eq!(audit_rows(&app.store, "DATASOURCE_CREATE").len(), 1);
+    assert_eq!(audit_rows(&app.store, "APPLY").len(), 1);
+    no_secret_anywhere(&app.store);
+
+    // --- a credential-free dry-run of the same file is still the honest
+    //     diff (unchanged — the stored credential is kept by omission), so
+    //     the oracle surface is gone without taking the preview away
+    let mut without = with_credential.clone();
+    without["datasources"][0]
+        .as_object_mut()
+        .unwrap()
+        .retain(|k, _| k != "username" && k != "password");
+    let (status, diff) = tool_ok(&tool(&app, &hdr, "apply_dry_run", without).await);
+    assert_eq!(status, 200, "{diff}");
+    assert_eq!(diff["datasources"][0]["action"], "unchanged", "{diff}");
+    assert!(
+        diff["datasources"][0]["changes"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "no credential line for a declaration that carries none: {diff}"
+    );
+    // blank halves are "keep the stored credential", not a declaration —
+    // they pass the gate exactly like an omitted credential
+    let mut blank = with_credential.clone();
+    blank["datasources"][0]["username"] = json!("");
+    blank["datasources"][0]["password"] = json!("");
+    let (status, diff) = tool_ok(&tool(&app, &hdr, "apply_dry_run", blank).await);
+    assert_eq!(status, 200, "{diff}");
+    assert_eq!(diff["datasources"][0]["action"], "unchanged", "{diff}");
+    no_secret_anywhere(&app.store);
 }
 
 // ---------------- read tools + actions (mock engine) ----------------

@@ -18,7 +18,7 @@
   ],
   "title": "Tailrace — pipelines (A6 nine-metric surface + E2 SLO)",
   "uid": "tailrace-a6",
-  "description": "Out-of-the-box panels over the nine blueprint §7.4 series exposed by `GET /metrics` of tailrace-console (T-E2 companion deliverable). Scrape the console, not the nodes: the console proxies every node block and injects node=\"<name>\". Panel 1 overlays tailrace_slo_lag_target_seconds (the lag alert rule's threshold, same label set as the lag series) on the current lag.",
+  "description": "Out-of-the-box panels over the nine blueprint §7.4 series exposed by `GET /metrics` of tailrace-console (T-E2 companion deliverable). Scrape the console, not the nodes: the console proxies every node block and injects node=\"<name>\". Panel 1 overlays tailrace_slo_lag_target_seconds (the lag alert rule's threshold, same label set as the lag series) on the current lag. The SLO row (R11 T-V4) plots the achieved side: lag p50/p95/p99 per pipeline/statement from the console's 1h sample ring (tailrace_slo_lag_p{50,95,99}_seconds + tailrace_slo_lag_samples, labelled {pipeline,statement}) against the tightest lag target.",
   "tags": ["tailrace"],
   "timezone": "browser",
   "editable": true,
@@ -182,8 +182,8 @@
     {
       "id": 6,
       "type": "timeseries",
-      "title": "DLQ rows — 10m increase (tailrace_dlq_rows_total)",
-      "description": "Same window arithmetic as the console dlq_window alert rule (increment over a sliding window, counter resets credited as the post-reset value).",
+      "title": "DLQ isolation attempts — 10m increase (tailrace_dlq_rows_total)",
+      "description": "Same window arithmetic as the console dlq_window alert rule (increment over a sliding window, counter resets credited as the post-reset value). Since v1.3 (T-V2) the counter counts every isolation ATTEMPT — a replay storm re-isolates the same bad rows — while the bad_rows/ side file holds each bad row once; a tall bar here with a flat side file is a replay storm, not new bad data.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 17 },
       "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "bars", "fillOpacity": 60 } }, "overrides": [] },
@@ -247,6 +247,111 @@
           "refId": "A",
           "expr": "sum by (node, pipeline) (rate(tailrace_pipeline_bytes_total{node=~\"$node\",pipeline=~\"$pipeline\"}[5m]))",
           "legendFormat": "{{node}} p{{pipeline}}"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "SLO — lag p50 / p95 / p99 (console sample ring, 1h)",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 41 },
+      "panels": []
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Lag quantiles vs SLO target (tailrace_slo_lag_p{50,95,99}_seconds / tailrace_slo_lag_target_seconds)",
+      "description": "Achieved side of the SLO (R11 T-V4): nearest-rank lag quantiles per pipeline/statement over the console's 1h sample ring — one sample per evaluator pass (15s default), idle passes (tailrace_pipeline_source_idle = 1) excluded, so a quiet source does not drag p95 up. Every quantile is one of the stored samples (recomputable via GET /api/slo). The dashed line is the tightest enabled lag rule threshold for the same pipeline/statement; p95 under it = SLO met over the last hour.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 9, "w": 16, "x": 0, "y": 42 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2, "fillOpacity": 0 } },
+        "overrides": [
+          {
+            "matcher": { "id": "byFrameRefID", "options": "D" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }
+            ]
+          }
+        ]
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "tailrace_slo_lag_p50_seconds{pipeline=~\"$pipeline\"}",
+          "legendFormat": "p50 p{{pipeline}} s{{statement}}"
+        },
+        {
+          "refId": "B",
+          "expr": "tailrace_slo_lag_p95_seconds{pipeline=~\"$pipeline\"}",
+          "legendFormat": "p95 p{{pipeline}} s{{statement}}"
+        },
+        {
+          "refId": "C",
+          "expr": "tailrace_slo_lag_p99_seconds{pipeline=~\"$pipeline\"}",
+          "legendFormat": "p99 p{{pipeline}} s{{statement}}"
+        },
+        {
+          "refId": "D",
+          "expr": "min by (pipeline, statement) (tailrace_slo_lag_target_seconds{node=~\"$node\",pipeline=~\"$pipeline\"})",
+          "legendFormat": "target p{{pipeline}} s{{statement}}"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "table",
+      "title": "SLO compliance — p95 / p99 vs target, with sample support",
+      "description": "Current values per pipeline/statement: p95 and p99 over the 1h ring, the tightest lag target (empty when no enabled lag rule watches the series) and the sample count behind the quantiles (a fully covered hour at the 15s default holds about 240; a freshly started console holds fewer — read the quantiles with their support).",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 9, "w": 8, "x": 16, "y": 42 },
+      "fieldConfig": {
+        "defaults": { "unit": "s" },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "samples" },
+            "properties": [{ "id": "unit", "value": "short" }]
+          }
+        ]
+      },
+      "options": { "showHeader": true },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (pipeline, statement) (tailrace_slo_lag_p95_seconds{pipeline=~\"$pipeline\"})",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "B",
+          "expr": "max by (pipeline, statement) (tailrace_slo_lag_p99_seconds{pipeline=~\"$pipeline\"})",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "C",
+          "expr": "min by (pipeline, statement) (tailrace_slo_lag_target_seconds{node=~\"$node\",pipeline=~\"$pipeline\"})",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "D",
+          "expr": "max by (pipeline, statement) (tailrace_slo_lag_samples{pipeline=~\"$pipeline\"})",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        { "id": "merge", "options": {} },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true },
+            "renameByName": { "Value #A": "p95", "Value #B": "p99", "Value #C": "target", "Value #D": "samples" }
+          }
         }
       ]
     }

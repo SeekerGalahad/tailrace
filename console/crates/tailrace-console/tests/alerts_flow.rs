@@ -2,10 +2,14 @@
 //! machine driven by mock snapshots (threshold boundary, event rows only on
 //! transitions, resolved always reachable, disable mid-flight), window
 //! rules over mock counter history (incl. restart/gap holds — R9 review
-//! fix), per-series episodes and node-unreachable holds, webhook delivery
-//! (received / unreachable never fails the pass), the SSE hub, and the
-//! `/metrics` SLO target riding the lag series' label set end to end
-//! through a mock node.
+//! fix), per-series episodes and node-unreachable holds, the T-V1 idle hold
+//! (lag episodes neither fired nor resolved while the source reports idle),
+//! webhook delivery (received / unreachable never fails the pass), the SSE
+//! hub, and the `/metrics` SLO target riding the lag series' label set end
+//! to end through a mock node. R11 T-V4 adds the SLO history contract:
+//! evaluator passes feed the 1h lag sample ring, whose quantiles surface on
+//! `GET /api/slo` and `/metrics` recomputable from the raw ring rows, with
+//! sliding windows and ring eviction pinned on a deterministic clock.
 
 mod common;
 
@@ -45,6 +49,19 @@ fn lag_snapshot(node: &str, pipeline: &str, lag: f64) -> Vec<Sample> {
         ),
         Some(node),
     )
+}
+
+/// Lag plus the T-V1 idle gauge for one statement, as a node renders them
+/// (same label set); `idle` None omits the idle series (no verdict).
+fn lag_idle_snapshot(node: &str, pipeline: &str, lag: f64, idle: Option<u8>) -> Vec<Sample> {
+    let mut text =
+        format!("tailrace_pipeline_lag_seconds{{pipeline=\"{pipeline}\",statement=\"0\"}} {lag}\n");
+    if let Some(i) = idle {
+        text.push_str(&format!(
+            "tailrace_pipeline_source_idle{{pipeline=\"{pipeline}\",statement=\"0\"}} {i}\n"
+        ));
+    }
+    parse_samples(&text, Some(node))
 }
 
 async fn create_rule(app: &TestApp, body: Value) -> i64 {
@@ -382,6 +399,111 @@ async fn evaluator_episodes_land_only_on_transitions_and_resolve() {
         .await
         .unwrap()
         .is_empty());
+}
+
+/// T-V1 idle hold through the driver: an episode opened under real backlog
+/// is neither re-fired nor resolved while the source reports idle (the lag
+/// gauge keeps climbing on the clock — the positional verdict says nothing
+/// is behind the cursor); it resolves on the first Clear once rows flow
+/// again. A pipeline idle from the start never opens an episode, however
+/// long the silence. Episode rows and the rule's aggregate state are read
+/// back through the API to pin the store side of "hold".
+#[tokio::test]
+async fn evaluator_holds_lag_episodes_while_source_idle() {
+    let app = app().await;
+    create_rule(
+        &app,
+        json!({"name": "lag", "ruleType": "lag_seconds", "params": {"threshold": 30}}),
+    )
+    .await;
+    let mut ev = Evaluator::new();
+    let mut t = T0;
+
+    // real backlog (idle 0) and lag over threshold → firing
+    t += 15_000;
+    let notices = ev
+        .run_pass(
+            &app.state,
+            &lag_idle_snapshot("edge-1", "3", 45.0, Some(0)),
+            t,
+        )
+        .await
+        .unwrap();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0].event, "firing");
+    let episode = notices[0].event_id;
+
+    // caught up: idle 1 while the lag climbs through an hour of silence →
+    // no notice of either kind, the one episode stays open
+    for lag in [60.0, 300.0, 900.0, 3600.0] {
+        t += 15_000;
+        let n = ev
+            .run_pass(
+                &app.state,
+                &lag_idle_snapshot("edge-1", "3", lag, Some(1)),
+                t,
+            )
+            .await
+            .unwrap();
+        assert!(
+            n.is_empty(),
+            "idle hold must emit nothing at lag {lag}: {n:?}"
+        );
+    }
+    let (_, b) = req(&app, "GET", "/api/alerts", None).await;
+    assert_eq!(b["rules"][0]["state"], "firing", "held open, not resolved");
+    assert_eq!(b["rules"][0]["openEvent"]["id"], episode);
+    let events = b["events"].as_array().unwrap();
+    assert_eq!(
+        events.len(),
+        1,
+        "no duplicate episode under hold: {events:?}"
+    );
+    assert_eq!(events[0]["state"], "firing");
+    assert_eq!(
+        events[0]["sample"]["value"], 45.0,
+        "a held tick does not touch the open row's sample"
+    );
+
+    // rows flow again (idle 0) and the flush refreshed the lag → resolved
+    // on the same row
+    t += 15_000;
+    let notices = ev
+        .run_pass(
+            &app.state,
+            &lag_idle_snapshot("edge-1", "3", 2.0, Some(0)),
+            t,
+        )
+        .await
+        .unwrap();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0].event, "resolved");
+    assert_eq!(notices[0].event_id, episode);
+
+    // a pipeline that is idle from its first sample never fires — the
+    // "running but no data" pipeline that used to page on lag forever
+    for lag in [100.0, 10_000.0, 86_400.0] {
+        t += 15_000;
+        let n = ev
+            .run_pass(
+                &app.state,
+                &lag_idle_snapshot("edge-1", "4", lag, Some(1)),
+                t,
+            )
+            .await
+            .unwrap();
+        assert!(
+            n.is_empty(),
+            "idle-from-start never opens an episode: {n:?}"
+        );
+    }
+    let (_, b) = req(&app, "GET", "/api/alerts", None).await;
+    assert_eq!(b["rules"][0]["state"], "inactive");
+    assert_eq!(
+        b["events"].as_array().unwrap().len(),
+        1,
+        "still only pipeline 3's (resolved) episode"
+    );
 }
 
 /// Window rules over mock counter snapshots: no base inside the window →
@@ -1144,4 +1266,319 @@ async fn snapshot_derives_heartbeat_age_from_console_clock_and_flags_unreachable
     assert_eq!(notices.len(), 1);
     assert_eq!(notices[0].event, "firing");
     assert!(notices[0].series_key.contains("node=\"edge-1\""));
+}
+
+// ---------------- R11 T-V4: SLO history (lag sample ring) ----------------
+
+/// The console `/metrics` body (open route).
+async fn scrape_metrics(app: &TestApp) -> String {
+    let resp = app
+        .router
+        .clone()
+        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap()
+}
+
+/// The raw ring rows of one pipeline/statement inside the half-open window
+/// (from, to] — read straight from the table, independent of the code
+/// under test.
+fn ring_values(app: &TestApp, pipeline: &str, statement: &str, from: i64, to: i64) -> Vec<f64> {
+    app.store
+        .with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT lag_secs FROM slo_lag_sample WHERE pipeline = ?1 AND statement = ?2 \
+                 AND ts_ms > ?3 AND ts_ms <= ?4",
+            )?;
+            let rows = stmt.query_map((pipeline, statement, from, to), |r| r.get::<_, f64>(0))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .unwrap()
+}
+
+/// Independent nearest-rank (percent form, integer ceil): sorted[⌈n·pct/100⌉ − 1].
+fn recompute(values: &[f64], pct: usize) -> f64 {
+    let mut v = values.to_vec();
+    v.sort_by(f64::total_cmp);
+    let rank = (v.len() * pct).div_ceil(100).max(1);
+    v[rank - 1]
+}
+
+/// R11 T-V4 acceptance «p95 有样本支撑可复算»: 20 evaluator passes 15s apart
+/// write the ring as a side effect of evaluation; `GET /api/slo` answers
+/// p50/p95/p99 + sample count + window, and every quantile is recomputed
+/// here from the raw table rows of the reported window (an independent
+/// nearest-rank) — equal, and each one a stored sample. Idle passes (T-V1
+/// gauge at 1) leave no sample; two nodes reporting one pair in a pass keep
+/// the worse lag; `/metrics` serves the same numbers under
+/// `{pipeline,statement}` and nothing at all while the ring is empty.
+#[tokio::test]
+async fn slo_quantiles_recompute_from_the_ring_over_api_and_metrics() {
+    let app = app().await;
+    let text = scrape_metrics(&app).await;
+    assert!(
+        !text.contains("tailrace_slo_lag_p95_seconds")
+            && !text.contains("tailrace_slo_lag_samples"),
+        "empty ring: no SLO quantile family at all (absent ≠ 0): {text}"
+    );
+
+    // the HTTP surfaces read the console wall clock: end the passes 1s
+    // before it so every sample sits inside the default (1h) window
+    let now = tailrace_console::slo::now_ms();
+    // pipeline 3: the values 1..=20 in scrambled order (one per pass)
+    let lags = [
+        7.0, 19.0, 3.0, 12.0, 20.0, 1.0, 15.0, 9.0, 4.0, 18.0, 11.0, 2.0, 16.0, 6.0, 13.0, 8.0,
+        17.0, 5.0, 14.0, 10.0,
+    ];
+    let pass_ts = |i: usize| now - 1_000 - (lags.len() - 1 - i) as u64 * 15_000;
+    let mut evaluator = Evaluator::new();
+    for (i, lag) in lags.iter().enumerate() {
+        let mut samples = lag_idle_snapshot("edge-1", "3", *lag, Some(0));
+        // pipeline 4: idle (gauge 1) on even passes → never sampled there
+        samples.extend(lag_idle_snapshot(
+            "edge-2",
+            "4",
+            1000.0 + i as f64,
+            Some(if i % 2 == 0 { 1 } else { 0 }),
+        ));
+        if i == lags.len() - 1 {
+            // pipeline 5 reported by two nodes in one pass → one sample, max
+            samples.extend(lag_snapshot("edge-1", "5", 2.0));
+            samples.extend(lag_snapshot("edge-2", "5", 6.0));
+        }
+        evaluator
+            .run_pass(&app.state, &samples, pass_ts(i))
+            .await
+            .unwrap();
+    }
+
+    let (s, b) = req(&app, "GET", "/api/slo", None).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["windowSecs"], 3600, "default window = the whole ring");
+    assert_eq!(b["retentionSecs"], 3600);
+    assert_eq!(
+        b["intervalSecs"],
+        tailrace_console::alerting::interval_from_env().as_secs()
+    );
+    let (from, to) = (b["fromMs"].as_i64().unwrap(), b["toMs"].as_i64().unwrap());
+    assert_eq!(to - from, 3_600_000);
+    assert!(to as u64 >= now, "window ends at the request clock");
+    let series = b["series"].as_array().unwrap();
+    assert_eq!(
+        series
+            .iter()
+            .map(|s| s["pipeline"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["3", "4", "5"]
+    );
+    for s in series {
+        let (p, st) = (
+            s["pipeline"].as_str().unwrap(),
+            s["statement"].as_str().unwrap(),
+        );
+        let values = ring_values(&app, p, st, from, to);
+        assert_eq!(
+            s["samples"],
+            values.len(),
+            "sample count = ring rows ({p}/{st})"
+        );
+        for (key, pct) in [("p50", 50), ("p95", 95), ("p99", 99)] {
+            let reported = s[key].as_f64().unwrap();
+            assert_eq!(
+                reported,
+                recompute(&values, pct),
+                "{key} of {p}/{st} recomputes"
+            );
+            assert!(values.contains(&reported), "{key} is a stored sample");
+        }
+    }
+    // the hand-checkable expectations behind the recomputation
+    let p3 = &series[0];
+    assert_eq!(
+        (
+            p3["samples"].as_u64(),
+            p3["p50"].as_f64(),
+            p3["p95"].as_f64(),
+            p3["p99"].as_f64()
+        ),
+        (Some(20), Some(10.0), Some(19.0), Some(20.0)),
+        "1..=20 → nearest-rank p50 10 / p95 19 / p99 20"
+    );
+    assert_eq!(p3["node"], "edge-1");
+    assert_eq!(p3["oldestMs"], pass_ts(0));
+    assert_eq!(p3["newestMs"], pass_ts(lags.len() - 1));
+    let p4 = &series[1];
+    assert_eq!(p4["samples"], 10, "the 10 idle passes left no sample");
+    assert_eq!(
+        (p4["p50"].as_f64(), p4["p95"].as_f64(), p4["p99"].as_f64()),
+        (Some(1009.0), Some(1019.0), Some(1019.0))
+    );
+    let p5 = &series[2];
+    assert_eq!(
+        (
+            p5["samples"].as_u64(),
+            p5["p95"].as_f64(),
+            p5["node"].as_str()
+        ),
+        (Some(1), Some(6.0), Some("edge-2")),
+        "two nodes, one pass → the worse lag, one sample"
+    );
+
+    // filters narrow by label value; the window query is clamped 1..=3600
+    let (_, b) = req(&app, "GET", "/api/slo?pipeline=3", None).await;
+    assert_eq!(b["series"].as_array().unwrap().len(), 1);
+    let (_, b) = req(&app, "GET", "/api/slo?pipeline=3&statement=1", None).await;
+    assert!(b["series"].as_array().unwrap().is_empty());
+    let (_, b) = req(&app, "GET", "/api/slo?windowSecs=99999", None).await;
+    assert_eq!(b["windowSecs"], 3600);
+    let (_, b) = req(&app, "GET", "/api/slo?windowSecs=abc", None).await;
+    assert_eq!(b["windowSecs"], 3600);
+    let (_, b) = req(&app, "GET", "/api/slo?windowSecs=0", None).await;
+    assert_eq!(b["windowSecs"], 1);
+    assert!(
+        b["series"].as_array().unwrap().is_empty(),
+        "the newest pass sits 1s back — outside a 1s window ending now"
+    );
+
+    // /metrics: the same numbers, labelled {pipeline,statement} (no node)
+    let text = scrape_metrics(&app).await;
+    for family in [
+        "tailrace_slo_lag_p50_seconds",
+        "tailrace_slo_lag_p95_seconds",
+        "tailrace_slo_lag_p99_seconds",
+        "tailrace_slo_lag_samples",
+    ] {
+        assert_eq!(
+            text.matches(&format!("# TYPE {family} gauge\n")).count(),
+            1,
+            "{family} declared once"
+        );
+    }
+    for s in series {
+        let labels = format!(
+            "{{pipeline=\"{}\",statement=\"{}\"}}",
+            s["pipeline"].as_str().unwrap(),
+            s["statement"].as_str().unwrap()
+        );
+        for (family, key) in [
+            ("tailrace_slo_lag_p50_seconds", "p50"),
+            ("tailrace_slo_lag_p95_seconds", "p95"),
+            ("tailrace_slo_lag_p99_seconds", "p99"),
+        ] {
+            let line = format!("{family}{labels} {}\n", s[key].as_f64().unwrap());
+            assert!(text.contains(&line), "missing {line:?} in {text}");
+        }
+        let line = format!("tailrace_slo_lag_samples{labels} {}\n", s["samples"]);
+        assert!(text.contains(&line), "missing {line:?} in {text}");
+    }
+}
+
+/// R11 T-V4 acceptance «窗口滑动 + 裁剪生效» (deterministic clock): the
+/// window is (now − windowSecs, now] — as `now` advances, the oldest
+/// samples leave it (a large early lag stops deciding p95 without any
+/// prune); each pass evicts the ring tail older than 1h in its own batch,
+/// a pass that reports no lag at all still evicts, and the boot sweep drops
+/// what a downtime left behind (idempotent).
+#[tokio::test]
+async fn slo_window_slides_and_ring_prunes_on_write_and_at_startup() {
+    use tailrace_console::slo::{startup_prune, window_summaries, RETENTION_SECS};
+    let app = app().await;
+    let mut evaluator = Evaluator::new();
+    let pass = |lag: f64| lag_snapshot("edge-1", "3", lag);
+    let rows = |app: &TestApp| -> Vec<(i64, f64)> {
+        app.store
+            .with_conn(|c| {
+                let mut stmt =
+                    c.prepare("SELECT ts_ms, lag_secs FROM slo_lag_sample ORDER BY ts_ms")?;
+                let r = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                Ok(r.collect::<Result<Vec<_>, _>>()?)
+            })
+            .unwrap()
+    };
+    let t = |offset: i64| (T0 as i64 + offset) as u64;
+
+    // 58m20s back: a 500s lag, still inside the 1h ring
+    evaluator
+        .run_pass(&app.state, &pass(500.0), t(-3_500_000))
+        .await
+        .unwrap();
+    for (offset, lag) in [(-45_000, 4.0), (-30_000, 1.0), (-15_000, 3.0), (0, 2.0)] {
+        evaluator
+            .run_pass(&app.state, &pass(lag), t(offset))
+            .await
+            .unwrap();
+    }
+    assert_eq!(rows(&app).len(), 5, "nothing older than 1h yet");
+
+    let at = |now: u64, window: u64| {
+        let v = window_summaries(&app.store, now, window, Some("3"), Some("0")).unwrap();
+        assert!(v.len() <= 1);
+        v.into_iter()
+            .next()
+            .map(|s| (s.samples, s.p50, s.p95, s.p99, s.oldest_ms))
+    };
+    // last minute: [4,1,3,2] → p50 2, p95/p99 4
+    assert_eq!(at(t(0), 60), Some((4, 2.0, 4.0, 4.0, T0 as i64 - 45_000)));
+    // whole ring: the 500 joins and decides p95/p99
+    assert_eq!(
+        at(t(0), RETENTION_SECS),
+        Some((5, 3.0, 500.0, 500.0, T0 as i64 - 3_500_000))
+    );
+    // slide 30s: (T0−30s, T0+30s] — the samples at −45s and −30s (the
+    // boundary is exclusive) leave the window
+    assert_eq!(
+        at(t(30_000), 60),
+        Some((2, 2.0, 3.0, 3.0, T0 as i64 - 15_000))
+    );
+    // slide the hour 200s: the 500 leaves the window before any prune
+    assert_eq!(
+        at(t(200_000), RETENTION_SECS),
+        Some((4, 2.0, 4.0, 4.0, T0 as i64 - 45_000))
+    );
+    assert!(
+        rows(&app).iter().any(|(_, lag)| *lag == 500.0),
+        "not pruned yet"
+    );
+    // a window with nothing in it summarizes to nothing
+    assert_eq!(at(t(600_000), 60), None);
+
+    // ring eviction rides the next pass: cutoff T0+200s−1h removes the 500
+    evaluator
+        .run_pass(&app.state, &pass(6.0), t(200_000))
+        .await
+        .unwrap();
+    let left = rows(&app);
+    assert_eq!(left.len(), 5);
+    assert!(
+        left.iter()
+            .all(|(ts, _)| *ts > T0 as i64 + 200_000 - 3_600_000),
+        "every surviving row is inside the ring: {left:?}"
+    );
+    assert!(!left.iter().any(|(_, lag)| *lag == 500.0));
+
+    // a pass that reports no lag series still evicts the tail
+    evaluator
+        .run_pass(&app.state, &[], t(30_000 + 3_600_000))
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&app),
+        vec![(T0 as i64 + 200_000, 6.0)],
+        "only the sample younger than the empty pass' cutoff survives"
+    );
+
+    // console restarts 2h after its last write: the boot sweep drops the tail
+    let boot = t(200_000 + 3_600_000 + 7_200_000);
+    assert_eq!(startup_prune(&app.store, boot).unwrap(), 1);
+    assert!(rows(&app).is_empty());
+    assert_eq!(startup_prune(&app.store, boot).unwrap(), 0, "idempotent");
+    assert_eq!(at(boot, RETENTION_SECS), None);
 }

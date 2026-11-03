@@ -7,15 +7,16 @@
 //! client's declared `clientInfo.name`; clients that do not echo it fall
 //! back to `X-MCP-Client` / `User-Agent` labelling.
 //!
-//! Tools: fourteen entries (the §7.5 ten plus the R8 four — DDL
+//! Tools: sixteen entries (the §7.5 ten, the R8 four — DDL
 //! draft/execute/evolve and backfill status; `trigger_backfill` already
-//! covered create-with-dryRun), each a thin adapter over the REST handler
-//! it maps to — same DTOs, same error envelopes, invoked in-process (no
-//! HTTP hop, no session middleware; `/mcp` follows the MCP convention of no
-//! console auth, only a global fixed-window rate limit). Read tools are
-//! always on. The six write tools need BOTH the process-level switch
-//! (`--mcp-allow-write` / `MCP_ALLOW_WRITE=1`) AND `"confirm": true` in the
-//! call arguments.
+//! covered create-with-dryRun — and the R11 pipeline-as-code pair
+//! `apply` / `apply_dry_run`, which spends the ≤16 budget), each a thin
+//! adapter over the REST handler it maps to — same DTOs, same error
+//! envelopes, invoked in-process (no HTTP hop, no session middleware;
+//! `/mcp` follows the MCP convention of no console auth, only a global
+//! fixed-window rate limit). Read tools are always on. The seven write
+//! tools need BOTH the process-level switch (`--mcp-allow-write` /
+//! `MCP_ALLOW_WRITE=1`) AND `"confirm": true` in the call arguments.
 //!
 //! Tool descriptions are GENERATED from the OpenAPI document (R8): each
 //! tool names its `(method, path)` and the description text is the
@@ -29,12 +30,22 @@
 //! non-string name, non-object `arguments` — audited as rejected with
 //! `UNKNOWN_TOOL` / `INVALID_PARAMS`). Write tools that pass the gates
 //! additionally produce the REST handler's own domain
-//! audit row (PIPELINE_CREATE / PIPELINE_DEPLOY / PIPELINE_ACTION) under
-//! the same actor: the handler's operator resolves to the MCP identity.
+//! audit row (PIPELINE_CREATE / PIPELINE_DEPLOY / PIPELINE_ACTION, the T-G6
+//! per-write rows plus the APPLY summary) under the same actor: the
+//! handler's operator resolves to the MCP identity.
 //!
 //! `trigger_backfill` (T-A2, §7.3): maps to POST /api/pipelines/{id}/backfill
 //! with `dryRun` defaulting to TRUE (blueprint §7.5 — an MCP caller gets the
 //! zero-side-effect preview unless it explicitly asks for execution).
+//!
+//! `apply` / `apply_dry_run` (T-V3, R11): the T-G6 pipeline-as-code pair as
+//! tools — POST /api/apply and POST /api/apply/dry-run, the declaration file
+//! riding the call arguments verbatim (minus `confirm`). The diff is computed
+//! once, server-side, by the same `plan()` the CLI shell and CI hit, so an
+//! MCP client cannot see a different diff than the one apply lands. The dry
+//! run has zero side effects (nothing written, nothing audited beyond this
+//! module's MCP_TOOL_CALL envelope row); the apply is the idempotent upsert
+//! behind both write gates.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -86,7 +97,10 @@ pub const RATE_LIMITED: i64 = -32002;
 /// four: the DDL closed loop (`ddl_draft` read — it composes text only;
 /// `ddl_execute` / `ddl_evolve` write — they run DDL on Doris) and
 /// `backfill_status` (read — the job progress list; `trigger_backfill`
-/// already covers create, dryRun included). Fourteen of the ≤16 budget.
+/// already covers create, dryRun included). The R11 pair closes the
+/// sixteen: `apply` write (the T-G6 idempotent upsert), `apply_dry_run`
+/// read (the same diff, zero side effects). Sixteen of the ≤16 budget —
+/// the surface is full; a new tool needs a budget ruling first.
 pub const TOOLS: &[(&str, bool)] = &[
     ("list_datasources", false),
     ("list_pipelines", false),
@@ -102,6 +116,8 @@ pub const TOOLS: &[(&str, bool)] = &[
     ("ddl_execute", true),
     ("ddl_evolve", true),
     ("backfill_status", false),
+    ("apply", true),
+    ("apply_dry_run", false),
 ];
 
 // ---------------- state / router ----------------
@@ -358,10 +374,10 @@ fn instructions(allow_write: bool) -> String {
     };
     format!(
         "Tailrace console management plane. Read tools (list/get/compile, ddl_draft, \
-         backfill_status) are always available. Write tools (create_pipeline, \
-         deploy_pipeline, pause_resume_pipeline, trigger_backfill, ddl_execute, ddl_evolve) \
-         are {writes}; every write call must also pass \"confirm\": true. All calls are \
-         audited as actor mcp:<client>."
+         backfill_status, apply_dry_run) are always available. Write tools (create_pipeline, \
+         deploy_pipeline, pause_resume_pipeline, trigger_backfill, ddl_execute, ddl_evolve, \
+         apply) are {writes}; every write call must also pass \"confirm\": true. All calls \
+         are audited as actor mcp:<client>."
     )
 }
 
@@ -616,9 +632,71 @@ async fn execute(
             api::datasources::ddl_evolve(st, identity(), HeaderMap::new(), Path(target)).await
         }
         "backfill_status" => api::pipelines::backfill_jobs(st, Path(req_i64(args, "id")?)).await,
+        // R11 (T-V3): the T-G6 pipeline-as-code pair. The arguments ARE the
+        // declaration file (datasources / tables / pipelines sections) and
+        // pass through verbatim once `confirm` is lifted out — the handler's
+        // own top-level key check then refuses a typo'd section as a 400,
+        // exactly as it does for the CLI shell. Both run the same `plan()`:
+        // dry-run stops at the diff (handler-side zero side effects), apply
+        // executes it under the MCP identity so its per-write domain rows
+        // and the APPLY summary row carry `mcp:<client>`.
+        "apply" => {
+            let mut body = args.clone();
+            body.remove("confirm");
+            api::apply::apply(st, identity(), HeaderMap::new(), json_bytes(&body)).await
+        }
+        "apply_dry_run" => {
+            // R11 review: `/mcp` carries no console session and this tool
+            // rides neither write gate, while `plan()` opens the stored
+            // credential and compares it with a declared one (so a re-applied
+            // file reads "unchanged"). Over an unauthenticated transport that
+            // comparison is a password oracle — declare a guess, read whether
+            // the `credential` diff line appears — with none of the lockout
+            // the REST login has. Refuse declarations that carry a credential
+            // at all: omitting it keeps the stored one (§4.2 blank-password
+            // semantics), and the session-scoped REST `POST /api/apply/dry-run`
+            // previews credential changes with the authority they need.
+            if let Some(name) = declared_credential(args) {
+                return Err(RpcErr::new(
+                    INVALID_PARAMS,
+                    format!(
+                        "apply_dry_run does not accept datasource credentials over MCP \
+                         (datasource {name:?} declares username/password): omit them — the \
+                         stored credential is kept — or preview with the session-scoped \
+                         POST /api/apply/dry-run"
+                    ),
+                    Some(json!({ "code": "CREDENTIALS_NOT_ALLOWED", "datasource": name })),
+                ));
+            }
+            api::apply::dry_run(st, identity(), HeaderMap::new(), json_bytes(args)).await
+        }
         other => return Err(RpcErr::invalid_params(format!("unknown tool: {other}"))),
     };
     Ok(response)
+}
+
+/// The first `datasources[]` entry of a declaration that carries a
+/// credential — the same presence test as `credential_payload`
+/// (`api/datasources.rs`: non-blank username OR non-empty password), so
+/// exactly the declarations `plan()` would compare against the store are
+/// the ones refused. Returns the entry's `name` (empty when missing).
+fn declared_credential(args: &Map<String, Value>) -> Option<String> {
+    args.get("datasources")?.as_array()?.iter().find_map(|ds| {
+        let has_user = ds
+            .get("username")
+            .and_then(Value::as_str)
+            .is_some_and(|u| !u.trim().is_empty());
+        let has_pass = ds
+            .get("password")
+            .and_then(Value::as_str)
+            .is_some_and(|p| !p.is_empty());
+        (has_user || has_pass).then(|| {
+            ds.get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        })
+    })
 }
 
 /// The DDL tools' path triple: `(datasourceId, db, table)` — required, typed.
@@ -730,6 +808,8 @@ fn tool_route(name: &str) -> (&'static str, &'static str) {
             "/api/datasources/{id}/tables/{db}/{table}/ddl/evolve",
         ),
         "backfill_status" => ("GET", "/api/pipelines/{id}/backfill/jobs"),
+        "apply" => ("POST", "/api/apply"),
+        "apply_dry_run" => ("POST", "/api/apply/dry-run"),
         other => unreachable!("tool_route called with unregistered tool {other:?}"),
     }
 }
@@ -777,6 +857,33 @@ fn tool_definition(name: &str, write: bool) -> Value {
         "datasourceId": { "type": "integer", "description": "Doris/StarRocks datasource id" },
         "db": { "type": "string" },
         "table": { "type": "string" }
+    });
+    // The T-G6 declaration file, shared by the apply pair: the section
+    // bodies are the REST CRUD DTOs (DatasourceUpsertBody / TableRegisterBody
+    // + datasource name / PipelineUpsertBody — see the OpenAPI components),
+    // kept as opaque objects here so this schema cannot drift from serde.
+    // Absent vs present section is meaningful (docs/ops/pipeline-file.md).
+    let apply_file = json!({
+        "type": "object",
+        "description": "Declaration file (docs/ops/pipeline-file.md). Every section is optional; a PRESENT section is the declared full set of that kind — console objects it does not name are reported as orphans, never deleted. Objects are identified by business key (datasource name / datasource+db+table / pipeline name), never by numeric id.",
+        "properties": {
+            "datasources": {
+                "type": "array",
+                "description": "DatasourceUpsertBody entries: name, type, connJson, optional username/password (blank password keeps the stored credential)",
+                "items": { "type": "object" }
+            },
+            "tables": {
+                "type": "array",
+                "description": "TableRegisterBody entries plus `datasource` — the owning datasource NAME (numeric ids are still accepted)",
+                "items": { "type": "object" }
+            },
+            "pipelines": {
+                "type": "array",
+                "description": "PipelineUpsertBody entries: name, sqlContent, dsMapping (alias -> datasource NAME or id), checkpointMs, preferredNodeId, config",
+                "items": { "type": "object" }
+            }
+        },
+        "additionalProperties": false
     });
     let description = openapi_tool_description(name);
     let mut schema = match name {
@@ -914,6 +1021,16 @@ fn tool_definition(name: &str, write: bool) -> Value {
             "required": ["id"],
             "additionalProperties": false
         }),
+        "apply" => apply_file,
+        "apply_dry_run" => {
+            // R11 review: the read tool refuses declared credentials (see
+            // `execute`) — say so where an agent reads the argument shape
+            let mut schema = apply_file;
+            schema["properties"]["datasources"]["description"] = json!(
+                "DatasourceUpsertBody entries: name, type, connJson. username/password are REFUSED by this tool (CREDENTIALS_NOT_ALLOWED): the MCP transport carries no console session, and a credential diff over it would be a password oracle — omit them (the stored credential is kept) or preview credential changes over the session-scoped POST /api/apply/dry-run"
+            );
+            schema
+        }
         other => unreachable!("tool_definition called with unregistered tool {other:?}"),
     };
     if write {
@@ -1133,11 +1250,11 @@ fn tool_label(params: &Value) -> String {
     }
 }
 
-/// One audit-bounded JSON rendering: serialized then head-truncated to
-/// [`MAX_AUDIT_STRING_CHARS`] chars (for values that cannot ride the
-/// args map, e.g. a non-object `arguments` payload).
+/// One audit-bounded JSON rendering: credentials stripped, then serialized
+/// and head-truncated to [`MAX_AUDIT_STRING_CHARS`] chars (for values that
+/// cannot ride the args map, e.g. a non-object `arguments` payload).
 fn brief_value(v: &Value) -> Value {
-    let s = serde_json::to_string(v).unwrap_or_default();
+    let s = serde_json::to_string(&abbreviate_value(v)).unwrap_or_default();
     if s.chars().count() > MAX_AUDIT_STRING_CHARS {
         let head: String = s.chars().take(MAX_AUDIT_STRING_CHARS).collect();
         Value::String(format!("{head}...({} chars)", s.chars().count()))
@@ -1146,23 +1263,50 @@ fn brief_value(v: &Value) -> Value {
     }
 }
 
-/// Bound audit noise: string values longer than [`MAX_AUDIT_STRING_CHARS`]
-/// are head-truncated with their original length noted (SQL bodies etc.).
+/// Keys whose values never ride an audit row, at any depth: the declaration
+/// file's datasource credentials (`DatasourceUpsertBody.username` /
+/// `.password`, nested under `datasources[]` on the apply pair). The
+/// datasources.rs invariant — plaintext never reaches storage — holds for
+/// `audit_log.detail_json` too (R11 review). Matched case-insensitively.
+const REDACTED_KEYS: &[&str] = &["password", "username"];
+const REDACTED: &str = "<redacted>";
+
+/// Bound audit noise and strip credentials, recursively: string values
+/// longer than [`MAX_AUDIT_STRING_CHARS`] are head-truncated with their
+/// original length noted (SQL bodies etc.), arrays and objects are walked,
+/// and a non-null value under a [`REDACTED_KEYS`] key becomes [`REDACTED`]
+/// (a null stays null — "no credential declared" is not a secret). The
+/// pre-review version truncated top-level strings only and cloned nested
+/// values verbatim, which landed `datasources[].password` in the audit log.
 fn abbreviate_args(args: &Map<String, Value>) -> Value {
     Value::Object(
         args.iter()
-            .map(|(k, v)| {
-                let v = match v {
-                    Value::String(s) if s.chars().count() > MAX_AUDIT_STRING_CHARS => {
-                        let head: String = s.chars().take(MAX_AUDIT_STRING_CHARS).collect();
-                        Value::String(format!("{head}...({} chars)", s.chars().count()))
-                    }
-                    other => other.clone(),
-                };
-                (k.clone(), v)
-            })
+            .map(|(k, v)| (k.clone(), abbreviate_field(k, v)))
             .collect(),
     )
+}
+
+fn abbreviate_field(key: &str, v: &Value) -> Value {
+    if !v.is_null() && REDACTED_KEYS.iter().any(|r| key.eq_ignore_ascii_case(r)) {
+        return Value::String(REDACTED.to_string());
+    }
+    abbreviate_value(v)
+}
+
+fn abbreviate_value(v: &Value) -> Value {
+    match v {
+        Value::String(s) if s.chars().count() > MAX_AUDIT_STRING_CHARS => {
+            let head: String = s.chars().take(MAX_AUDIT_STRING_CHARS).collect();
+            Value::String(format!("{head}...({} chars)", s.chars().count()))
+        }
+        Value::Array(items) => Value::Array(items.iter().map(abbreviate_value).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), abbreviate_field(k, v)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 // ---------------- rate limit ----------------
@@ -1205,20 +1349,21 @@ impl RateLimiter {
 mod tests {
     use super::*;
 
-    /// §7.5 + R8 surface guard: exactly fourteen tools (the blueprint ten
-    /// plus the DDL closed loop and backfill status — within the ≤16
-    /// budget), eight read + six write, unique names, every definition
-    /// well-formed, `confirm` required on writes, and every description
-    /// GENERATED from the OpenAPI document (route prefix + the operation's
-    /// text — the same-source rule; a handler losing its doc comment turns
-    /// this red, not a silently stale hand-written copy).
+    /// §7.5 + R8 + R11 surface guard: exactly sixteen tools (the blueprint
+    /// ten, the DDL closed loop and backfill status, the pipeline-as-code
+    /// apply pair — the ≤16 budget spent), nine read + seven write, unique
+    /// names, every definition well-formed, `confirm` required on writes,
+    /// and every description GENERATED from the OpenAPI document (route
+    /// prefix + the operation's text — the same-source rule; a handler
+    /// losing its doc comment turns this red, not a silently stale
+    /// hand-written copy).
     #[test]
     fn tool_table_matches_the_registered_surface() {
-        assert_eq!(TOOLS.len(), 14, "fourteen tools (≤16 budget)");
+        assert_eq!(TOOLS.len(), 16, "sixteen tools (the ≤16 budget, now full)");
         assert!(TOOLS.len() <= 16, "the R8 tool-face budget");
         let reads = TOOLS.iter().filter(|(_, w)| !w).count();
         let writes = TOOLS.iter().filter(|(_, w)| *w).count();
-        assert_eq!((reads, writes), (8, 6));
+        assert_eq!((reads, writes), (9, 7));
         let names: Vec<&str> = TOOLS.iter().map(|(n, _)| *n).collect();
         let mut unique = names.clone();
         unique.sort_unstable();
@@ -1307,5 +1452,97 @@ mod tests {
         assert!(!rl.allow_at(t0 + std::time::Duration::from_millis(900)));
         // new window
         assert!(rl.allow_at(t0 + std::time::Duration::from_secs(1)));
+    }
+
+    /// R11 review: the audit rendering strips credentials at every depth
+    /// (the apply pair's `datasources[].username/password`, any key case),
+    /// keeps a declared-null as null, leaves the rest of the object intact
+    /// and truncates long nested strings too — and the non-object fallback
+    /// (`brief_value`) goes through the same stripping before it is
+    /// serialized.
+    #[test]
+    fn audit_args_redact_credentials_at_every_depth_and_bound_strings() {
+        let long_sql = "SELECT ".repeat(60);
+        let args: Map<String, Value> = serde_json::from_value(json!({
+            "confirm": true,
+            "datasources": [
+                {"name": "lake", "type": "doris",
+                 "connJson": {"jdbcUrl": "jdbc:mysql://fe:9030", "streamLoadUrl": "http://fe:8030"},
+                 "username": "root", "password": "s3cr3t-pw"},
+                {"name": "edge", "type": "kafka", "connJson": {"bootstrap": "b:9092"},
+                 "password": null}
+            ],
+            "pipelines": [{"name": "p", "sqlContent": long_sql, "nested": {"PASSWORD": "Upper-Case-Key"}}]
+        }))
+        .unwrap();
+        let out = abbreviate_args(&args);
+        let text = out.to_string();
+        for secret in ["s3cr3t-pw", "\"root\"", "Upper-Case-Key"] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
+        assert_eq!(out["datasources"][0]["password"], REDACTED);
+        assert_eq!(out["datasources"][0]["username"], REDACTED);
+        assert_eq!(out["pipelines"][0]["nested"]["PASSWORD"], REDACTED);
+        assert_eq!(
+            out["datasources"][1]["password"],
+            Value::Null,
+            "a declared null is not a secret"
+        );
+        assert_eq!(out["datasources"][0]["name"], "lake");
+        assert_eq!(
+            out["datasources"][0]["connJson"]["jdbcUrl"],
+            "jdbc:mysql://fe:9030"
+        );
+        assert_eq!(out["confirm"], true);
+        let sql = out["pipelines"][0]["sqlContent"].as_str().unwrap();
+        assert!(
+            sql.ends_with(&format!("...({} chars)", long_sql.chars().count())),
+            "nested long strings are bounded too: {sql}"
+        );
+        // the non-object fallback strips before it serializes
+        let brief = brief_value(&json!([{"password": "pw-in-array"}]));
+        assert!(!brief.to_string().contains("pw-in-array"), "{brief}");
+        assert!(brief.to_string().contains(REDACTED));
+    }
+
+    /// R11 review: `apply_dry_run` refuses a declaration that carries a
+    /// credential — the presence test is `credential_payload`'s (a blank
+    /// username / empty password is "keep the stored credential", not a
+    /// declaration), and the first offending entry is named.
+    #[test]
+    fn declared_credential_matches_the_plan_presence_test() {
+        let file = |ds: Value| -> Map<String, Value> {
+            serde_json::from_value(json!({ "datasources": [ds] })).unwrap()
+        };
+        assert_eq!(declared_credential(&Map::new()), None, "no section");
+        assert_eq!(
+            declared_credential(&file(json!({"name": "a", "type": "kafka"}))),
+            None
+        );
+        assert_eq!(
+            declared_credential(&file(
+                json!({"name": "a", "username": "  ", "password": ""})
+            )),
+            None,
+            "blank halves keep the stored credential — not a declaration"
+        );
+        assert_eq!(
+            declared_credential(&file(json!({"name": "a", "password": "x"}))),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            declared_credential(&file(json!({"name": "b", "username": "root"}))),
+            Some("b".to_string())
+        );
+        assert_eq!(
+            declared_credential(&file(json!({"password": "x"}))),
+            Some(String::new()),
+            "a nameless entry is still refused"
+        );
+        let two: Map<String, Value> = serde_json::from_value(json!({
+            "datasources": [{"name": "clean"}, {"name": "second", "password": "x"}]
+        }))
+        .unwrap();
+        assert_eq!(declared_credential(&two), Some("second".to_string()));
     }
 }
