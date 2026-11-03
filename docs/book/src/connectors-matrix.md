@@ -1,6 +1,6 @@
 # 连接器矩阵
 
-> 矩阵各行与仓库 `README.zh-CN.md`「连接器矩阵」同源（post-R8 工作线实况；jdbc 行的文档链接改指本站 [JDBC 批源](connectors-jdbc.md) 章）。逐连接器文档页随各自连接器交付后逐篇开页——目前只有 JDBC 一篇（维表装载也在其 §四·五）。代码锚点为仓库内 `路径:行号`，与 README 能力矩阵同一批实读。
+> 矩阵各行与仓库 `README.zh-CN.md`「连接器矩阵」同源（post-R11 工作线实况；jdbc 行的文档链接改指本站 [JDBC 批源](connectors-jdbc.md) 章）。逐连接器文档页随各自连接器交付后逐篇开页——目前只有 JDBC 一篇（维表装载也在其 §四·五）。代码锚点为仓库内 `路径:行号`，与 README 能力矩阵同一批实读。
 
 ## 一、源 / 汇矩阵
 
@@ -50,7 +50,7 @@ post-R8 为**十六词**线契约（`engine/crates/tailrace-ir/src/column_type.r
 | `variant` | Utf8（原始 JSON 透传） | `VARIANT`（A4，DESC 回读 `variant`，2.1.7/3.1.4 双版本探针实测） |
 | `null` | Null | **未映射**（显式报错不折叠） |
 
-未知词：一个 minor 版本的迁移窗内 warn（列名 + 已知词表）并折为 `utf8`——与 G2 前 `_ => Utf8` 臂行为一致；窗口常量翻转后转硬错误、装配期拒绝（`column_type.rs:14-20`）。建表闭环对唯一未映射词 `null` **显式报错不折叠**。`infer-schema` 对 SQL 后端的 DDL 列型按同一词表收窄（`engine/crates/tailrace-metadata/src/infer.rs:257` `ddl_arrow_type` / `:296` `pg_arrow_type`；`array<float>` 折回 `list<float32>`，dim 对 DESC 不可见）。
+未知词：1.2.x 为一个 minor 版本的迁移窗（warn 列名 + 已知词表后折为 `utf8`，与 G2 前 `_ => Utf8` 臂行为一致）；**R11 起窗口常量已翻 false（1.3.0 BREAKING）**——未知词装配期硬错，错误携列名 + 原词 + 已知词表（`column_type.rs:173` `UNKNOWN_TYPE_UTF8_MIGRATION_WINDOW`、`:182` `arrow_type_or_utf8`）。建表闭环对唯一未映射词 `null` **显式报错不折叠**。`infer-schema` 对 SQL 后端的 DDL 列型按同一词表收窄（`engine/crates/tailrace-metadata/src/infer.rs:257` `ddl_arrow_type` / `:296` `pg_arrow_type`；`array<float>` 折回 `list<float32>`，dim 对 DESC 不可见）。
 
 ### 3.1 VARIANT 与向量列的读回语义（探针实测，如实入档）
 
