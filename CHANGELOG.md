@@ -5,13 +5,163 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+<!-- Release notes draft (v1.3.0) — paste into the GitHub Release body when the
+     user gate opens the tag. Every claim below is from this tree; nothing is
+     tagged or published yet (see the [1.3.0] scope paragraph). -->
+
+**v1.3.0 — the breaking minor: unknown column-type words stop folding, and they
+now fail at the registration desk instead of at deploy.**
+
+Two rounds land in this cut: R11 (the v1.3 feature line) and R12 (the
+breaking-change footwork + hygiene wave).
+
+- **Idle-aware alerting.** A pipeline that is running but has no data stops
+  paging you: sources report a *positional* idle verdict (EOF for files,
+  next-offset == end-offset for Kafka), the console holds the `lag_seconds`
+  rule while backlog is genuinely absent, and a firing episode now closes
+  after two consecutive idle ticks (R12) instead of timing out.
+- **The DLQ side file deduplicates rows.** One bad row lands once per replay
+  window; the attempt counters keep counting, so a replay storm stays visible
+  on the audit face.
+- **SLO history.** lag p50/p95/p99 over a 1 h sample ring, on `/metrics` and
+  `GET /api/slo`; every reported quantile is a stored sample.
+- **MCP GitOps is complete.** 16 tools (8 read + 8 write): `apply` /
+  `apply_dry_run` (R11) plus `publish_pipeline` (R12), so an AI client can
+  create, preview, publish and read lag without touching REST.
+- **BREAKING, twice.** (1) An unknown column-type word is a hard error at
+  pipeline assembly and — new in this cut — at register / apply / DDL-draft /
+  publish in the console, with the column index, the offending word and the
+  suggested vocabulary in the 400. (2) MCP `get_pipeline_logs` left the
+  sixteen-tool surface (the REST `GET /api/pipelines/{id}/logs` remains).
+  Both have an upgrade guide in the [1.3.0] entry below.
+- **Hygiene.** Dogfooding round 5 (a real new-user run of the README
+  Quickstart, with a friction list), the gate-discipline record (no
+  `CARGO_PROFILE_*_DEBUG` prefix in gate commands), and three dogfood scripts
+  whose assertions had quietly become vacuous.
+
+```bash
+# after the user gate publishes 1.3.0
+cargo install tailrace-node --version 1.3.0 --locked
+cargo install tailrace-console --version 1.3.0 --locked
+```
+
 ## [Unreleased]
 
-_v1.3 development line (`feature/v1.3-dev`, R11 §二). Anchors are
-`path:line` in this tree._
+_Nothing yet — v1.3.0 was cut from this section on 2026-11-15._
+
+## [1.3.0] - 2026-11-15
+
+_Scope: changes since v1.2.0 — two development rounds on the v1.3 line
+(`feature/v1.3-dev` through merge `c056b37`, then `feature/v1.3-fixes` at
+`2a41a7a`): **R11** (T-V1 idle-aware alerting / T-V2 DLQ row dedup / T-V3 MCP
+apply pair / T-V4 SLO lag quantiles / T-V5 migration-window hard error / T-V6
+compose-2.1.7 vector re-verify) and **R12** (T-A column-type precheck / T-B
+two-tick idle clear / T-C MCP `publish_pipeline` / T-D hygiene wave / T-E
+dogfooding round 5 / T-F this cut). This entry cuts the tree at 1.3.0 in
+lockstep — one workspace version inherited by all 23 members, 22 of them
+publishable (`tests-contract` stays `publish = false`); the v1.3.0 tag, the
+binary release and the crates.io publish follow it (R5 precedent — version
+first, publish second). e2e counts quoted below are the figures recorded when
+each round landed (`scripts/e2e/`, against Doris 2.1.7 in compose and an
+external 3.1.4), not re-run for this entry unless the bullet says so. Anchors
+are `path:line` in this tree._
+
+### Breaking changes and upgrade guide (1.2.0 → 1.3.0)
+
+1. **Unknown column-type vocabulary is a hard error — and it now fails early.**
+   `UNKNOWN_TYPE_UTF8_MIGRATION_WINDOW` is `false`
+   (`engine/crates/tailrace-ir/src/column_type.rs:173`): the one-minor
+   warn-then-fold window G2 shipped in 1.2.x is closed, so a
+   `TableObject.columns` type word outside the 16-word vocabulary — `utf8,
+   string, int8, int16, int32, int64, float32, float64, decimal(p,s),
+   timestamp(s|ms|us|ns), date, bool, binary, list<float32[,dim]>, variant,
+   null` (`KNOWN_VOCABULARY`, `column_type.rs:202`) — fails pipeline assembly
+   through `arrow_type_or_utf8` / `arrow_field_or_utf8` (`column_type.rs:182`
+   / `:229`). **New in this cut (R12 T-A)**: the console refuses the word before
+   it becomes a stored declaration — `register_table`
+   (`console/crates/tailrace-console/src/api/datasources.rs:1332`), the apply
+   plan's `tables` section (`api/apply.rs:592`), `ddl/draft`'s `columnTypes`
+   overrides (`api/datasources.rs:2014`) and the publish gate for
+   already-registered declarations (`api/pipelines.rs:1196`, the
+   `unknown_type_gate` at `:375`) all answer 400 with
+   `err.table_object.unknown_column_type` naming the column index, the
+   offending word and the suggested vocabulary — never the engine's assembly
+   error. Upgrade guide in one sentence: **a 1.2.0 declaration that carries an
+   unknown word now errors at the registration desk, with the suggested words
+   listed, instead of passing register→apply→publish and failing at deploy or
+   node restart.** `GET /api/datasources/tables` additionally lists such
+   pre-existing words per row as `unknownColumnTypes`
+   (`api/datasources.rs:354`, built at `:1408`) — a hint only, no behaviour
+   change, so a 1.2.0 store stays readable and you can re-spell the word and
+   re-save. Legitimate 16-word declarations are unaffected; the contract case
+   `ta_column_type_precheck` (`console/crates/tailrace-console/tests/
+  datasources_crud.rs:770`) drives register-reject / draft-reject /
+  legal-pass / legacy-compat (a 1.2.0-shaped spec applies, then re-applies as
+  `unchanged`) in one test. The apply-side refusal rides the same helper
+  (`api/apply.rs:592`); the publish gate reports the same code as a compile
+  diagnostic (`api/pipelines.rs:375`) — the Added bullet below records which
+  of those have a pinned case.
+2. **MCP: `get_pipeline_logs` left the surface; `publish_pipeline` took its
+   place** (R12 T-C). The tool count stays at the ≤16 budget — now 8 read +
+   8 write (`console/crates/tailrace-console/src/mcp.rs:108`, the split pinned
+   at `:1336`). An MCP client that called `get_pipeline_logs` must switch to the
+   session-scoped REST route `GET /api/pipelines/{id}/logs` (unchanged, still
+   served by the SSE bridge) or read state through `get_pipeline` /
+   `get_pipeline_stats`; `publish_pipeline` (`mcp.rs:680`) is a write tool
+   behind the usual trio — `--mcp-allow-write` / `MCP_ALLOW_WRITE=1`, a literal
+   `"confirm": true`, and an audit row under `mcp:<client>` — and maps 1:1 onto
+   `POST /api/pipelines/{id}/publish`.
 
 ### Added
 
+- **Column-type precheck at the console's entry points** (T-A, R12 — the
+  breaking change's only guardrail, and the fix for the worst upgrade
+  first-impression: a 1.2.0 store with an unknown word used to register, apply
+  and publish green, then fail at deploy or node reassembly). Shared helper
+  `validate_column_type_words` (`console/crates/tailrace-console/src/api/
+  datasources.rs:1941`) parses every `[name, type]` pair through
+  `tailrace_catalog::ColumnType::parse` (catalog re-exports it — zero new
+  dependencies) and rejects the first word outside the vocabulary with a 400
+  carrying the column index, the word and `KNOWN_VOCABULARY`
+  (`err.table_object.unknown_column_type`, `api/messages.rs:189`). Wired at
+  `register_table` (`api/datasources.rs:1332`), the apply plan
+  (`api/apply.rs:592`) and `ddl/draft` (`api/datasources.rs:2014`), plus a
+  publish gate over already-registered declarations (`unknown_type_gate`,
+  `api/pipelines.rs:375` / `:1196`) and the additive `unknownColumnTypes`
+  hint on the tables list (`api/datasources.rs:354`). Test:
+  `ta_column_type_precheck` (`tests/datasources_crud.rs:770`) covers
+  register-reject (400 names the column index, the word and the vocabulary;
+  the row is not persisted), draft-reject, legal-16-word pass and 1.2.0-spec
+  compatibility (apply, then a second apply as `unchanged`). **The apply-side
+  and publish-gate refusals have no dedicated case in that test file**
+  (the file's own doc comment claims an apply case; the body drives only the
+  legacy-compat apply) — recorded here as a known coverage hole, not as a
+  covered path. `docs/protocol/console-api.md` row 1 documents both faces.
+- **MCP `publish_pipeline`: the GitOps chain closes over MCP** (T-C, R12 —
+  dogfooding round 4's "pure-MCP GitOps stops at publish"). The ≤16 budget is
+  spent by replacement, not expansion: the debug-only `get_pipeline_logs`
+  snapshot tool (`logs_snapshot`) is gone and `publish_pipeline` takes its slot
+  (`console/crates/tailrace-console/src/mcp.rs:108` — 8 read + 8 write, pinned
+  at `:1336`); the REST logs route is untouched. The tool is a thin adapter on
+  `api::pipelines::publish` (`mcp.rs:680`), so every gate the REST handler
+  runs (referenced table objects resolved, `${ds:id.db.table}` spec
+  materialised, version bumped) applies verbatim, and its description and
+  parameter schema stay OpenAPI-generated (`tool_route` at `:757`, schema at
+  `:996`). `initialize` instructions list the eight write tools
+  (`mcp.rs:379-383`). Contract test
+  `publish_pipeline_tool_runs_the_write_gates_and_publishes`
+  (`tests/mcp_server.rs:770`); the new MCP-only e2e
+  `scripts/e2e/mcp_publish_chain.sh` drives apply → dry-run → idempotent
+  re-apply → publish → lag hop with nothing but `/mcp` calls (no run recorded
+  at cut time — the script ships with the wave).
+- **compose-2.1.7 vector re-verify closed** (T-V6, R11 — the R9 W4 deferral).
+  The `variant_vector.sh` compose branch had never run; it now does, probe
+  first (`scripts/e2e/evidence/vector-probe-2.1.7-2026-11-02/`) then the full
+  e2e on the compose stack (`scripts/e2e/evidence/
+  variant-vector-e2e-2.1.7-2026-11-02/`, run2 **47/47**; run1 kept as the
+  environmental record of a BE-swap bring-up wrinkle). Same verdicts as the
+  3.1.4 record: variant passthrough and the f32 vector round-trip land
+  identically, the decoder dim guard is the only guard, no `[skip]` needed.
 - **Idle-aware alerting** (T-V1, dogfooding #5 — the "running pipeline with
   no data pages on lag forever" friction). Sources carry a positional idle
   verdict (`Source::idle() -> Option<bool>`,
@@ -38,16 +188,27 @@ _v1.3 development line (`feature/v1.3-dev`, R11 §二). Anchors are
   additive `sourceIdle: true|false|null` (pipeline totals fold
   conservatively: any backlog → false, all idle → true, else null). The
   console's `lag_seconds` rule holds a series whose idle gauge is 1 (same
-  node/pipeline/statement labels): verdict Unknown — never fires, never
-  resolves, sample tagged `reason:"source_idle"`
-  (`console/crates/tailrace-console/src/alerting.rs`, verdict (c) in the
-  module doc); an absent or 0 idle series leaves the rule exactly as in
+  node/pipeline/statement labels): `console/crates/tailrace-console/src/
+  alerting.rs`, verdict (c) in the module doc — **single idle tick: verdict
+  Unknown, never fires, never resolves, sample tagged
+  `reason:"source_idle"`**. That hold is the shape R11 shipped with; R12's
+  T-B bullet under Changed adds the second tick (Clear) because an episode
+  opened on real backlog could not close while the source stayed idle — see
+  that bullet for the corrected semantics.
+  An absent or 0 idle series leaves the rule exactly as in
   1.2.0, so connectors without a verdict are unaffected. `docs/ops/prometheus-alerts.yaml` gains
   the PromQL twin (`unless on (node, pipeline, statement)
-  tailrace_pipeline_source_idle == 1`). Tests: file EOF silent period and
-  kafka catch-up hold while real backlog still fires (alerting unit tests
-  ×3 + driver-level `evaluator_holds_lag_episodes_while_source_idle`), file
-  source EOF/backlog/missing verdicts, kafka streak logic, metrics mapping.
+  tailrace_pipeline_source_idle == 1`). Tests: the hold side is pinned by
+  the alerting unit cases `lag_rule_holds_while_file_source_is_idle_at_eof`
+  (`alerting.rs:1235`) and `lag_rule_holds_once_kafka_source_caught_up`
+  (`:1292`) with `lag_rule_fires_on_real_backlog` (`:1366`) as the negative
+  control, plus the contract case
+  `idle_verdict_never_holds_a_broken_sink_under_default_tuning`
+  (`tests/contract/tests/executor_loop.rs:386`, added by the R11 review).
+  File EOF/backlog/missing verdicts, kafka streak logic and the metrics
+  mapping are pinned separately (the R11 draft's
+  `evaluator_holds_lag_episodes_while_source_idle` name never existed in the
+  tree — corrected here to the names that do).
 - **MCP apply pair: the tool face goes 14 → 16, spending the ≤16 budget**
   (T-V3, R11). Two new tools over `POST /mcp`
   (`console/crates/tailrace-console/src/mcp.rs:104`, the `TOOLS` table):
@@ -65,7 +226,9 @@ _v1.3 development line (`feature/v1.3-dev`, R11 §二). Anchors are
   registered by T-G6, so no OpenAPI change). A passed `apply` produces
   the handler's own domain rows (DATASOURCE/TABLE/PIPELINE_CREATE … with
   `"via":"apply"`) plus the APPLY summary row under `mcp:<client>`. Pinned
-  by the surface unit test (16 tools, 9R+7W) and the contract tests:
+  by the surface unit test (16 tools, 9R+7W — **R12 T-C restates it as 8R+8W**,
+  `publish_pipeline` replacing the `get_pipeline_logs` snapshot, see Added
+  above) and the contract tests:
   switch-off rejection + audit row, dry-run zero side effects (store and
   audit byte-identical but the envelope row), confirm gate, idempotent
   re-apply auditing only the envelope (`tests/mcp_server.rs:595`).
@@ -118,8 +281,9 @@ _v1.3 development line (`feature/v1.3-dev`, R11 §二). Anchors are
   is asserted head-on: a file source at EOF publishes
   `tailrace_pipeline_source_idle=1`, the lag gauge climbs past the threshold
   over pure silence and the rule is HELD — through a pause too (the verdict
-  freezes at its last poll) — no firing, no notice; new data re-stamps the
-  lag and the episode stays quiet. A REAL lag is manufactured the way an
+  goes absent there rather than freezing at its last poll, `lib.rs:936-939`)
+  — no firing, no notice; new data re-stamps the lag and the episode stays
+  quiet. A REAL lag is manufactured the way an
   operator meets one: rows pile up behind a sink whose target path became a
   directory, the first backlog row's flush fails and the restart backoff
   freezes the counters at idle=0 → firing; repairing the sink inside the
@@ -149,12 +313,93 @@ _v1.3 development line (`feature/v1.3-dev`, R11 §二). Anchors are
   its sample count. Findings in `docs/dev/dogfooding-round4-2026-10-31.md`:
   the idle hold shadows a Clear when a backlog drains within one evaluator
   tick (the episode lingers firing until the next data or stop — R12
-  candidate), pure-MCP GitOps stops at publish (no tool in the ≤16 budget;
+  candidate, closed by T-B below), pure-MCP GitOps stops at publish (no tool
+  in the ≤16 budget;
   `deploy_pipeline` on a DRAFT answers 400), the tables-list GET lives at a
   different path shape than its POST (405), and a file-source pipeline only
   feeds the SLO ring while draining (EOF = idle = not sampled).
+  **R12 re-run (W4)**: that first finding (and the pause premise) made the
+  script's assertions stale, not the code — `I2.2` / `L0.2` still demanded a
+  frozen `idle=1` across a pause, which the R11 review fix had already
+  replaced with "verdict absent" on purpose. The script now asserts the
+  shipped contract (idle series ABSENT during the pause and inside the
+  refused-flush backoff, `HOOK_BASE` recorded at the end of section I so
+  later counts read `base + n`) and stands at **69/69**, run twice on the cut
+  tree (`scripts/e2e/evidence/alert_flow-r12w4-2026-11-15/`). No product code
+  changed for it.
+
 ### Changed
 
+- **Idle verdict: two consecutive idle ticks close a firing episode** (T-B,
+  R12 — the round-4 finding "the idle hold shadows a Clear"). R11's rule held
+  EVERY idle tick as `Unknown`, so an episode opened under real backlog never
+  closed once the source went quiet: the lag gauge kept climbing on the clock
+  and the episode lingered until an 80 s timeout — "the problem is gone but
+  the alarm is still ringing". The judgement now distinguishes the two
+  idles off the existing label set (`tailrace_pipeline_source_idle == 1`;
+  no new engine field, no new series): **one idle tick holds** (`Unknown`,
+  sample tagged `reason:"source_idle"` — anti-jitter), **two consecutive idle
+  ticks mean true silence** (source has no backlog AND `pending_rows == 0`
+  per the R11 mouth) and resolve to `Clear` (sample tagged
+  `reason:"idle_cleared"`, the open episode closes on the same row); any
+  non-idle tick resets the counter and evaluates normally
+  (`console/crates/tailrace-console/src/alerting.rs:673`
+  `threshold_verdicts`, counter carried on the evaluator at `:772`).
+  Contract test `evaluator_idle_hold_clears_on_two_ticks`
+  (`tests/alerts_flow.rs:413`: single idle holds, second idle tick resolves
+  the same episode, recovery evaluates normally); e2e section W in
+  `alert_flow.sh` asserts the closed-then-held tail. `docs/protocol/
+  console-api.md` 裁决 11 states the full three-state + idle semantics.
+- **Hygiene wave: gate discipline, engine-v1 stats field set, three dogfood
+  assertions** (T-D, R12; no product code). `docs/dev/
+  gate-discipline-cargo-profile-2026-11-14.md` records the rule the wave
+  itself follows — **gate commands never carry `CARGO_PROFILE_DEV_DEBUG=0`
+  (or any `CARGO_PROFILE_*_DEBUG`)**; `Cargo.toml:71-72` / `:84-85` own the
+  debuginfo policy since R6, so the override only forks a second fingerprint
+  tree (~31 GB × 2, the seven-full-disks failure class). Registered exceptions
+  are named in the record (`scripts/release-crates.sh:63`, the single-writer
+  publish window; historical workflow drafts, kept as history). `docs/protocol/
+  engine-v1.md` now documents the stats FIELD SET rather than its example's
+  subset — `StatementCountersSnapshot` serializes `flushMsTotal` /
+  `lastFlushDurMs` / `lastDataMs` too — and keeps `sourceIdle` with the
+  version note that no published version carries it.
+  `scripts/dogfood/round2.sh`: `TSTEP=now` (missing `$`) made every step after
+  the first report 0 s — fixed (`:56`), now 23/24 with the one FAIL being
+  round 2's own 14-tool MCP face (labelled as drift). `scripts/dogfood/
+  round4.sh`: `S2.5`'s `S_N2 >= S_N` was vacuously true (a 1 h ring cannot
+  shrink inside its window) → now "sample count at the drain edge == count
+  after 4 s of silence" plus "idle gauge exactly 1" (`:359`); `G1.7` only
+  checked a non-empty post-apply generation → now `GEN1` (read before the
+  no-op apply) must equal `GEN2` (`:275`). Whole script re-run 36/36.
+- **Version honesty recheck: R11/R12 are in no published artifact**
+  (`docs/design/architecture.zh.md` header + §一 / §11.2 / §12.1 / debt table,
+  and `docs/book/src/architecture.md` + `protocol-engine.md` follow). The
+  2026-11-03 claim "crates.io is still 1.1.0" was stale — all 22 packages
+  reached 1.2.0 on 2026-11-03 and `cargo install … --version 1.2.0 --locked`
+  succeeds on a clean machine — while the R11/R12 capabilities measured on
+  the installed 1.2.0 binary (no `sourceIdle`, 14 MCP tools, 7 node metric
+  families) are NOT in any release. Debt item 10 closes; the new entry is the
+  1.3.0 tag/publish, the user's reserved decision.
+- **Dogfooding round 5: a real new-user run of the README Quickstart**
+  (T-E, R12; report `docs/dev/dogfooding-round5-2026-11-14.md`, evidence
+  `scripts/dogfood/evidence/round5-2026-11-14/`). Fresh directory, no source
+  tree, plain `cargo install … --version 1.2.0 --locked`, README's three
+  commands verbatim, then the promised "log in, create a pipeline, data
+  flows" — through Doris (2 rows, decimal / µs timestamp / date intact), DDL
+  closed loop and backfill (2 rows written, table still 2 rows after a replay).
+  Verdict: the three commands are byte-executable (only `<...>` placeholders
+  need substitution), but the promise after them is not reachable from the
+  README alone — three unwritten preconditions block the first write: a
+  file-source table object has no UI registration path ("发现资产" is disabled
+  while the table filter is "全部", and the discover endpoint refuses file
+  sources outright); a Doris-sink deploy 502s without
+  `TAILRACE_DS_<datasourceId>` (`api/pipelines.rs:1571`), a name that appears
+  in no README; and the file table name IS the file name under the datasource
+  directory (`conn-file/src/lib.rs:73-79`), so a mismatched name backs off
+  forever while the pipeline still reads RUNNING. Plus four lesser items
+  (single-BE wizard defaults replication 3, "30 秒" vs ~17 min first compile,
+  the placeholder text, the SPA footer still saying v0.1.0). The report also
+  fixes the English README's stale capability row (metrics/tool counts).
 - **DLQ side file is a set of bad rows, not a log of isolation attempts**
   (T-V2, dogfooding #3). `BadRowDlq::write` dedups on the row key
   `(statement, row position, rawB64)` (`engine/crates/tailrace-runtime/src/dlq.rs`)
@@ -1053,7 +1298,8 @@ web UI.
   `checksums.txt`, and community health files (CONTRIBUTING, SECURITY,
   CODE_OF_CONDUCT, issue/PR templates).
 
-[Unreleased]: https://github.com/SeekerGalahad/tailrace/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/SeekerGalahad/tailrace/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/SeekerGalahad/tailrace/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/SeekerGalahad/tailrace/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/SeekerGalahad/tailrace/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/SeekerGalahad/tailrace/compare/v0.1.0...v1.0.0
