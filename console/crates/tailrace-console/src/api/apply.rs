@@ -37,7 +37,7 @@ use utoipa::ToSchema;
 
 use crate::api::datasources::{
     credential_payload, parse_key_model, registry_type, required_conn_keys, table_kind_for,
-    DatasourceUpsertBody, TableRegisterBody,
+    validate_column_type_words, DatasourceUpsertBody, TableRegisterBody,
 };
 use crate::api::messages;
 use crate::api::pipelines::{PipelineConfig, PipelineUpsertBody};
@@ -586,6 +586,11 @@ fn plan(state: &AppState, file: &ApplyFile) -> Result<Plan, Response> {
             .columns_json
             .as_ref()
             .map(|cols| serde_json::to_string(cols).unwrap_or_else(|_| "[]".into()));
+        // T-A 词汇预检：apply tables 计划段的各列类型词须在 16 词表内，
+        // 首个未知词 400（第几列、什么词、建议词表），不转为 utf8 入库。
+        if let Some(cols) = &body.columns_json {
+            validate_column_type_words(&key, cols)?;
+        }
         let format = body
             .format
             .as_deref()

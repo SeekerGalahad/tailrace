@@ -15,6 +15,7 @@ use utoipa::ToSchema;
 
 use crate::api::{audit, iso, operator_of, ErrorResponse};
 use crate::state::AppState;
+use tailrace_catalog::{ColumnType, KNOWN_VOCABULARY};
 
 // ---------------- static type registry (§4.2 GET /api/datasource-types) ----------------
 
@@ -345,6 +346,12 @@ pub struct TableObjectItem {
     pub cursor_semantics: String,
     pub source: String,
     pub columns_json: Option<Vec<(String, String)>>,
+    /// 1.2.0 存量提示（T-A）：表对象登记的列类型词中不在 16 词表内的项，
+    /// `[列名, 词]` 形式，只提示不改行为——1.2.0 登记表的存量表在升级后可见，
+    /// 方便人工在预检拦截前把词改到 16 词表内（register/apply/ddl/draft
+    /// 全面加校验后即拒绝新写入）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unknown_column_types: Option<Vec<(String, String)>>,
     /// Declared key column (T-D1; null = not declared) — dim full-table
     /// load pagination key / doris UNIQUE KEY dedup basis / jdbc cursor.
     pub sequence_column: Option<String>,
@@ -1319,6 +1326,16 @@ pub async fn register_table(
         .columns_json
         .as_ref()
         .map(|cols| serde_json::to_string(cols).unwrap_or_else(|_| "[]".into()));
+    // T-A 词汇预检：register 的 columnsJson 各列类型词须在 16 词表内，
+    // 首个未知词 400（第几列、什么词、建议词表），不转为 utf8 入库。
+    if let Some(cols) = &body.columns_json {
+        if let Err(r) = validate_column_type_words(
+            &format!("{}.{}", body.db_name.trim(), body.table_name.trim()),
+            cols,
+        ) {
+            return r;
+        }
+    }
     let tid = match store.insert_table_object(
         id,
         body.db_name.trim(),
@@ -1382,10 +1399,20 @@ pub async fn list_tables(
             // Store errors propagate to 500 like list_table_objects above;
             // only an unparseable blob degrades to null (build_plan_table
             // semantics, pipelines.rs).
+            // T-A 词汇预检：1.2.0 存量表登记的列类型词若不在 16 词表内，
+            // 列出 [列名, 词] 作为 unknown_column_types（只提示不改行为）。
             let columns_json = store
                 .table_object_columns_json(t.id)?
                 .flatten()
                 .and_then(|s| serde_json::from_str::<Vec<(String, String)>>(&s).ok());
+            let unknown_column_types = columns_json.as_ref().and_then(|cols| {
+                let bad: Vec<(String, String)> = cols
+                    .iter()
+                    .filter(|(_, ty)| ColumnType::parse(ty).is_err())
+                    .cloned()
+                    .collect();
+                (!bad.is_empty()).then_some(bad)
+            });
             Ok(TableObjectItem {
                 id: t.id,
                 datasource_id: t.datasource_id,
@@ -1396,6 +1423,7 @@ pub async fn list_tables(
                 cursor_semantics: t.cursor_semantics,
                 source: t.source,
                 columns_json,
+                unknown_column_types,
                 sequence_column: t.sequence_column,
                 key_model: t.key_model,
             })
@@ -1904,6 +1932,27 @@ fn registered_columns(
     Ok(cols)
 }
 
+/// T-A 词汇预检：`columnsJson` / `columnTypes` 的每一条 `[name, type]` 都要
+/// 在 16 词表内（`tailrace_catalog::ColumnType::parse`，零新依赖）。
+/// 对首个不在表内的项 400，信封指明第几列、什么词、建议词表
+/// (`KNOWN_VOCABULARY`)，不透出引擎侧的装配错误。已知 16 词全放行；
+/// 空/未登记列表不触发（apply 的 tables 段与 register 的无列表走各自
+/// 规则，此处只做“声明了类型就必须在表内”的门）。
+pub(crate) fn validate_column_type_words(
+    table_key: &str,
+    cols: &[(String, String)],
+) -> Result<(), Response> {
+    for (idx, (_name, ty)) in cols.iter().enumerate() {
+        if ColumnType::parse(ty).is_err() {
+            return Err(super::messages::bad_request(
+                "err.table_object.unknown_column_type",
+                &[table_key, &(idx + 1).to_string(), ty, KNOWN_VOCABULARY],
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Wall time + affected rows summed over a batch outcome.
 fn exec_totals(outcome: &tailrace_metadata::ExecOutcome) -> (u64, u64) {
     outcome.statements.iter().fold((0, 0), |(ms, rows), s| {
@@ -1957,6 +2006,22 @@ pub async fn ddl_draft(
     let columns = match body.column_types {
         None => columns,
         Some(overrides) => {
+            // T-A 词汇预检：draft 的 columnTypes 各列类型词须在 16 词表内，
+            // 首个未知词 400（第几列、什么词、建议词表），不透出引擎侧
+            // 装配错误。名字不在登记列表的已由 err.ddl.override_column_unknown
+            // 兜底；此处只判词本身。
+            for (idx, (_name, ty)) in overrides.iter().enumerate() {
+                if ColumnType::parse(ty).is_err() {
+                    return super::messages::bad_request(
+                        "err.table_object.unknown_column_type",
+                        &[
+                            &format!("{}.{}.{}", t.datasource_id, t.db_name, t.table_name),
+                            &(idx + 1).to_string(),
+                            ty,
+                        ],
+                    );
+                }
+            }
             let mut cols = columns;
             for (name, ty) in overrides {
                 match cols.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(&name)) {

@@ -27,7 +27,9 @@ pub use plan_options::{PlanOptions, RecoveryOptions, ReliabilityOptions, TuningO
 /// goes through [`arrow_field_or_utf8`]
 /// (strict the same way, plus the `variant` field marker the decoder
 /// reads).
-pub use tailrace_ir::column_type::{arrow_field_or_utf8, arrow_type_or_utf8, ColumnType};
+pub use tailrace_ir::column_type::{
+    arrow_field_or_utf8, arrow_type_or_utf8, ColumnType, KNOWN_VOCABULARY,
+};
 
 /// Option key canon (R8 G1): the names of the legacy top-level fields that
 /// moved into `TableObject::options`. The catalog owns the SPELLING only

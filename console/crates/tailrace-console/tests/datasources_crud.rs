@@ -598,7 +598,11 @@ async fn table_list_carries_columns_json() {
     assert_eq!(s, StatusCode::CREATED, "{b}");
     let id = b["id"].as_i64().unwrap();
 
-    let cols = json!([["id", "int64"], ["payload", "utf8"], ["ts", "timestamp"]]);
+    let cols = json!([
+        ["id", "int64"],
+        ["payload", "utf8"],
+        ["ts", "timestamp(us)"]
+    ]);
     let (s, b) = req(
         &app,
         "POST",
@@ -753,4 +757,154 @@ async fn starrocks_type_registered_through_console() {
             .contains("starrocks"),
         "{b}"
     );
+}
+
+/// T-A 词汇预检合同测试（四例 + 1 例存量兼容）：
+/// 1. register 拒：columnsJson 含未知词（varchar(64)）→ 400，信封指明第几列、
+///    什么词、建议词表，不写入库；
+/// 2. apply 拒：表声明文件 columnsJson 含未知词 → 400，同形信封；
+/// 3. draft 拒：ddl/draft 的 columnTypes 覆盖含未知词 → 400；
+/// 4. 放行：合法 16 词（含 timestamp(us)/decimal(18,2)）按原样注册/应用；
+/// 5. 存量兼容：1.2.0 形态 spec（全部合法词）仍可部署，预检不阻断既有合法数据。
+#[tokio::test]
+async fn ta_column_type_precheck() {
+    let app = app().await;
+
+    // 种一个 kafka 数据源，供 register/apply/draft 复用
+    let (s, b) = req(
+        &app,
+        "POST",
+        "/api/datasources",
+        Some(json!({"name": "edge-kafka", "type": "kafka", "connJson": {"bootstrap": "127.0.0.1:19092"}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let ds = b["id"].as_i64().unwrap();
+
+    // ---------- 1. register 拒：未知词 ----------
+    let path = format!("/api/datasources/{ds}/tables");
+    let (s, b) = req(
+        &app,
+        "POST",
+        &path,
+        Some(json!({
+            "dbName": "shop", "tableName": "bad",
+            "columnsJson": [["id", "int64"], ["amount", "varchar(64)"]]
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert_eq!(
+        b["error"]["message_key"], "err.table_object.unknown_column_type",
+        "{b}"
+    );
+    let msg = b["error"]["message"].as_str().unwrap().to_string();
+    assert!(
+        msg.contains("第 2 列") && msg.contains("varchar(64)") && msg.contains("utf8"),
+        "400 must name column index, offending word, vocabulary, got: {msg}"
+    );
+    // 未写入库：列表里查不到 bad
+    let (s, b) = req(&app, "GET", "/api/datasources/tables?datasourceId=", None).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert!(
+        b["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["tableName"] != "bad"),
+        "register of unknown word must not persist: {b}"
+    );
+
+    // ---------- 4. 放行：合法 16 词 ----------
+    // draft 端点只对 doris/starrocks 表可用 → 再种一个 doris
+    let (s, b) = req(
+        &app,
+        "POST",
+        "/api/datasources",
+        Some(json!({
+            "name": "shop-doris", "type": "doris",
+            "connJson": {"jdbcUrl": "jdbc:mysql://127.0.0.1:19030/shop", "streamLoadUrl": "http://127.0.0.1:18040"},
+            "username": "loader", "password": "pw"
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let doris = b["id"].as_i64().unwrap();
+    let doris_path = format!("/api/datasources/{doris}/tables");
+
+    let (s, b) = req(
+        &app,
+        "POST",
+        &doris_path,
+        Some(json!({
+            "dbName": "shop", "tableName": "good",
+            "columnsJson": [["id", "int64"], ["ts", "timestamp(us)"], ["amt", "decimal(18,2)"]]
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+
+    // list-tables 行为：合法表的 unknown_column_types 为空/不出现
+    let (s, b) = req(&app, "GET", "/api/datasources/tables?datasourceId=", None).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let good_row = b["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["tableName"] == "good")
+        .expect("good row");
+    assert!(
+        good_row.get("unknown_column_types").is_none(),
+        "legal table reports no unknown types: {b}"
+    );
+
+    // ---------- 3. draft 拒：columnTypes 覆盖含未知词（doris 表上） ----------
+    let path = format!("/api/datasources/{doris}/tables/shop/good/ddl/draft");
+    let (s, b) = req(
+        &app,
+        "POST",
+        &path,
+        Some(json!({"columnTypes": [["amt", "varchar(64)"]]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    assert_eq!(
+        b["error"]["message_key"], "err.table_object.unknown_column_type",
+        "{b}"
+    );
+    let msg = b["error"]["message"].as_str().unwrap().to_string();
+    assert!(
+        msg.contains("varchar(64)"),
+        "draft 400 must name the offending word, got: {msg}"
+    );
+
+    // 同一请求中合法的覆盖仍先被词校验拒绝（不进入生成器）
+    let (s, b) = req(
+        &app,
+        "POST",
+        &path,
+        Some(json!({"columnTypes": [["amt", "decimal(38,9)"]]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["columns"][2][1], "decimal(38,9)", "{b}");
+
+    // ---------- 5. 存量兼容：1.2.0 形态 spec（全部合法词）可应用 ----------
+    let file = json!({
+        "tables": [
+            {
+                "datasource": "edge-kafka",
+                "dbName": "shop",
+                "tableName": "legacy_ok",
+                "columnsJson": [["order_no", "utf8"], ["qty", "int64"], ["payload", "utf8"]]
+            }
+        ]
+    });
+    let (s, b) = req(&app, "POST", "/api/apply", Some(file.clone())).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["summary"]["create"], 1, "{b}");
+    // 同一 spec 再来一次应为 unchanged（幂等，不因预检而阻断）
+    let (s, b) = req(&app, "POST", "/api/apply", Some(file)).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["summary"]["unchanged"], 1, "{b}");
 }
