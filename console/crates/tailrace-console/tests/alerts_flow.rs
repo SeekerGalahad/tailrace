@@ -401,15 +401,16 @@ async fn evaluator_episodes_land_only_on_transitions_and_resolve() {
         .is_empty());
 }
 
-/// T-V1 idle hold through the driver: an episode opened under real backlog
-/// is neither re-fired nor resolved while the source reports idle (the lag
-/// gauge keeps climbing on the clock — the positional verdict says nothing
-/// is behind the cursor); it resolves on the first Clear once rows flow
-/// again. A pipeline idle from the start never opens an episode, however
-/// long the silence. Episode rows and the rule's aggregate state are read
-/// back through the API to pin the store side of "hold".
+/// T-B idle hold → Clear two-tick semantics through the driver: an episode
+/// opened under real backlog is held on the first idle tick (Unknown, no
+/// notice), then closed with a resolved notice on the second consecutive idle
+/// tick (true silence — lag over silence is wall time, not a late row). It
+/// resolves even though the lag gauge keeps climbing on the clock — the old
+/// behavior left it firing until an 80s timeout. A pipeline idle from its
+/// first sample never opens an episode. Episode rows and the rule's aggregate
+/// state are read back through the API to pin the store side.
 #[tokio::test]
-async fn evaluator_holds_lag_episodes_while_source_idle() {
+async fn evaluator_idle_hold_clears_on_two_ticks() {
     let app = app().await;
     create_rule(
         &app,
@@ -433,40 +434,65 @@ async fn evaluator_holds_lag_episodes_while_source_idle() {
     assert_eq!(notices[0].event, "firing");
     let episode = notices[0].event_id;
 
-    // caught up: idle 1 while the lag climbs through an hour of silence →
-    // no notice of either kind, the one episode stays open
-    for lag in [60.0, 300.0, 900.0, 3600.0] {
-        t += 15_000;
-        let n = ev
-            .run_pass(
-                &app.state,
-                &lag_idle_snapshot("edge-1", "3", lag, Some(1)),
-                t,
-            )
-            .await
-            .unwrap();
-        assert!(
-            n.is_empty(),
-            "idle hold must emit nothing at lag {lag}: {n:?}"
-        );
-    }
+    // tick 1 caught up (idle 1): single idle → Unknown, held, no notice,
+    // episode stays open
+    t += 15_000;
+    let n = ev
+        .run_pass(
+            &app.state,
+            &lag_idle_snapshot("edge-1", "3", 60.0, Some(1)),
+            t,
+        )
+        .await
+        .unwrap();
+    assert!(n.is_empty(), "first idle tick holds, emits nothing: {n:?}");
     let (_, b) = req(&app, "GET", "/api/alerts", None).await;
-    assert_eq!(b["rules"][0]["state"], "firing", "held open, not resolved");
+    assert_eq!(
+        b["rules"][0]["state"], "firing",
+        "held open after one idle tick"
+    );
     assert_eq!(b["rules"][0]["openEvent"]["id"], episode);
-    let events = b["events"].as_array().unwrap();
-    assert_eq!(
-        events.len(),
-        1,
-        "no duplicate episode under hold: {events:?}"
-    );
-    assert_eq!(events[0]["state"], "firing");
-    assert_eq!(
-        events[0]["sample"]["value"], 45.0,
-        "a held tick does not touch the open row's sample"
-    );
 
-    // rows flow again (idle 0) and the flush refreshed the lag → resolved
-    // on the same row
+    // tick 2 caught up (idle 1): second consecutive idle → Clear,
+    // resolved notice on the same episode
+    t += 15_000;
+    let notices = ev
+        .run_pass(
+            &app.state,
+            &lag_idle_snapshot("edge-1", "3", 300.0, Some(1)),
+            t,
+        )
+        .await
+        .unwrap();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0].event, "resolved");
+    assert_eq!(notices[0].event_id, episode, "same episode closed");
+    assert_eq!(notices[0].sample["reason"], "idle_cleared");
+    let (_, b) = req(&app, "GET", "/api/alerts", None).await;
+    assert_eq!(
+        b["rules"][0]["state"], "inactive",
+        "episode cleared, rule inactive"
+    );
+    assert!(b["rules"][0]["openEvent"].is_null());
+    let events = b["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["id"], episode);
+    assert_eq!(events[0]["state"], "resolved");
+
+    // further idle ticks stay quiet — nothing left to hold
+    t += 15_000;
+    let n = ev
+        .run_pass(
+            &app.state,
+            &lag_idle_snapshot("edge-1", "3", 3600.0, Some(1)),
+            t,
+        )
+        .await
+        .unwrap();
+    assert!(n.is_empty(), "silence after clear emits nothing: {n:?}");
+
+    // rows flow again (idle 0) → counter reset, normal evaluation;
+    // lag below threshold → Clear, no new episode
     t += 15_000;
     let notices = ev
         .run_pass(
@@ -476,9 +502,12 @@ async fn evaluator_holds_lag_episodes_while_source_idle() {
         )
         .await
         .unwrap();
-    assert_eq!(notices.len(), 1, "{notices:?}");
-    assert_eq!(notices[0].event, "resolved");
-    assert_eq!(notices[0].event_id, episode);
+    assert!(
+        notices.is_empty(),
+        "rows flow again, no transition: {notices:?}"
+    );
+    let (_, b) = req(&app, "GET", "/api/alerts", None).await;
+    assert_eq!(b["rules"][0]["state"], "inactive");
 
     // a pipeline that is idle from its first sample never fires — the
     // "running but no data" pipeline that used to page on lag forever

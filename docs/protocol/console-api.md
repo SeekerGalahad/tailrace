@@ -206,7 +206,11 @@
      Prometheus 栈也能告警是定位；有 Prometheus 的用户用 `docs/ops/prometheus-alerts.yaml` 等价规则 + `docs/ops/grafana-dashboard.json`。
    - **五类规则 v1**：`lag_seconds`（`tailrace_pipeline_lag_seconds > threshold`；**v1.3 T-V1 idle 感知**：同标签 node/pipeline/statement 的
      `tailrace_pipeline_source_idle == 1`——引擎侧**位置判据**：文件源读到 EOF / kafka 消费位连续 3 次检查等于各分区 end-offset，非时间判据，
-     慢消费者游标前仍有行时永不判 idle——该序列本拍 **Unknown/hold**（不 firing 不 resolve，sample 记 `reason:"source_idle"`）；
+     慢消费者游标前仍有行时永不判 idle——**v1.3 两拍判据**：同标签
+     node/pipeline/statement 的 idle 单拍 **Unknown/hold**（不 firing 不 resolve，
+     sample 记 `reason:"source_idle"`，防抖动）；**连续两拍 idle** 判定「真静默」
+     （源无积压 ∧ pending_rows==0），lag 过阈值时第二拍出
+     `Outcome::Clear`（sample 记 `reason:"idle_cleared"`，关闭进行中 episode）；
      idle 序列缺失或为 0 时规则行为与 v1.2 完全一致）、`state_failed`（`tailrace_pipeline_state == 3`）、
      `heartbeat_age`（**console 侧**心跳年龄 > threshold——R9 评审修复：评估器输入里该序列由 `metrics::snapshot` 按 `node.last_heartbeat`
      （console 最后一次收到心跳的时刻）为每个登记节点**合成**（标签 node/node_id），节点自报的 `tailrace_node_heartbeat_age_seconds`
@@ -217,8 +221,8 @@
      规则匹配到的每条序列各自得到 Firing / Clear / **Unknown** 之一，Unknown = 本拍不评估、**保持现状**（既不开新事件也不关闭进行中事件）——
      它覆盖 (a) 窗口类无可用基线（见下）、(b) 序列所属节点本拍不可达（`Snapshot.unreachable_nodes`：`gather` 对该节点 `/metrics` 取得
      Err——宕机/分区/一次 3s 抓取超时——节点掉线**不是**条件消失，其进行中事件保持直到节点再次应答或规则被删/禁）、(c) **lag 序列的源报 idle**
-     （v1.3 T-V1：lag 是最近含数 flush 以来的墙钟，运行中但无数据的管道会「永远滞后」；引擎的位置裁决说游标后无积压，沉默上的 lag 不是迟到的行——
-     hold，既不新开也不关闭；真有积压（idle=0）或源不可判（无 idle 序列）时照常评估，故真 lag 照常 firing）。
+     （c) **lag 序列的源报 idle**（v1.3 T-B/T-V1：lag 是最近含数 flush 以来的墙钟，运行中但无数据的管道会「永远滞后」；引擎的位置裁决说游标后无积压，沉默上的 lag 不是迟到的行。单拍 idle → `Unknown` hold（防抖动，sample 记 `reason:"source_idle"`）；**连续两拍 idle → `Outcome::Clear`**（true silence，sample 记 `reason:"idle_cleared"`，关闭进行中 episode，lag 归零语义）；非 idle 拍重置计数器并按 `lag > threshold` 正常评估（Firing/Clear）。真有积压（idle=0）或源不可判（无 idle 序列）时照常评估，故真 lag 照常 firing。引擎口径 R11：
+     `tailrace_pipeline_source_idle` 的语义 = 源无积压 ∧ pending_rows==0）。
      **序列缺失而其节点可达**才按条件消失处理（管道不再暴露 lag 即不再滞后：resolved，sample 记 `reason:"series_absent"`）。
      `flush_errors_window` 在引擎只发 `result="success"` 的现状下处于**休眠**（A6 注明 Dedup/Retry/Error 拆分随 A2 确定性标签落地）——
      评估契约由 mock 快照单测钉住，不是空实现。该类序列不可能携带的过滤（state_failed+statement、heartbeat_age+pipeline/statement）在 POST/PUT 即 400。

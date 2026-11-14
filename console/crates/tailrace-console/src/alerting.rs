@@ -561,6 +561,7 @@ pub fn evaluate_rule(
     params: &RuleParams,
     samples: &[Sample],
     windows: &CounterWindows,
+    idle_ticks: &mut HashMap<String, u64>,
     now_ms: u64,
 ) -> Vec<SeriesVerdict> {
     match kind {
@@ -574,15 +575,20 @@ pub fn evaluate_rule(
                 .filter(|s| s.metric == "tailrace_pipeline_source_idle" && s.value == 1.0)
                 .map(|s| &s.labels)
                 .collect();
-            threshold_verdicts(samples, params, "tailrace_pipeline_lag_seconds", |s| {
-                idle.contains(&s.labels)
-            })
+            threshold_verdicts(
+                samples,
+                params,
+                "tailrace_pipeline_lag_seconds",
+                |s| idle.contains(&s.labels),
+                idle_ticks,
+            )
         }
         RuleKind::HeartbeatAge => threshold_verdicts(
             samples,
             params,
             "tailrace_node_heartbeat_age_seconds",
             |_| false,
+            idle_ticks,
         ),
         RuleKind::StateFailed => samples
             .iter()
@@ -657,11 +663,19 @@ pub fn evaluate_rule(
 /// for which `hold` is true is not evaluated this tick (Unknown, sample
 /// tagged `reason:"source_idle"`) — the T-V1 idle hold for lag; heartbeat
 /// passes `|_| false`.
+///
+/// For lag, `idle_ticks` is this series' consecutive-idle counter (keyed by the
+/// lag series' rendered series key). A single idle tick holds (Unknown, anti-jitter);
+/// **two consecutive idle ticks** mean true silence — source has no backlog
+/// (`tailrace_pipeline_source_idle` R11 mouth: source idle ∧ pending_rows==0) — so
+/// lag over silence resolves to `Clear` instead of holding forever. Any non-idle
+/// tick resets the counter and evaluates normally (Firing/Clear).
 fn threshold_verdicts(
     samples: &[Sample],
     params: &RuleParams,
     metric: &str,
     hold: impl Fn(&Sample) -> bool,
+    idle_ticks: &mut HashMap<String, u64>,
 ) -> Vec<SeriesVerdict> {
     samples
         .iter()
@@ -671,16 +685,30 @@ fn threshold_verdicts(
                 "metric": metric, "value": s.value,
                 "threshold": params.threshold, "labels": s.labels,
             });
+            let key = series_key(s);
             let outcome = if hold(s) {
-                sample["reason"] = json!("source_idle");
-                Outcome::Unknown
-            } else if s.value > params.threshold {
-                Outcome::Firing
+                // anti-jitter: a lone idle tick holds; two consecutive idle ticks
+                // turn the hold into Clear (true silence — lag over silence is not
+                // a late row, it is wall time, so the firing episode may close).
+                let n = idle_ticks.entry(key.clone()).or_insert(0);
+                *n += 1;
+                if *n >= 2 {
+                    sample["reason"] = json!("idle_cleared");
+                    Outcome::Clear
+                } else {
+                    sample["reason"] = json!("source_idle");
+                    Outcome::Unknown
+                }
             } else {
-                Outcome::Clear
+                idle_ticks.remove(&key);
+                if s.value > params.threshold {
+                    Outcome::Firing
+                } else {
+                    Outcome::Clear
+                }
             };
             SeriesVerdict {
-                series_key: series_key(s),
+                series_key: key,
                 outcome,
                 sample,
             }
@@ -737,6 +765,11 @@ impl AlertNotice {
 #[derive(Default)]
 pub struct Evaluator {
     windows: CounterWindows,
+    /// Consecutive passes a lag series has reported `tailrace_pipeline_source_idle == 1`,
+    /// keyed by that lag series' rendered series key. A single idle tick holds (Unknown,
+    /// anti-jitter); two consecutive idle ticks mean true silence → `Clear` (lag over
+    /// silence is wall time, not a late row, so a firing episode can finally close).
+    idle_ticks: HashMap<String, u64>,
     /// The previous pass' webhook delivery task. Deliveries are spawned so
     /// a black-holed webhook can never stall evaluation, persistence or
     /// SSE; each new delivery awaits the previous one first, so one
@@ -817,7 +850,14 @@ impl Evaluator {
                     ));
                 }
             } else {
-                let verdicts = evaluate_rule(kind, &params, &snap.samples, &self.windows, now_ms);
+                let verdicts = evaluate_rule(
+                    kind,
+                    &params,
+                    &snap.samples,
+                    &self.windows,
+                    &mut self.idle_ticks,
+                    now_ms,
+                );
                 let mut covered: HashSet<String> = HashSet::new();
                 // pre-migration-05 rows (series_key "") — the first series
                 // that fires under this rule adopts the oldest one instead
@@ -1164,6 +1204,7 @@ mod tests {
             &params,
             &samples,
             &CounterWindows::default(),
+            &mut HashMap::new(),
             0,
         );
         assert_eq!(vs.len(), 2, "pipeline 9 filtered out: {vs:?}");
@@ -1179,6 +1220,7 @@ mod tests {
             &params,
             &[],
             &CounterWindows::default(),
+            &mut HashMap::new(),
             0,
         );
         assert!(vs.is_empty());
@@ -1201,6 +1243,7 @@ mod tests {
                 &params,
                 &[lag(silence), idle(1.0)],
                 &CounterWindows::default(),
+                &mut HashMap::new(),
                 0,
             );
             assert_eq!(vs.len(), 1, "{vs:?}");
@@ -1228,6 +1271,7 @@ mod tests {
             &params,
             &[lag(600.0)],
             &CounterWindows::default(),
+            &mut HashMap::new(),
             0,
         );
         assert_eq!(
@@ -1254,6 +1298,7 @@ mod tests {
         let s0: &[(&str, &str)] = &[("node", "a"), ("pipeline", "3"), ("statement", "0")];
         let s1: &[(&str, &str)] = &[("node", "a"), ("pipeline", "3"), ("statement", "1")];
         let w = CounterWindows::default();
+        let mut idle_ticks = HashMap::new();
         // tick 1: both statements behind the end offsets → both fire
         let vs = evaluate_rule(
             RuleKind::LagSeconds,
@@ -1265,6 +1310,7 @@ mod tests {
                 sample("tailrace_pipeline_source_idle", s1, 0.0),
             ],
             &w,
+            &mut idle_ticks,
             0,
         );
         assert_eq!(vs.len(), 2);
@@ -1281,6 +1327,7 @@ mod tests {
                 sample("tailrace_pipeline_source_idle", s1, 0.0),
             ],
             &w,
+            &mut idle_ticks,
             0,
         );
         let by_stmt = |st: &str| {
@@ -1305,6 +1352,7 @@ mod tests {
                 sample("tailrace_pipeline_source_idle", s0, 0.0),
             ],
             &w,
+            &mut idle_ticks,
             0,
         );
         assert_eq!(vs[0].outcome, Outcome::Clear);
@@ -1330,6 +1378,7 @@ mod tests {
                 sample("tailrace_pipeline_source_idle", elsewhere, 1.0),
             ],
             &CounterWindows::default(),
+            &mut HashMap::new(),
             0,
         );
         assert_eq!(vs.len(), 2);
@@ -1354,6 +1403,7 @@ mod tests {
                 sample("tailrace_pipeline_source_idle", here, 0.0),
             ],
             &CounterWindows::default(),
+            &mut HashMap::new(),
             0,
         );
         assert_eq!(vs[0].outcome, Outcome::Clear);
@@ -1375,9 +1425,107 @@ mod tests {
                 ),
             ],
             &CounterWindows::default(),
+            &mut HashMap::new(),
             0,
         );
         assert_eq!(vs[0].outcome, Outcome::Firing, "idle is a lag-only hold");
+    }
+
+    /// T-B idle hold → Clear two-tick semantics:
+    /// - single idle tick → Unknown (hold, anti-jitter);
+    /// - two consecutive idle ticks → Clear (true silence: lag over silence is
+    ///   wall time, not a late row, so the firing episode closes);
+    /// - non-idle tick resets the counter and evaluates normally (Firing/Clear).
+    #[test]
+    fn lag_rule_two_tick_idle_clears_holding_episode() {
+        let params = parse_params(RuleKind::LagSeconds, &json!({"threshold": 30})).unwrap();
+        let labels: &[(&str, &str)] = &[("node", "a"), ("pipeline", "7"), ("statement", "0")];
+        let lag = |v: f64| sample("tailrace_pipeline_lag_seconds", labels, v);
+        let idle = |v: f64| sample("tailrace_pipeline_source_idle", labels, v);
+        let mut idle_ticks = HashMap::new();
+        let w = CounterWindows::default();
+
+        // tick 1: single idle → Unknown, held, not cleared
+        let vs = evaluate_rule(
+            RuleKind::LagSeconds,
+            &params,
+            &[lag(45.0), idle(1.0)],
+            &w,
+            &mut idle_ticks,
+            0,
+        );
+        assert_eq!(vs.len(), 1);
+        assert_eq!(vs[0].outcome, Outcome::Unknown, "first idle tick holds");
+        assert_eq!(vs[0].sample["reason"], "source_idle");
+
+        // tick 2: second consecutive idle → Clear (true silence closes the episode)
+        let vs = evaluate_rule(
+            RuleKind::LagSeconds,
+            &params,
+            &[lag(900.0), idle(1.0)],
+            &w,
+            &mut idle_ticks,
+            0,
+        );
+        assert_eq!(vs.len(), 1);
+        assert_eq!(
+            vs[0].outcome,
+            Outcome::Clear,
+            "two consecutive idle ticks clear"
+        );
+        assert_eq!(vs[0].sample["reason"], "idle_cleared");
+        assert_eq!(
+            vs[0].sample["value"], 900.0,
+            "lag still recorded even though cleared"
+        );
+
+        // tick 3: idle again while still silent → stays Clear (true silence persists,
+        // no open episode to hold); counter keeps counting
+        let vs = evaluate_rule(
+            RuleKind::LagSeconds,
+            &params,
+            &[lag(120.0), idle(1.0)],
+            &w,
+            &mut idle_ticks,
+            0,
+        );
+        assert_eq!(vs.len(), 1);
+        assert_eq!(vs[0].outcome, Outcome::Clear, "continuing idle stays Clear");
+
+        // tick 4: rows flow again (idle 0) → counter resets, normal evaluation;
+        // lag below threshold → Clear
+        let vs = evaluate_rule(
+            RuleKind::LagSeconds,
+            &params,
+            &[lag(2.0), idle(0.0)],
+            &w,
+            &mut idle_ticks,
+            0,
+        );
+        assert_eq!(vs.len(), 1);
+        assert_eq!(
+            vs[0].outcome,
+            Outcome::Clear,
+            "rows flow again → normal evaluation clears"
+        );
+        assert!(vs[0].sample.get("reason").is_none());
+
+        // tick 5: non-idle lag above threshold → Firing (recovery from idle resumes
+        // normal verdicts)
+        let vs = evaluate_rule(
+            RuleKind::LagSeconds,
+            &params,
+            &[lag(31.0), idle(0.0)],
+            &w,
+            &mut idle_ticks,
+            0,
+        );
+        assert_eq!(vs.len(), 1);
+        assert_eq!(
+            vs[0].outcome,
+            Outcome::Firing,
+            "backlog resumed → fires again"
+        );
     }
 
     /// state_failed is per series: only the FAILED series fires.
@@ -1406,6 +1554,7 @@ mod tests {
             &params,
             &samples,
             &CounterWindows::default(),
+            &mut HashMap::new(),
             0,
         );
         assert_eq!(vs.len(), 3);
@@ -1441,10 +1590,17 @@ mod tests {
             )
         };
         let outcome = |w: &CounterWindows, now: u64| {
-            evaluate_rule(RuleKind::DlqWindow, &params, &[s(0.0)], w, now)
-                .into_iter()
-                .next()
-                .map(|v| (v.outcome, v.sample.clone()))
+            evaluate_rule(
+                RuleKind::DlqWindow,
+                &params,
+                &[s(0.0)],
+                w,
+                &mut HashMap::new(),
+                now,
+            )
+            .into_iter()
+            .next()
+            .map(|v| (v.outcome, v.sample.clone()))
         };
 
         // t=0 → 100, t=30s → 105: at t=45s the cutoff (t=−15s) has no
@@ -1520,10 +1676,17 @@ mod tests {
         .unwrap();
         w3.observe(&[s(0.0)], T0);
         w3.observe(&[s(50.0)], T0 + 7_200_000);
-        let v = evaluate_rule(RuleKind::DlqWindow, &long, &[s(50.0)], &w3, T0 + 7_200_000)
-            .into_iter()
-            .next()
-            .unwrap();
+        let v = evaluate_rule(
+            RuleKind::DlqWindow,
+            &long,
+            &[s(50.0)],
+            &w3,
+            &mut HashMap::new(),
+            T0 + 7_200_000,
+        )
+        .into_iter()
+        .next()
+        .unwrap();
         assert_eq!(
             v.outcome,
             Outcome::Unknown,
@@ -1573,6 +1736,7 @@ mod tests {
             &params,
             &[err(3.0), ok(1000.0)],
             &w,
+            &mut HashMap::new(),
             1_000_000_060_000,
         );
         assert_eq!(vs.len(), 1, "only the error series: {vs:?}");
@@ -1658,6 +1822,7 @@ mod tests {
             &params,
             &samples,
             &CounterWindows::default(),
+            &mut HashMap::new(),
             0,
         );
         assert!(
