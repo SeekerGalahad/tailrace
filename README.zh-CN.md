@@ -14,13 +14,16 @@
 
 ## 状态
 
-**已发布：v1.2.0**——CHANGELOG 版本切点 2026-10-31；v1.2.0 git tag 与 GitHub
-Release（9 资产 = 8 tarball + checksums.txt）已于 **2026-11-02** 上线。全树锁版
-1.2.0（22 个可发布 crate 同步 lockstep）。**截至 2026-11-03，crates.io 发布未执行**——
-crates.io 现值仍为 1.1.0（实查：`tailrace-ir` / `tailrace-console` /
-`tailrace-runtime` max_version 1.1.0；`tailrace-ddl` 从未上架），`cargo install
-tailrace-node --version 1.2.0` 暂不可解析——请用 GitHub Release tarball 或从 tag
-构建。随版交付：引擎数据面（kafka / file / jdbc 为源，Doris + StarRocks Stream Load
+**已发布：v1.2.0**——CHANGELOG 版本切点 2026-10-31；v1.2.0 git tag、GitHub
+Release（9 资产 = 8 tarball + checksums.txt）与 crates.io 发包（22 个可发布 crate
+全部 1.2.0，lockstep）已于 **2026-11-02/03** 上线。两条渠道任选安装：
+
+```bash
+cargo install tailrace-node --version 1.2.0 --locked   # crates.io
+# 或从 https://github.com/SeekerGalahad/tailrace/releases/tag/v1.2.0 取 tarball
+```
+
+随版交付：引擎数据面（kafka / file / jdbc 为源，Doris + StarRocks Stream Load
 与 file 为汇）、数据源发现与模式推断（`discover` / `infer-schema`）、SSH 部署链、
 性能账本（docs/BENCHMARKS.md）、8 job CI 矩阵与下方全部能力——叠在 v1.1.0
 （2026-10-25，首批 21 个 crate 上 crates.io、tag 与 9 资产 Release 在档）之上。

@@ -15,14 +15,17 @@ server) from the same two binaries.
 
 ## Status
 
-**Released: v1.2.0** — CHANGELOG cut 2026-10-31; the v1.2.0 tag and the
-GitHub Release (9 assets: 8 tarballs + checksums.txt) went live on
-2026-11-02. The workspace is versioned 1.2.0 in lockstep (22 publishable
-crates). **As of 2026-11-03 the crates.io publish has not been executed** —
-crates.io still shows 1.1.0 (checked: `tailrace-ir` / `tailrace-console` /
-`tailrace-runtime` max_version 1.1.0; `tailrace-ddl` was never published),
-so `cargo install tailrace-node --version 1.2.0` does not resolve yet; use
-the GitHub Release tarballs or build from the tag. It ships the engine data
+**Released: v1.2.0** — CHANGELOG cut 2026-10-31; the v1.2.0 tag, the
+GitHub Release (9 assets: 8 tarballs + checksums.txt) and the crates.io
+publish (all 22 publishable crates at 1.2.0 in lockstep) went live on
+2026-11-02/03. Install it from either channel:
+
+```bash
+cargo install tailrace-node --version 1.2.0 --locked   # crates.io
+# or download a tarball from https://github.com/SeekerGalahad/tailrace/releases/tag/v1.2.0
+```
+
+It ships the engine data
 plane (kafka / file / jdbc sources; Doris + StarRocks Stream Load and file
 sinks), datasource discovery & schema inference (`discover` /
 `infer-schema`), the SSH deploy chain, the performance ledger
