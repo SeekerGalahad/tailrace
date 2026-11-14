@@ -57,7 +57,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Extension, Json, Router};
-use console_auth::{AuthContext, AuthUser, M2mState};
+use console_auth::{AuthContext, AuthUser};
 use serde_json::{json, Map, Value};
 use utoipa::OpenApi;
 
@@ -97,19 +97,23 @@ pub const RATE_LIMITED: i64 = -32002;
 /// four: the DDL closed loop (`ddl_draft` read — it composes text only;
 /// `ddl_execute` / `ddl_evolve` write — they run DDL on Doris) and
 /// `backfill_status` (read — the job progress list; `trigger_backfill`
-/// already covers create, dryRun included). The R11 pair closes the
-/// sixteen: `apply` write (the T-G6 idempotent upsert), `apply_dry_run`
-/// read (the same diff, zero side effects). Sixteen of the ≤16 budget —
-/// the surface is full; a new tool needs a budget ruling first.
+/// already covers create, dryRun included). The R11 pair (the `apply` /
+/// `apply_dry_run` pipeline-as-code tools) and the R12 `publish_pipeline`
+/// write tool (T-C) close the sixteen: eight read + eight write, the ≤16
+/// budget spent exactly once. `publish_pipeline` replaces the debug-only
+/// `get_pipeline_logs` snapshot — the API surface stays 16; the log
+/// endpoint itself is untouched and remains reachable over the
+/// session-scoped REST `GET /api/pipelines/{id}/logs`. A new tool still
+/// needs a budget ruling first.
 pub const TOOLS: &[(&str, bool)] = &[
     ("list_datasources", false),
     ("list_pipelines", false),
     ("get_pipeline", false),
     ("get_pipeline_stats", false),
-    ("get_pipeline_logs", false),
     ("compile_sql", false),
     ("create_pipeline", true),
     ("deploy_pipeline", true),
+    ("publish_pipeline", true),
     ("pause_resume_pipeline", true),
     ("trigger_backfill", true),
     ("ddl_draft", false),
@@ -375,9 +379,9 @@ fn instructions(allow_write: bool) -> String {
     format!(
         "Tailrace console management plane. Read tools (list/get/compile, ddl_draft, \
          backfill_status, apply_dry_run) are always available. Write tools (create_pipeline, \
-         deploy_pipeline, pause_resume_pipeline, trigger_backfill, ddl_execute, ddl_evolve, \
-         apply) are {writes}; every write call must also pass \"confirm\": true. All calls \
-         are audited as actor mcp:<client>."
+         deploy_pipeline, publish_pipeline, pause_resume_pipeline, trigger_backfill, \
+         ddl_execute, ddl_evolve, apply) are {writes}; every write call must also pass \
+         \"confirm\": true. All calls are audited as actor mcp:<client>."
     )
 }
 
@@ -537,11 +541,6 @@ async fn execute(
         }
         "get_pipeline" => api::pipelines::detail(st, Path(req_i64(args, "id")?)).await,
         "get_pipeline_stats" => api::pipelines::stats(st, Path(req_i64(args, "id")?)).await,
-        "get_pipeline_logs" => {
-            let id = req_i64(args, "id")?;
-            let lines = opt_i64(args, "lines")?.unwrap_or(200);
-            logs_snapshot(state, id, lines).await
-        }
         "compile_sql" => {
             req_str(args, "sql")?;
             api::pipelines::compile(st, json_bytes(args)).await
@@ -670,6 +669,18 @@ async fn execute(
             }
             api::apply::dry_run(st, identity(), HeaderMap::new(), json_bytes(args)).await
         }
+        // R12 (T-C): the last link of the pure-MCP GitOps chain — publish a
+        // drafted pipeline (version+1 + spec snapshot) behind the same write
+        // gates as every other write tool. Maps to POST /api/pipelines/{id}/publish,
+        // whose gate resolves every referenced table object, materializes the
+        // `${ds:id.db.table}` spec and bumps the version (see the handler's
+        // utoipa doc for the full T-A7 / LOW-5 gate list). Idempotent per
+        // pipeline id: re-publishing an unchanged draft re-snapshots with a
+        // new version (that is the handler's contract, not this tool's).
+        "publish_pipeline" => {
+            let id = req_i64(args, "id")?;
+            api::pipelines::publish(st, identity(), HeaderMap::new(), Path(id)).await
+        }
         other => return Err(RpcErr::invalid_params(format!("unknown tool: {other}"))),
     };
     Ok(response)
@@ -720,55 +731,6 @@ fn ddl_body(args: &Map<String, Value>) -> Bytes {
     json_bytes(&body)
 }
 
-/// `get_pipeline_logs` for a request/response tool: the REST route is an
-/// SSE bridge (§4.5), which cannot fold into one JSON-RPC result — this is
-/// the same engine tail pull the bridge does for its first screen
-/// (`tail=1&limit`, clamped 50..500), as a single snapshot.
-async fn logs_snapshot(state: &AppState, id: i64, lines: i64) -> Response {
-    let lines = lines.clamp(50, 500);
-    let Some(full) = state.store().pipeline_full(id).ok().flatten() else {
-        return api::messages::not_found("err.pipeline.not_found", &[&id.to_string()]);
-    };
-    let Some(node_id) = full.base.assigned_node else {
-        return Json(json!({
-            "ok": false,
-            "error": api::messages::t("err.pipeline.undeployed_plain", &[&id.to_string()]),
-        }))
-        .into_response();
-    };
-    let Some(node) = state.store().node(node_id).ok().flatten() else {
-        return api::messages::not_found(
-            "err.pipeline.assigned_node_missing",
-            &[&node_id.to_string()],
-        );
-    };
-    let Some(api_url) = node.api_url else {
-        return console_auth::ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            "ENGINE_UNREACHABLE",
-            "node has not reported an api_url yet",
-        )
-        .into_response();
-    };
-    let endpoint =
-        console_proxy::NodeEndpoint::with_token(api_url, state.bootstrap().global_token());
-    match endpoint
-        .get_json(
-            state.node_client(),
-            &format!("/v1/pipelines/{id}/logs?tail=1&limit={lines}"),
-        )
-        .await
-    {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => console_auth::ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            "ENGINE_UNREACHABLE",
-            e.to_string(),
-        )
-        .into_response(),
-    }
-}
-
 // ---------------- tool descriptions / schemas ----------------
 
 fn tool_definitions() -> Vec<Value> {
@@ -789,10 +751,10 @@ fn tool_route(name: &str) -> (&'static str, &'static str) {
         "list_pipelines" => ("GET", "/api/pipelines"),
         "get_pipeline" => ("GET", "/api/pipelines/{id}"),
         "get_pipeline_stats" => ("GET", "/api/pipelines/{id}/stats"),
-        "get_pipeline_logs" => ("GET", "/api/pipelines/{id}/logs"),
         "compile_sql" => ("POST", "/api/pipelines/compile"),
         "create_pipeline" => ("POST", "/api/pipelines"),
         "deploy_pipeline" => ("POST", "/api/pipelines/{id}/deploy"),
+        "publish_pipeline" => ("POST", "/api/pipelines/{id}/publish"),
         "pause_resume_pipeline" => ("POST", "/api/pipelines/{id}/pause"),
         "trigger_backfill" => ("POST", "/api/pipelines/{id}/backfill"),
         "ddl_draft" => (
@@ -1031,6 +993,14 @@ fn tool_definition(name: &str, write: bool) -> Value {
             );
             schema
         }
+        "publish_pipeline" => json!({
+            "type": "object",
+            "properties": {
+                "id": id_prop
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        }),
         other => unreachable!("tool_definition called with unregistered tool {other:?}"),
     };
     if write {
@@ -1363,7 +1333,7 @@ mod tests {
         assert!(TOOLS.len() <= 16, "the R8 tool-face budget");
         let reads = TOOLS.iter().filter(|(_, w)| !w).count();
         let writes = TOOLS.iter().filter(|(_, w)| *w).count();
-        assert_eq!((reads, writes), (9, 7));
+        assert_eq!((reads, writes), (8, 8));
         let names: Vec<&str> = TOOLS.iter().map(|(n, _)| *n).collect();
         let mut unique = names.clone();
         unique.sort_unstable();
