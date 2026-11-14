@@ -15,7 +15,7 @@
 //! LOW-5 R8 +2 key——publish 活表核实 2；T-E2 告警 +6 key——规则 CRUD 门禁，
 //! 2026-10-31 实测；T-G6 管道即代码 +11 key——apply 声明文件门禁，2026-10-31
 //! 落地）：字典
-//! **93 key**（[`tests::KEY_LIST`] 与 `template` 同步，长度由
+//! **94 key**（[`tests::KEY_LIST`] 与 `template` 同步，长度由
 //! [`tests::templates_use_only_positional_placeholders`]
 //! 钉住）；调用点规模见上一轮登记（T-E2 实测 120 站点），T-G6 的
 //! apply.rs 全部走本字典（含 bad_body 复用），新增 17 个调用站点
@@ -183,6 +183,11 @@ fn template(key: &str) -> Option<&'static str> {
         // T-A7 key model on record (unique/duplicate)
         "err.table_object.key_model_datasource" => {
             "keyModel 仅可声明在 doris/starrocks 数据源的表上（Doris 键模型概念），当前类型 {0}"
+        }
+        // T-A 词汇预检：columnsJson / columnTypes 的第 N 列含不在 16 词表内的词，
+        // 400 指明第几列、什么词、建议词表（KNOWN_VOCABULARY）
+        "err.table_object.unknown_column_type" => {
+            "表 {0} 第 {1} 列「{2}」的类型词不在支持的列类型表内：utf8/string/int8/int16/int32/int64/float32/float64/decimal(p,s)/timestamp(s|ms|us|ns)/date/bool/binary/list<float32[,dim]>/variant/null（未知类型不折叠为 utf8，按表内词重写）"
         }
         // ---- T-A1 建表闭环（draft / execute / evolve）----
         "err.ddl.datasource_kind" => {
@@ -375,7 +380,7 @@ mod tests {
     }
 
     /// 字典自洽：模板只含 {数字} 占位，且插值后无残留花括号。
-    /// 另钉字典规模 = 93 key（模块文档「规模口径」的机器锚点，T39 ③；T35 +3；
+    /// 另钉字典规模 = 94 key（模块文档「规模口径」的机器锚点，T39 ③；T35 +3；
     /// T-D1 dim join +6：发布门禁 3 + 维表登记 3；T-A1 建表闭环 +10；
     /// T-A2 回填 +9：not_published/statement_index/dim_unsupported/
     /// bounds_type/bounds_value/bounds_order/sink_unsupported/
@@ -397,7 +402,7 @@ mod tests {
     fn templates_use_only_positional_placeholders() {
         let keys: Vec<&str> = KEY_LIST.to_vec();
         assert!(!keys.is_empty());
-        assert_eq!(keys.len(), 93, "字典规模漂移：同步模块文档「规模口径」");
+        assert_eq!(keys.len(), 94, "字典规模漂移：同步模块文档「规模口径」");
         for key in keys {
             let tpl = template(key).expect("listed key resolves");
             let mut rest = tpl;
@@ -833,5 +838,7 @@ mod tests {
         "err.apply.table_key_model_invalid",
         "err.apply.mapping_datasource_unknown",
         "err.apply.concurrent_modification",
+        // T-A 词汇预检：columnsJson / columnTypes 的第 N 列含不在 16 词表内的词
+        "err.table_object.unknown_column_type",
     ];
 }

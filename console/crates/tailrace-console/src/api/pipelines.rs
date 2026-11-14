@@ -366,6 +366,93 @@ fn partial_declaration_diags(
 /// every stream load — "Only unique key merge on write support partial
 /// update"). Unregistered sinks are skipped here: the callers report them
 /// as missing table objects. Undeclared statements cost nothing.
+/// T-A 词汇预检（发布门）：每条声明的语句所引用的源/汇/维表，其已登记
+/// 的 columnsJson 中若含不在 16 词表内的列类型词（如存量的 `varchar(64)`），
+/// 立即 400，信封指明第几列、什么词、建议词表（`KNOWN_VOCABULARY`），
+/// 而非等到 /v1 装配时由引擎硬错。空列表或不含类型的表不触发；
+/// 未注册的表由 publish gate 的另一条检查报 missing。已登记合法 16
+/// 词（1.2.0 形态）全放行。
+fn unknown_type_gate(
+    store: &console_store::Store,
+    statements: &[StatementOut],
+) -> Vec<CompileDiag> {
+    use tailrace_catalog::ColumnType;
+    let mut out: Vec<CompileDiag> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for st in statements {
+        for ref_ in [&st.source, &st.sink] {
+            if seen.contains(ref_) {
+                continue;
+            }
+            seen.push(ref_.clone());
+            let Some(table) = store.table_object_for_reference(ref_).ok().flatten() else {
+                continue;
+            };
+            let columns: Vec<(String, String)> = store
+                .table_object_columns_json(table.id)
+                .ok()
+                .flatten()
+                .flatten()
+                .map(|s| serde_json::from_str::<Vec<(String, String)>>(&s).unwrap_or_default())
+                .unwrap_or_default();
+            if let Some((idx, (_name, ty))) = columns
+                .into_iter()
+                .enumerate()
+                .find(|(_, (_, ty))| ColumnType::parse(ty).is_err())
+            {
+                out.push(CompileDiag {
+                    line: 0,
+                    message: super::messages::t(
+                        "err.table_object.unknown_column_type",
+                        &[ref_, &(idx + 1).to_string(), &ty],
+                    ),
+                });
+                break;
+            }
+        }
+        for d in &st.dims {
+            if seen.contains(&d.reference) {
+                continue;
+            }
+            seen.push(d.reference.clone());
+            let Some(table) = store
+                .table_object_for_dim_reference(&d.reference)
+                .ok()
+                .flatten()
+            else {
+                continue;
+            };
+            let columns: Vec<(String, String)> = store
+                .table_object_columns_json(table.id)
+                .ok()
+                .flatten()
+                .flatten()
+                .map(|s| serde_json::from_str::<Vec<(String, String)>>(&s).unwrap_or_default())
+                .unwrap_or_default();
+            if let Some((idx, (_name, ty))) = columns
+                .into_iter()
+                .enumerate()
+                .find(|(_, (_, ty))| ColumnType::parse(ty).is_err())
+            {
+                out.push(CompileDiag {
+                    line: 0,
+                    message: super::messages::t(
+                        "err.table_object.unknown_column_type",
+                        &[
+                            &d.reference,
+                            &(idx + 1).to_string(),
+                            &ty,
+                            tailrace_catalog::KNOWN_VOCABULARY,
+                        ],
+                    ),
+                });
+                break;
+            }
+        }
+    }
+    out
+}
+
 fn partial_declarations_gate(
     store: &console_store::Store,
     statements: &[StatementOut],
@@ -1102,6 +1189,11 @@ pub async fn publish(
     if let Err(d) = sink_partial_declarations(&statements) {
         gate.push(d);
     }
+    // T-A 词汇预检（发布门）：任何已登记表对象的 columnsJson 含不在 16
+    // 词表内的列类型词（如存量的 `varchar(64)`），即拒绝发布——在 /v1
+    // 装配前把存量管道拦在 400，而非等到 deploy/重启重组装时硬错；不
+    // 改行为、只拦未知词，1.2.0 合法登记（16 词）不受影响。
+    gate.extend(unknown_type_gate(store, &statements));
     // LOW-5 (R8): local gate clean → the live table has the last word. A
     // registered keyModel=unique whose live SHOW CREATE TABLE says
     // otherwise (DUPLICATE, MoR) is a 400 here, not a 3am load failure;
