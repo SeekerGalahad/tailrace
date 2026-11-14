@@ -53,7 +53,7 @@ CONSOLE_PID=""; NODE_PID=""
 T0=$(date +%s); TSTEP=$T0
 SUMMARY=""
 step() { # step <pass|fail> <name> [detail]
-  local now; now=$(date +%s); local dt=$((now - TSTEP)); TSTEP=now
+  local now; now=$(date +%s); local dt=$((now - TSTEP)); TSTEP=$now
   if [ "$1" = "pass" ]; then
     PASS=$((PASS+1)); printf '  ok    %-4ss  %s\n' "$dt" "$2"; SUMMARY+="ok   ${dt}s  $2"$'\n'
   else
@@ -141,8 +141,12 @@ INIT_RAW="$(curl -s -D "$WORK/mcp-headers" -X POST -H 'Content-Type: application
 MCP_SID="$(awk 'tolower($1)=="mcp-session-id:"{gsub(/\r/,"");print $2}' "$WORK/mcp-headers")"
 SRV="$(jq -r '.result.serverInfo.name // empty' <<<"$INIT_RAW" 2>/dev/null)"
 N_TOOLS="$(mcp_raw tools/list '{}' | jq -r '.result.tools | length')"
+# The 14 here is THIS round's face (it predates the R11 apply pair and the
+# R12 publish tool); on a later tree the assertion FAILs by design, which is
+# the signal that the script no longer matches HEAD. The unbound-var guard
+# keeps that FAIL readable instead of aborting under `set -u` (R12 T-D).
 { [ "$N_TOOLS" = "14" ] && [ "$SRV" = "tailrace-console" ] && [ -n "$MCP_SID" ]; } && step pass "D1.3 MCP initialize handshake (serverInfo=$SRV, session=${MCP_SID:0:8}…) + tools/list → 14 tools" \
-  || step fail "D1.3 MCP handshake" "tools=$N_TOOLS body=$(head -c 200 <<<"$MCP_BODY")"
+  || step fail "D1.3 MCP handshake (round 2's 14-tool face; HEAD may differ)" "tools=$N_TOOLS body=$(head -c 200 <<<"${MCP_BODY:-}")"
 
 # ---------- D2 datasources + table object (REST: no MCP tool for these) ----------
 req POST /api/datasources \

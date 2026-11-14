@@ -1,0 +1,19 @@
+# TYPE tailrace_console_db_write_seconds gauge
+tailrace_console_db_write_seconds{op="tx_last"} 0.000043
+tailrace_console_db_write_seconds{op="tx_avg"} 0.0005027217391304348
+# node engine-node
+# TYPE tailrace_dlq_rows_total counter
+tailrace_dlq_rows_total{node="engine-node",pipeline="1",statement="0"} 0
+# TYPE tailrace_flush_duration_seconds gauge
+tailrace_flush_duration_seconds{node="engine-node",pipeline="1",statement="0"} 0.252
+# TYPE tailrace_flush_total counter
+tailrace_flush_total{node="engine-node",pipeline="1",result="success",statement="0"} 1
+# TYPE tailrace_node_heartbeat_age_seconds gauge
+tailrace_node_heartbeat_age_seconds{node="engine-node",node_id="sn-d2d6c0c5708593f8"} 16.887
+# TYPE tailrace_pipeline_lag_seconds gauge
+tailrace_pipeline_lag_seconds{node="engine-node",pipeline="1",statement="0"} 753.186
+# TYPE tailrace_pipeline_rows_total counter
+tailrace_pipeline_rows_total{node="engine-node",pipeline="1",result="dlq",statement="0"} 0
+tailrace_pipeline_rows_total{node="engine-node",pipeline="1",result="ok",statement="0"} 2
+# TYPE tailrace_pipeline_state gauge
+tailrace_pipeline_state{node="engine-node",pipeline="1"} 0

@@ -10,6 +10,9 @@ understanding the codebase evolution.
 - Architecture Decision Records (ADRs)
 - Migration guides with before/after evidence
 - Documentation consistency audits (claim → code-anchor reconciliation)
+- Machine-gate discipline records (e.g., `gate-discipline-cargo-profile-2026-11-14.md`
+  — gate commands never carry a `CARGO_PROFILE_*_DEBUG` prefix; the prefix forks
+  Cargo fingerprints and grows a second artifact tree)
 
 ## What does NOT belong here
 

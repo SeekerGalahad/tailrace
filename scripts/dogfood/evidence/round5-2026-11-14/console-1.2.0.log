@@ -1,0 +1,19 @@
+[2m2026-11-14T14:56:33.142288Z[0m [32m INFO[0m [2mrusqlite_migration[0m[2m:[0m Database migrated to version 6
+──────────────────────────────────────────────────────────────
+[Tailrace] 首次启动：初始管理员已创建
+[Tailrace]   用户名：admin
+[Tailrace]   初始密码：<redacted>
+[Tailrace]   （仅此一次显示，请妥善保存）
+──────────────────────────────────────────────────────────────
+──────────────────────────────────────────────────────────────
+[Tailrace] 节点自注册 bootstrap token（本次启动生成，仅此一次显示）：
+[Tailrace]   tr_b_<redacted>
+[Tailrace]   引擎侧 --bootstrap-token 使用它；固定请设 TAILRACE_BOOTSTRAP_TOKEN
+──────────────────────────────────────────────────────────────
+[2m2026-11-14T14:56:33.157421Z[0m [32m INFO[0m [2mtailrace_console::alerting[0m[2m:[0m alert evaluator started [3minterval_secs[0m[2m=[0m15
+[2m2026-11-14T14:56:33.159807Z[0m [32m INFO[0m [2mtailrace_console[0m[2m:[0m tailrace-console 1.2.0 listening on http://0.0.0.0:8080
+[2m2026-11-14T14:56:33.159830Z[0m [32m INFO[0m [2mtailrace_console[0m[2m:[0m data dir: ./data | swagger: http://0.0.0.0:8080/swagger-ui | api doc: http://0.0.0.0:8080/api-docs/openapi.json
+[2m2026-11-14T14:56:33.159834Z[0m [32m INFO[0m [2mtailrace_console[0m[2m:[0m mcp: http://0.0.0.0:8080/mcp (write tools disabled)
+[2m2026-11-14T15:27:28.990493Z[0m [32m INFO[0m [2mtailrace_console::backfill[0m[2m:[0m console backfill started (bf- ledger namespace, deterministic labels) [3mjob[0m[2m=[0m"20261114-01" [3mpipeline_id[0m[2m=[0m1 [3mstatement_index[0m[2m=[0m0 [3mfrom[0m[2m=[0m0 [3mto[0m[2m=[0m223
+[2m2026-11-14T15:27:28.990822Z[0m [32m INFO[0m [2mtailrace_runtime[0m[2m:[0m pipeline run started (bounded backfill) [3mpipeline_id[0m[2m=[0m1 [3mstatements[0m[2m=[0m1 [3mfrom[0m[2m=[0m0 [3mto[0m[2m=[0m223
+[2m2026-11-14T15:27:29.146458Z[0m [32m INFO[0m [2mtailrace_console::backfill[0m[2m:[0m console backfill finished [3mjob[0m[2m=[0m"20261114-01" [3mpipeline_id[0m[2m=[0m1 [3mrows[0m[2m=[0m2
