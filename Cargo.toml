@@ -109,7 +109,12 @@ base64 = "0.22"
 axum = { version = "0.8", features = ["json"] }
 reqwest = { version = "0.13", default-features = false, features = ["http2", "blocking", "json"] }
 # console side (design doc §3.1 / §5.1 / A3 / A4)
-rusqlite = { version = "0.40", features = ["bundled"] }
+# R12 gate: rusqlite 0.41 pulls libsqlite3-sys 0.39.x — the first bundled
+# SQLite line past CVE-2026-119375 (0.6.0–0.38.2 bundle ≤3.53.2, and a
+# process opening a -wal a less trusted party wrote can be attacked with
+# stale bytes from memory). The old 0.40 pin came from rusqlite_migration
+# 2.6's `^0.40.0`; 2.7.0 widens it to `^0.41.0`, so the pair moves together.
+rusqlite = { version = "0.41", features = ["bundled"] }
 # T35 (SSH deploy chain, §4.4): pure-Rust SSH client — the openssh wrapped
 # client needs system libssh/openssh-cli and was ruled out on the card.
 # default-features = false drops the aws-lc-rs default backend (aws-lc-sys
@@ -117,8 +122,8 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # same reasoning as the sqlx NO-tls note below); ring covers kex/cipher
 # for key-auth sessions against OpenSSH servers, flate2 keeps the
 # zlib@openssh.com compression offer available.
-russh = { version = "0.64", default-features = false, features = ["ring", "flate2"] }
-rusqlite_migration = "2.6"
+russh = { version = "0.65", default-features = false, features = ["ring", "flate2"] }
+rusqlite_migration = "2.7"
 argon2 = { version = "0.6", features = ["rand_core"] }
 utoipa = "6"
 utoipa-axum = "0.3"

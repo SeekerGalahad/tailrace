@@ -45,5 +45,16 @@ ignore = [
     "RUSTSEC-2026-0391",
     "RUSTSEC-2026-0398",
     "RUSTSEC-2026-0403",
-    "RUSTSEC-2026-0410",
+    # RUSTSEC-2026-0410 (zstd-sys build-time leak) no longer matches: the
+    # 1.2.0 R8 round already took zstd-sys to 2.1.2, and the entry only
+    # survived as a stale ignore (deny reported advisory-not-detected).
+    # Dropped in the R12 gate round.
+    # RUSTSEC-2026-0440: astral-tokio-tar is unmaintained (Astral ended
+    # maintenance 2026-11-03). It reaches us only as a dev-dependency of
+    # testcontainers (0.27 and 0.28 both pin ^0.6), i.e. the ephemeral
+    # docker stack in CI live tests — no product binary links it. Astral's
+    # suggested replacement is tar-codec, which testcontainers does not use;
+    # there is no upgrade path until upstream swaps the crate. Re-check when
+    # testcontainers bumps its tar edge.
+    "RUSTSEC-2026-0440",
 ]
