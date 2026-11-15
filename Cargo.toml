@@ -36,7 +36,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.2.0"
+version = "1.3.0"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.95"
@@ -109,7 +109,12 @@ base64 = "0.22"
 axum = { version = "0.8", features = ["json"] }
 reqwest = { version = "0.13", default-features = false, features = ["http2", "blocking", "json"] }
 # console side (design doc §3.1 / §5.1 / A3 / A4)
-rusqlite = { version = "0.40", features = ["bundled"] }
+# R12 gate: rusqlite 0.41 pulls libsqlite3-sys 0.39.x — the first bundled
+# SQLite line past CVE-2026-119375 (0.6.0–0.38.2 bundle ≤3.53.2, and a
+# process opening a -wal a less trusted party wrote can be attacked with
+# stale bytes from memory). The old 0.40 pin came from rusqlite_migration
+# 2.6's `^0.40.0`; 2.7.0 widens it to `^0.41.0`, so the pair moves together.
+rusqlite = { version = "0.41", features = ["bundled"] }
 # T35 (SSH deploy chain, §4.4): pure-Rust SSH client — the openssh wrapped
 # client needs system libssh/openssh-cli and was ruled out on the card.
 # default-features = false drops the aws-lc-rs default backend (aws-lc-sys
@@ -117,8 +122,8 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # same reasoning as the sqlx NO-tls note below); ring covers kex/cipher
 # for key-auth sessions against OpenSSH servers, flate2 keeps the
 # zlib@openssh.com compression offer available.
-russh = { version = "0.64", default-features = false, features = ["ring", "flate2"] }
-rusqlite_migration = "2.6"
+russh = { version = "0.65", default-features = false, features = ["ring", "flate2"] }
+rusqlite_migration = "2.7"
 argon2 = { version = "0.6", features = ["rand_core"] }
 utoipa = "6"
 utoipa-axum = "0.3"
@@ -179,19 +184,19 @@ testcontainers = { version = "0.27.3", default-features = false, features = ["bl
 # tags are pinned to the preheated local images (mysql:8.0, postgres:15).
 testcontainers-modules = { version = "0.15", default-features = false, features = ["kafka", "mysql", "postgres", "blocking"] }
 # internal crates (path + version, mirrors original engine practice)
-tailrace-connector = { path = "engine/crates/tailrace-connector", version = "1.2.0" }
-tailrace-conn-kafka = { path = "engine/crates/tailrace-conn-kafka", version = "1.2.0" }
-tailrace-conn-file = { path = "engine/crates/tailrace-conn-file", version = "1.2.0" }
-tailrace-conn-doris = { path = "engine/crates/tailrace-conn-doris", version = "1.2.0" }
-tailrace-conn-mqtt = { path = "engine/crates/tailrace-conn-mqtt", version = "1.2.0" }
-tailrace-conn-jdbc = { path = "engine/crates/tailrace-conn-jdbc", version = "1.2.0" }
-tailrace-conn-s3 = { path = "engine/crates/tailrace-conn-s3", version = "1.2.0" }
-tailrace-ir = { path = "engine/crates/tailrace-ir", version = "1.2.0" }
-tailrace-decode = { path = "engine/crates/tailrace-decode", version = "1.2.0" }
-tailrace-transform = { path = "engine/crates/tailrace-transform", version = "1.2.0" }
-tailrace-parser = { path = "engine/crates/tailrace-parser", version = "1.2.0" }
-tailrace-state = { path = "engine/crates/tailrace-state", version = "1.2.0" }
-tailrace-catalog = { path = "engine/crates/tailrace-catalog", version = "1.2.0" }
+tailrace-connector = { path = "engine/crates/tailrace-connector", version = "1.3.0" }
+tailrace-conn-kafka = { path = "engine/crates/tailrace-conn-kafka", version = "1.3.0" }
+tailrace-conn-file = { path = "engine/crates/tailrace-conn-file", version = "1.3.0" }
+tailrace-conn-doris = { path = "engine/crates/tailrace-conn-doris", version = "1.3.0" }
+tailrace-conn-mqtt = { path = "engine/crates/tailrace-conn-mqtt", version = "1.3.0" }
+tailrace-conn-jdbc = { path = "engine/crates/tailrace-conn-jdbc", version = "1.3.0" }
+tailrace-conn-s3 = { path = "engine/crates/tailrace-conn-s3", version = "1.3.0" }
+tailrace-ir = { path = "engine/crates/tailrace-ir", version = "1.3.0" }
+tailrace-decode = { path = "engine/crates/tailrace-decode", version = "1.3.0" }
+tailrace-transform = { path = "engine/crates/tailrace-transform", version = "1.3.0" }
+tailrace-parser = { path = "engine/crates/tailrace-parser", version = "1.3.0" }
+tailrace-state = { path = "engine/crates/tailrace-state", version = "1.3.0" }
+tailrace-catalog = { path = "engine/crates/tailrace-catalog", version = "1.3.0" }
 # T16 (roadmap §九): default-features = false so a connector-trimmed
 # tailrace-node actually drops the connector crates from its link graph.
 # Without it every runtime edge (node AND tailrace-api, which sits in the
@@ -204,12 +209,12 @@ tailrace-catalog = { path = "engine/crates/tailrace-catalog", version = "1.2.0" 
 # unchanged; tailrace-api never instantiates connectors, while tests/contract
 # does exercise default_registry() and therefore re-enables connector-file
 # explicitly in its own manifest.
-tailrace-runtime = { path = "engine/crates/tailrace-runtime", version = "1.2.0", default-features = false }
-tailrace-metadata = { path = "engine/crates/tailrace-metadata", version = "1.2.0" }
+tailrace-runtime = { path = "engine/crates/tailrace-runtime", version = "1.3.0", default-features = false }
+tailrace-metadata = { path = "engine/crates/tailrace-metadata", version = "1.3.0" }
 # T-A1 (R6): pure draft-DDL generator — no IO, no tokio; console pairs it
 # with tailrace-metadata's mysql_exec for the create-table closed loop.
-tailrace-ddl = { path = "engine/crates/tailrace-ddl", version = "1.2.0" }
-tailrace-api = { path = "engine/crates/tailrace-api", version = "1.2.0" }
-console-store = { path = "console/crates/console-store", version = "1.2.0" }
-console-auth = { path = "console/crates/console-auth", version = "1.2.0" }
-console-proxy = { path = "console/crates/console-proxy", version = "1.2.0" }
+tailrace-ddl = { path = "engine/crates/tailrace-ddl", version = "1.3.0" }
+tailrace-api = { path = "engine/crates/tailrace-api", version = "1.3.0" }
+console-store = { path = "console/crates/console-store", version = "1.3.0" }
+console-auth = { path = "console/crates/console-auth", version = "1.3.0" }
+console-proxy = { path = "console/crates/console-proxy", version = "1.3.0" }

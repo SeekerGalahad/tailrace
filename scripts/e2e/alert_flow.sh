@@ -9,13 +9,16 @@
 #                  lag gauge still climbs with wall time (lag = seconds since
 #                  the last data-carrying flush) but the console HOLDS the
 #                  lag rule (Unknown, reason source_idle) — no firing, no
-#                  notice, through a pause as well (the verdict freezes at
-#                  its last value while polls are suspended). This is the
-#                  1.2.0 false positive dogfooding round 3 #6 recorded
-#                  ("空闲活管道的 lag 规则会合法 re-fire"); pre-R11 this script
-#                  MANUFACTURED its lag by pausing an EOF source — under T-V1
-#                  that is silence, not lag, and it no longer fires (R11 W5
-#                  baseline run: 40/50, L1.1 state=inactive);
+#                  notice. This is the 1.2.0 false positive dogfooding round
+#                  3 #6 recorded ("空闲活管道的 lag 规则会合法 re-fire"). R11
+#                  review (9799a61) then changed the PAUSE contract: a paused
+#                  statement publishes NO verdict (`obs_idle(None)` — a
+#                  frozen idle would hold the rule across the whole pause),
+#                  the gauge is omitted, and console-api.md 裁决 (c) says an
+#                  unjudgeable source evaluates normally — so a source paused
+#                  AT EOF FIRES on wall-clock lag (I2 below pins exactly
+#                  that, contributing one firing+resolved pair the later
+#                  sections count against HOOK_BASE);
 #   lag rule     : a REAL lag is manufactured as an operator meets one — rows
 #                  pile up behind a broken sink. tuning.pollRows=1 makes every
 #                  data poll stop short of EOF (verdict idle=0 = backlog);
@@ -66,27 +69,32 @@
 #        线（tailrace_slo_lag_target_seconds 同标签对照，T-E2 SLO v1）；
 #   I    idle hold（T-V1）：I1 源读到 EOF → node 与 console /metrics 的
 #        tailrace_pipeline_source_idle=1 与 lag 系列同标签 → lag 随墙钟越过
-#        threshold=6 → 规则仍 inactive、webhook 0 条（1.2.0 在此 firing）；
-#        I2 pause/resume 走 console 代理（PAUSED/RUNNING 裁决）——暂停时判
-#        据冻结为 1，仍 hold；I3 追加 W-2 → 落盘 → lag 重新≈0 → 仍 0 条通知；
+#        threshold=6 且单拍 idle 被 hold → 规则仍 inactive、webhook 0 条
+#        （1.2.0 在此 firing）；I2 pause/resume 走 console 代理——R11 评审
+#        后暂停即 obs_idle(None)，序列消失（源不可判），按 console-api.md
+#        裁决 (c) 正常评估 → firing +1 对通知（记为 HOOK_BASE 基线）；I3
+#        追加 W-2 → 落盘 → lag 重新≈0 → 该 episode 正常 Clear → 回 inactive；
 #   L    真 lag：sink 文件换成目录 + 追加 BACKLOG_ROWS 行 → 首行 flush 失败
-#        → PIPELINE_RESTART（退避 20s）→ 退避期 idle=0 冻结、lag 越 6 →
-#        state=firing（open episode 在场）→ webhook 第 1 条（x-tailrace-
-#        event: firing，sample.value > 6 数字断言，sample 无 reason）→
-#        alert_event 落 firing 行；退避期内修复 sink → 重启排空积压（非
-#        idle、lag≈0）→ 同一 event 行翻 resolved（id 不变、resolvedAt/
-#        resolvedSample 在场）→ webhook 第 2 条；sink 行数 = 2 + BACKLOG_ROWS
-#        （失败的 flush 未写入，重放不重复）；
-#   W    idle 尾巴：排空后再次 EOF、lag 再越 6 —— 规则 inactive、webhook 仍
-#        恰 2 条（无 re-fire、无 per-tick 重复——防刷屏核心 + T-V1 根修）；
+#        → PIPELINE_RESTART（退避 20s）→ 退避窗口无线程发布判决，idle 序列
+#        **缺失**（不可判，绝不为 1——陈旧 idle=1 会 hold 真 lag）→ 重启后
+#        首拍重发 idle=0、lag 越 6 → state=firing（open episode 在场）→
+#        webhook 第 1 条（x-tailrace-event: firing，sample.value > 6 数字
+#        断言，sample 无 reason）→ alert_event 落 firing 行；退避期内修复
+#        sink → 重启排空积压（非 idle、lag≈0）→ 同一 event 行翻 resolved
+#        （id 不变、resolvedAt/resolvedSample 在场）→ webhook 第 2 条；sink
+#        行数 = 2 + BACKLOG_ROWS（失败的 flush 未写入，重放不重复）；
+#   W    idle 尾巴：排空后再次 EOF、lag 再越 6 —— 规则 inactive、webhook
+#        只多 L 段那 2 条（无 re-fire、无 per-tick 重复——防刷屏核心 +
+#        T-V1 根修 + T-B 两拍 idle Clear）；
 #        console /metrics 有 tailrace_slo_lag_p95_seconds（排空期的非 idle
 #        样本，T-V4 交叉核验，samples≥1）→ stop；
 #   F    真 FAILED：投影列序与 sink 登记列序相反（SELECT extra, id 对
 #        (id, extra)）→ runtime 首个带数据批次 bail「transform output
 #        column order != sink」→ recovery.autoRestart=false 即终态 FAILED
 #        （node /metrics tailrace_pipeline_state=3）→ 建 state_failed 规则
-#        → firing（webhook 第 3 条）→ stop（series 消失）→ resolved（第 4
-#        条）；DELETE 规则 → 204 → 空集。注：F 段刻意不依赖 badRowPolicy
+#        → firing（+1 通知）→ stop（series 消失）→ resolved（再 +1）；全部
+#        计数断言都相对 I 段末尾记下的 HOOK_BASE。DELETE 规则 → 204 → 空集。
+#        注：F 段刻意不依赖 badRowPolicy
 #        （坏 JSON 行在默认 dlq 策略下只进 DLQ，不是语句错误——run3 实测），
 #        非默认 badRowPolicy 的端到端由 B 段专门覆盖；
 #   B    badRowPolicy 非默认值端到端（R10 评审：a435afe 给 PipelineConfig 补
@@ -470,27 +478,32 @@ S="$(rule_state af-lag)"; N="$(hook_seen)"
 { [ "$S" = "inactive" ] && [ "$N" = "0" ]; } \
   && step pass "I1.3 CORE HELD: ≥2 evaluator passes over lag $(lag_now)s > 6 with idle=1 → rule state=$S, webhook $N notices (1.2.0 fired here — the R11 W5 baseline of the pre-revision script read L1.1 state=inactive for the same reason)" \
   || step fail "I1.3 idle hold" "state=$S hook=$N lag=$(lag_now) idle=$(idle_now)"
-# I2 pause/resume through the console proxy. While polls are suspended the
-# verdict keeps its last value (the runtime publishes it after each poll),
-# so a source paused AT EOF stays idle=1 and the rule stays held — the
-# pause that manufactured this script's firing before R11 is silence now.
+# I2 pause/resume through the console proxy. R11 review (9799a61) made the
+# pause RESET the verdict to unknown on purpose (`lib.rs` "no polls while
+# paused: the verdict is unknown, not the last poll's — a frozen idle would
+# hold the lag rules for the whole pause"), and the gauge is omitted when
+# the source cannot tell (`metrics.rs`). So a source paused AT EOF has NO
+# idle series: console-api.md 裁决 (c) 「源不可判（无 idle 序列）时照常评估」
+# — the lag gauge keeps climbing on wall time and the rule FIRES normally.
+# (The pre-9799a61 script asserted the opposite — a frozen idle=1 that held
+# the rule; that premise is what this section now pins down as gone.)
 req POST "/api/pipelines/$LAG_PID/pause" '{}' "$TOKEN"
 { [ "$CODE" = "200" ] && grep -q '"PAUSED"' <<<"$BODY"; } \
-  && step pass "I2.1 pipeline paused via the console proxy (engine verdict PAUSED — pulling stops, the idle verdict freezes at its last value 1)" \
+  && step pass "I2.1 pipeline paused via the console proxy (engine verdict PAUSED — pulling stops, the idle verdict RESETS to unknown)" \
   || step fail "I2.1 pause" "http=$CODE body=$BODY"
-sleep 5
+sleep 5 # ≥2 evaluator ticks (2s)
 S="$(rule_state af-lag)"; N="$(hook_seen)"
-{ [ "$S" = "inactive" ] && [ "$N" = "0" ] && [ "$(idle_now)" = "1" ]; } \
-  && step pass "I2.2 CORE still held through the pause: lag $(lag_now)s, idle=1 frozen, state=$S, webhook $N notices" \
-  || step fail "I2.2 paused hold" "state=$S hook=$N lag=$(lag_now) idle=$(idle_now)"
+{ [ -z "$(idle_now)" ] && [ "$S" = "firing" ] && [ "$N" = "1" ]; } \
+  && step pass "I2.2 CORE the pause drops the verdict: no tailrace_pipeline_source_idle series for pipeline $LAG_PID (unknown, R11 review), so with lag $(lag_now)s > 6 the rule evaluates normally → state=$S, webhook $N notice (a frozen idle would have HELD it here)" \
+  || step fail "I2.2 paused verdict" "state=$S hook=$N lag=$(lag_now) idle=$(idle_now)"
 req POST "/api/pipelines/$LAG_PID/resume" '{}' "$TOKEN"
 { [ "$CODE" = "200" ] && grep -q '"RUNNING"' <<<"$BODY"; } \
   && step pass "I2.3 pipeline resumed (engine verdict RUNNING — polls back on, still at EOF)" \
   || step fail "I2.3 resume" "http=$CODE body=$BODY"
 # I3 new data: W-2 lands (pollRows=1 → one poll, flushRows=1 → flushed at
-# once), last_data_ms re-stamps, the lag gauge drops to ~0, the delivering
-# poll's successor reaches EOF again (idle back to 1). Evaluation never
-# stopped — there was simply nothing to fire or resolve.
+# once), last_data_ms re-stamps, the lag gauge drops to ~0 → Clear → the
+# pause-opened episode resolves; the delivering poll's successor reaches EOF
+# again (idle back to 1) and the two-tick idle Clear keeps it quiet.
 printf '%s\n' '{"id":"W-2"}' >> "$WORK/node/wl_in"
 W2C=0
 for i in $(seq 1 20); do
@@ -504,9 +517,12 @@ LAG_AFTER="$(lag_now)"
   || step fail "I3.1 new data" "w2=$W2C lag=$LAG_AFTER"
 sleep 3
 S="$(rule_state af-lag)"; N="$(hook_seen)"
-{ [ "$S" = "inactive" ] && [ "$N" = "0" ] && [ "$(idle_now)" = "1" ]; } \
-  && step pass "I3.2 after the data landed: idle back to 1 (EOF again), state=$S, webhook still $N — the whole idle episode produced zero notices" \
+{ [ "$S" = "inactive" ] && [ "$N" = "2" ] && [ "$(idle_now)" = "1" ]; } \
+  && step pass "I3.2 after the data landed: the pause-opened episode resolved on the real Clear (idle back to 1 = EOF again), state=$S, webhook $N notices — the I section contributed exactly one firing+resolved pair" \
   || step fail "I3.2 post-data" "state=$S hook=$N idle=$(idle_now)"
+# Baseline for every later count: the I section's one firing+resolved pair
+# (2 notices) is in the book, so L/F/B/D are all asserted as offsets from it.
+HOOK_BASE="$(hook_seen)"
 
 # ---------- L a REAL lag: backlog behind a broken sink → firing ----------
 # idle=0 is what makes a lag real: rows behind the cursor. The file source
@@ -514,10 +530,15 @@ S="$(rule_state af-lag)"; N="$(hook_seen)"
 # data poll does. To hold that verdict for seconds the flush of the first
 # backlog row has to fail: the sink path becomes a DIRECTORY (FileSink
 # re-opens the target per flush), the statement errors, the registry logs
-# PIPELINE_RESTART and backs off 20s — and for that backoff the counters are
-# frozen: idle=0, last_data_ms = W-2's flush. The lag gauge crosses 6 →
-# the console FIRES (no hold: idle is 0). A sink outage with rows piling up
-# is the canonical real lag an operator wants paged for.
+# PIPELINE_RESTART and backs off 20s. During that backoff window there is
+# NO statement thread at all, so no verdict is published: the gauge is
+# omitted (unknown), not 0 — the R11 review's `obs_idle(None)` on the
+# statement-error path (lib.rs) plus metrics.rs "omitted when the source
+# cannot tell". What matters here is the NEGATIVE claim: the outage must
+# never look idle (a stale idle=1 would hold a real lag). The restarted
+# thread re-publishes 0 on its first poll (backlog behind the cursor), which
+# L1.1 asserts. A sink outage with rows piling up is the canonical real lag
+# an operator wants paged for.
 mv "$WORK/node/wl" "$WORK/node/wl.keep" && mkdir "$WORK/node/wl"
 for i in $(seq 1 "$BACKLOG_ROWS"); do printf '{"id":"B-%d"}\n' "$i"; done >> "$WORK/node/wl_in"
 [ -d "$WORK/node/wl" ] && [ "$(count_lines "$WORK/node/wl_in")" = "$((2 + BACKLOG_ROWS))" ] \
@@ -529,9 +550,10 @@ for i in $(seq 1 15); do
   [ "${RST:-0}" -ge 1 ] 2>/dev/null && break
   sleep 1
 done
-{ [ "${RST:-0}" -ge 1 ] && [ "$(idle_now)" = "0" ]; } \
-  && step pass "L0.2 CORE the first backlog row's flush failed → PIPELINE_RESTART event #$RST (backing off 20s) with the idle gauge frozen at 0 (backlog) — a real lag is now accumulating" \
-  || step fail "L0.2 outage" "restart_events=$RST idle=$(idle_now) events=$(grep "pipeline#$LAG_PID" "$WORK/node-state/events.log" 2>/dev/null | tail -2)"
+IDLE_L0="$(idle_now)"
+{ [ "${RST:-0}" -ge 1 ] && [ "$IDLE_L0" != "1" ]; } \
+  && step pass "L0.2 CORE the first backlog row's flush failed → PIPELINE_RESTART event #$RST (backing off 20s); the idle series is ${IDLE_L0:-absent} (NOT 1) — the error path resets the verdict to unknown and the backoff window publishes nothing, so a real lag can never be held as idle" \
+  || step fail "L0.2 outage" "restart_events=$RST idle=${IDLE_L0:-<absent>} events=$(grep "pipeline#$LAG_PID" "$WORK/node-state/events.log" 2>/dev/null | tail -2)"
 S="$(wait_rule af-lag firing 20)"
 OPEN_ID="$(req GET /api/alerts "" "$TOKEN"; jq -r --arg n af-lag '.rules[] | select(.name==$n) | .openEvent.id // empty' <<<"$BODY" 2>/dev/null)"
 [ "$S" = "firing" ] \
@@ -573,11 +595,13 @@ EV_RSAMPLE="$(jq -r --arg n af-lag '.events[] | select(.ruleName==$n) | .resolve
 { [ "${EV_STATE2:-x}" = "resolved" ] && [ -n "$EV_RESOLVED" ] && [ "${EV_ID2:-x}" = "${OPEN_ID:-x}" ] && [ -n "$EV_ID2" ] && awk -v v="${EV_RSAMPLE:-99}" 'BEGIN{exit !(v<6)}'; } \
   && step pass "L4.2 CORE the SAME episode row flipped to resolved (id=$EV_ID2 unchanged, resolvedAt set, resolvedSample.value=${EV_RSAMPLE}s < 6 — a real Clear from the drain, not series_absent) — no second row" \
   || step fail "L4.2 episode flip" "id=$EV_ID2 open=$OPEN_ID state=$EV_STATE2 resolvedAt=$EV_RESOLVED rsample=$EV_RSAMPLE"
-N="$(wait_hook 2 10)"
-if [ "$N" = "2" ] && jq -e 'select(.event_header=="resolved")' "$WORK/hook.jsonl" >/dev/null 2>&1; then
-  step pass "W1 CORE anti-flood: the webhook holds EXACTLY the episode's 2 notices (firing + resolved) — silent while firing persisted through the backoff, silent after it closed"
+# Hook-count baseline was recorded right after section I (HOOK_BASE = the
+# pause-opened episode's firing+resolved pair). Everything below is an offset.
+N="$(wait_hook "$((HOOK_BASE + 2))" 10)"
+if [ "$N" = "$((HOOK_BASE + 2))" ] && jq -e 'select(.event_header=="resolved")' "$WORK/hook.jsonl" >/dev/null 2>&1; then
+  step pass "W1 CORE anti-flood: the webhook holds EXACTLY 2 notices for the L episode on top of the $HOOK_BASE already there (firing + resolved) — silent while firing persisted through the backoff, silent after it closed"
 else
-  step fail "W1 anti-flood" "n=$N hook=$(jq -rc '.event_header' "$WORK/hook.jsonl" 2>/dev/null | paste -sd, -)"
+  step fail "W1 anti-flood" "n=$N want=$((HOOK_BASE + 2)) base=$HOOK_BASE hook=$(jq -rc '.event_header' "$WORK/hook.jsonl" 2>/dev/null | paste -sd, -)"
 fi
 # the drain lands every backlog row exactly once on top of W-1/W-2: the
 # failed flush wrote nothing, so the replayed B-1 is not a duplicate
@@ -594,13 +618,15 @@ B1C="$(grep -c '"B-1"}' "$WORK/node/wl" 2>/dev/null)"
 # W3 the idle tail: the drain reached EOF, the verdict is idle=1 again and
 # the lag climbs past 6 once more — 1.2.0 re-fired here (round 3 #6: the
 # firing/resolved oscillation every idle stretch; this script used to race
-# a stop against it). Under T-V1 the rule is held: still exactly 2 notices.
+# a stop against it). Under T-V1 + T-B the two-tick idle judgment closes any
+# already-open lag episode and then holds; the L episode contributed exactly
+# 2 notices on the HOOK_BASE baseline, so that count must not move.
 V="$(wait_lag_over 6 20)"
 sleep 5
 S="$(rule_state af-lag)"; TOTAL_HOOKS="$(hook_seen)"
-{ [ "$S" = "inactive" ] && [ "$TOTAL_HOOKS" = "2" ] && [ "$(idle_now)" = "1" ]; } \
-  && step pass "W3 CORE idle tail held: lag back over 6 (${V}s → $(lag_now)s) with idle=1 after the drain, state=$S, STILL exactly 2 notices across the whole episode (outage, backoff, drain, idle tail) — no re-fire, zero per-tick noise" \
-  || step fail "W3 idle tail" "state=$S total=$TOTAL_HOOKS lag=$(lag_now) idle=$(idle_now) hook=$(jq -rc '.event_header' "$WORK/hook.jsonl" 2>/dev/null | paste -sd, -)"
+{ [ "$S" = "inactive" ] && [ "$TOTAL_HOOKS" = "$((HOOK_BASE + 2))" ] && [ "$(idle_now)" = "1" ]; } \
+  && step pass "W3 CORE idle tail held: lag back over 6 (${V}s → $(lag_now)s) with idle=1 after the drain, state=$S, STILL $TOTAL_HOOKS notices (base $HOOK_BASE + the L episode's 2) across the whole L episode (outage, backoff, drain, idle tail) — no re-fire, zero per-tick noise" \
+  || step fail "W3 idle tail" "state=$S total=$TOTAL_HOOKS want=$((HOOK_BASE + 2)) lag=$(lag_now) idle=$(idle_now) hook=$(jq -rc '.event_header' "$WORK/hook.jsonl" 2>/dev/null | paste -sd, -)"
 # W4 T-V4 cross-check: the drain's non-idle passes were sampled into the SLO
 # ring (idle passes are not — slo.rs), so the console renders p95 for this
 # pipeline with a sample count that supports it
@@ -656,10 +682,10 @@ S="$(wait_rule af-failed firing 15)"
 [ "$S" = "firing" ] \
   && step pass "F2.1 CORE the rule fired on the real FAILED pipeline within one evaluator tick (~2s)" \
   || step fail "F2.1 failed firing" "state=$S"
-N="$(wait_hook 3 15)"
-[ "$N" = "3" ] \
-  && step pass "F2.2 webhook notice #3 received (state_failed firing)" \
-  || step fail "F2.2 webhook #3" "n=$N"
+N="$(wait_hook "$((HOOK_BASE + 3))" 15)"
+[ "$N" = "$((HOOK_BASE + 3))" ] \
+  && step pass "F2.2 webhook notice received (state_failed firing) — $N total = base $HOOK_BASE + L's 2 + this one" \
+  || step fail "F2.2 webhook firing" "n=$N want=$((HOOK_BASE + 3)) base=$HOOK_BASE"
 req POST "/api/pipelines/$FAIL_PID/stop" '{}' "$TOKEN"
 { [ "$CODE" = "200" ]; } && step pass "F3.0 poison pipeline stopped (registry entry gone → the state series disappears from /metrics)" \
   || step fail "F3.0 stop" "http=$CODE body=$BODY"
@@ -667,11 +693,11 @@ S="$(wait_rule af-failed inactive 20)"
 [ "$S" = "inactive" ] \
   && step pass "F3.1 CORE resolved the honest way: the series is ABSENT while its node still answers /metrics → reason=series_absent (R9 review fix: a node that is DOWN would HOLD the episode instead of faking a recovery)" \
   || step fail "F3.1 failed resolved" "state=$S"
-N="$(wait_hook 4 15)"
-if [ "$N" = "4" ] && jq -e 'select(.event_header=="resolved") | (.body|fromjson|.sample.reason) == "series_absent"' <(tail -1 "$WORK/hook.jsonl") >/dev/null 2>&1; then
-  step pass "F3.2 webhook notice #4 received (state_failed resolved, sample.reason=series_absent) — 4 notices total across two episodes, every one a transition"
+N="$(wait_hook "$((HOOK_BASE + 4))" 15)"
+if [ "$N" = "$((HOOK_BASE + 4))" ] && jq -e 'select(.event_header=="resolved") | (.body|fromjson|.sample.reason) == "series_absent"' <(tail -1 "$WORK/hook.jsonl") >/dev/null 2>&1; then
+  step pass "F3.2 webhook notice received (state_failed resolved, sample.reason=series_absent) — $N total = base $HOOK_BASE + L's 2 + F's 2, every one a transition"
 else
-  step fail "F3.2 webhook #4" "n=$N last=$(tail -1 "$WORK/hook.jsonl" 2>/dev/null | head -c 200)"
+  step fail "F3.2 webhook resolved" "n=$N want=$((HOOK_BASE + 4)) base=$HOOK_BASE last=$(tail -1 "$WORK/hook.jsonl" 2>/dev/null | head -c 200)"
 fi
 
 # ---------- cleanup of the rule face ----------
@@ -687,9 +713,9 @@ req GET /api/alerts "" "$TOKEN"
 NR="$(jq -r '.rules | length' <<<"$BODY" 2>/dev/null)"
 sleep 2
 NH="$(wc -l < "$WORK/hook.jsonl" 2>/dev/null | tr -d ' ')"
-{ [ "$D1" = "204" ] && [ "$D2" = "204" ] && [ "$NR" = "0" ] && [ "$NH" = "4" ]; } \
-  && step pass "S3.1 rules deleted (204 ×2) → empty rule set; no extra notice (none was firing — a firing rule would have been closed with reason=deleted and its resolved delivered first)" \
-  || step fail "S3.1 rule cleanup" "d1=$D1 d2=$D2 rules=$NR hook_notices=$NH"
+{ [ "$D1" = "204" ] && [ "$D2" = "204" ] && [ "$NR" = "0" ] && [ "$NH" = "$((HOOK_BASE + 4))" ]; } \
+  && step pass "S3.1 rules deleted (204 ×2) → empty rule set; no extra notice (none was firing — a firing rule would have been closed with reason=deleted and its resolved delivered first), $NH notices = base $HOOK_BASE + L's 2 + F's 2" \
+  || step fail "S3.1 rule cleanup" "d1=$D1 d2=$D2 rules=$NR hook_notices=$NH want=$((HOOK_BASE + 4)) base=$HOOK_BASE"
 
 # ---------- B badRowPolicy: the NON-default values end to end ----------
 # R10 review: a435afe gave PipelineConfig the bad_row_policy field and the
@@ -872,9 +898,9 @@ WANT_RAWS="$(printf '%s\n' '{broken-1' 'not json at all' '{"unterminated":' | so
 req POST "/api/pipelines/$DLQ_PID/stop" '{}' "$TOKEN"
 [ "$CODE" = "200" ] && step pass "D3.3 storm pipeline stopped" || step fail "D3.3 stop" "http=$CODE body=$BODY"
 NH="$(hook_seen)"
-[ "$NH" = "4" ] \
-  && step pass "D3.4 webhook untouched by sections B and D: still the 4 notices of the two rule episodes" \
-  || step fail "D3.4 webhook drift" "hook_notices=$NH"
+[ "$NH" = "$((HOOK_BASE + 4))" ] \
+  && step pass "D3.4 webhook untouched by sections B and D: still $NH notices (base $HOOK_BASE + L's 2 + F's 2) — the two rule episodes, nothing else" \
+  || step fail "D3.4 webhook drift" "hook_notices=$NH want=$((HOOK_BASE + 4)) base=$HOOK_BASE"
 
 TOTAL=$((PASS+FAIL))
 echo "== alert_flow e2e summary: $PASS/$TOTAL steps passed =="

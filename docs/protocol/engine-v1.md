@@ -149,11 +149,20 @@ SQL 编译诊断（编辑器内联报错数据源）。
 ```json
 { "ok": true, "stats": {
     "pipelineId": 42, "status": "RUNNING",
-    "totals":  { "consumed": 0, "flushed": 0, "skipped": 0, "bad": 0, "flushes": 0, "lastFlushMs": 0, "sourceIdle": null },
-    "statements": [ { "consumed": 0, "flushed": 0, "skipped": 0, "bad": 0, "flushes": 0, "lastFlushMs": 0, "sourceIdle": null } ] } }
+    "totals":  { "consumed": 0, "flushed": 0, "skipped": 0, "bad": 0, "flushes": 0,
+                 "lastFlushMs": 0, "flushMsTotal": 0, "lastFlushDurMs": 0, "lastDataMs": 0,
+                 "sourceIdle": null },
+    "statements": [ { "consumed": 0, "flushed": 0, "skipped": 0, "bad": 0, "flushes": 0,
+                      "lastFlushMs": 0, "flushMsTotal": 0, "lastFlushDurMs": 0, "lastDataMs": 0,
+                      "sourceIdle": null } ] } }
 ```
 
-`sourceIdle`（v1.3 T-V1，R11 新增）：语句级 idle 判决——`true` = 源游标后无积压**且** sink 缓冲无待写行，`false` = 任一侧有积压，`null` = 无判决（尚未轮询、轮询失败、已暂停或语句循环退出）。`totals.sourceIdle` 为保守折叠：任一语句 `false` 即 `false`，全部 `true` 才 `true`，否则 `null`。
+字段全集以 `StatementCountersSnapshot`（`engine/crates/tailrace-runtime/src/pipeline_log.rs:379-405`）为准——该结构体逐字段全序列化，无 `skip_serializing`：
+
+- **基础计数**：`consumed` / `flushed` / `skipped` / `bad` / `flushes` / `lastFlushMs`；
+- **A6 附加三项**（添加性字段，1.1.0 起；旧客户端忽略即无感）：`flushMsTotal`（累计 flush 耗时 ms）、`lastFlushDurMs`（最近一次 flush 耗时 ms）、`lastDataMs`（最近一次**含数** flush 的墙钟 ms——lag 判据的基）；
+- `sourceIdle`（v1.3 T-V1，R11 新增）：语句级 idle 判决——`true` = 源游标后无积压**且** sink 缓冲无待写行，`false` = 任一侧有积压，`null` = 无判决（尚未轮询、轮询失败、已暂停或语句循环退出）。`totals.sourceIdle` 为保守折叠：任一语句 `false` 即 `false`，全部 `true` 才 `true`，否则 `null`（`PipeCounters::totals`，同文件 :455-485）。
+- 版本面提醒：**`sourceIdle` 不在任何已发布版本里**（crates.io 最新为 1.2.0，该字段随 v1.3 开发线 R11 引入）——对着 1.2.0 二进制查 stats 不会看到它；其余字段（含 A6 三项）在 1.2.0 已存在。
 
 不在册（未部署/已停止）→ `{"ok": false, "error": "pipeline #42 not registered ..."}`（日志仍可查）。
 

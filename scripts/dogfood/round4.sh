@@ -260,6 +260,11 @@ SUM3="$(jq -cS '.summary' <<<"$T_BODY" 2>/dev/null)"
   || step fail "G1.6 converged dry-run" "summary=$SUM3"
 req GET "/api/pipelines/$P_ID" "" "$TOKEN"
 UA1="$(jq -r '.updatedAt // empty' <<<"$BODY" 2>/dev/null)"
+# generation BEFORE the no-op apply — the idempotency claim is "unchanged
+# objects are not touched", so the comparison needs both ends of the pair
+# (a lone post-reading only proves the field exists).
+req GET /api/datasources "" "$TOKEN"
+GEN1="$(jq -r --arg n df4-files '(.items // [])[] | select(.name==$n) | (.generation | tostring) // empty' <<<"$BODY" 2>/dev/null)"
 sleep 1
 tool apply "$(jq -c '. + {confirm:true}' "$WORK/pipelines.v1.json")"
 SUM4="$(jq -cS '.summary' <<<"$T_BODY" 2>/dev/null)"
@@ -267,9 +272,9 @@ req GET "/api/pipelines/$P_ID" "" "$TOKEN"
 UA2="$(jq -r '.updatedAt // .updated_at // empty' <<<"$BODY" 2>/dev/null)"
 req GET /api/datasources "" "$TOKEN"
 GEN2="$(jq -r --arg n df4-files '(.items // [])[] | select(.name==$n) | (.generation | tostring) // empty' <<<"$BODY" 2>/dev/null)"
-{ [ "$SUM4" = "$(jq -cS . <<<'{"create":0,"update":0,"unchanged":4,"orphan":0}')" ] && [ "$UA1" = "$UA2" ] && [ -n "$GEN2" ]; } \
-  && step pass "G1.7 CORE 幂等二连: second apply summary $SUM4, pipeline updatedAt byte-unchanged ($UA2), datasource generation still $GEN2 — unchanged objects are not touched" \
-  || step fail "G1.7 idempotent apply" "summary=$SUM4 ua1=$UA1 ua2=$UA2 gen=$GEN2"
+{ [ "$SUM4" = "$(jq -cS . <<<'{"create":0,"update":0,"unchanged":4,"orphan":0}')" ] && [ "$UA1" = "$UA2" ] && [ -n "$GEN1" ] && [ "$GEN1" = "$GEN2" ]; } \
+  && step pass "G1.7 CORE 幂等二连: second apply summary $SUM4, pipeline updatedAt byte-unchanged ($UA2), datasource generation $GEN1 → $GEN2 (equal — unchanged objects are not touched)" \
+  || step fail "G1.7 idempotent apply" "summary=$SUM4 ua1=$UA1 ua2=$UA2 gen1=$GEN1 gen2=$GEN2"
 
 # ---------- G3 the deploy hop: where pure-MCP GitOps stops ----------
 tool deploy_pipeline "{\"id\":$P_ID,\"confirm\":true}"
@@ -338,14 +343,21 @@ DT=$(( $(date +%s) - T_DRAIN0 ))
   && step pass "S2.4 backlog drained: $ROWS rows landed in orders_out in ≤${DT}s (≈$(( ROWS / (DT>0?DT:1) )) rows/s at pollRows=1 — the per-row batch cost is the drain's speed)" \
   || step fail "S2.4 drain" "lines=$GOT want=$ROWS"
 # after the drain the source is idle (EOF): no NEW samples, the ring keeps
-# the window's history — that is the file-source SLO shape (doc friction)
+# the window's history — that is the file-source SLO shape (doc friction).
+# Assertion shape (R12 T-D): the old `>=` was vacuously true (a 1h ring can
+# never shrink inside its window, so it proved nothing). The claim is "no
+# new samples accrue over silence" — measure the count at the drain edge and
+# again after 4s of idle and require it FROZEN, plus the idle gauge exactly 1.
+req GET "/api/slo?pipeline=$P_ID" "" "$TOKEN"
+S_N_AT_DRAIN="$(jq -r '.series[0].samples // 0' <<<"$BODY" 2>/dev/null)"
 sleep 4
 req GET "/api/slo?pipeline=$P_ID" "" "$TOKEN"
 S_N2="$(jq -r '.series[0].samples // 0' <<<"$BODY" 2>/dev/null)"
 S_LAG="$(curl -s "http://$CONSOLE_ADDR/metrics" | grep "^tailrace_pipeline_source_idle{.*pipeline=\"$P_ID\"" | head -1)"
-[ "${S_N2:-0}" -ge "${S_N:-0}" ] 2>/dev/null \
-  && step pass "S2.5 after the drain: idle gauge '$S_LAG' (EOF), the ring keeps its $S_N2 samples (1h retention) — no new samples accrue over silence" \
-  || step fail "S2.5 idle ring" "samples=$S_N2 (was $S_N)"
+S_LAG_V="$(awk '{print $NF}' <<<"$S_LAG")"
+{ [ -n "$S_N_AT_DRAIN" ] && [ "${S_N2:-x}" = "${S_N_AT_DRAIN:-y}" ] && [ "${S_LAG_V:-}" = "1" ]; } \
+  && step pass "S2.5 after the drain: idle gauge '$S_LAG' (EOF), the ring stays FROZEN at $S_N2 samples across 4s of silence (1h retention, no new samples accrue)" \
+  || step fail "S2.5 idle ring" "samples=$S_N2 (at drain=${S_N_AT_DRAIN:-?}, earlier=$S_N) idle='$S_LAG'"
 
 # ---------- G4 GitOps edit: v2 changes checkpointMs ----------
 jq '.pipelines[0].checkpointMs = 5000' "$WORK/pipelines.v1.json" > "$WORK/pipelines.v2.json"

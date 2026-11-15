@@ -1,8 +1,8 @@
-# tailrace 架构设计（post-R11 版）
+# tailrace 架构设计（post-R12 开发线版）
 
-> 读者：新贡献者与评审者。本文档描述**已落地**的系统形态：基线 = **v1.2.0**（CHANGELOG 版本切点 2026-10-31；tag 与 GitHub Release 打于 2026-11-02，指向 `main` 合并点 `84a1393`——其内容 = v1.1.0 + 扩展轮 / R6 / R7 / R8 / R8.5 + **R9**（T-A4 VARIANT / T-A5 向量列 / T-E2 告警与 SLO 目标线）+ **R10**（T-G3 Cursor 开放化 / T-G6 管道即代码 / 尾债束）），**加上其后 R11 一轮**（v1.3 开发线 `feature/v1.3-dev`：T-V1 idle 感知告警 / T-V2 DLQ 逐行去重 / T-V3 MCP apply 对 / T-V4 SLO 分位数 / T-V5 迁移窗硬错 + 评审修复），落稿工作树 HEAD `9799a61`，不是愿景稿。
-> 版本诚实声明（2026-11-03 实查）：**GitHub Release v1.2.0 已发布**（`gh release view v1.2.0`：9 资产 = 8 tarball + checksums.txt，publishedAt 2026-11-02T12:00:16Z）；**crates.io 现值仍为 1.1.0**（`tailrace-ir` / `tailrace-console` / `tailrace-runtime` max_version 1.1.0，`tailrace-ddl` 404 从未上架）——工作区 `Cargo.toml:39` `version = "1.2.0"` 的 22 包 lockstep publish 尚未执行；R11 五项能力**未随任何 tag 发布**（CHANGELOG Unreleased 段，含 1.3.0 BREAKING：未知类型词硬错）。
-> 三条引用纪律：性能数字一律引 `docs/BENCHMARKS.md` 现值（带行号锚点）；代码锚点 `路径:行号` 可直接点开核对（本文全部行号为 2026-11-03 落稿会话在上述 HEAD 实测；短路径按 crate 名省写——`conn-doris/src/lib.rs` = `engine/crates/tailrace-conn-doris/src/lib.rs`、`mcp.rs` / `pipelines.rs` 等 = `console/crates/tailrace-console/src/{,api/}` 下同名文件）；内部过程档已私仓化，本文只引用公开仓内文件。
+> 读者：新贡献者与评审者。本文档描述**已落地**的系统形态：发布基线 = **v1.2.0**（CHANGELOG 版本切点 2026-10-31；GitHub Release 9 资产打于 2026-11-02，指向 `main` 合并点 `84a1393`——其内容 = v1.1.0 + 扩展轮 / R6 / R7 / R8 / R8.5 + **R9**（T-A4 VARIANT / T-A5 向量列 / T-E2 告警与 SLO 目标线）+ **R10**（T-G3 Cursor 开放化 / T-G6 管道即代码 / 尾债束）），**加上其后 R11 一轮**（T-V1 idle 感知告警 / T-V2 DLQ 逐行去重 / T-V3 MCP apply 对 / T-V4 SLO 分位数 / T-V5 迁移窗硬错 + 评审修复）**与正在进行的 R12 轮**（v1.3 开发线 `feature/v1.3-fixes`，自 main@9dad0e9：T-A 列类型预检 / T-B idle 两拍 Clear / T-C MCP `publish_pipeline` / T-D 卫生波 / T-E dogfood round5 / T-F 版本 prep）——**R12 尚未收口，v1.3.0 的 tag 与发包未执行**（用户保留决策）。本文落稿于 R12 W4（T-D+T-E），不是愿景稿。
+> 版本诚实声明（2026-11-14 实查，**取代 2026-11-03 段**）：**GitHub Release v1.2.0 已发布**（9 资产 = 8 tarball + checksums.txt，publishedAt 2026-11-02T12:00:16Z）；**crates.io 22 包已全部上到 1.2.0**（2026-11-03 完成；逐包实查 `crates.io/api/v1/crates/<name>` 的 max_version=1.2.0，含首上的 `tailrace-ddl`；本机 `cargo install tailrace-node --version 1.2.0 --locked` 与同参 `tailrace-console` 均安装成功——「新用户装得到」是实证不是推断，见 `docs/dev/dogfooding-round5-2026-11-14.md`）。**R11 起的能力（含 R12 的 T-A/T-B/T-C）不在任何已发布版本里**：1.2.0 二进制实测 stats 无 `sourceIdle`、MCP `tools/list` 恰 14 工具（非 16）——CHANGELOG 记在 `[Unreleased]`，含 1.3.0 BREAKING：未知类型词硬错。
+> 三条引用纪律：性能数字一律引 `docs/BENCHMARKS.md` 现值（带行号锚点）；代码锚点 `路径:行号` 可直接点开核对（本文全部行号为 2026-11-03 落稿会话在上述 HEAD 实测；**2026-11-14 R12 W4 只改版本段/债务表/维护约定三处散文面，未触碰任何代码锚点**；短路径按 crate 名省写——`conn-doris/src/lib.rs` = `engine/crates/tailrace-conn-doris/src/lib.rs`、`mcp.rs` / `pipelines.rs` 等 = `console/crates/tailrace-console/src/{,api/}` 下同名文件）；内部过程档已私仓化，本文只引用公开仓内文件。
 
 ## 目录
 
@@ -22,7 +22,7 @@
 
 ## 一、项目定位与北极星
 
-**v1.0：一条 SQL、两个二进制、零 JVM 的数据接入引擎，管理台内置，Doris/StarRocks 写入语义按档位交付（1.0=label 幂等档；事务接口 exactly-once 与 group commit 吞吐档=v1.x，触发条件见 T18 纪要）。**（ASSESSMENT-AND-OUTLOOK.md §一，北极星原文）**v1.0.0（2026-10-23）、v1.1.0（2026-10-25）与 v1.2.0（CHANGELOG 2026-10-31 / tag+Release 2026-11-02）均已发布**：前两版 crates.io 21 包 lockstep 发到 1.1.0、GitHub Release 各 9 资产；v1.2.0 的 GitHub Release 9 资产已发、**crates.io 22 包 lockstep publish 尚未执行**（本档头部版本诚实声明）。
+**v1.0：一条 SQL、两个二进制、零 JVM 的数据接入引擎，管理台内置，Doris/StarRocks 写入语义按档位交付（1.0=label 幂等档；事务接口 exactly-once 与 group commit 吞吐档=v1.x，触发条件见 T18 纪要）。**（ASSESSMENT-AND-OUTLOOK.md §一，北极星原文）**v1.0.0（2026-10-23）、v1.1.0（2026-10-25）与 v1.2.0（CHANGELOG 2026-10-31 / GitHub Release 2026-11-02 / crates.io 2026-11-03）均已发布**：三版 crates.io lockstep（21/21/22 包）与 GitHub Release 各 9 资产。v1.2.0 是**当前唯一可 `cargo install` 的版本**；R11 起的能力在 `[Unreleased]`（见头部版本诚实声明）。
 
 三条差异化支柱（ASSESSMENT-AND-OUTLOOK.md §一；兑现列为 post-R11 工作线实况）：
 
@@ -665,7 +665,7 @@ stats JSON 逐语句附加 `sourceIdle: true|false|null`（管道级保守折叠
 
 ### 11.2 CI 与 release
 
-CI 8 job 沿 v1.1.0（rust / msrv / no-default-features / slim-features / macos / web / chaos / smoke；`.github/workflows/ci.yml`）。release：4 目标矩阵（linux/macOS × x64/arm64）→ 8 tarball + checksums（release.yml:33-38）。**v1.2.0 发布事实（2026-11-02）**：GitHub Release 9 资产已发（本档头部实查）；**crates.io 仍 1.1.0**——22 包 1.2.0 lockstep publish 未执行（`tailrace-ddl` 从未上架，22 为 `scripts/release-crates.sh` 的完整性检查值：脚本改读 `[workspace.package] version`，`--list` 与 `cargo metadata` publishable 集精确一致）；R11 五项在 Unreleased（§〇）。
+CI 8 job 沿 v1.1.0（rust / msrv / no-default-features / slim-features / macos / web / chaos / smoke；`.github/workflows/ci.yml`）。release：4 目标矩阵（linux/macOS × x64/arm64）→ 8 tarball + checksums（release.yml:33-38）。**v1.2.0 发布事实（分两段）**：GitHub Release 9 资产 2026-11-02 上线；**crates.io 22 包 lockstep 于 2026-11-03 完成**（逐包实查 max_version=1.2.0，含首上的 `tailrace-ddl`；22 为 `scripts/release-crates.sh` 的完整性检查值——脚本读 `[workspace.package] version`，`--list` 与 `cargo metadata` publishable 集精确一致）；R11 起能力仍在 Unreleased（§〇）。
 
 ### 11.3 工程治理（post-R8 立面；R11 顺带清偿公开面残债）
 
@@ -725,7 +725,7 @@ gantt
 - **R8.5 正典文档对齐轮（merge 003f27e，零代码）**：五正典（本文档/双 README/ASSESSMENT/mdBook 八章）对齐 post-R8；CHANGELOG 增 Unreleased；核查报告 docs/dev/doc-audit-2026-10-30.md。
 - **R9（评审修复 efc33a5，e2e variant 41/41+42/42、variant_vector 46/46、alert_flow 38/38→50/50、dogfooding round3 27/27）**：T-A4 VARIANT 直写（ce67dca——DDL 映射+decoder 整段透传+探针证「JSON 字符串字面量服务端即析构」使 sink 零改动）；T-A5 向量列（f9c56bd——`ARRAY<FLOAT>`+dim COMMENT+`check_vector_cells` 行前拒绝）；T-E2 告警/SLO/ops bundles（00b9af6——规则引擎+webhook/SSE+SLO 目标线+grafana/prometheus 两件）；评审修复（efc33a5——逐序列三态 episode/不可达 hold/console 时钟 heartbeat_age/窗口基线 60s 松弛/阈值≥0/删除必达 resolved/webhook 脱离评估循环/不可能过滤器 400/dim 向量 evolve 不再 409/MAX_VECTOR_DIM 与 f32 有限守卫）；e2e 证明与复认证（dedd179）。
 - **R10（评审修复 45228e5，e2e alert_flow 50/50、dogfooding round3 复认证）**：T-G3 Cursor 开放化（53de510——`Custom{kind,payload}`+台账读旧写新+双 fixture）；T-G6 管道即代码（df8353b——/api/apply+dry-run 同一 plan()+CLI 薄壳+pipeline-file.md）；尾债束（a435afe——badRowPolicy 透传+键集契约测试、MEM_LIMIT 可重试、DLQ at-least-once 语义如实披露、round3 open-item 游标/flush 短一行证据链结案 docs/dev/open-item-cursor-flush.md）；评审修复（45228e5——badRowPolicy 非默认 e2e 50/50、open-item 证据诚实、文档时态漂移）。
-- **v1.2.0 发布（版本切点 db72994+dab86ad preflight，merge 84a1393 打 tag）**：工作区 23 成员锁版 1.2.0（22 publishable）；CHANGELOG [1.2.0] 定稿（版本日期 2026-10-31）；release-crates.sh 改动态读版本+发布拓扑补 tailrace-ddl（完整性检查 21→22）；tag 与 GitHub Release 9 资产于 2026-11-02 上线（R5 先例：先定版后发布）。**crates.io 22 包 publish 截至本档未执行**（§〇 版本诚实声明）。
+- **v1.2.0 发布（版本切点 db72994+dab86ad preflight，merge 84a1393 打 tag）**：工作区 23 成员锁版 1.2.0（22 publishable）；CHANGELOG [1.2.0] 定稿（版本日期 2026-10-31）；release-crates.sh 改动态读版本+发布拓扑补 tailrace-ddl（完整性检查 21→22）；**三条发布足迹**：GitHub Release 9 资产 2026-11-02 上线（R5 先例：先定版后发布）→ **crates.io 22 包 1.2.0 lockstep publish 2026-11-03 完成**（`release-log-20261103.txt`；本机 2026-11-14 逐包实查与 `cargo install … --version 1.2.0 --locked` 双证，见 §〇 版本诚实声明与 `docs/dev/dogfooding-round5-2026-11-14.md`）。
 - **R11（HEAD 9799a61，e2e alert_flow 69/69、variant_vector compose 2.1.7 47/47、dogfooding round4 36/36）**：T-V1 idle 感知告警（73341a3——`Source::idle()` 位置判据+语句级 `publish_idle`+lag 规则 hold+stats sourceIdle）；T-V3 MCP 14→16（29f02ce——apply/apply_dry_run 对+公开面债三件）；T-V4 SLO 分位数（f4ec700——1h 样本环迁移 06+nearest-rank p50/p95/p99+/api/slo+grafana SLO row）；T-V5 迁移窗硬错（cf69dc8——BREAKING，1.3.0；compose 2.1.7 向量复验）；T-V2 与评审修复（73341a3/9799a61——DLQ 行键改行位点（指标仍计次）、idle 判决计 sink 积压并在退出/暂停复位、MCP 审计脱敏任意深度、apply_dry_run 拒凭据 oracle）；e2e 再认证（1658d36——alert_flow 重写 50→69 步含 idle/风暴两景）。
 
 ### 12.2 未清债务（按域，2026-11-03 盘点）
@@ -739,7 +739,7 @@ gantt
 7. **~~G2 迁移窗~~ 已关（R11 T-V5）**：`UNKNOWN_TYPE_UTF8_MIGRATION_WINDOW=false`（column_type.rs:173），未知词装配期硬错——1.2.0→1.3.0 的唯一 BREAKING；升级面=手工登记的词表外类型串（§3.3）。
 8. **variant 与向量列读回语义**（A4/A5 已端到端落地，§3.3）：仍开放/显式取舍——variant 根级字符串值不保真（为 Debezium 字符串编码 JSON 让路）；点键 raw 回显 3.1.4 与 2.1.7 有版本差（e2e 只断言子列）；向量 dim 只是登记侧守卫（Doris 不持有数组维度）；`estimatedRows` 诚实降级 null（回填 dryRun）。~~compose 2.1.7 向量复跑~~ 已由 R11 补做（`scripts/e2e/evidence/vector-probe-2.1.7-2026-11-02/`、`variant-vector-e2e-2.1.7-2026-11-02/` 47/47）。
 9. 开放问题沿旧：OTLP 默认开未决；proto plan 解码 gated 维持（CustomScan qualifier 边界）；`migrate` 留 501（nodes_admin.rs:1193）；`ticket` 端点尚未开路由（凭据加密静态半边已落地，票据链为 v1.x 结构性修复，console-api.md「已知差异」）。
-10. **crates.io 1.2.0 publish 未执行**（§〇）：GitHub Release 已发而 crates.io 停在 1.1.0——22 包 lockstep（含首上 `tailrace-ddl`）待发布窗。
+10. ~~**crates.io 1.2.0 publish 未执行**~~ **已清（2026-11-03）**：22 包 1.2.0 lockstep 全部上架（逐包实查 max_version=1.2.0，含首上的 `tailrace-ddl`；`scripts/release-log-20261103.txt` 记 20 条 `PUB … OK` + 已被先前 publish 覆盖的 `SKIP … already 1.2.0`，中途两次 `FAIL — wave stopped` 由 `--resume` 续完）。**新入场项 = 1.3.0 的 22 包发包与 tag**——R12 收口后的用户保留决策（本文不代办）。
 11. **idle hold 的 Clear 遮蔽窗**（dogfooding round4，R12 候选）：积压在一个评估 tick（15s）内排干时，idle=1 使 episode 维持 firing 到下一数据或 stop——hold 语义的正确代价，但可细化。
 12. **纯 MCP GitOps 止于 publish**（dogfooding round4）：≤16 预算无 publish 工具、`deploy_pipeline` 对 DRAFT 答 400——MCP 面管道即代码闭环差一环，预算裁决先行。
 13. **告警/SLO/apply 无 web 页面**（§八）：REST+SSE+CLI+MCP+Grafana 面可用，SPA 侧未接。
@@ -816,4 +816,4 @@ flowchart LR
   README -->|"连接器文档"| CONN
 ```
 
-> 维护约定：本文档随能力落地更新（v1.0.0 / v1.1.0 / v1.2.0 随发布对齐；post-R11 版随 R9-R11 与 v1.2.0 发布事实对齐，2026-11-03）；性能/状态数字改动只改来源文件（BENCHMARKS/ASSESSMENT），本文档同步锚点即可。轮次任务卡与评审过程档属私仓（docs/dev/README.md），公开仓文档以提交史（`git log v1.1.0..HEAD`）为过程事实来源。
+> 维护约定：本文档随能力落地更新（v1.0.0 / v1.1.0 / v1.2.0 随发布对齐；**post-R12 版（2026-11-14）**随 R12 W4 的卫生波与 dogfood round5 对齐：版本诚实声明改为「crates.io 22 包 @1.2.0 已发」（原「仍 1.1.0 / 未执行」段已被实证取代）、R11+ 能力明确标注为未发布、未清债务删一条（crates.io publish）并新增 1.3.0 发包项）；性能/状态数字改动只改来源文件（BENCHMARKS/ASSESSMENT），本文档同步锚点即可。轮次任务卡与评审过程档属私仓（docs/dev/README.md），公开仓文档以提交史（`git log v1.1.0..HEAD`）为过程事实来源。

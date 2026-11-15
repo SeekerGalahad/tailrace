@@ -14,19 +14,22 @@ use serde_json::{json, Value};
 use tailrace_console::mcp::McpState;
 use tower::ServiceExt;
 
-/// §7.5 table order + the R8 four + the R11 apply pair — `tools/list` must
-/// expose exactly these sixteen (the pause and resume routes share the
-/// `pause_resume_pipeline` slot; the DDL closed loop, backfill status and
-/// the pipeline-as-code pair ride at the end).
+/// §7.5 table order + the R8 four + the R11 apply pair + the R12 publish
+/// tool (T-C) — `tools/list` must expose exactly these sixteen (the pause
+/// and resume routes share the `pause_resume_pipeline` slot; the DDL closed
+/// loop, backfill status and the pipeline-as-code pair ride at the end; the
+/// debug-only `get_pipeline_logs` snapshot was replaced by `publish_pipeline`
+/// in R12, so the log endpoint itself stays reachable over the session-scoped
+/// REST `GET /api/pipelines/{id}/logs` and is no longer an MCP tool).
 const ALL_TOOLS: [&str; 16] = [
     "list_datasources",
     "list_pipelines",
     "get_pipeline",
     "get_pipeline_stats",
-    "get_pipeline_logs",
     "compile_sql",
     "create_pipeline",
     "deploy_pipeline",
+    "publish_pipeline",
     "pause_resume_pipeline",
     "trigger_backfill",
     "ddl_draft",
@@ -36,9 +39,10 @@ const ALL_TOOLS: [&str; 16] = [
     "apply",
     "apply_dry_run",
 ];
-const WRITE_TOOLS: [&str; 7] = [
+const WRITE_TOOLS: [&str; 8] = [
     "create_pipeline",
     "deploy_pipeline",
+    "publish_pipeline",
     "pause_resume_pipeline",
     "trigger_backfill",
     "ddl_execute",
@@ -226,6 +230,7 @@ async fn initialize_and_tools_list_expose_the_sixteen_tools() {
             "backfill_status" => "GET /api/pipelines/{id}/backfill/jobs",
             "apply" => "POST /api/apply",
             "apply_dry_run" => "POST /api/apply/dry-run",
+            "publish_pipeline" => "POST /api/pipelines/{id}/publish",
             _ => continue,
         };
         assert!(
@@ -299,6 +304,7 @@ async fn write_tools_are_rejected_while_the_switch_is_off() {
                 {"name": "p", "sqlContent": "SELECT 1"}
             ]}),
         ),
+        ("publish_pipeline", json!({"confirm": true, "id": 1})),
     ];
     for (name, args) in &calls {
         let b = tool(&app, &hdr, name, args.clone()).await;
@@ -323,7 +329,7 @@ async fn write_tools_are_rejected_while_the_switch_is_off() {
         .iter()
         .filter(|(_, _, d)| d["code"] == "WRITE_DISABLED")
         .collect();
-    assert_eq!(rejected.len(), 7, "{rows:#?}");
+    assert_eq!(rejected.len(), 8, "{rows:#?}");
     for (actor, entity, detail) in &rejected {
         assert_eq!(actor, "mcp:gate-test");
         assert!(
@@ -333,8 +339,8 @@ async fn write_tools_are_rejected_while_the_switch_is_off() {
         assert_eq!(detail["outcome"], "rejected");
         assert_eq!(detail["tool"], entity.as_deref().unwrap());
     }
-    // 7 rejected + 1 ok read = the complete MCP audit trail
-    assert_eq!(rows.len(), 8, "{rows:#?}");
+    // 8 rejected + 1 ok read = the complete MCP audit trail
+    assert_eq!(rows.len(), 9, "{rows:#?}");
     assert!(audit_rows(&app.store, "PIPELINE_CREATE").is_empty());
     assert!(
         audit_rows(&app.store, "TABLE_DDL_EXECUTE").is_empty(),
@@ -755,6 +761,110 @@ async fn apply_tools_share_the_g6_diff_and_dry_run_writes_nothing() {
     assert_eq!(body["error"]["message_key"], "err.apply.unknown_key");
 }
 
+/// R12 (T-C): `publish_pipeline` write tool — gates, publish audit row and
+/// idempotent re-publish. Maps to POST /api/pipelines/{id}/publish (the
+/// T-A7 / LOW-5 publish gate: every referenced table object resolvable,
+/// version+1, spec snapshot). A draft created over REST is published through
+/// the MCP face only.
+#[tokio::test]
+async fn publish_pipeline_tool_runs_the_write_gates_and_publishes() {
+    let app = app_with_mcp(true).await;
+    let hdr = [("x-mcp-client", "publish-agent")];
+    let (_kafka, doris, _, _) = seed_datasources(&app).await;
+    // a DRAFT pipeline over REST — publish_pipeline alone turns it live
+    let (s, b) = req(
+        &app,
+        "POST",
+        "/api/pipelines",
+        Some(json!({
+            "name": "orders→ods",
+            "sqlContent": PIPELINE_SQL,
+            "dsMapping": {"shop": _kafka, "ods": doris},
+            "checkpointMs": 10000,
+            "preferredNodeId": null,
+            "config": {"reliability": null, "recovery": null, "tuning": null,
+                       "groupPrefix": null, "startOffset": "earliest"}
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let pid = b["id"].as_i64().unwrap();
+    let (_, body) = tool_ok(&tool(&app, &hdr, "get_pipeline", json!({"id": pid})).await);
+    assert_eq!(body["status"], "DRAFT");
+
+    // --- gate 1: switch off → WRITE_DISABLED (rely on the default-off app)
+    let app_ro = app_with_mcp(false).await;
+    let b = tool(
+        &app_ro,
+        &hdr,
+        "publish_pipeline",
+        json!({"confirm": true, "id": pid}),
+    )
+    .await;
+    assert_eq!(b["error"]["code"], -32001, "{b}");
+    assert_eq!(b["error"]["data"]["code"], "WRITE_DISABLED", "{b}");
+
+    // --- gate 2: confirm:true required
+    let b = tool(&app, &hdr, "publish_pipeline", json!({"id": pid})).await;
+    assert_eq!(b["error"]["code"], -32602, "{b}");
+    assert_eq!(b["error"]["data"]["code"], "CONFIRM_REQUIRED", "{b}");
+    let b = tool(
+        &app,
+        &hdr,
+        "publish_pipeline",
+        json!({"confirm": false, "id": pid}),
+    )
+    .await;
+    assert_eq!(b["error"]["data"]["code"], "CONFIRM_REQUIRED", "{b}");
+
+    // --- publish: 200 + version bump + spec snapshot + handler audit row
+    let args = json!({"confirm": true, "id": pid});
+    let (status, result) = tool_ok(&tool(&app, &hdr, "publish_pipeline", args).await);
+    assert_eq!(status, 200, "{result}");
+    assert_eq!(result["id"], pid);
+    let version = result["version"].as_i64().expect("version");
+    assert!(!result["specJson"].as_str().unwrap().is_empty(), "{result}");
+    assert_eq!(result["dryRun"], Value::Null, "publish is not a dry run");
+    let (_, body) = tool_ok(&tool(&app, &hdr, "get_pipeline", json!({"id": pid})).await);
+    assert_eq!(body["status"], "PUBLISHED", "{body}");
+
+    let rows = audit_rows(&app.store, "MCP_TOOL_CALL");
+    let ok_publish = rows
+        .iter()
+        .find(|(_, e, d)| e.as_deref() == Some("publish_pipeline") && d["outcome"] == "ok")
+        .expect("ok publish audit");
+    assert_eq!(ok_publish.0, "mcp:publish-agent");
+    assert_eq!(ok_publish.2["httpStatus"], 200);
+    let domain = audit_rows(&app.store, "PIPELINE_PUBLISH");
+    assert_eq!(
+        domain.len(),
+        1,
+        "handler's own publish audit row: {domain:#?}"
+    );
+    assert_eq!(domain[0].0, "mcp:publish-agent");
+    assert_eq!(domain[0].1.as_deref(), Some(pid.to_string().as_str()));
+    assert_eq!(domain[0].2["version"], version);
+
+    // --- idempotent re-publish: new version, snapshot again
+    let again = json!({"confirm": true, "id": pid});
+    let (_, result) = tool_ok(&tool(&app, &hdr, "publish_pipeline", again).await);
+    let next_version = result["version"].as_i64().expect("next version");
+    assert!(next_version > version, "re-publish must bump: {result}");
+
+    // --- unknown pipeline → 404 through the tool envelope
+    let (status, body) = tool_err(
+        &tool(
+            &app,
+            &hdr,
+            "publish_pipeline",
+            json!({"confirm": true, "id": 999999}),
+        )
+        .await,
+    );
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["error"]["code"], "NOT_FOUND", "{body}");
+}
+
 /// R11 review, two findings on the apply pair's credential handling.
 /// (1) `apply_dry_run` is always-on over the unauthenticated `/mcp`, and
 /// `plan()` compares a declared credential against the stored one — a
@@ -924,22 +1034,10 @@ async fn read_tools_and_actions_round_trip_through_the_mock_engine() {
     assert_eq!(body["ok"], true);
     assert_eq!(body["stats"]["totals"]["consumed"], 128000);
 
-    // logs snapshot: one tail pull; `lines` clamped to the 50..500 band
-    let (_, body) = tool_ok(
-        &tool(
-            &app,
-            &hdr,
-            "get_pipeline_logs",
-            json!({"id": pid, "lines": 10}),
-        )
-        .await,
-    );
-    assert_eq!(body["entries"].as_array().unwrap().len(), 3);
-    assert_eq!(body["lastSeq"], 3);
-    assert_eq!(
-        st.log_queries.lock().unwrap().last().map(String::as_str),
-        Some("limit=50&tail=1")
-    );
+    // logs: the `get_pipeline_logs` snapshot tool was retired in R12
+    // (replaced by `publish_pipeline`); the endpoint itself stays over the
+    // session-scoped REST `GET /api/pipelines/{id}/logs`, not /mcp — so
+    // there is no MCP log tool to call here.
 
     // compile: ok + the 400-with-diagnostics shape as a tool error
     let (_, body) = tool_ok(
@@ -1002,9 +1100,6 @@ async fn read_tools_and_actions_round_trip_through_the_mock_engine() {
 
     // REST 404s surface as tool errors carrying the §4.0 envelope
     let (status, body) = tool_err(&tool(&app, &hdr, "get_pipeline", json!({"id": 999})).await);
-    assert_eq!(status, 404);
-    assert_eq!(body["error"]["code"], "NOT_FOUND");
-    let (status, body) = tool_err(&tool(&app, &hdr, "get_pipeline_logs", json!({"id": 999})).await);
     assert_eq!(status, 404);
     assert_eq!(body["error"]["code"], "NOT_FOUND");
 
