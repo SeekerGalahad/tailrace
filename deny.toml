@@ -57,4 +57,15 @@ ignore = [
     # there is no upgrade path until upstream swaps the crate. Re-check when
     # testcontainers bumps its tar edge.
     "RUSTSEC-2026-0440",
+    # RUSTSEC-2026-0543 / -0555 / -0542: chrono, chrono-tz and humantime are
+    # unmaintained (chronotope/chrono#1768, announced 2026-11; humantime
+    # only because it wraps chrono). All versions affected, "no safe
+    # upgrade is available" — they reach us transitively via
+    # datafusion→arrow-array (chrono/chrono-tz) and
+    # datafusion→object_store (humantime), so removing them means leaving
+    # the datafusion face, not a version bump. Alternatives (jiff/time)
+    # need upstream DF adoption first. Re-check when datafusion migrates.
+    "RUSTSEC-2026-0543",
+    "RUSTSEC-2026-0555",
+    "RUSTSEC-2026-0542",
 ]

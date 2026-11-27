@@ -5,9 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-<!-- Release notes draft (v1.3.0) — paste into the GitHub Release body when the
-     user gate opens the tag. Every claim below is from this tree; nothing is
-     tagged or published yet (see the [1.3.0] scope paragraph). -->
+<!-- Release notes draft (v1.3.0) — written before the tag; every claim below is
+     from this tree. v1.3.0 was tagged and published (GitHub Release + crates.io)
+     on 2026-11-15. -->
 
 **v1.3.0 — the breaking minor: unknown column-type words stop folding, and they
 now fail at the registration desk instead of at deploy.**
@@ -47,7 +47,39 @@ cargo install tailrace-console --version 1.3.0 --locked
 
 ## [Unreleased]
 
-_Nothing yet — v1.3.0 was cut from this section on 2026-11-15._
+### Fixed
+
+- **CI advisory gate (time drift, not code): three lockfile bumps and three
+  documented ignores.** RUSTSEC-2026-0592 (`url` 2.5.8: stack overflow in
+  `Url::origin()` on nested `blob:` URLs) → `url` 2.5.9, which in turn
+  requires `form_urlencoded` ^1.2.3 (published 2026-11-20, after the 1.3.0
+  cut) → `form_urlencoded` 1.2.3; RUSTSEC-2026-0544 (`libz-sys` 1.1.31:
+  zlib `gz_vacate()` heap buffer overflow, via rdkafka→curl-sys) →
+  `libz-sys` 1.1.33. All three are checksum-verified surgical `Cargo.lock`
+  updates (sha256 computed from the `.crate` files, dependency sets
+  re-checked one by one; no toolchain on the authoring machine, CI's
+  `--locked` gates the result). Both vulnerabilities postdate the v1.3.0
+  tag (2026-11-15), so any push to any branch was red.
+  RUSTSEC-2026-0543 / -0555 / -0542 (chrono, chrono-tz, humantime
+  unmaintained — all versions, no upgrade path, transitive via datafusion)
+  are ignored with comments in `deny.toml` per the zip-8.6.0 precedent.
+- **README bilingual release-facts refresh** (docs branch): restored the
+  English `README.md` that commit 3385603 (2026-11-14) had overwritten with
+  a Chinese rewrite — the GitHub landing page and both crates.io package
+  pages were Chinese-only. Both READMEs now state v1.3.0 as released (tag +
+  GitHub Release + crates.io, 2026-11-15, all 22 packages verified), the
+  Quickstart leads with `cargo install` (tarball alternative, honest
+  first-compile time), and documents the three new-user blockers found by
+  dogfooding round 5: the `TAILRACE_DS_<id>` credential env var (value
+  format `Basic base64(user:pass)`, SSH deploy chain does not inject it),
+  manual table-object registration for `file` datasources (table name =
+  file name), and `connector-jdbc` being an opt-in feature. Also fixed: the
+  dim-table reference syntax (`${ds:dim.<datasourceId>.<table>}`, the
+  store parses the numeric id — both READMEs previously showed an alias),
+  the MCP tool count in `--help`/comments and `console-api.md` (8R+8W with
+  `publish_pipeline`), `starrocks` missing from the datasource-type list,
+  and the stale "not yet tagged/published" CHANGELOG header.
+
 
 ## [1.3.0] - 2026-11-15
 
@@ -60,8 +92,8 @@ two-tick idle clear / T-C MCP `publish_pipeline` / T-D hygiene wave / T-E
 dogfooding round 5 / T-F this cut). This entry cuts the tree at 1.3.0 in
 lockstep — one workspace version inherited by all 23 members, 22 of them
 publishable (`tests-contract` stays `publish = false`); the v1.3.0 tag, the
-binary release and the crates.io publish follow it (R5 precedent — version
-first, publish second). e2e counts quoted below are the figures recorded when
+binary release and the crates.io publish followed on 2026-11-15 (R5 precedent —
+version first, publish second). e2e counts quoted below are the figures recorded when
 each round landed (`scripts/e2e/`, against Doris 2.1.7 in compose and an
 external 3.1.4), not re-run for this entry unless the bullet says so. Anchors
 are `path:line` in this tree._

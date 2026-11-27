@@ -2,7 +2,7 @@
 
 > 管理面 REST 协议正典（`tailrace-console` 二进制）。随 utoipa 注解同步维护；
 > 机器可读正典 = 运行时 `/api-docs/openapi.json`（66 路径，`tailrace-console/src/openapi.rs` `paths(…)` 登记数，2026-11-01 实测），Swagger UI 在 `/swagger-ui/`。
-> 首版 2026-10-11；鉴权协议安全修复改版 2026-10-13；MCP 面正典化 + 维表（T-D1）动线增补 2026-10-27；建表闭环（T-A1）三端点增补 2026-10-28；回填（T-A2）两端点增补 2026-10-28；部分列更新（T-A7）控制面开关 + evolve 双向互斥 + keyModel 登记增补 2026-10-28；R8 类型地基轮同步 2026-10-30（MCP 10→14 工具 + 工具描述 OpenAPI 同源；建表闭环词汇映射 4→13（A3）；infer-schema 收 `debezium-json` + 列型按十六词词汇收窄；draft body 增 `columnTypes`）；R8.5 评审修复轮 2026-10-30（三处 pre-A3 时态残留清偿：openapi 路径计数 49→58、evolve 比对词汇「4 类」→十六词、分区候选规则改为 A3 名称×类型双判——`int64`/`date`/`timestamp` 皆可取 RANGE 键）；告警/SLO（T-E2）五端点增补 2026-10-31（openapi 路径计数 58→63；规则引擎在 console、五类规则、事件只在状态迁移落行、webhook+SSE 投递、`/metrics` 增 `tailrace_slo_lag_target_seconds`——详见语义裁决 11）；管道即代码（T-G6）两端点增补 2026-10-31（openapi 路径计数 63→65；`POST /api/apply[/dry-run]` 声明文件结构化 diff + 幂等 upsert、CLI 薄壳 `tailrace-console apply`、JSON-only v1——详见语义裁决 12 与 `docs/ops/pipeline-file.md`）；R11 MCP apply 对（T-V3）增补 2026-11-01（MCP 14→16 工具=9R+7W，≤16 预算用满；`apply`(W)/`apply_dry_run`(R) 复用同一 G6 端点与 `plan()`，dry-run 零域审计；openapi 路径计数不变——两路径 T-G6 已登记）；R11 SLO 历史分位（T-V4）增补 2026-11-01（openapi 路径计数 65→66；console-store 迁移 06 `slo_lag_sample` 1h 环形样本表、告警评估拍顺带写入、启动清扫裁剪；`GET /api/slo` + `/metrics` 增 `tailrace_slo_lag_p50/p95/p99_seconds` 与 `tailrace_slo_lag_samples`——详见语义裁决 14）。
+> 首版 2026-10-11；鉴权协议安全修复改版 2026-10-13；MCP 面正典化 + 维表（T-D1）动线增补 2026-10-27；建表闭环（T-A1）三端点增补 2026-10-28；回填（T-A2）两端点增补 2026-10-28；部分列更新（T-A7）控制面开关 + evolve 双向互斥 + keyModel 登记增补 2026-10-28；R8 类型地基轮同步 2026-10-30（MCP 10→14 工具 + 工具描述 OpenAPI 同源；建表闭环词汇映射 4→13（A3）；infer-schema 收 `debezium-json` + 列型按十六词词汇收窄；draft body 增 `columnTypes`）；R8.5 评审修复轮 2026-10-30（三处 pre-A3 时态残留清偿：openapi 路径计数 49→58、evolve 比对词汇「4 类」→十六词、分区候选规则改为 A3 名称×类型双判——`int64`/`date`/`timestamp` 皆可取 RANGE 键）；告警/SLO（T-E2）五端点增补 2026-10-31（openapi 路径计数 58→63；规则引擎在 console、五类规则、事件只在状态迁移落行、webhook+SSE 投递、`/metrics` 增 `tailrace_slo_lag_target_seconds`——详见语义裁决 11）；管道即代码（T-G6）两端点增补 2026-10-31（openapi 路径计数 63→65；`POST /api/apply[/dry-run]` 声明文件结构化 diff + 幂等 upsert、CLI 薄壳 `tailrace-console apply`、JSON-only v1——详见语义裁决 12 与 `docs/ops/pipeline-file.md`）；R11 MCP apply 对（T-V3）增补 2026-11-01（MCP 14→16 工具=9R+7W，≤16 预算用满；`apply`(W)/`apply_dry_run`(R) 复用同一 G6 端点与 `plan()`，dry-run 零域审计；openapi 路径计数不变——两路径 T-G6 已登记）；R11 SLO 历史分位（T-V4）增补 2026-11-01（openapi 路径计数 65→66；console-store 迁移 06 `slo_lag_sample` 1h 环形样本表、告警评估拍顺带写入、启动清扫裁剪；`GET /api/slo` + `/metrics` 增 `tailrace_slo_lag_p50/p95/p99_seconds` 与 `tailrace_slo_lag_samples`——详见语义裁决 14）；R12 MCP `publish_pipeline`（T-C）增补 2026-11-15（以**替换** `get_pipeline_logs` 用满预算，16 工具=8R+8W；`GET /api/datasource-types` 清单补 `starrocks`；语义裁决 2 补 `TAILRACE_DS_*` 的值格式与下发条件）。
 
 ## 一、通用约定
 
@@ -20,7 +20,7 @@
 | ✅ | POST /api/auth/login · POST /api/auth/logout · GET /api/auth/me（P0） |
 | ✅ | POST /api/nodes/register · POST /api/nodes/heartbeat（m2m；协议 2026-10-13 安全修复改版：**register 响应携带服务端新生成的 per-node token** `bootstrapToken`（`tr_b_<48hex>`，一次性回显，节点须持久化并在此后 register/heartbeat 携带；每次成功 register 轮换并重新回显）；`node.bootstrap_token` 列仅存 sha256(token)，token 原文不再驻留库中；全局 bootstrap token 仅准入未知 node_key 的**首次注册**——已注册节点持全局 token 一律 401 BAD_NODE_TOKEN；未知节点心跳 401；吊销（digest 置 NULL）401） |
 | ✅ | GET /healthz · GET /swagger-ui/ · GET /api-docs/openapi.json |
-| ✅ | GET /api/datasource-types（静态注册表自述：kafka/doris/file + mysql/postgresql（T14，jdbc 批源族，jdbcUrl 字段），动态表单单一事实源） |
+| ✅ | GET /api/datasource-types（静态注册表自述：kafka/doris/starrocks/file + mysql/postgresql（T14，jdbc 批源族，jdbcUrl 字段），动态表单单一事实源） |
 | ✅ | GET /api/datasources?type= · POST /api/datasources · GET/PUT/DELETE /api/datasources/{id} |
 | ✅ | POST /api/datasources/test · POST /api/datasources/{id}/test（HTTP 恒 200，结果在 status 字段） |
 | ✅ | POST /api/datasources/{id}/tables（T-A7 起 body 可带 `keyModel:"unique"\|"duplicate"`……缺省 null=未声明）**·T-A 词汇预检（2026-11-14**：`columnsJson` 各 `[name,type]` 的 `type` 必在 16 词表内（`tailrace_catalog::ColumnType::parse`，零新依赖；表内词 `utf8/string/int8/int16/int32/int64/float32/float64/decimal(p,s)/timestamp(s|ms|us|ns)/date/bool/binary/list<float32[,dim]>/variant/null`），首个未知词 400，信封指明**第几列、什么词、建议词表**（`err.table_object.unknown_column_type`），不折叠为 utf8、不透出引擎装配错误） · GET /api/datasources/tables?datasourceId=&kind=（行带 `keyModel`；**T-A 存量提示**：行增可选 `unknownColumnTypes`，`[[列名,词]…]` 列出登记列中不在 16 词表内的项，**只提示不改行为**——1.2.0 登记表的存量可见，方便人工把词改到 16 词表内；register/apply/ddl/draft 全面加预检后新写入即拒） |
@@ -54,7 +54,7 @@
 ## 三、关键语义裁决
 
 1. **compile 的 `db.table` 改写**：编辑器 SQL 用 `库名.表名`，console 端仅改写 dsMapping 命中的两段名（别名 `o.id`、数字字面量 `1.5`、三段链、字符串/引号内不动）；未映射的 INSERT/FROM 目标由 parser 以「非 `${ds:}` 占位符」诊断拒绝（引用对拍）。group 约定 `tr.p{pipelineId}.s{index}`（compile 请求可带 pipelineId，缺省 0）。
-2. **plan authEnv 用 `TAILRACE_DS_{datasourceId}`**：早期示例写 `TR_DS_4`，但引擎 `credential_from_env` 只放行 `TAILRACE_` 前缀（engine-v1.md §四、tailrace-catalog lib.rs:219）——按运行引擎契约为准。
+2. **plan authEnv 用 `TAILRACE_DS_{datasourceId}`**：早期示例写 `TR_DS_4`，但引擎 `credential_from_env` 只放行 `TAILRACE_` 前缀（engine-v1.md §四、tailrace-catalog lib.rs:219）——按运行引擎契约为准。**变量值是 HTTP Basic 凭据原文**（形如 `Basic base64(user:pass)`，见 `tailrace-conn-doris/src/lib.rs` 的 `auth_env` 文档注释），node 在装配 sink 时现读；变量缺失即装配失败（`credentials never enter files`），deploy 回 502 ENGINE_REJECTED。该变量只在汇的数据源为 doris/starrocks **且**存有凭据时下发（`api/pipelines.rs` 的 `auth_env` 派生）；SSH 部署链不注入它，须在 node 自己的环境里设好。
 3. **凭据存储为 AES-256-GCM 密文**（静态半边已落地，2026-10-13：`datasource_credential` 两列分别存 base64 的 12B nonce 与 ciphertext，`console-store/src/secretbox.rs`；master key 解析 fail-closed——`TAILRACE_MASTER_KEY` 优先，否则 `<data-dir>/master.key` 首启生成，解析失败 console 拒绝启动，绝不降级）；凭据永不出现在任何响应（仅 `hasPassword`）。
 4. **探测语义**：TCP 连通（kafka bootstrap 逐主机、doris FE jdbcUrl+BE streamLoadUrl 全部可达才 CONN_OK）+ file 路径存在性。注意：开发机 TUN 代理会劫持非环回 TCP connect（瞬时假成功）；环回地址不受影响。协议级探测（Kafka metadata / Doris·MySQL·PG 握手）已随 T14 discover/infer-schema 交付（engine `tailrace-metadata`，见端点清单）。
 5. **自动分配合格节点** = ONLINE（心跳 90s 内）且已上报 api_url。
@@ -324,9 +324,9 @@
 ## 五、MCP 面（`POST /mcp`，T-E4 / 蓝图 §7.5）
 
 - **传输**：Streamable HTTP 请求/响应（无服务端 SSE 流）；单 body 单 JSON-RPC 消息，batch 拒绝（-32600）；`initialize` 发 `Mcp-Session-Id`（后续调用按 clientInfo.name 归因，未带回落 `X-MCP-Client`/`User-Agent`/anonymous）。协议版本 `2025-06-18`（echo 旧已知版本）。无 console 会话——全局固定窗口限速（默认 100 req/s，超限 429 + -32002）。
-- **写闸门**：七个写工具需**双重确认**——进程级开关 `--mcp-allow-write` / `MCP_ALLOW_WRITE=1` **且**调用参数 `"confirm": true`；缺一以 `WRITE_DISABLED`(-32001) / `INVALID_PARAMS`(code CONFIRM_REQUIRED) 拒绝。
+- **写闸门**：八个写工具需**双重确认**——进程级开关 `--mcp-allow-write` / `MCP_ALLOW_WRITE=1` **且**调用参数 `"confirm": true`；缺一以 `WRITE_DISABLED`(-32001) / `INVALID_PARAMS`(code CONFIRM_REQUIRED) 拒绝。
 - **审计**：每次工具调用——成功、失败、被拒——都落 `audit_log` 为 `MCP_TOOL_CALL`（actor=`mcp:<client>`），含从未到达工具执行的尝试（未知工具名 / 缺名 / 非对象 arguments，以 UNKNOWN_TOOL / INVALID_PARAMS 登记）；过闸的写调用另产生对应 REST 域审计行（PIPELINE_CREATE、T-G6 逐写入行 + APPLY 汇总等，operator 归到 MCP 身份）。
-- **十六工具表**（`tools/list` 顺序；R=读恒开，W=写需闸门）——蓝图 §7.5 的十工具 + R8 四工具（建表闭环 `ddl_draft`/`ddl_execute`/`ddl_evolve` 与回填进度 `backfill_status`）+ R11 管道即代码对（`apply`/`apply_dry_run`，T-V3——≤16 预算用满，再加工具需先裁预算）；仓库内正典即 `tailrace-console/src/mcp.rs:104` 的 `TOOLS` 表与单测 `tool_table_matches_the_registered_surface`（`mcp.rs:1361`：16 工具、9R+7W、唯一名、写必 confirm）。**工具描述自 R8 起由 OpenAPI 文档同源生成**（`openapi_tool_description`，`mcp.rs:828`——`tools/list` 的 description 取自 utoipa 注解，无第二份手写文案可漂移）。此处镜像供评审对拍：
+- **十六工具表**（`tools/list` 顺序；R=读恒开，W=写需闸门）——蓝图 §7.5 的十工具 + R8 四工具（建表闭环 `ddl_draft`/`ddl_execute`/`ddl_evolve` 与回填进度 `backfill_status`）+ R11 管道即代码对（`apply`/`apply_dry_run`，T-V3——≤16 预算用满，再加工具需先裁预算）+ R12 `publish_pipeline`（T-C——以**替换**而非扩张用满预算：调试型 `get_pipeline_logs` 快照工具退出 MCP 面，REST 日志端点 `GET /api/pipelines/{id}/logs` 原样保留）；仓库内正典即 `tailrace-console/src/mcp.rs:108` 的 `TOOLS` 表与单测 `tool_table_matches_the_registered_surface`（`mcp.rs:1331`：16 工具、8R+8W、唯一名、写必 confirm）。**工具描述自 R8 起由 OpenAPI 文档同源生成**（`openapi_tool_description`，`mcp.rs:790`——`tools/list` 的 description 取自 utoipa 注解，无第二份手写文案可漂移）。此处镜像供评审对拍：
 
 | # | 工具 | 读写 | 映射 | 关键参数 |
 |---|---|---|---|---|
@@ -334,10 +334,10 @@
 | 2 | `list_pipelines` | R | GET /api/pipelines | `page?` `pageSize?` |
 | 3 | `get_pipeline` | R | GET /api/pipelines/{id} | `id` |
 | 4 | `get_pipeline_stats` | R | GET /api/pipelines/{id}/stats | `id` |
-| 5 | `get_pipeline_logs` | R | 引擎 tail 单快照（SSE 不可折入单结果） | `id` `lines?`（钳 50..500） |
-| 6 | `compile_sql` | R | POST /api/pipelines/compile（纯函数） | `sql` `dsMapping?` `pipelineId?` |
-| 7 | `create_pipeline` | W | POST /api/pipelines | `name` `sqlContent` `dsMapping?` `checkpointMs?` `preferredNodeId?` `config?` + `confirm` |
-| 8 | `deploy_pipeline` | W | POST /api/pipelines/{id}/deploy | `id` `nodeId?` + `confirm` |
+| 5 | `compile_sql` | R | POST /api/pipelines/compile（纯函数） | `sql` `dsMapping?` `pipelineId?` |
+| 6 | `create_pipeline` | W | POST /api/pipelines | `name` `sqlContent` `dsMapping?` `checkpointMs?` `preferredNodeId?` `config?` + `confirm` |
+| 7 | `deploy_pipeline` | W | POST /api/pipelines/{id}/deploy | `id` `nodeId?` + `confirm` |
+| 8 | `publish_pipeline` | W | POST /api/pipelines/{id}/publish（R12 T-C：REST handler 的薄适配器，发布门逐条照过——引用表对象可解析、`${ds:id.db.table}` 物化、version 自增；`mcp.rs:680`，路由映射 `:757`，参数 schema `:996`；契约 `tests/mcp_server.rs` 的 `publish_pipeline_tool_runs_the_write_gates_and_publishes`） | `id` + `confirm` |
 | 9 | `pause_resume_pipeline` | W | POST /api/pipelines/{id}/pause·resume | `id` `action`("pause"|"resume") + `confirm` |
 | 10 | `trigger_backfill` | W | POST /api/pipelines/{id}/backfill（T-A2 已接真；`dryRun` 缺省 true——蓝图 §7.5 MCP 恒预览优先） | `id` `from` `to`（`{"type":"offset","value":N}` 对象）`statementIndex?` `dryRun?` + `confirm` |
 | 11 | `ddl_draft` | R（只组文本、不触 Doris） | POST /api/datasources/{id}/tables/{db}/{table}/ddl/draft | `datasourceId` `db` `table` + draft body 原样透传（`keyColumn?` `keyModel?` `replicationNum?` `partition?` `columnTypes?`） |
