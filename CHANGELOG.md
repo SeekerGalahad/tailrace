@@ -47,7 +47,36 @@ cargo install tailrace-console --version 1.3.0 --locked
 
 ## [Unreleased]
 
-_Nothing yet — v1.3.0 was cut from this section on 2026-11-15._
+### Fixed
+
+- **CI advisory gate (time drift, not code): two lockfile bumps and three
+  documented ignores.** RUSTSEC-2026-0592 (`url` 2.5.8: stack overflow in
+  `Url::origin()` on nested `blob:` URLs) → `url` 2.5.9; RUSTSEC-2026-0544
+  (`libz-sys` 1.1.31: zlib `gz_vacate()` heap buffer overflow, via
+  rdkafka→curl-sys) → `libz-sys` 1.1.33 — both are checksum-verified
+  surgical `Cargo.lock` updates (dependency sets unchanged, no toolchain on
+  the authoring machine; CI's `--locked` gates the result). Both advisories
+  postdate the v1.3.0 tag (2026-11-15), so any push to any branch was red.
+  RUSTSEC-2026-0543 / -0555 / -0542 (chrono, chrono-tz, humantime
+  unmaintained — all versions, no upgrade path, transitive via datafusion)
+  are ignored with comments in `deny.toml` per the zip-8.6.0 precedent.
+- **README bilingual release-facts refresh** (docs branch): restored the
+  English `README.md` that commit 3385603 (2026-11-14) had overwritten with
+  a Chinese rewrite — the GitHub landing page and both crates.io package
+  pages were Chinese-only. Both READMEs now state v1.3.0 as released (tag +
+  GitHub Release + crates.io, 2026-11-15, all 22 packages verified), the
+  Quickstart leads with `cargo install` (tarball alternative, honest
+  first-compile time), and documents the three new-user blockers found by
+  dogfooding round 5: the `TAILRACE_DS_<id>` credential env var (value
+  format `Basic base64(user:pass)`, SSH deploy chain does not inject it),
+  manual table-object registration for `file` datasources (table name =
+  file name), and `connector-jdbc` being an opt-in feature. Also fixed: the
+  dim-table reference syntax (`${ds:dim.<datasourceId>.<table>}`, the
+  store parses the numeric id — both READMEs previously showed an alias),
+  the MCP tool count in `--help`/comments and `console-api.md` (8R+8W with
+  `publish_pipeline`), `starrocks` missing from the datasource-type list,
+  and the stale "not yet tagged/published" CHANGELOG header.
+
 
 ## [1.3.0] - 2026-11-15
 
