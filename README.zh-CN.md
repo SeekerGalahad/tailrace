@@ -14,32 +14,24 @@
 
 ## 状态
 
-**已发布：v1.2.0**——CHANGELOG 版本切点 2026-10-31；v1.2.0 git tag、GitHub
+**当前发行版：v1.3.0**——CHANGELOG 版本切点 2026-11-15；v1.3.0 git tag、GitHub
 Release（9 资产 = 8 tarball + checksums.txt）与 crates.io 发包（22 个可发布 crate
-全部 1.2.0，lockstep）已于 **2026-11-02/03** 上线。两条渠道任选安装：
+全部 1.3.0，lockstep）已于 **2026-11-15** 上线。两条渠道任选安装：
 
 ```bash
-cargo install tailrace-node --version 1.2.0 --locked   # crates.io
-# 或从 https://github.com/SeekerGalahad/tailrace/releases/tag/v1.2.0 取 tarball
-```
-
-**源码树 = v1.3.0 定版**（2026-11-15 切点；23 个 workspace 成员 lockstep，22 个可
-发布，`tests-contract` 为 `publish = false`）。**tag / GitHub Release / crates.io 发包
-都未执行**——用户保留的放行决策（R5 先例：先定版、后发布）。CHANGELOG 头部载有
-release notes 草稿与 `[1.3.0]` 段（含 BREAKING 与升级指南）。放行后的安装命令：
-
-```bash
-cargo install tailrace-node --version 1.3.0 --locked
+cargo install tailrace-node --version 1.3.0 --locked    # crates.io
 cargo install tailrace-console --version 1.3.0 --locked
+# 或从 https://github.com/SeekerGalahad/tailrace/releases/tag/v1.3.0 取 tarball
 ```
 
-放行前想立刻试用请把两条 `--version` 换成 1.2.0（实测可装；两版行为差异见
-`[1.3.0]` 段）。
+v1.3.0 的源码树有 23 个 workspace 成员（22 个可发布，`tests-contract` 为
+`publish = false`）。上一版 v1.2.0（2026-11-02）仍可安装；两版行为差异见
+`[1.3.0]` 段的 BREAKING 与升级指南。
 
 随版交付：引擎数据面（kafka / file / jdbc 为源，Doris + StarRocks Stream Load
 与 file 为汇）、数据源发现与模式推断（`discover` / `infer-schema`）、SSH 部署链、
-性能账本（docs/BENCHMARKS.md）、8 job CI 矩阵与下方全部能力——叠在 v1.1.0
-（2026-10-25，首批 21 个 crate 上 crates.io、tag 与 9 资产 Release 在档）之上。
+性能账本（docs/BENCHMARKS.md）、8 job CI 矩阵与下方全部能力——叠在 v1.0.0
+（2026-10-23）、v1.1.0（2026-10-25）与 v1.2.0（2026-11-02）之上。
 
 **v1.1.0 之后**六轮开发随 v1.2.0 发布：`/metrics`、Debezium CDC 解码、MCP 服务、
 维表广播 join、建表闭环、确定性回填、部分列更新、十六词列类型词汇、`TableObject`
@@ -54,7 +46,7 @@ p50/p95/p99（1h 样本环）、**列类型词汇预检**（register/apply/ddl-d
 400，含第几列+建议词表），以及 **1.3.0 BREAKING**——未知列类型词迁移窗关闭
 （warn+折叠改装配期硬报错）。逐轮账见
 [docs/design/architecture.zh.md](docs/design/architecture.zh.md) §十二，
-[CHANGELOG.md](CHANGELOG.md) 为发布日志（`[1.3.0]` = 本轮定版段）。
+[CHANGELOG.md](CHANGELOG.md) 为发布日志（`[1.3.0]` 段含 BREAKING 与升级指南）。
 
 汇端交付档位如实表述：**label 幂等档已交付**，分两种模式。常驻管道用*进程作用域*
 label——同进程内重试复用同一 label，Doris 去重；跨重启的不重复来自已提交游标加表的
@@ -67,30 +59,57 @@ trait 现已带 `prepare / commit / abort` 钩子（默认 no-op）与 `SinkCapa
 
 ## 快速开始
 
-前置条件：Rust ≥ 1.95（rustup；仓库 pin 了 stable 工具链）、Node.js 22、pnpm。
+两个已发布的二进制。console 已内嵌 Web UI，不需要 Node 工具链，也不用克隆
+源码；首次 `cargo install` 在桌面机上约需 10–17 分钟编译（2026-11-14 的一次
+新用户实测：1.2.0 在 Apple M4 上 node 10m12s、console 6m29s），且需要 Rust
+工具链——Release tarball 两者都不需要。
 
 ```bash
-# 1. 构建前端并内嵌，再构建双二进制
-./scripts/build.sh
+# 1. 安装两个二进制
+cargo install tailrace-node --version 1.3.0 --locked
+cargo install tailrace-console --version 1.3.0 --locked
 
 # 2. 启动管理台（Web UI 在 http://127.0.0.1:8080）
-./target/release/tailrace-console --data-dir ./data
+tailrace-console --data-dir ./data
 #    首次启动会在 stderr 打印一次性 admin 初始密码与 bootstrap token——
 #    当场抄下，之后不再展示。
 #    加 --mcp-allow-write 开启 MCP 写工具（默认只读）。
 
 # 3. 启动引擎节点并向管理台自注册
-./target/release/tailrace-node serve \
+tailrace-node serve \
   --addr 127.0.0.1:18100 \
   --control-plane http://127.0.0.1:8080 \
   --advertise 127.0.0.1:18100 \
   --bootstrap-token <首启打印的 token>
 ```
 
-浏览器打开 http://127.0.0.1:8080，用 `admin` + 抄下的密码登录建管道；或跑
-`./scripts/smoke.sh` 做脚本化端到端自检（默认 25 步断言、无外部依赖；加 `--full`
-为 44 步——经 docker compose 走 Kafka→Doris）。Prometheus 抓两个二进制各自的
-`/metrics`；AI 客户端走管理台的 `POST /mcp`。
+浏览器打开 http://127.0.0.1:8080，用 `admin` + 抄下的密码登录，登记数据源与
+表对象，再建管道。有三件事 UI 目前不会告诉你——来自一次逐字照做本节的
+新用户实测（`docs/dev/dogfooding-round5-2026-11-14.md`）：
+
+- **Doris / StarRocks 汇的凭据要放在 node 的环境变量里。** 凭据绝不进 plan
+  文件：汇的数据源是 Doris 或 StarRocks **且**存了密码时，console 只把变量名
+  `TAILRACE_DS_<数据源id>` 下发给引擎，node 用时现读。启动 node 时把它设成
+  HTTP Basic 凭据，例如数据源 id 为 1 时
+  `TAILRACE_DS_1="Basic $(printf 'user:password' | base64)"`——否则部署会以
+  `ENGINE_REJECTED` 失败（"environment variable TAILRACE_DS_1 not set"）。SSH
+  部署链也不会注入，需要在 node 自己的环境里设好。
+- **`file` 数据源的表对象要手工登记。** 控制台的「发现资产」对 file 数据源
+  不可用（返回 400 并提示直接登记表对象），UI 也还没有手工登记表单。在它有
+  之前，调用 `POST /api/datasources/{id}/tables`，请求体形如
+  `{"dbName":"local","tableName":"orders_in","format":"jsonl","columnsJson":[["order_no","utf8"],["amt","decimal(18,2)"]]}`。
+  file 表的表名就是数据源目录下的文件名——引擎打开的是 `<数据源 path>/<表名>`，
+  所以 `orders_in` 指一个名字就叫 `orders_in` 的文件，而不是 `orders.jsonl`。
+- **默认二进制不含 JDBC 源与维表 join。** 已发布的 `tailrace-node` 与 Release
+  tarball 只编入 kafka、file、doris 三个连接器；`connector-jdbc` 是需显式打开
+  的 Cargo feature（`cargo build -p tailrace-node --features connector-jdbc`，
+  见 [docs/connectors/jdbc.md](docs/connectors/jdbc.md)）。
+
+告警规则、SLO 历史、管道即代码（`apply` / `dry-run`）与 DLQ 查看目前没有
+Web 页面，只能走 REST（[docs/protocol/console-api.md](docs/protocol/console-api.md)）。
+想从源码树做脚本化端到端自检，跑 `./scripts/smoke.sh`（默认 25 步断言、无外部
+依赖；加 `--full` 为 44 步——经 docker compose 走 Kafka→Doris）。Prometheus 抓
+两个二进制各自的 `/metrics`；AI 客户端走管理台的 `POST /mcp`。
 
 ## 连接器矩阵
 
@@ -98,8 +117,8 @@ trait 现已带 `prepare / commit / abort` 钩子（默认 no-op）与 `SinkCapa
 |---|---|---|---|
 | kafka | ✅ | ✅ | 主力源，分区位点游标，动态分区发现；汇侧按行产出 JSON 对象到 topic——生产者会话内 `enable.idempotence`，broker 侧无去重 label（重放为 at-least-once），不做分区键路由（`engine/crates/tailrace-conn-kafka/src/lib.rs:48` / `:502`） |
 | file | ✅ | ✅ | 本地/挂载文件；目前管理台回填唯一接受的源（字节位边界）；汇侧每次 flush 追加 jsonl 或滚出一个 parquet part 文件（`engine/crates/tailrace-conn-file/src/lib.rs:21` / `:374`）。两汇均不声明 `partial_update` / `transactional`；parser 汇白名单为 kafka / file / doris / starrocks（`engine/crates/tailrace-parser/src/lib.rs:159`） |
-| jdbc | ✅ | — | MySQL / PostgreSQL keyset 批源（[文档](docs/connectors/jdbc.md)） |
-| dim | 仅 JOIN | — | JDBC 承载的**广播**维表（`kind = dim`，在 JOIN 中以 `${ds:dim.<别名>}` 引用）：装配期全表装载，50 万行 / 64 MiB 上限，必须有唯一键——不是流式 join |
+| jdbc | ✅ | — | MySQL / PostgreSQL keyset 批源；**默认二进制不含**，需显式打开 `connector-jdbc` feature（[文档](docs/connectors/jdbc.md)） |
+| dim | 仅 JOIN | — | JDBC 承载的**广播**维表（`kind = dim`，在 JOIN 中以 `${ds:dim.<数据源id>.<表>} [AS] <别名>` 引用——填数字数据源 id 而不是名称；同 jdbc 需 `connector-jdbc`）：装配期全表装载，50 万行 / 64 MiB 上限，必须有唯一键——不是流式 join |
 | doris | — | ✅ | Stream Load；label 幂等（进程作用域 + 确定性）、部分列更新、sequence column |
 | starrocks | — | ✅ | 经 Doris 汇走 Stream Load，按 kind 门控 StarRocks 差异（FE 307 重定向跟随、头部集）；已对 `starrocks/allin1` e2e（`docker compose --profile starrocks`）；部分列更新仅 Doris |
 | mqtt | — | — | 占位，未实现（触发器制——docs/ASSESSMENT-AND-OUTLOOK.md §五） |
@@ -111,17 +130,16 @@ binlog。
 
 ## 能力矩阵（v1.2.0 + v1.3.0）
 
-下表全部为 v1.1.0 之后落在本源码树的能力，有单测/契约测试与所列 e2e 脚本覆盖。
-标 **[1.2.0]** 的行随发布（tag 2026-11-02）已出；标 **[1.3.0]** 的行为 v1.3 线
-（R11 + R12）落在本树、已随 `[1.3.0]` 定版但**尚未发布**。锚点为本仓库内的
-`路径:行号`（按 2026-11-15 定版树刷新）。
+下表全部为 v1.0.0 之后的能力，有单测/契约测试与所列 e2e 脚本覆盖。
+标 **[1.2.0]** 的行随 v1.2.0 发布（tag 2026-11-02）；标 **[1.3.0]** 的行随 v1.3.0
+发布（tag 2026-11-15）。锚点为本仓库内的 `路径:行号`（按 v1.3.0 tag 的树）。
 
 | 能力 | 做什么 | 代码位置（锚点） |
 |---|---|---|
 | **Prometheus `/metrics`** [1.2.0] | 10 指标面、手写 text format、零 exporter 依赖（1.2.0 为 9 项，第 10 项 idle gauge 见下）；node 端在抓取时从活管道计数器现算渲染，console 端另加 `tailrace_console_db_write_seconds`、SLO 目标线与 R11 起的 lag 分位数行 | `engine/crates/tailrace-api/src/metrics.rs:9`（指标面）`:246`（`node_metrics_text`）；`console/crates/tailrace-console/src/metrics.rs:160`（`scrape`），路由 `console/crates/tailrace-console/src/lib.rs:208` |
 | **Debezium CDC 解码** [1.2.0] | `format = "debezium-json"` 解码器：`c`/`r`/`u` 事件转行、`d` 与墓碑跳过、schemas-enabled 外壳解包、畸形事件进 DLQ。窄口 CDC：只消费事件，不抓 binlog | `engine/crates/tailrace-decode/src/lib.rs:1204`（`DebeziumJsonDecoder`）；派发 `engine/crates/tailrace-runtime/src/lib.rs:1636` |
 | **MCP 服务** [1.2.0，16 工具在 1.3.0] | `POST /mcp`（JSON-RPC 2.0，Streamable HTTP）：**16 工具——8 读、8 写**（1.2.0 为 14 = 9 读 + 5 写；R11 apply 对用满 ≤16 预算，R12 以 `publish_pipeline` **替换**调试型 `get_pipeline_logs` 快照工具而非扩张预算）。写工具须**同时**满足 `--mcp-allow-write` / `MCP_ALLOW_WRITE=1` 与 `"confirm": true`；每次调用审计为 `MCP_TOOL_CALL`、`actor = mcp:<client>`，凭据任意深度脱敏；只读的 `apply_dry_run` 拒收携凭据的声明文件（免会话端点不得成为密码 oracle）。工具描述由 OpenAPI 文档生成——无第二份手写文案可漂移 | `console/crates/tailrace-console/src/mcp.rs:108`（`TOOLS`），路由 `:197`；审计脱敏 `:1241-1242`；开关 `console/crates/tailrace-console/src/main.rs:32` |
-| **维表广播 join** [1.2.0] | `… JOIN ${ds:dim.<别名>} d ON …` 在装配期经 JDBC 全表装载维表为静态 MemTable；500 000 行 / 64 MiB 上限 fail-fast，必须有唯一键，仅 INNER / LEFT（RIGHT / FULL / CROSS 编译期拒绝） | `engine/crates/tailrace-runtime/src/dim.rs:36` `:39`（上限）；join 类型门 `engine/crates/tailrace-parser/src/lib.rs:358-359` |
+| **维表广播 join** [1.2.0] | `… JOIN ${ds:dim.<数据源id>.<表>} [AS] d ON …` 在装配期经 JDBC 全表装载维表为静态 MemTable；500 000 行 / 64 MiB 上限 fail-fast，必须有唯一键，仅 INNER / LEFT（RIGHT / FULL / CROSS 编译期拒绝）；依赖需显式打开的 `connector-jdbc` feature | `engine/crates/tailrace-runtime/src/dim.rs:36` `:39`（上限）；join 类型门 `engine/crates/tailrace-parser/src/lib.rs:358-359` |
 | **建表闭环** [1.2.0] | draft → 人工确认键模型（必选；缺省 422）→ execute 全文审计 → evolve 仅 `ADD COLUMN`（Light Schema Change；改类型/删列只报告不执行）。纯函数生成器：schema + hints 进，DDL + 「这是猜测」标注出；R6 映射 13 个标量词，R9 起 `variant` → `VARIANT`、`list<float32[,dim]>` → `ARRAY<FLOAT>`，未映射类型（`null`）报错而非折叠 | `engine/crates/tailrace-ddl/src/lib.rs:180`（`generate_draft`）`:438`（`doris_type`）；执行 `engine/crates/tailrace-metadata/src/lib.rs:233`（`mysql_exec`）；端点 `console/crates/tailrace-console/src/api/datasources.rs:1979` `:2112` `:2271`；web 向导 `web/src/api/datasources.ts` |
 | **确定性回填** [1.2.0] | `POST /api/pipelines/{id}/backfill` 带 `dryRun`（零副作用）→ 在 `bf-<job>` 台账命名空间与独立消费组内有界运行；label 为 `前缀-语句号-<sha256(from,to)[..8]>_<批序号>`，重放同区间即去重；console 启动期把孤儿 job 标 failed。源门现状：仅 `file`（Kafka 分区级种子为后续项） | `engine/crates/tailrace-conn-doris/src/lib.rs:153`（`range_fingerprint`）`:187`（`LabelMode`）；`engine/crates/tailrace-runtime/src/lib.rs:849`（`run_bounded`）`:1676`（`backfill_state_dir`）；`console/crates/tailrace-console/src/api/pipelines.rs:2433`（POST）`:2529`（jobs）`:2384`（源门） |
 | **部分列更新** [1.2.0] | 开关即 SQL：`INSERT INTO sink (k, a) SELECT …`——INSERT 列清单声明子集，裸 INSERT 整行写。四道门：登记 `key_model = unique` → 活表 `SHOW CREATE TABLE` 须为 UNIQUE merge-on-write（FE 不可达 = 502，不猜）→ 无进行中 Schema Change（409）→ sink 能力 + `sequence_column ∈ 子集`。Stream Load 同时发 `partial_columns:true` **与** `columns` 头（缺头时 Doris 静默把未列出的列置 NULL——活探针实证） | parser `engine/crates/tailrace-parser/src/lib.rs:93-98` `:281`（`insert_column_list`）；`engine/crates/tailrace-conn-doris/src/lib.rs:589`（`with_partial_columns`）；门 `console/crates/tailrace-console/src/api/pipelines.rs:456`（`partial_declarations_gate`）`:549`（`live_key_model_gate`）`:1183`（门聚合） |
@@ -173,7 +191,8 @@ debug 档数字亦不代表 release 构建性能（口径限定随账本同载�
 **与 Flink CDC / SeaTunnel / Vector / Airbyte 有何区别？**
 Flink CDC 与 SeaTunnel 是 JVM 数据集成平台；Airbyte 是多容器 ELT 平台（含
 Temporal）；Vector 与 Redpanda Connect 是带私有转换语言（VRL / Bloblang）、无控制面的
-单二进制。tailrace 是刻意做小的接入引擎——一条 SQL 一条管道、至少一次投递 + 汇端
+单二进制——而且 2026 年起两者都自带原生 Doris Stream Load sink，「能写 Doris 的
+单二进制」本身已不再稀缺。tailrace 是刻意做小的接入引擎——一条 SQL 一条管道、至少一次投递 + 汇端
 label 幂等、两个二进制、无集群——同时把 Doris / StarRocks 写路径的运维闭环一并交付：
 带键模型确认的 DDL 草稿、确定性回填、部分列更新、`/metrics`、MCP 服务与 SSH 部署链。
 流式 join、水位线与状态后端是明确的非目标。需要完整平台就用平台；要在边缘小盒子把
@@ -286,6 +305,9 @@ feature 契约构建、web、testcontainers 临时栈 chaos、端到端 smoke）
 - [docs/book/](docs/book/)——mdBook 文档站（中文单轨；本地 `mdbook build` 构建）
 
 ## 开发
+
+从源码构建需要 Rust ≥ 1.95（rustup；仓库 pin 了 stable 工具链）、Node.js 22 与
+pnpm；`./scripts/build.sh` 构建前端并内嵌，再构建双二进制。
 
 ```bash
 make fmt lint test   # cargo fmt / clippy / test

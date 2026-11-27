@@ -5,9 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-<!-- Release notes draft (v1.3.0) — paste into the GitHub Release body when the
-     user gate opens the tag. Every claim below is from this tree; nothing is
-     tagged or published yet (see the [1.3.0] scope paragraph). -->
+<!-- Release notes draft (v1.3.0) — written before the tag; every claim below is
+     from this tree. v1.3.0 was tagged and published (GitHub Release + crates.io)
+     on 2026-11-15. -->
 
 **v1.3.0 — the breaking minor: unknown column-type words stop folding, and they
 now fail at the registration desk instead of at deploy.**
@@ -60,8 +60,8 @@ two-tick idle clear / T-C MCP `publish_pipeline` / T-D hygiene wave / T-E
 dogfooding round 5 / T-F this cut). This entry cuts the tree at 1.3.0 in
 lockstep — one workspace version inherited by all 23 members, 22 of them
 publishable (`tests-contract` stays `publish = false`); the v1.3.0 tag, the
-binary release and the crates.io publish follow it (R5 precedent — version
-first, publish second). e2e counts quoted below are the figures recorded when
+binary release and the crates.io publish followed on 2026-11-15 (R5 precedent —
+version first, publish second). e2e counts quoted below are the figures recorded when
 each round landed (`scripts/e2e/`, against Doris 2.1.7 in compose and an
 external 3.1.4), not re-run for this entry unless the bullet says so. Anchors
 are `path:line` in this tree._
