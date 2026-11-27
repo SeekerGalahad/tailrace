@@ -14,7 +14,7 @@
 //! adapter over the REST handler it maps to — same DTOs, same error
 //! envelopes, invoked in-process (no HTTP hop, no session middleware;
 //! `/mcp` follows the MCP convention of no console auth, only a global
-//! fixed-window rate limit). Read tools are always on. The seven write
+//! fixed-window rate limit). Read tools are always on. The eight write
 //! tools need BOTH the process-level switch (`--mcp-allow-write` /
 //! `MCP_ALLOW_WRITE=1`) AND `"confirm": true` in the call arguments.
 //!
@@ -1319,9 +1319,10 @@ impl RateLimiter {
 mod tests {
     use super::*;
 
-    /// §7.5 + R8 + R11 surface guard: exactly sixteen tools (the blueprint
+    /// §7.5 + R8 + R11 + R12 surface guard: exactly sixteen tools (the blueprint
     /// ten, the DDL closed loop and backfill status, the pipeline-as-code
-    /// apply pair — the ≤16 budget spent), nine read + seven write, unique
+    /// apply pair, the R12 `publish_pipeline` — the ≤16 budget spent),
+    /// eight read + eight write, unique
     /// names, every definition well-formed, `confirm` required on writes,
     /// and every description GENERATED from the OpenAPI document (route
     /// prefix + the operation's text — the same-source rule; a handler
