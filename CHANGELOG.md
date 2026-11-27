@@ -49,14 +49,17 @@ cargo install tailrace-console --version 1.3.0 --locked
 
 ### Fixed
 
-- **CI advisory gate (time drift, not code): two lockfile bumps and three
+- **CI advisory gate (time drift, not code): three lockfile bumps and three
   documented ignores.** RUSTSEC-2026-0592 (`url` 2.5.8: stack overflow in
-  `Url::origin()` on nested `blob:` URLs) → `url` 2.5.9; RUSTSEC-2026-0544
-  (`libz-sys` 1.1.31: zlib `gz_vacate()` heap buffer overflow, via
-  rdkafka→curl-sys) → `libz-sys` 1.1.33 — both are checksum-verified
-  surgical `Cargo.lock` updates (dependency sets unchanged, no toolchain on
-  the authoring machine; CI's `--locked` gates the result). Both advisories
-  postdate the v1.3.0 tag (2026-11-15), so any push to any branch was red.
+  `Url::origin()` on nested `blob:` URLs) → `url` 2.5.9, which in turn
+  requires `form_urlencoded` ^1.2.3 (published 2026-11-20, after the 1.3.0
+  cut) → `form_urlencoded` 1.2.3; RUSTSEC-2026-0544 (`libz-sys` 1.1.31:
+  zlib `gz_vacate()` heap buffer overflow, via rdkafka→curl-sys) →
+  `libz-sys` 1.1.33. All three are checksum-verified surgical `Cargo.lock`
+  updates (sha256 computed from the `.crate` files, dependency sets
+  re-checked one by one; no toolchain on the authoring machine, CI's
+  `--locked` gates the result). Both vulnerabilities postdate the v1.3.0
+  tag (2026-11-15), so any push to any branch was red.
   RUSTSEC-2026-0543 / -0555 / -0542 (chrono, chrono-tz, humantime
   unmaintained — all versions, no upgrade path, transitive via datafusion)
   are ignored with comments in `deny.toml` per the zip-8.6.0 precedent.
